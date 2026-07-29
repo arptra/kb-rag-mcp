@@ -25,6 +25,12 @@ export KB_PROJECT_ROOT="${project_root}"
 export UV_BIN="${venv_dir}/bin/uv"
 export UV_CACHE_DIR="${project_root}/.uv-cache"
 export UV_PYTHON_INSTALL_DIR="${project_root}/.uv-python"
+export HF_HOME="${project_root}/.cache/huggingface"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export HF_HUB_DISABLE_TELEMETRY=1
+export TRANSFORMERS_OFFLINE=1
+export DO_NOT_TRACK=1
 export PATH="${venv_dir}/bin:${PATH}"
 export PYTHONPATH="${project_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
 

@@ -26,8 +26,9 @@ class Settings(BaseSettings):
 
     knowledge_dir: Path = Path("knowledge")
     cache_dir: Path = Path(".cache/kb")
-    embedding_provider: Literal["sentence_transformers", "hash"] = "sentence_transformers"
-    embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
+    embedding_provider: Literal["sentence_transformers", "hash"] = "hash"
+    embedding_model: str = "./models/Qwen3-Embedding-0.6B"
+    embedding_local_files_only: bool = True
     embedding_device: Literal["auto", "cpu", "mps", "cuda"] = "auto"
     embedding_batch_size: int = Field(default=8, ge=1)
     embedding_max_seq_length: int = Field(default=2048, ge=1)

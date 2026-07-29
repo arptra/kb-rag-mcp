@@ -3,6 +3,7 @@
 .uv-cache/
 .uv-python/
 .cache/
+models/
 .env
 __pycache__/
 *.py[cod]

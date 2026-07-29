@@ -120,8 +120,12 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "python-frontmatter" },
-    { name = "sentence-transformers" },
     { name = "typer" },
+]
+
+[package.optional-dependencies]
+semantic = [
+    { name = "sentence-transformers" },
 ]
 
 [package.dev-dependencies]
@@ -141,9 +145,10 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.11,<3" },
     { name = "pydantic-settings", specifier = ">=2.10,<3" },
     { name = "python-frontmatter", specifier = ">=1.1,<2" },
-    { name = "sentence-transformers", specifier = ">=5.0,<6" },
+    { name = "sentence-transformers", marker = "extra == 'semantic'", specifier = ">=5.0,<6" },
     { name = "typer", specifier = ">=0.16,<1" },
 ]
+provides-extras = ["semantic"]
 
 [package.metadata.requires-dev]
 dev = [

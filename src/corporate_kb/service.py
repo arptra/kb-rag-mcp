@@ -40,6 +40,7 @@ def create_embedding_provider(settings: Settings) -> EmbeddingProvider:
         max_seq_length=settings.embedding_max_seq_length,
         dimension=settings.embedding_dimension,
         query_instruction=settings.query_instruction,
+        local_files_only=settings.embedding_local_files_only,
     )
 
 
@@ -151,7 +152,7 @@ class KnowledgeService:
                 return self._stats
             if not self.settings.auto_index:
                 raise KnowledgeIndexMissingError(
-                    "Knowledge index is missing or incompatible.\nRun: uv run kb index"
+                    "Knowledge index is missing or incompatible.\nRun: ./scripts/dev.sh index"
                 )
             return self.build_index(force=True)
 

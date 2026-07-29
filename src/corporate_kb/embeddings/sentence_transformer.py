@@ -24,6 +24,7 @@ class SentenceTransformerEmbeddingProvider:
         max_seq_length: int,
         dimension: int,
         query_instruction: str,
+        local_files_only: bool = True,
     ) -> None:
         self._model_name = model_name
         self._device_setting = device
@@ -31,6 +32,7 @@ class SentenceTransformerEmbeddingProvider:
         self._max_seq_length = max_seq_length
         self._dimension = dimension
         self._query_instruction = query_instruction
+        self._local_files_only = local_files_only
         self._model: Any | None = None
 
     @property
@@ -54,6 +56,7 @@ class SentenceTransformerEmbeddingProvider:
                 "dimension": self.dimension,
                 "max_seq_length": self._max_seq_length,
                 "query_instruction": self._query_instruction,
+                "local_files_only": self._local_files_only,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -110,11 +113,21 @@ class SentenceTransformerEmbeddingProvider:
 
             device = self._resolve_device()
             logger.info("Loading embedding model %s on %s", self.model_name, device)
-            self._model = SentenceTransformer(
-                self.model_name,
-                device=device,
-                truncate_dim=self.dimension,
-            )
+            try:
+                self._model = SentenceTransformer(
+                    self.model_name,
+                    device=device,
+                    truncate_dim=self.dimension,
+                    local_files_only=self._local_files_only,
+                )
+            except Exception as exc:
+                if not self._local_files_only:
+                    raise
+                raise RuntimeError(
+                    "Embedding model is not available locally and network access is disabled. "
+                    "Set KB_EMBEDDING_MODEL to a local model directory or use "
+                    "KB_EMBEDDING_PROVIDER=hash. No external download was attempted."
+                ) from exc
             self._model.max_seq_length = self._max_seq_length
         return self._model
 

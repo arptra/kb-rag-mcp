@@ -17,7 +17,7 @@ knowledge/*.md, *.html, *.txt
        ↓
 loader + normalizer + structural chunker
        ↓
-Qwen3 Embedding (или тестовый hash provider)
+local feature hashing (по умолчанию) или локальная embedding-модель
        ↓
 NumPy matrix in RAM
        ↓
@@ -47,7 +47,8 @@ Qwen Code CLI
 ## Первый запуск
 
 Убедитесь, что доступен Python 3.12. Глобальный `uv` не нужен: setup-скрипт создаст `.venv`,
-установит `uv` непосредственно в него и синхронизирует зависимости из lock-файла:
+установит `uv` непосредственно в него и синхронизирует базовые зависимости из lock-файла.
+Hugging Face, PyTorch и `sentence-transformers` в базовую установку не входят:
 
 ```bash
 ./scripts/setup-venv.sh
@@ -63,48 +64,65 @@ command -v uv
 echo "$UV_BIN"
 ```
 
-Сначала проверьте всю инфраструктуру без сети и без скачивания Qwen-модели:
+Полностью локальный режим по умолчанию использует hash provider и не требует модели или сети:
 
 ```bash
-KB_EMBEDDING_PROVIDER=hash \
-  uv run kb index --force
-
-KB_EMBEDDING_PROVIDER=hash \
-  uv run kb search "Какой сервис владеет дневными лимитами?"
+./scripts/dev.sh index-hash
+./scripts/dev.sh search-hash
 ```
 
-Hash provider — только детерминированная проверка цепочки загрузка → chunking → cache → cosine
-search → MCP. Это не production semantic embedding.
+Hash provider строит локальные lexical vectors из слов и символьных триграмм. Он пригоден для
+полностью автономного поиска по совпадающей терминологии, но не понимает смысл и синонимы так же
+хорошо, как semantic embedding model.
 
-После smoke test постройте реальный индекс:
+Для качественного semantic search сначала положите заранее полученные и одобренные model files в
+локальный каталог. Этот проект не скачивает их. Например:
 
 ```bash
-uv run kb index --force
-uv run kb search "Какой сервис владеет дневными лимитами?"
+models/Qwen3-Embedding-0.6B/
 ```
 
-Первый реальный запуск скачает `Qwen/Qwen3-Embedding-0.6B` с Hugging Face. По умолчанию выбирается
-CUDA, затем MPS, затем CPU. Устройство и размер батча можно задать через `.env` или `KB_*` variables.
+После этого активируйте окружение, укажите только локальный путь и постройте индекс:
+
+```bash
+./scripts/dev.sh install-semantic
+source ./scripts/activate-venv.sh
+export KB_EMBEDDING_PROVIDER=sentence_transformers
+export KB_EMBEDDING_MODEL="$KB_PROJECT_ROOT/models/Qwen3-Embedding-0.6B"
+export KB_EMBEDDING_LOCAL_FILES_ONLY=true
+
+./scripts/dev.sh index-semantic
+./scripts/dev.sh search "Какой сервис владеет дневными лимитами?"
+```
+
+`local_files_only=true`, `HF_HUB_OFFLINE=1` и `TRANSFORMERS_OFFLINE=1` запрещают обращения к
+Hugging Face. Если model files отсутствуют, индексирование завершится понятной ошибкой без попытки
+скачивания. По умолчанию выбирается CUDA, затем MPS, затем CPU.
+
+`scripts/start-mcp.sh` по умолчанию запускает MCP с `KB_EMBEDDING_PROVIDER=hash`, поэтому обычное
+подключение Qwen полностью offline. Для локальной semantic-модели явно передайте provider и путь в
+environment Qwen-конфигурации. Все runtime wrappers используют `uv run --offline --no-sync`:
+после установки они не обращаются к package registry и не меняют окружение.
 
 ## CLI
 
 ```bash
-uv run kb index
-uv run kb index --force
-uv run kb search "Как рассчитывается дневной лимит?" --top-k 5
-uv run kb search "Как рассчитывается дневной лимит?" --service limits-service
-uv run kb search "Как рассчитывается дневной лимит?" --document-type business_rule
-uv run kb documents
-uv run kb stats
-uv run kb eval
-uv run kb eval --top-k 5
+uv run --offline --no-sync kb index
+uv run --offline --no-sync kb index --force
+uv run --offline --no-sync kb search "Как рассчитывается дневной лимит?" --top-k 5
+uv run --offline --no-sync kb search "Как рассчитывается дневной лимит?" --service limits-service
+uv run --offline --no-sync kb search "Как рассчитывается дневной лимит?" --document-type business_rule
+uv run --offline --no-sync kb documents
+uv run --offline --no-sync kb stats
+uv run --offline --no-sync kb eval
+uv run --offline --no-sync kb eval --top-k 5
 ```
 
 У `search`, `documents`, `stats` и `eval` есть `--json`. В этом режиме stdout содержит только JSON,
 а логи остаются в stderr.
 
 Если кэша нет или он несовместим, обычный поиск при `KB_AUTO_INDEX=false` завершится практичным
-сообщением `Run: uv run kb index`. Это предотвращает неожиданное скачивание большой модели во время
+сообщением `Run: ./scripts/dev.sh index`. Это предотвращает неожиданную сетевую активность во время
 MCP discovery.
 
 ## Подключение к Qwen Code
@@ -123,7 +141,10 @@ qwen mcp add \
   --include-tools kb_search,kb_get_document,kb_list_documents,kb_stats \
   -e KB_KNOWLEDGE_DIR=/absolute/path/to/repository/knowledge \
   -e KB_CACHE_DIR=/absolute/path/to/repository/.cache/kb \
-  -e KB_EMBEDDING_PROVIDER=sentence_transformers \
+  -e KB_EMBEDDING_PROVIDER=hash \
+  -e KB_EMBEDDING_LOCAL_FILES_ONLY=true \
+  -e HF_HUB_OFFLINE=1 \
+  -e TRANSFORMERS_OFFLINE=1 \
   -e KB_AUTO_INDEX=false \
   local-corporate-kb \
   /absolute/path/to/repository/scripts/start-mcp.sh
@@ -159,7 +180,7 @@ qwen
 Ручной запуск stdio server:
 
 ```bash
-uv run kb-mcp
+./scripts/start-mcp.sh
 ```
 
 stdout зарезервирован для MCP-протокола; все application logs направляются в stderr.
@@ -199,7 +220,7 @@ custom_field: "неизвестные поля тоже сохраняются"
 Пересобрать кэш:
 
 ```bash
-uv run kb index --force
+./scripts/dev.sh index
 ```
 
 Полностью удалить его можно командой `rm -rf .cache/kb`, после чего снова выполнить `kb index`.
@@ -210,7 +231,8 @@ uv run kb index --force
 Все параметры перечислены в `.env.example`. Основные:
 
 - `KB_EMBEDDING_PROVIDER=sentence_transformers|hash`;
-- `KB_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B`;
+- `KB_EMBEDDING_MODEL=./models/Qwen3-Embedding-0.6B` — локальный каталог model files;
+- `KB_EMBEDDING_LOCAL_FILES_ONLY=true` — fail-closed запрет сетевой загрузки модели;
 - `KB_EMBEDDING_DEVICE=auto|cpu|mps|cuda`;
 - `KB_EMBEDDING_DIMENSION=1024`;
 - `KB_CHUNK_SIZE_TOKENS=700`, `KB_CHUNK_HARD_MAX_TOKENS=900`,
@@ -223,9 +245,9 @@ uv run kb index --force
 ## Проверки
 
 ```bash
-uv run ruff check .
-uv run mypy src
-KB_EMBEDDING_PROVIDER=hash uv run pytest -q
+./scripts/dev.sh lint
+./scripts/dev.sh typecheck
+./scripts/dev.sh test
 ./scripts/dev.sh check
 ```
 
@@ -233,12 +255,15 @@ KB_EMBEDDING_PROVIDER=hash uv run pytest -q
 
 ```bash
 ./scripts/dev.sh install
+./scripts/dev.sh install-semantic
 ./scripts/dev.sh test
 ./scripts/dev.sh lint
 ./scripts/dev.sh typecheck
 ./scripts/dev.sh index-hash
 ./scripts/dev.sh search-hash
 ./scripts/dev.sh index
+./scripts/dev.sh search
+./scripts/dev.sh index-semantic
 ./scripts/dev.sh eval
 ./scripts/dev.sh serve
 ```

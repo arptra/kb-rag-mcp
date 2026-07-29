@@ -94,5 +94,5 @@ def test_service_requires_explicit_index_when_auto_index_is_disabled(settings_fa
         provider=CountingHashProvider(settings.embedding_dimension),
     )
 
-    with pytest.raises(KnowledgeIndexMissingError, match="uv run kb index"):
+    with pytest.raises(KnowledgeIndexMissingError, match=r"\./scripts/dev\.sh index"):
         service.load_or_build_index()

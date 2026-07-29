@@ -1,4 +1,4 @@
-"""Deterministic feature-hashing embeddings for tests and smoke checks."""
+"""Deterministic local feature-hashing embeddings with no model dependency."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ _WORD = re.compile(r"\w+", re.UNICODE)
 
 
 class HashEmbeddingProvider:
-    """Offline embeddings; useful for pipeline verification, not semantic production search."""
+    """Offline lexical embeddings based on words and character trigrams."""
 
     def __init__(self, dimension: int = 256) -> None:
         if dimension < 1:
