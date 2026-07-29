@@ -46,16 +46,21 @@ Qwen Code CLI
 
 ## Первый запуск
 
-Установите [`uv`](https://docs.astral.sh/uv/getting-started/installation/), если его ещё нет:
+Убедитесь, что доступен Python 3.12. Глобальный `uv` не нужен: setup-скрипт создаст `.venv`,
+установит `uv` непосредственно в него и синхронизирует зависимости из lock-файла:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+./scripts/setup-venv.sh
+source ./scripts/activate-venv.sh
 ```
 
-Установите Python 3.12 и зафиксированные зависимости:
+После активации `command -v uv` должен указывать на `.venv/bin/uv`. Скрипт удаляет действующие
+shell alias/function с именем `uv`, ставит `.venv/bin` первым в `PATH` и экспортирует `UV_BIN`:
 
 ```bash
-uv sync
+command -v python
+command -v uv
+echo "$UV_BIN"
 ```
 
 Сначала проверьте всю инфраструктуру без сети и без скачивания Qwen-модели:
@@ -106,7 +111,8 @@ MCP discovery.
 
 Скопируйте `examples/qwen-settings.example.json` в `.qwen/settings.json` проекта и замените все
 `/ABSOLUTE/PATH/...` реальными абсолютными путями. Не рассчитывайте на раскрытие `${PROJECT_ROOT}`
-в JSON. Для stdio особенно важны абсолютный путь к `uv` и корректный `cwd`.
+в JSON. Пример запускает `scripts/start-mcp.sh`: этот wrapper сам активирует локальный `.venv` и
+использует только `.venv/bin/uv`, поэтому глобальный `PATH` Qwen-процесса не имеет значения.
 
 Альтернатива через CLI (выполняйте из корня этого репозитория, подставив абсолютные пути):
 
@@ -120,7 +126,7 @@ qwen mcp add \
   -e KB_EMBEDDING_PROVIDER=sentence_transformers \
   -e KB_AUTO_INDEX=false \
   local-corporate-kb \
-  /absolute/path/to/uv run kb-mcp
+  /absolute/path/to/repository/scripts/start-mcp.sh
 ```
 
 `stdio` — транспорт по умолчанию, поэтому `--transport http` здесь не нужен. Синтаксис команды
@@ -220,11 +226,22 @@ uv run kb index --force
 uv run ruff check .
 uv run mypy src
 KB_EMBEDDING_PROVIDER=hash uv run pytest -q
-make check
+./scripts/dev.sh check
 ```
 
-Дополнительные цели: `make install`, `make test`, `make lint`, `make typecheck`, `make index-hash`,
-`make search-hash`, `make index`, `make eval`, `make serve`.
+Обычный shell-скрипт `scripts/dev.sh` также объединяет повседневные команды:
+
+```bash
+./scripts/dev.sh install
+./scripts/dev.sh test
+./scripts/dev.sh lint
+./scripts/dev.sh typecheck
+./scripts/dev.sh index-hash
+./scripts/dev.sh search-hash
+./scripts/dev.sh index
+./scripts/dev.sh eval
+./scripts/dev.sh serve
+```
 
 Тесты всегда инжектируют hash provider и не требуют интернета, Hugging Face, GPU, Qwen Code, Docker
 или внешней БД. MCP integration test использует официальный v2 `Client` напрямую с объектом

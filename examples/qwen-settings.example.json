@@ -6,11 +6,8 @@
   },
   "mcpServers": {
     "local-corporate-kb": {
-      "command": "/ABSOLUTE/PATH/TO/uv",
-      "args": [
-        "run",
-        "kb-mcp"
-      ],
+      "command": "/ABSOLUTE/PATH/TO/REPOSITORY/scripts/start-mcp.sh",
+      "args": [],
       "cwd": "/ABSOLUTE/PATH/TO/REPOSITORY",
       "env": {
         "KB_KNOWLEDGE_DIR": "/ABSOLUTE/PATH/TO/REPOSITORY/knowledge",
