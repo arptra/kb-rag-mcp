@@ -1,0 +1,33 @@
+{
+  "mcp": {
+    "allowed": [
+      "local-corporate-kb"
+    ]
+  },
+  "mcpServers": {
+    "local-corporate-kb": {
+      "command": "/ABSOLUTE/PATH/TO/uv",
+      "args": [
+        "run",
+        "kb-mcp"
+      ],
+      "cwd": "/ABSOLUTE/PATH/TO/REPOSITORY",
+      "env": {
+        "KB_KNOWLEDGE_DIR": "/ABSOLUTE/PATH/TO/REPOSITORY/knowledge",
+        "KB_CACHE_DIR": "/ABSOLUTE/PATH/TO/REPOSITORY/.cache/kb",
+        "KB_EMBEDDING_PROVIDER": "sentence_transformers",
+        "KB_EMBEDDING_MODEL": "Qwen/Qwen3-Embedding-0.6B",
+        "KB_AUTO_INDEX": "false",
+        "KB_LOG_LEVEL": "INFO"
+      },
+      "includeTools": [
+        "kb_search",
+        "kb_get_document",
+        "kb_list_documents",
+        "kb_stats"
+      ],
+      "timeout": 120000,
+      "trust": false
+    }
+  }
+}

@@ -1,0 +1,28 @@
+[
+  {
+    "question": "Какой сервис владеет дневными лимитами?",
+    "expected_documents": [
+      "services/limits-service.md",
+      "business/daily-limits.md"
+    ]
+  },
+  {
+    "question": "Какое событие публикуется после изменения лимита?",
+    "expected_documents": [
+      "services/limits-service.md",
+      "business/daily-limits.md"
+    ]
+  },
+  {
+    "question": "Почему payments-service не должен сам рассчитывать лимит?",
+    "expected_documents": [
+      "adr/ADR-001-limit-ownership.md"
+    ]
+  },
+  {
+    "question": "Кто владеет профилем клиента?",
+    "expected_documents": [
+      "services/customer-service.md"
+    ]
+  }
+]
