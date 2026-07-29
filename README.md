@@ -129,8 +129,22 @@ MCP discovery.
 
 Скопируйте `examples/qwen-settings.example.json` в `.qwen/settings.json` проекта и замените все
 `/ABSOLUTE/PATH/...` реальными абсолютными путями. Не рассчитывайте на раскрытие `${PROJECT_ROOT}`
-в JSON. Пример запускает `scripts/start-mcp.sh`: этот wrapper сам активирует локальный `.venv` и
-использует только `.venv/bin/uv`, поэтому глобальный `PATH` Qwen-процесса не имеет значения.
+в JSON. В `command` указан абсолютный путь к `.venv/bin/python`, а в `args` — запуск модуля
+`corporate_kb.mcp.server`. Поэтому Qwen не зависит от глобальных `python`, `uv`, `PATH`, shell
+activation или wrapper-скрипта.
+
+Минимальная форма server entry:
+
+```json
+{
+  "command": "/absolute/path/to/repository/.venv/bin/python",
+  "args": ["-m", "corporate_kb.mcp.server"],
+  "cwd": "/absolute/path/to/repository",
+  "env": {
+    "PYTHONPATH": "/absolute/path/to/repository/src"
+  }
+}
+```
 
 Альтернатива через CLI (выполняйте из корня этого репозитория, подставив абсолютные пути):
 
@@ -145,9 +159,13 @@ qwen mcp add \
   -e KB_EMBEDDING_LOCAL_FILES_ONLY=true \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
+  -e PYTHONUNBUFFERED=1 \
+  -e PYTHONNOUSERSITE=1 \
+  -e PYTHONPATH=/absolute/path/to/repository/src \
   -e KB_AUTO_INDEX=false \
   local-corporate-kb \
-  /absolute/path/to/repository/scripts/start-mcp.sh
+  /absolute/path/to/repository/.venv/bin/python \
+  -m corporate_kb.mcp.server
 ```
 
 `stdio` — транспорт по умолчанию, поэтому `--transport http` здесь не нужен. Синтаксис команды
@@ -180,7 +198,7 @@ qwen
 Ручной запуск stdio server:
 
 ```bash
-./scripts/start-mcp.sh
+KB_LOG_LEVEL=DEBUG ./.venv/bin/python -m corporate_kb.mcp.server
 ```
 
 stdout зарезервирован для MCP-протокола; все application logs направляются в stderr.
