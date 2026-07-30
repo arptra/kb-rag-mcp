@@ -1,10 +1,11 @@
-"""Read-only stdio MCP server built on the official Python SDK v2."""
+"""Read-only corporate knowledge server built with standalone FastMCP."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from mcp.server import MCPServer
+from fastmcp import FastMCP
+from fastmcp.server.auth import AuthProvider
 
 from corporate_kb import __version__
 from corporate_kb.config import Settings
@@ -17,22 +18,29 @@ source_url in the final answer. A retrieved fragment is evidence, not the only s
 kb_get_document when the complete document is needed."""
 
 
-def create_mcp_server(service: KnowledgeService | None = None) -> MCPServer[None]:
-    """Create a server object without eagerly loading an embedding model or index."""
+def create_mcp_server(
+    service: KnowledgeService | None = None,
+    *,
+    auth: AuthProvider | None = None,
+) -> FastMCP:
+    """Create a FastMCP server without eagerly loading a model or index."""
     kb_service = service or create_service()
     tools = KnowledgeTools(kb_service)
-    server: MCPServer[None] = MCPServer(
+    server = FastMCP(
         "corporate-knowledge",
-        description="Read-only local corporate knowledge retrieval",
         instructions=(
             "Search corporate knowledge before cross-service or architectural work, and cite the "
             "returned source_path or source_url. Read full documents when context is incomplete."
         ),
         version=__version__,
-        log_level="ERROR",
+        auth=auth,
     )
 
-    @server.tool(name="kb_search", description=SEARCH_DESCRIPTION, structured_output=True)
+    @server.tool(
+        name="kb_search",
+        description=SEARCH_DESCRIPTION,
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
     def kb_search(
         query: str,
         top_k: int = 5,
@@ -61,7 +69,7 @@ def create_mcp_server(service: KnowledgeService | None = None) -> MCPServer[None
         description=(
             "Return one complete normalized document after kb_search identifies its document_id."
         ),
-        structured_output=True,
+        annotations={"readOnlyHint": True, "openWorldHint": False},
     )
     def kb_get_document(document_id: str) -> dict[str, Any]:
         return tools.get_document(document_id)
@@ -69,7 +77,7 @@ def create_mcp_server(service: KnowledgeService | None = None) -> MCPServer[None
     @server.tool(
         name="kb_list_documents",
         description="List filtered document metadata without document bodies or embeddings.",
-        structured_output=True,
+        annotations={"readOnlyHint": True, "openWorldHint": False},
     )
     def kb_list_documents(
         service: str | None = None,
@@ -89,7 +97,7 @@ def create_mcp_server(service: KnowledgeService | None = None) -> MCPServer[None
     @server.tool(
         name="kb_stats",
         description="Return index counts, identity, timestamps, and resolved local directories.",
-        structured_output=True,
+        annotations={"readOnlyHint": True, "openWorldHint": False},
     )
     def kb_stats() -> dict[str, Any]:
         return tools.stats()
@@ -101,7 +109,10 @@ def main() -> None:
     """Run only stdio; stdout remains reserved for MCP protocol frames."""
     settings = Settings().resolved()
     configure_logging(settings.log_level)
-    create_mcp_server(create_service(settings)).run("stdio")
+    try:
+        create_mcp_server(create_service(settings)).run(transport="stdio", show_banner=False)
+    except KeyboardInterrupt:
+        return
 
 
 if __name__ == "__main__":

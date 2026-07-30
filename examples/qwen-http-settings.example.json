@@ -1,0 +1,24 @@
+{
+  "mcp": {
+    "allowed": [
+      "remote-corporate-kb"
+    ]
+  },
+  "mcpServers": {
+    "remote-corporate-kb": {
+      "httpUrl": "https://kb.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_THE_SERVER_TOKEN"
+      },
+      "includeTools": [
+        "kb_search",
+        "kb_get_document",
+        "kb_list_documents",
+        "kb_stats"
+      ],
+      "discoveryTimeoutMs": 10000,
+      "timeout": 120000,
+      "trust": false
+    }
+  }
+}

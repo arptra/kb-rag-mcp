@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from mcp.client import Client
+from fastmcp import Client
 
 from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
 from corporate_kb.mcp.server import create_mcp_server
@@ -34,7 +34,7 @@ limits-service owns daily limits.
 
     async with Client(server) as client:
         listed = await client.list_tools()
-        assert {tool.name for tool in listed.tools} == {
+        assert {tool.name for tool in listed} == {
             "kb_search",
             "kb_get_document",
             "kb_list_documents",
@@ -43,18 +43,18 @@ limits-service owns daily limits.
 
         search = await client.call_tool("kb_search", {"query": "daily limits"})
         assert search.is_error is False
-        assert isinstance(search.structured_content, dict)
-        assert search.structured_content["result_count"] == 1
-        hit = search.structured_content["results"][0]
+        assert isinstance(search.data, dict)
+        assert search.data["result_count"] == 1
+        hit = search.data["results"][0]
         assert hit["source_path"] == "limits.md"
         assert "citation" in hit
 
         document = await client.call_tool("kb_get_document", {"document_id": hit["document_id"]})
-        assert document.structured_content["title"] == "Limits Service"
+        assert document.data["title"] == "Limits Service"
 
         stats = await client.call_tool("kb_stats", {})
-        assert stats.structured_content["document_count"] == 1
-        assert stats.structured_content["embedding_provider"] == "hash"
+        assert stats.data["document_count"] == 1
+        assert stats.data["embedding_provider"] == "hash"
 
         documents = await client.call_tool("kb_list_documents", {})
-        assert documents.structured_content["document_count"] == 1
+        assert documents.data["document_count"] == 1

@@ -7,7 +7,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "beautifulsoup4>=4.13,<5",
     "markdownify>=1.2,<2",
-    "mcp[cli]>=2,<3",
+    "fastmcp==3.4.4",
     "numpy>=2.2,<3",
     "pydantic>=2.11,<3",
     "pydantic-settings>=2.10,<3",
@@ -23,6 +23,7 @@ semantic = [
 [project.scripts]
 kb = "corporate_kb.cli:main"
 kb-mcp = "corporate_kb.mcp.server:main"
+kb-mcp-http = "corporate_kb.mcp.http_server:main"
 
 [dependency-groups]
 dev = [

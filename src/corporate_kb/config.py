@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_QUERY_INSTRUCTION = (
@@ -40,6 +40,22 @@ class Settings(BaseSettings):
     default_top_k: int = Field(default=5, ge=1, le=20)
     auto_index: bool = False
     log_level: str = "INFO"
+    mcp_http_host: str = "127.0.0.1"
+    mcp_http_port: int = Field(default=8000, ge=1, le=65535)
+    mcp_http_path: str = "/mcp"
+    mcp_http_bearer_token: SecretStr | None = None
+    mcp_http_allowed_hosts: str = "127.0.0.1:*,localhost:*,[::1]:*"
+    mcp_http_allowed_origins: str = ""
+
+    @field_validator("mcp_http_path")
+    @classmethod
+    def validate_http_path(cls, value: str) -> str:
+        """Keep the MCP route unambiguous for ASGI routing and auth checks."""
+        if not value.startswith("/") or value == "/" or value.endswith("/"):
+            raise ValueError("KB_MCP_HTTP_PATH must look like /mcp without a trailing slash")
+        if "?" in value or "#" in value or "//" in value:
+            raise ValueError("KB_MCP_HTTP_PATH must be a plain absolute URL path")
+        return value
 
     @model_validator(mode="after")
     def validate_chunking(self) -> Settings:

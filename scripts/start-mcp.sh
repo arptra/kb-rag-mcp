@@ -11,4 +11,4 @@ unset KB_ACTIVATE_QUIET
 export KB_EMBEDDING_PROVIDER="${KB_EMBEDDING_PROVIDER:-hash}"
 export KB_EMBEDDING_LOCAL_FILES_ONLY="${KB_EMBEDDING_LOCAL_FILES_ONLY:-true}"
 
-exec "${UV_BIN}" run --offline --no-sync --project "${KB_PROJECT_ROOT}" kb-mcp "$@"
+exec "${VIRTUAL_ENV}/bin/python" -m corporate_kb.mcp.server "$@"

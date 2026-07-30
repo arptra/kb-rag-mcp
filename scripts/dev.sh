@@ -18,8 +18,11 @@ Usage: ./scripts/dev.sh <command> [arguments]
 
 Commands:
   install       Create/update the local venv and install locked dependencies
+  install-pip   Create/update the local venv with pip; does not use uv
   install-semantic
                 Install optional local semantic embedding dependencies
+  install-pip-semantic
+                Install runtime, dev, and semantic dependencies with pip
   test          Run offline tests with the hash embedding provider
   lint          Run Ruff
   typecheck     Run mypy
@@ -32,6 +35,7 @@ Commands:
                 Rebuild with an explicitly configured local semantic model
   eval          Run retrieval evaluation
   serve         Start the stdio MCP server
+  serve-http    Start the authenticated Streamable HTTP MCP server
 EOF
 }
 
@@ -39,8 +43,14 @@ case "${command_name}" in
   install)
     exec "${script_dir}/setup-venv.sh" "$@"
     ;;
+  install-pip)
+    exec "${script_dir}/setup-pip.sh" "$@"
+    ;;
   install-semantic)
     exec "${script_dir}/setup-venv.sh" --extra semantic "$@"
+    ;;
+  install-pip-semantic)
+    exec "${script_dir}/setup-pip.sh" --semantic "$@"
     ;;
   help|-h|--help)
     show_help
@@ -51,51 +61,55 @@ esac
 export KB_ACTIVATE_QUIET=true
 source "${script_dir}/activate-venv.sh"
 unset KB_ACTIVATE_QUIET
-uv_runtime=("${UV_BIN}" run --offline --no-sync)
+python_runtime=("${VIRTUAL_ENV}/bin/python")
 
 case "${command_name}" in
   test)
-    KB_EMBEDDING_PROVIDER=hash "${uv_runtime[@]}" pytest -q "$@"
+    KB_EMBEDDING_PROVIDER=hash "${python_runtime[@]}" -m pytest -q "$@"
     ;;
   lint)
-    "${uv_runtime[@]}" ruff check . "$@"
+    "${python_runtime[@]}" -m ruff check . "$@"
     ;;
   typecheck)
-    "${uv_runtime[@]}" mypy src "$@"
+    "${python_runtime[@]}" -m mypy src "$@"
     ;;
   check)
-    "${uv_runtime[@]}" ruff check .
-    "${uv_runtime[@]}" mypy src
-    KB_EMBEDDING_PROVIDER=hash "${uv_runtime[@]}" pytest -q
+    "${python_runtime[@]}" -m ruff check .
+    "${python_runtime[@]}" -m mypy src
+    KB_EMBEDDING_PROVIDER=hash "${python_runtime[@]}" -m pytest -q
     ;;
   index-hash)
-    KB_EMBEDDING_PROVIDER=hash "${uv_runtime[@]}" kb index --force "$@"
+    KB_EMBEDDING_PROVIDER=hash "${python_runtime[@]}" -m corporate_kb.cli index --force "$@"
     ;;
   search-hash)
     query="${1:-Какой сервис владеет дневными лимитами?}"
     if [[ $# -gt 0 ]]; then
       shift
     fi
-    KB_EMBEDDING_PROVIDER=hash "${uv_runtime[@]}" kb search "${query}" --top-k 5 "$@"
+    KB_EMBEDDING_PROVIDER=hash "${python_runtime[@]}" -m corporate_kb.cli \
+      search "${query}" --top-k 5 "$@"
     ;;
   index)
-    "${uv_runtime[@]}" kb index --force "$@"
+    "${python_runtime[@]}" -m corporate_kb.cli index --force "$@"
     ;;
   search)
     query="${1:-Какой сервис владеет дневными лимитами?}"
     if [[ $# -gt 0 ]]; then
       shift
     fi
-    "${uv_runtime[@]}" kb search "${query}" --top-k 5 "$@"
+    "${python_runtime[@]}" -m corporate_kb.cli search "${query}" --top-k 5 "$@"
     ;;
   index-semantic)
-    "${uv_runtime[@]}" kb index --force "$@"
+    "${python_runtime[@]}" -m corporate_kb.cli index --force "$@"
     ;;
   eval)
-    "${uv_runtime[@]}" kb eval "$@"
+    "${python_runtime[@]}" -m corporate_kb.cli eval "$@"
     ;;
   serve)
     exec "${script_dir}/start-mcp.sh" "$@"
+    ;;
+  serve-http)
+    exec "${script_dir}/start-mcp-http.sh" "$@"
     ;;
   *)
     echo "Unknown command: ${command_name}" >&2

@@ -2,11 +2,14 @@
 
 Это локальный MVP корпоративного RAG: документы индексируются Python-процессом, embeddings
 сохраняются в проверяемый файловый кэш, а при поиске целиком находятся в RAM. Qwen Code остаётся
-единственной генеративной моделью и получает найденные фрагменты через read-only MCP tools.
-MCP-сервер не формулирует финальные ответы, не исполняет shell-команды и не изменяет документы.
+единственной генеративной моделью и получает найденные фрагменты через read-only MCP tools по
+локальному `stdio` или удалённому Streamable HTTP. MCP-сервер не формулирует финальные ответы,
+не исполняет shell-команды и не изменяет документы.
 
-Проект рассчитан на Python 3.12, `uv` и официальный MCP Python SDK v2. Зафиксированная версия SDK
-указана в `uv.lock`; сторонний пакет `fastmcp` не используется.
+Проект рассчитан на Python 3.12 и standalone `FastMCP==3.4.4`. Запуск после установки не зависит
+от `uv`: все runtime-скрипты вызывают Python из `.venv` напрямую. Для разработки доступна
+воспроизводимая установка через `uv.lock`, а для корпоративных машин — отдельная установка через
+обычный `pip`.
 
 ## Архитектура
 
@@ -21,9 +24,18 @@ local feature hashing (по умолчанию) или локальная embedd
        ↓
 NumPy matrix in RAM
        ↓
-MCP stdio
+MCP stdio / Streamable HTTP
        ↓
 Qwen Code CLI
+```
+
+В удалённом режиме тот же индекс один раз загружается в память серверного процесса, после чего к
+нему одновременно подключаются Qwen Code CLI с разных машин:
+
+```text
+Qwen CLI ─┐
+Qwen CLI ─┼─ HTTPS / Bearer token ─ MCP Streamable HTTP ─ in-memory index
+Qwen CLI ─┘
 ```
 
 `DocumentLoader` безопасно обходит только `KB_KNOWLEDGE_DIR`, нормализует Markdown/TXT и переводит
@@ -41,28 +53,61 @@ Qwen Code CLI
 - `chunks.json` — чанки без отдельной копии embedding;
 - `embeddings.npy` — матрица без pickle.
 
-Это не Vector DB: нет отдельного сервиса, индекса ANN, SQL или сетевого API. Диск используется для
-ускорения старта, но поиск выполняется полным cosine scan по NumPy-матрице в памяти.
+Это не Vector DB: нет отдельного сервиса хранения, индекса ANN или SQL. Удалённый HTTP — только
+read-only MCP-фасад; поиск выполняется полным cosine scan по NumPy-матрице в памяти, а диск
+используется для ускорения старта.
 
 ## Первый запуск
 
-Убедитесь, что доступен Python 3.12. Глобальный `uv` не нужен: setup-скрипт создаст `.venv`,
-установит `uv` непосредственно в него и синхронизирует базовые зависимости из lock-файла.
+### Подключение сотрудника к удалённой базе
+
+RAG, индекс и документы находятся только на сервере. На клиентской машине не нужны Python,
+FastMCP, `uv`, локальная `.venv` или копия `knowledge/`.
+
+Администратор один раз открывает `install.sh` и заполняет две строки:
+
+```bash
+default_mcp_url="https://kb.company.example/mcp"
+default_mcp_token="SERVER_BEARER_TOKEN"
+```
+
+После этого сотруднику передаётся только готовый `install.sh`. Он запускает:
+
+```bash
+./install.sh
+```
+
+Скрипт проверяет наличие Qwen Code и регистрирует удалённый Streamable HTTP MCP `corporate-kb` в
+user scope. Повторный запуск обновляет эту запись. Никакие документы на клиент не скачиваются:
+Qwen вызывает `kb_search` и `kb_get_document` на сервере и получает только результаты запросов.
+
+Вместо встраивания адреса и токена в файл их можно передать через окружение:
+
+```bash
+CORPORATE_KB_MCP_URL='https://kb.company.example/mcp' \
+CORPORATE_KB_MCP_TOKEN='SERVER_BEARER_TOKEN' \
+./install.sh
+```
+
+### Установка серверной части
+
+Убедитесь, что доступен Python 3.12. На корпоративной машине рекомендуется pip-вариант: он не
+читает `uv.lock`, не запускает `uv` и не зависит от установленной в системе версии `uv`.
 Hugging Face, PyTorch и `sentence-transformers` в базовую установку не входят:
+
+```bash
+./scripts/setup-pip.sh
+source ./scripts/activate-venv.sh
+```
+
+Для разработки с точными версиями из lock-файла остаётся вариант:
 
 ```bash
 ./scripts/setup-venv.sh
 source ./scripts/activate-venv.sh
 ```
 
-После активации `command -v uv` должен указывать на `.venv/bin/uv`. Скрипт удаляет действующие
-shell alias/function с именем `uv`, ставит `.venv/bin` первым в `PATH` и экспортирует `UV_BIN`:
-
-```bash
-command -v python
-command -v uv
-echo "$UV_BIN"
-```
+Оба варианта создают одинаковую `.venv`; runtime-команды используют только `.venv/bin/python`.
 
 Полностью локальный режим по умолчанию использует hash provider и не требует модели или сети:
 
@@ -85,7 +130,7 @@ models/Qwen3-Embedding-0.6B/
 После этого активируйте окружение, укажите только локальный путь и постройте индекс:
 
 ```bash
-./scripts/dev.sh install-semantic
+./scripts/dev.sh install-pip-semantic
 source ./scripts/activate-venv.sh
 export KB_EMBEDDING_PROVIDER=sentence_transformers
 export KB_EMBEDDING_MODEL="$KB_PROJECT_ROOT/models/Qwen3-Embedding-0.6B"
@@ -101,21 +146,19 @@ Hugging Face. Если model files отсутствуют, индексиров�
 
 `scripts/start-mcp.sh` по умолчанию запускает MCP с `KB_EMBEDDING_PROVIDER=hash`, поэтому обычное
 подключение Qwen полностью offline. Для локальной semantic-модели явно передайте provider и путь в
-environment Qwen-конфигурации. Все runtime wrappers используют `uv run --offline --no-sync`:
+environment Qwen-конфигурации. Все runtime wrappers вызывают Python из готовой `.venv` напрямую:
 после установки они не обращаются к package registry и не меняют окружение.
 
 ## CLI
 
 ```bash
-uv run --offline --no-sync kb index
-uv run --offline --no-sync kb index --force
-uv run --offline --no-sync kb search "Как рассчитывается дневной лимит?" --top-k 5
-uv run --offline --no-sync kb search "Как рассчитывается дневной лимит?" --service limits-service
-uv run --offline --no-sync kb search "Как рассчитывается дневной лимит?" --document-type business_rule
-uv run --offline --no-sync kb documents
-uv run --offline --no-sync kb stats
-uv run --offline --no-sync kb eval
-uv run --offline --no-sync kb eval --top-k 5
+./.venv/bin/python -m corporate_kb.cli index
+./.venv/bin/python -m corporate_kb.cli index --force
+./.venv/bin/python -m corporate_kb.cli search "Как рассчитывается дневной лимит?" --top-k 5
+./.venv/bin/python -m corporate_kb.cli search "Как рассчитывается дневной лимит?" --service limits-service
+./.venv/bin/python -m corporate_kb.cli documents
+./.venv/bin/python -m corporate_kb.cli stats
+./.venv/bin/python -m corporate_kb.cli eval --top-k 5
 ```
 
 У `search`, `documents`, `stats` и `eval` есть `--json`. В этом режиме stdout содержит только JSON,
@@ -126,6 +169,29 @@ uv run --offline --no-sync kb eval --top-k 5
 MCP discovery.
 
 ## Подключение к Qwen Code
+
+Если MCP-серверы хранятся в отдельном каталоге, установите туда автономную runtime-копию. Скрипт
+создаёт подкаталог `corporate-kb`, копирует только необходимые файлы, создаёт собственный `.venv`,
+ставит locked runtime dependencies без dev-пакетов, строит hash-индекс и печатает готовый server
+entry для Qwen:
+
+```bash
+./scripts/install-mcp-server.sh /absolute/path/to/mcp-servers
+```
+
+Если версия `uv` на целевой машине отличается или `uv` запрещён политиками, установите ту же
+runtime-копию через pip:
+
+```bash
+./scripts/install-mcp-server.sh /absolute/path/to/mcp-servers --pip
+```
+
+Для закрытого окружения можно сначала только скопировать файлы, затем настроить корпоративный Python
+package registry и завершить установку командами, которые напечатает скрипт:
+
+```bash
+./scripts/install-mcp-server.sh /absolute/path/to/mcp-servers --copy-only
+```
 
 Скопируйте `examples/qwen-settings.example.json` в `.qwen/settings.json` проекта и замените все
 `/ABSOLUTE/PATH/...` реальными абсолютными путями. Не рассчитывайте на раскрытие `${PROJECT_ROOT}`
@@ -203,6 +269,107 @@ KB_LOG_LEVEL=DEBUG ./.venv/bin/python -m corporate_kb.mcp.server
 
 stdout зарезервирован для MCP-протокола; все application logs направляются в stderr.
 
+## Удалённый MCP по HTTP
+
+Удалённый режим заранее загружает готовый индекс и только после этого открывает порт. Поэтому все
+подключённые Qwen CLI используют один прогретый процесс и не строят embeddings при каждом запросе.
+Endpoint реализует рекомендованный для удалённых MCP-серверов Streamable HTTP, а не устаревший SSE.
+
+### 1. Подготовить сервер
+
+Скопируйте репозиторий и документы на сервер, установите runtime и один раз постройте индекс:
+
+```bash
+cd /opt/corporate-kb
+./scripts/setup-pip.sh --no-dev
+./scripts/dev.sh index-hash
+```
+
+Сгенерируйте отдельный секрет длиной не менее 32 символов:
+
+```bash
+openssl rand -hex 32
+```
+
+Для прямого запуска внутри доверенной сети или VPN задайте секрет, адрес/IP сервера в allowlist и
+запустите listener:
+
+```bash
+export KB_MCP_HTTP_BEARER_TOKEN='PASTE_GENERATED_TOKEN'
+export KB_MCP_HTTP_HOST='0.0.0.0'
+export KB_MCP_HTTP_PORT='8000'
+export KB_MCP_HTTP_ALLOWED_HOSTS='10.0.0.5:*,kb.internal.example'
+export KB_AUTO_INDEX='false'
+
+./scripts/start-mcp-http.sh
+```
+
+Публичный health check не раскрывает тексты документов:
+
+```bash
+curl http://10.0.0.5:8000/health
+```
+
+Сам `/mcp` требует заголовок `Authorization: Bearer ...`. Сервер не запустится без токена; bind на
+внешний интерфейс также не разрешается, пока в `KB_MCP_HTTP_ALLOWED_HOSTS` нет внешнего IP или
+домена. `KB_AUTO_INDEX=false` гарантирует, что удалённый процесс не начнёт неожиданную
+переиндексацию.
+
+### 2. Подключить Qwen CLI
+
+Перед раздачей впишите в корневой `install.sh` публичный HTTPS-адрес сервера и созданный токен:
+
+```bash
+default_mcp_url="https://kb.company.example/mcp"
+default_mcp_token="THE_SERVER_TOKEN"
+```
+
+Сотруднику передаётся только этот один файл. В любом каталоге он выполняет:
+
+```bash
+bash install.sh
+```
+
+Скрипт не скачивает репозиторий, документы или Python-зависимости и не создаёт каталог RAG. Он
+только добавляет подключение `corporate-kb` в пользовательскую конфигурацию уже установленного
+Qwen Code. После запуска сотрудник перезапускает `qwen` и проверяет соединение через `/mcp`.
+
+Bearer-токен внутри готового скрипта является секретом: раздавайте файл через защищённый
+корпоративный канал. Для отзыва доступа замените токен на сервере и выпустите новый скрипт.
+
+### 3. Доступ через интернет
+
+Не передавайте Bearer-токен по открытому интернету через обычный HTTP. Оставьте backend на
+`127.0.0.1:8000`, а наружу опубликуйте его как HTTPS через Nginx, Caddy, ingress или корпоративный
+API gateway:
+
+```bash
+export KB_MCP_HTTP_BEARER_TOKEN='PASTE_GENERATED_TOKEN'
+export KB_MCP_HTTP_HOST='127.0.0.1'
+export KB_MCP_HTTP_ALLOWED_HOSTS='kb.example.com'
+./scripts/start-mcp-http.sh
+```
+
+Минимальные существенные параметры location для Nginx:
+
+```nginx
+location /mcp {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+}
+```
+
+После этого клиент подключается к `https://kb.example.com/mcp`. TLS-сертификат и сетевой доступ
+настраиваются на reverse proxy; порт `8000` не должен быть открыт наружу.
+
+Когда документы изменились, выполните `./scripts/dev.sh index-hash` и перезапустите HTTP-процесс.
+Уже работающий процесс намеренно продолжает обслуживать согласованную старую версию индекса до
+рестарта.
+
 ## Добавление Confluence-страницы
 
 Экспортируйте страницу в HTML либо сохраните её как Markdown и положите внутрь `knowledge/`.
@@ -256,6 +423,9 @@ custom_field: "неизвестные поля тоже сохраняются"
 - `KB_CHUNK_SIZE_TOKENS=700`, `KB_CHUNK_HARD_MAX_TOKENS=900`,
   `KB_CHUNK_OVERLAP_TOKENS=80`;
 - `KB_AUTO_INDEX=false`.
+- `KB_MCP_HTTP_HOST`, `KB_MCP_HTTP_PORT`, `KB_MCP_HTTP_PATH`;
+- `KB_MCP_HTTP_BEARER_TOKEN` — обязательный секрет для HTTP-режима;
+- `KB_MCP_HTTP_ALLOWED_HOSTS`, `KB_MCP_HTTP_ALLOWED_ORIGINS` — comma-separated allowlists.
 
 Относительные пути разрешаются относительно текущего project working directory; `kb stats`
 показывает итоговые абсолютные пути.
@@ -273,7 +443,9 @@ custom_field: "неизвестные поля тоже сохраняются"
 
 ```bash
 ./scripts/dev.sh install
+./scripts/dev.sh install-pip
 ./scripts/dev.sh install-semantic
+./scripts/dev.sh install-pip-semantic
 ./scripts/dev.sh test
 ./scripts/dev.sh lint
 ./scripts/dev.sh typecheck
@@ -284,11 +456,12 @@ custom_field: "неизвестные поля тоже сохраняются"
 ./scripts/dev.sh index-semantic
 ./scripts/dev.sh eval
 ./scripts/dev.sh serve
+./scripts/dev.sh serve-http
 ```
 
 Тесты всегда инжектируют hash provider и не требуют интернета, Hugging Face, GPU, Qwen Code, Docker
-или внешней БД. MCP integration test использует официальный v2 `Client` напрямую с объектом
-`MCPServer` и in-memory transport — сетевой порт не поднимается.
+или внешней БД. Интеграционные тесты проверяют как in-memory MCP transport, так и HTTP handshake
+через ASGI без открытия сетевого порта.
 
 ## Ограничения MVP и развитие
 
@@ -298,7 +471,8 @@ custom_field: "неизвестные поля тоже сохраняются"
 - Нет reranker, hybrid/BM25 retrieval и отдельной оценки authority при ранжировании.
 - Точный token counter реальной модели не используется для предварительного chunking: интерфейс
   `TokenCounter` отделён, поэтому его можно подключить без связи chunker с SentenceTransformer.
-- MCP работает только через локальный stdio subprocess.
+- Статический Bearer-токен даёт всем клиентам одинаковые права; для персональных учётных записей,
+  отзыва сессий и аудита нужен внешний gateway/IdP либо полноценный OAuth.
 
 Для перехода на настоящую Vector DB нужно реализовать `PostgresKnowledgeStore` или
 `QdrantKnowledgeStore` с тем же контрактом `KnowledgeStore`, выбрать реализацию при сборке
