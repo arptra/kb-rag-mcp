@@ -22,11 +22,4 @@ if [[ -z "${KB_MCP_HTTP_BEARER_TOKEN:-}" ]]; then
   exit 2
 fi
 
-if [[ -z "${KB_MCP_HTTP_ALLOWED_HOSTS:-}" ]]; then
-  printf '%s\n' \
-    "KB_MCP_HTTP_ALLOWED_HOSTS is required for the default external bind." \
-    "Example: export KB_MCP_HTTP_ALLOWED_HOSTS='kb.example.com,10.0.0.5:*'" >&2
-  exit 2
-fi
-
 exec "${VIRTUAL_ENV}/bin/python" -m corporate_kb.mcp.http_server "$@"

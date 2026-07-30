@@ -17,10 +17,7 @@ TOKEN = "test-token-that-is-at-least-32-characters-long"
 
 
 def _indexed_service(settings_factory) -> tuple[KnowledgeService, Settings]:
-    settings = settings_factory(
-        mcp_http_bearer_token=TOKEN,
-        mcp_http_allowed_hosts="testserver",
-    )
+    settings = settings_factory(mcp_http_bearer_token=TOKEN)
     settings.knowledge_dir.mkdir(parents=True)
     (settings.knowledge_dir / "limits.md").write_text(
         "# Limits\n\nlimits-service owns daily limits.",
@@ -34,20 +31,19 @@ def _indexed_service(settings_factory) -> tuple[KnowledgeService, Settings]:
     return service, settings
 
 
-def test_http_settings_require_a_strong_token_and_external_host_allowlist(
+def test_http_settings_require_a_strong_token_but_allow_any_external_host(
     settings_factory,
 ) -> None:
     with pytest.raises(ValueError, match="KB_MCP_HTTP_BEARER_TOKEN is required"):
         validate_http_settings(settings_factory())
     with pytest.raises(ValueError, match="at least 32"):
         validate_http_settings(settings_factory(mcp_http_bearer_token="short"))
-    with pytest.raises(ValueError, match="External HTTP bind"):
+    assert (
         validate_http_settings(
-            settings_factory(
-                mcp_http_host="0.0.0.0",
-                mcp_http_bearer_token=TOKEN,
-            )
+            settings_factory(mcp_http_host="0.0.0.0", mcp_http_bearer_token=TOKEN)
         )
+        == TOKEN
+    )
 
 
 @pytest.mark.asyncio

@@ -237,7 +237,7 @@ qwen mcp add \
 `stdio` — транспорт по умолчанию, поэтому `--transport http` здесь не нужен. Синтаксис команды
 сверен с [официальной документацией Qwen Code](https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/),
 но в среде разработки этого репозитория `qwen` не был установлен, и команда локально не выполнялась.
-JSON-конфигурация также задаёт `cwd`, `trust: false` и allowlist из четырёх tools.
+JSON-конфигурация также задаёт `cwd`, `trust: false` и клиентский фильтр из четырёх tools.
 
 Проверка подключения:
 
@@ -291,14 +291,13 @@ cd /opt/corporate-kb
 openssl rand -hex 32
 ```
 
-Для прямого запуска внутри доверенной сети или VPN задайте секрет, адрес/IP сервера в allowlist и
-запустите listener:
+Для прямого запуска внутри доверенной сети или VPN задайте секрет и запустите listener на всех
+сетевых интерфейсах:
 
 ```bash
 export KB_MCP_HTTP_BEARER_TOKEN='PASTE_GENERATED_TOKEN'
 export KB_MCP_HTTP_HOST='0.0.0.0'
 export KB_MCP_HTTP_PORT='8000'
-export KB_MCP_HTTP_ALLOWED_HOSTS='10.0.0.5:*,kb.internal.example'
 export KB_AUTO_INDEX='false'
 
 ./scripts/start-mcp-http.sh
@@ -310,10 +309,25 @@ export KB_AUTO_INDEX='false'
 curl http://10.0.0.5:8000/health
 ```
 
-Сам `/mcp` требует заголовок `Authorization: Bearer ...`. Сервер не запустится без токена; bind на
-внешний интерфейс также не разрешается, пока в `KB_MCP_HTTP_ALLOWED_HOSTS` нет внешнего IP или
-домена. `KB_AUTO_INDEX=false` гарантирует, что удалённый процесс не начнёт неожиданную
-переиндексацию.
+Сам `/mcp` требует заголовок `Authorization: Bearer ...`. Ограничения по Host, Origin, домену или IP
+нет: сервер принимает клиента с любого адреса, если передан правильный токен. `KB_AUTO_INDEX=false`
+гарантирует, что удалённый процесс не начнёт неожиданную переиндексацию.
+
+Проверяйте с клиентской машины не только `/health`, но и настоящий MCP `initialize`:
+
+```bash
+curl -i --max-time 15 \
+  'http://10.0.0.5:8000/mcp' \
+  -H 'Authorization: Bearer PASTE_GENERATED_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"curl-test","version":"1.0"}}}'
+```
+
+Ожидается `HTTP/1.1 200`. `401` означает неверный токен, `404` — неверный путь, а `421` — что
+запущена старая сборка с Host allowlist. Прямой FastMCP listener, запущенный через Python или `uv`,
+использует обычный HTTP. `https://` указывайте только при наличии TLS reverse proxy; иначе Qwen
+обычно сообщает `TypeError: fetch failed`.
 
 ### 2. Подключить Qwen CLI
 
@@ -346,7 +360,6 @@ API gateway:
 ```bash
 export KB_MCP_HTTP_BEARER_TOKEN='PASTE_GENERATED_TOKEN'
 export KB_MCP_HTTP_HOST='127.0.0.1'
-export KB_MCP_HTTP_ALLOWED_HOSTS='kb.example.com'
 ./scripts/start-mcp-http.sh
 ```
 
@@ -425,7 +438,6 @@ custom_field: "неизвестные поля тоже сохраняются"
 - `KB_AUTO_INDEX=false`.
 - `KB_MCP_HTTP_HOST`, `KB_MCP_HTTP_PORT`, `KB_MCP_HTTP_PATH`;
 - `KB_MCP_HTTP_BEARER_TOKEN` — обязательный секрет для HTTP-режима;
-- `KB_MCP_HTTP_ALLOWED_HOSTS`, `KB_MCP_HTTP_ALLOWED_ORIGINS` — comma-separated allowlists.
 
 Относительные пути разрешаются относительно текущего project working directory; `kb stats`
 показывает итоговые абсолютные пути.

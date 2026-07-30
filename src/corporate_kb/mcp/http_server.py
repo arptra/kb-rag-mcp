@@ -16,17 +16,11 @@ from corporate_kb.mcp.server import create_mcp_server
 from corporate_kb.service import KnowledgeService, configure_logging, create_service
 
 logger = logging.getLogger(__name__)
-_LOOPBACK_BINDS = {"127.0.0.1", "localhost", "::1"}
-_LOOPBACK_ALLOWED_HOSTS = {"127.0.0.1:*", "localhost:*", "[::1]:*"}
 _READ_SCOPE = "kb:read"
 
 
-def _csv_items(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
 def validate_http_settings(settings: Settings) -> str:
-    """Validate fail-closed remote-server settings and return the raw token."""
+    """Validate authenticated remote-server settings and return the raw token."""
     secret = settings.mcp_http_bearer_token
     if secret is None:
         raise ValueError(
@@ -36,18 +30,6 @@ def validate_http_settings(settings: Settings) -> str:
     token = secret.get_secret_value()
     if len(token) < 32:
         raise ValueError("KB_MCP_HTTP_BEARER_TOKEN must contain at least 32 characters")
-
-    allowed_hosts = set(_csv_items(settings.mcp_http_allowed_hosts))
-    if not allowed_hosts:
-        raise ValueError("KB_MCP_HTTP_ALLOWED_HOSTS must contain at least one Host value")
-    if (
-        settings.mcp_http_host not in _LOOPBACK_BINDS
-        and not allowed_hosts.difference(_LOOPBACK_ALLOWED_HOSTS)
-    ):
-        raise ValueError(
-            "External HTTP bind requires a non-loopback value in "
-            "KB_MCP_HTTP_ALLOWED_HOSTS, for example: kb.example.com,10.0.0.5:*"
-        )
     return token
 
 
@@ -94,9 +76,7 @@ def create_http_app(service: KnowledgeService, settings: Settings) -> ASGIApp:
     server = create_http_server(service, settings)
     return server.http_app(
         path=settings.mcp_http_path,
-        host_origin_protection=True,
-        allowed_hosts=_csv_items(settings.mcp_http_allowed_hosts),
-        allowed_origins=_csv_items(settings.mcp_http_allowed_origins),
+        host_origin_protection=False,
     )
 
 
@@ -129,9 +109,7 @@ def main() -> None:
             port=settings.mcp_http_port,
             path=settings.mcp_http_path,
             log_level=settings.log_level,
-            host_origin_protection=True,
-            allowed_hosts=_csv_items(settings.mcp_http_allowed_hosts),
-            allowed_origins=_csv_items(settings.mcp_http_allowed_origins),
+            host_origin_protection=False,
         )
     except KeyboardInterrupt:
         return

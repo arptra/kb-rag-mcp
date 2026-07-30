@@ -44,8 +44,6 @@ class Settings(BaseSettings):
     mcp_http_port: int = Field(default=8000, ge=1, le=65535)
     mcp_http_path: str = "/mcp"
     mcp_http_bearer_token: SecretStr | None = None
-    mcp_http_allowed_hosts: str = "127.0.0.1:*,localhost:*,[::1]:*"
-    mcp_http_allowed_origins: str = ""
 
     @field_validator("mcp_http_path")
     @classmethod
