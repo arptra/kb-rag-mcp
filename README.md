@@ -89,6 +89,19 @@ CORPORATE_KB_MCP_TOKEN='SERVER_BEARER_TOKEN' \
 ./install.sh
 ```
 
+Если старая версия Qwen показывает `TypeError: fetch failed` и при нажатии «Подключить» вообще не
+обращается к серверу, используйте stdio→HTTP мост из
+[`examples/qwen-mcp-remote-settings.example.json`](examples/qwen-mcp-remote-settings.example.json).
+Скопируйте из него `mcpServers` в `~/.qwen/settings.json` и замените два placeholder:
+
+- `REPLACE_WITH_SERVER_IP_OR_DOMAIN` — адрес удалённого сервера;
+- `REPLACE_WITH_SERVER_TOKEN` — Bearer-токен.
+
+На клиенте должны быть доступны `node` и `npx`; `uv`, Python и файлы RAG не нужны. В Windows
+замените `"command": "npx"` на `"command": "npx.cmd"`. Для HTTPS удалите из `args` строку
+`"--allow-http"`. Кнопка OAuth-аутентификации для статического Bearer-токена не используется.
+Мост пишет подробный диагностический лог в `~/.mcp-auth/` благодаря флагу `--debug`.
+
 ### Установка серверной части
 
 Убедитесь, что доступен Python 3.12. На корпоративной машине рекомендуется pip-вариант: он не

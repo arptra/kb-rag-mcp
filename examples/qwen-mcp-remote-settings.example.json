@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "corporate-kb": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote@latest",
+        "http://REPLACE_WITH_SERVER_IP_OR_DOMAIN:8000/mcp",
+        "--allow-http",
+        "--transport",
+        "http-only",
+        "--header",
+        "Authorization:${AUTH_HEADER}",
+        "--debug"
+      ],
+      "env": {
+        "AUTH_HEADER": "Bearer REPLACE_WITH_SERVER_TOKEN"
+      },
+      "timeout": 120000,
+      "trust": false
+    }
+  }
+}
