@@ -11,6 +11,11 @@
 воспроизводимая установка через `uv.lock`, а для корпоративных машин — отдельная установка через
 обычный `pip`.
 
+Отдельные пошаговые инструкции:
+
+- [подключение Qwen на клиентском компьютере](README.client.md);
+- [развёртывание базы и API на удалённом сервере](README.server.md).
+
 ## Архитектура
 
 ```text
@@ -61,46 +66,29 @@ read-only MCP-фасад; поиск выполняется полным cosine 
 
 ### Подключение сотрудника к удалённой базе
 
-RAG, индекс и документы находятся только на сервере. На клиентской машине не нужны Python,
-FastMCP, `uv`, локальная `.venv` или копия `knowledge/`.
+RAG, индекс и документы находятся только на сервере. Для старых версий Qwen сотруднику
+передаётся один файл [`clients/corporate_kb_stdio_proxy.py`](clients/corporate_kb_stdio_proxy.py).
+Qwen запускает его локально через `uv` как stdio MCP, а Python-процесс ходит к удалённому
+серверу через обычные HTTP GET-запросы. Node.js, `npx`, `mcp-remote`, Nginx, копия проекта,
+`.venv`, документы и индекс на клиенте не нужны.
 
-Администратор один раз открывает `install.sh` и заполняет две строки:
+Готовый settings находится в
+[`examples/qwen-uv-stdio-settings.example.json`](examples/qwen-uv-stdio-settings.example.json), а полная
+инструкция для сотрудника — в [`README.client.md`](README.client.md).
 
-```bash
-default_mcp_url="https://kb.company.example/mcp"
-default_mcp_token="SERVER_BEARER_TOKEN"
-```
+Новые версии Qwen также могут подключаться к `/mcp` напряму через Streamable HTTP; скрипт
+`install.sh` оставлен как опциональный способ для таких клиентов.
+Скопируйте из неё `mcpServers` в `~/.qwen/settings.json` и замените четыре placeholder:
 
-После этого сотруднику передаётся только готовый `install.sh`. Он запускает:
-
-```bash
-./install.sh
-```
-
-Скрипт проверяет наличие Qwen Code и регистрирует удалённый Streamable HTTP MCP `corporate-kb` в
-user scope. Повторный запуск обновляет эту запись. Никакие документы на клиент не скачиваются:
-Qwen вызывает `kb_search` и `kb_get_document` на сервере и получает только результаты запросов.
-
-Вместо встраивания адреса и токена в файл их можно передать через окружение:
-
-```bash
-CORPORATE_KB_MCP_URL='https://kb.company.example/mcp' \
-CORPORATE_KB_MCP_TOKEN='SERVER_BEARER_TOKEN' \
-./install.sh
-```
-
-Если старая версия Qwen показывает `TypeError: fetch failed` и при нажатии «Подключить» вообще не
-обращается к серверу, используйте stdio→HTTP мост из
-[`examples/qwen-mcp-remote-settings.example.json`](examples/qwen-mcp-remote-settings.example.json).
-Скопируйте из него `mcpServers` в `~/.qwen/settings.json` и замените два placeholder:
-
+- `REPLACE_WITH_ABSOLUTE_UV_PATH` — результат `which uv` или `where uv` (в Windows `uv.exe`);
+- `REPLACE_WITH_ABSOLUTE_PATH` — каталог, в котором сотрудник сохранил единственный `.py`-файл;
 - `REPLACE_WITH_SERVER_IP_OR_DOMAIN` — адрес удалённого сервера;
 - `REPLACE_WITH_SERVER_TOKEN` — Bearer-токен.
 
-На клиенте должны быть доступны `node` и `npx`; `uv`, Python и файлы RAG не нужны. В Windows
-замените `"command": "npx"` на `"command": "npx.cmd"`. Для HTTPS удалите из `args` строку
-`"--allow-http"`. Кнопка OAuth-аутентификации для статического Bearer-токена не используется.
-Мост пишет подробный диагностический лог в `~/.mcp-auth/` благодаря флагу `--debug`.
+Qwen запускает этот файл как локальный MCP по `stdio` командой `uv run`. Скрипт содержит inline
+dependency на FastMCP, поэтому `uv` сам создаёт изолированное кэшированное окружение. Локальный MCP
+обращается к удалённому RAG только через обычные авторизованные JSON GET endpoints `/api/v1/*`.
+`node`, `npx`, `mcp-remote`, локальная копия документов и локальный индекс не нужны.
 
 ### Установка серверной части
 
@@ -321,6 +309,19 @@ export KB_AUTO_INDEX='false'
 ```bash
 curl http://10.0.0.5:8000/health
 ```
+
+Для stdio-клиента сервер также предоставляет защищённый read-only JSON API. Например, проверка
+поиска использует обычный GET и тот же Bearer-токен:
+
+```bash
+curl -G 'http://10.0.0.5:8000/api/v1/search' \
+  -H 'Authorization: Bearer PASTE_GENERATED_TOKEN' \
+  --data-urlencode 'query=какой сервис владеет дневными лимитами' \
+  --data-urlencode 'top_k=5'
+```
+
+Доступны `/api/v1/search`, `/api/v1/document`, `/api/v1/documents` и `/api/v1/stats`. Они используют
+тот же прогретый индекс, что и MCP tools, не строят embeddings на клиенте и не изменяют документы.
 
 Сам `/mcp` требует заголовок `Authorization: Bearer ...`. Ограничения по Host, Origin, домену или IP
 нет: сервер принимает клиента с любого адреса, если передан правильный токен. `KB_AUTO_INDEX=false`

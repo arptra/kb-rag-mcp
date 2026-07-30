@@ -13,10 +13,70 @@ from starlette.types import ASGIApp
 
 from corporate_kb.config import Settings
 from corporate_kb.mcp.server import create_mcp_server
+from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeService, configure_logging, create_service
 
 logger = logging.getLogger(__name__)
 _READ_SCOPE = "kb:read"
+
+
+def _authorized(request: Request, token: str) -> bool:
+    scheme, separator, supplied = request.headers.get("authorization", "").partition(" ")
+    return (
+        bool(separator)
+        and scheme.lower() == "bearer"
+        and secrets.compare_digest(supplied, token)
+    )
+
+
+def _unauthorized_response() -> JSONResponse:
+    return JSONResponse(
+        {"error": "unauthorized"},
+        status_code=401,
+        headers={"WWW-Authenticate": 'Bearer scope="kb:read"'},
+    )
+
+
+def _optional_query(request: Request, name: str, default: str | None = None) -> str | None:
+    value = request.query_params.get(name)
+    return value if value not in (None, "") else default
+
+
+def _integer_query(
+    request: Request,
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = request.query_params.get(name)
+    try:
+        value = default if raw is None or raw == "" else int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _float_query(request: Request, name: str) -> float | None:
+    raw = request.query_params.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+
+
+def _api_error(exc: Exception) -> JSONResponse:
+    if isinstance(exc, KeyError):
+        return JSONResponse({"error": str(exc.args[0])}, status_code=404)
+    if isinstance(exc, ValueError):
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    logger.exception("Remote knowledge API request failed", exc_info=exc)
+    return JSONResponse({"error": "internal server error"}, status_code=500)
 
 
 def validate_http_settings(settings: Settings) -> str:
@@ -54,6 +114,7 @@ class ConstantTimeTokenVerifier(TokenVerifier):
 def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP:
     """Create an authenticated FastMCP server with a public health route."""
     token = validate_http_settings(settings)
+    tools = KnowledgeTools(service)
     server = create_mcp_server(service, auth=ConstantTimeTokenVerifier(token))
 
     @server.custom_route("/health", methods=["GET"], include_in_schema=False)
@@ -67,6 +128,68 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 "embedding_provider": stats.embedding_provider,
             }
         )
+
+    @server.custom_route("/api/v1/search", methods=["GET"], include_in_schema=False)
+    async def api_search(request: Request) -> JSONResponse:
+        if not _authorized(request, token):
+            return _unauthorized_response()
+        try:
+            query = request.query_params.get("query", "")
+            if not query.strip():
+                raise ValueError("query must not be empty")
+            return JSONResponse(
+                tools.search(
+                    query=query,
+                    top_k=_integer_query(request, "top_k", 5, minimum=1, maximum=20),
+                    min_score=_float_query(request, "min_score"),
+                    service=_optional_query(request, "service"),
+                    domain=_optional_query(request, "domain"),
+                    document_type=_optional_query(request, "document_type"),
+                    status=_optional_query(request, "status", "current"),
+                    authority=_optional_query(request, "authority"),
+                    source_type=_optional_query(request, "source_type"),
+                )
+            )
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/api/v1/document", methods=["GET"], include_in_schema=False)
+    async def api_document(request: Request) -> JSONResponse:
+        if not _authorized(request, token):
+            return _unauthorized_response()
+        try:
+            document_id = request.query_params.get("document_id", "")
+            if not document_id:
+                raise ValueError("document_id must not be empty")
+            return JSONResponse(tools.get_document(document_id))
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/api/v1/documents", methods=["GET"], include_in_schema=False)
+    async def api_documents(request: Request) -> JSONResponse:
+        if not _authorized(request, token):
+            return _unauthorized_response()
+        try:
+            return JSONResponse(
+                tools.list_documents(
+                    service=_optional_query(request, "service"),
+                    domain=_optional_query(request, "domain"),
+                    document_type=_optional_query(request, "document_type"),
+                    status=_optional_query(request, "status"),
+                    limit=_integer_query(request, "limit", 50, minimum=1, maximum=500),
+                )
+            )
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/api/v1/stats", methods=["GET"], include_in_schema=False)
+    async def api_stats(request: Request) -> JSONResponse:
+        if not _authorized(request, token):
+            return _unauthorized_response()
+        try:
+            return JSONResponse(tools.stats())
+        except Exception as exc:
+            return _api_error(exc)
 
     return server
 

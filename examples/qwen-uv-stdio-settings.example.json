@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "corporate-kb": {
+      "command": "REPLACE_WITH_ABSOLUTE_UV_PATH",
+      "args": [
+        "run",
+        "REPLACE_WITH_ABSOLUTE_PATH/corporate_kb_stdio_proxy.py"
+      ],
+      "env": {
+        "CORPORATE_KB_API_URL": "http://REPLACE_WITH_SERVER_IP_OR_DOMAIN:8000",
+        "CORPORATE_KB_API_TOKEN": "REPLACE_WITH_SERVER_TOKEN",
+        "CORPORATE_KB_API_TIMEOUT": "30"
+      },
+      "timeout": 120000,
+      "trust": false
+    }
+  }
+}

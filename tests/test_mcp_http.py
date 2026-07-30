@@ -65,6 +65,28 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
         assert health.status_code == 200
         assert health.json()["documents"] == 1
 
+        unauthorized_api = await anonymous_client.get("/api/v1/stats")
+        assert unauthorized_api.status_code == 401
+
+        api_headers = {"Authorization": f"Bearer {TOKEN}"}
+        api_stats = await anonymous_client.get("/api/v1/stats", headers=api_headers)
+        assert api_stats.status_code == 200
+        assert api_stats.json()["document_count"] == 1
+
+        api_search = await anonymous_client.get(
+            "/api/v1/search",
+            params={"query": "daily limits"},
+            headers=api_headers,
+        )
+        assert api_search.status_code == 200
+        assert api_search.json()["results"][0]["source_path"] == "limits.md"
+
+        missing_query = await anonymous_client.get(
+            "/api/v1/search",
+            headers=api_headers,
+        )
+        assert missing_query.status_code == 400
+
         unauthorized = await anonymous_client.post("/mcp", json={})
         assert unauthorized.status_code == 401
         assert unauthorized.headers["www-authenticate"].startswith("Bearer")
