@@ -54,7 +54,9 @@ knowledge/
 └── business-rules.txt
 ```
 
-Скрытые каталоги и неподдерживаемые форматы не индексируются.
+Скрытые каталоги, symlink-каталоги, symlink-файлы и неподдерживаемые форматы не индексируются.
+Повреждённый или нечитаемый документ пропускается с предупреждением в логе; остальные документы
+продолжают индексироваться.
 
 ## 2. Установить серверное окружение
 
@@ -90,6 +92,25 @@ embeddings.npy
 
 ```bash
 ./scripts/dev.sh search-hash 'дневные лимиты'
+```
+
+Для 10 000 документов первый semantic-индекс может строиться долго: embedding-модель должна
+обработать каждый новый chunk. На CPU это нормально; для ускорения используйте GPU и увеличьте
+batch size, если хватает памяти:
+
+```bash
+export KB_EMBEDDING_PROVIDER=sentence_transformers
+export KB_EMBEDDING_DEVICE=cuda
+export KB_EMBEDDING_BATCH_SIZE=32
+./scripts/dev.sh index
+```
+
+При последующих обновлениях неизменившиеся chunks берутся из предыдущего кэша, поэтому модель
+обрабатывает только новые или изменённые chunks. Во время обхода, chunking и embedding сервер пишет
+прогресс в stderr; для systemd смотрите его так:
+
+```bash
+sudo journalctl -u corporate-kb -f
 ```
 
 ## 4. Создать токен
@@ -246,6 +267,11 @@ sudo systemctl restart corporate-kb
 ```
 
 Новый процесс загрузит обновлённый индекс до начала обслуживания клиентов.
+
+На старте сервер не перестраивает embeddings при каждом запросе: он загружает совместимый кэш в
+RAM. Если кэш несовместим, в логах будут отдельные этапы `Loaded knowledge documents`, `Chunked
+knowledge documents`, `Embedded ...` и `Saved knowledge cache`, поэтому зависание можно отличить от
+медленного semantic indexing.
 
 ## Обновление приложения
 

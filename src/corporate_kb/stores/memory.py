@@ -51,7 +51,9 @@ class InMemoryKnowledgeStore:
         self._documents = {document.document_id: document for document in documents}
         self._chunks = list(chunks)
         self._chunk_index = {chunk.chunk_id: index for index, chunk in enumerate(chunks)}
-        self._embeddings = matrix.copy()
+        # The store never mutates the matrix. Keeping the caller's array avoids a second
+        # full copy of large indexes during startup (which can otherwise trigger swapping).
+        self._embeddings = matrix
 
     def search(
         self,
@@ -76,18 +78,43 @@ class InMemoryKnowledgeStore:
         if not self._chunks:
             return []
 
-        candidate_indices = [
-            index for index, chunk in enumerate(self._chunks) if self._matches(chunk, filters)
-        ]
-        if not candidate_indices:
+        active_filters = filters.active()
+        if active_filters:
+            candidate_indices = np.asarray(
+                [
+                    index
+                    for index, chunk in enumerate(self._chunks)
+                    if self._matches(chunk, filters)
+                ],
+                dtype=np.intp,
+            )
+        else:
+            candidate_indices = np.arange(len(self._chunks), dtype=np.intp)
+        if candidate_indices.size == 0:
             return []
-        index_array = np.asarray(candidate_indices, dtype=np.intp)
-        scores = self._embeddings[index_array] @ query
-        ranked = sorted(
-            zip(candidate_indices, scores.tolist(), strict=True),
-            key=lambda item: (-item[1], self._chunks[item[0]].chunk_id),
-        )
-        selected = [item for item in ranked if min_score is None or item[1] >= min_score][:top_k]
+
+        scores = self._embeddings[candidate_indices] @ query
+        eligible_positions = np.arange(scores.shape[0], dtype=np.intp)
+        if min_score is not None:
+            eligible_positions = np.flatnonzero(scores >= min_score).astype(np.intp, copy=False)
+        if eligible_positions.size == 0:
+            return []
+
+        if eligible_positions.size > top_k:
+            top_positions = np.argpartition(
+                -scores[eligible_positions], top_k - 1
+            )[:top_k]
+            eligible_positions = eligible_positions[top_positions]
+
+        ranked = [
+            (
+                int(candidate_indices[position]),
+                float(scores[position]),
+            )
+            for position in eligible_positions
+        ]
+        ranked.sort(key=lambda item: (-item[1], self._chunks[item[0]].chunk_id))
+        selected = ranked[:top_k]
         results: list[SearchResult] = []
         for rank, (chunk_index, score) in enumerate(selected, start=1):
             if not math.isfinite(score):

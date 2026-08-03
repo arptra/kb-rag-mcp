@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from corporate_kb.loaders.filesystem import FileSystemDocumentLoader
 
 
@@ -78,3 +80,32 @@ def test_filesystem_ignores_hidden_and_unsupported_files(tmp_path: Path) -> None
     documents = FileSystemDocumentLoader().load_directory(root)
 
     assert [document.source_path for document in documents] == ["visible.txt"]
+
+
+def test_filesystem_skips_malformed_documents_and_continues(tmp_path: Path) -> None:
+    root = tmp_path / "knowledge"
+    root.mkdir()
+    (root / "good.md").write_text("# Good\n\nReadable document.", encoding="utf-8")
+    (root / "bad-encoding.md").write_bytes(b"# Broken\n\xff\xfe")
+    (root / "bad-frontmatter.md").write_text(
+        "---\n: invalid: yaml: [\n---\n# Broken\n",
+        encoding="utf-8",
+    )
+
+    documents = FileSystemDocumentLoader().load_directory(root)
+
+    assert [document.source_path for document in documents] == ["good.md"]
+
+
+def test_filesystem_does_not_follow_symlink_directory_cycle(tmp_path: Path) -> None:
+    root = tmp_path / "knowledge"
+    root.mkdir()
+    (root / "good.md").write_text("# Good", encoding="utf-8")
+    try:
+        (root / "cycle").symlink_to(root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    documents = FileSystemDocumentLoader().load_directory(root)
+
+    assert [document.source_path for document in documents] == ["good.md"]

@@ -79,7 +79,7 @@ case "${command_name}" in
     KB_EMBEDDING_PROVIDER=hash "${python_runtime[@]}" -m pytest -q
     ;;
   index-hash)
-    KB_EMBEDDING_PROVIDER=hash "${python_runtime[@]}" -m corporate_kb.cli index --force "$@"
+    KB_EMBEDDING_PROVIDER=hash "${python_runtime[@]}" -m corporate_kb.cli index --force --incremental "$@"
     ;;
   search-hash)
     query="${1:-Какой сервис владеет дневными лимитами?}"
@@ -90,7 +90,7 @@ case "${command_name}" in
       search "${query}" --top-k 5 "$@"
     ;;
   index)
-    "${python_runtime[@]}" -m corporate_kb.cli index --force "$@"
+    "${python_runtime[@]}" -m corporate_kb.cli index --force --incremental "$@"
     ;;
   search)
     query="${1:-Какой сервис владеет дневными лимитами?}"
@@ -100,7 +100,7 @@ case "${command_name}" in
     "${python_runtime[@]}" -m corporate_kb.cli search "${query}" --top-k 5 "$@"
     ;;
   index-semantic)
-    "${python_runtime[@]}" -m corporate_kb.cli index --force "$@"
+    "${python_runtime[@]}" -m corporate_kb.cli index --force --incremental "$@"
     ;;
   eval)
     "${python_runtime[@]}" -m corporate_kb.cli eval "$@"

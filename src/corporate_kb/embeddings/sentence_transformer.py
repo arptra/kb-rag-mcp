@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -66,14 +67,39 @@ class SentenceTransformerEmbeddingProvider:
         if not texts:
             return np.empty((0, self.dimension), dtype=np.float32)
         model = self._get_model()
-        encoded = model.encode(
-            texts,
-            batch_size=self._batch_size,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
+        started = time.perf_counter()
+        batch_count = (len(texts) + self._batch_size - 1) // self._batch_size
+        progress_step = max(1, batch_count // 20)
+        logger.info(
+            "Encoding %d texts with batch_size=%d (%d batches)",
+            len(texts),
+            self._batch_size,
+            batch_count,
         )
-        return self._validate_matrix(encoded, len(texts))
+        batches: list[NDArray[np.float32]] = []
+        for batch_number, start in enumerate(range(0, len(texts), self._batch_size), start=1):
+            batch = texts[start : start + self._batch_size]
+            encoded = model.encode(
+                batch,
+                batch_size=self._batch_size,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            batches.append(self._validate_matrix(encoded, len(batch)))
+            if (
+                batch_number == 1
+                or batch_number % progress_step == 0
+                or batch_number == batch_count
+            ):
+                logger.info("Encoded batches: %d/%d", batch_number, batch_count)
+        matrix = np.vstack(batches).astype(np.float32, copy=False)
+        logger.info(
+            "Encoded %d texts in %.3f seconds",
+            len(texts),
+            time.perf_counter() - started,
+        )
+        return matrix
 
     def embed_query(self, query: str) -> NDArray[np.float32]:
         model = self._get_model()

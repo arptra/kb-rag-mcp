@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sys
 import threading
 import time
 from datetime import UTC, datetime
@@ -19,7 +20,7 @@ from corporate_kb.embeddings.base import EmbeddingProvider
 from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
 from corporate_kb.embeddings.sentence_transformer import SentenceTransformerEmbeddingProvider
 from corporate_kb.loaders.filesystem import FileSystemDocumentLoader
-from corporate_kb.models import Document, IndexStats, SearchFilters, SearchResult
+from corporate_kb.models import Chunk, Document, IndexStats, SearchFilters, SearchResult
 from corporate_kb.stores.base import KnowledgeStore
 from corporate_kb.stores.memory import InMemoryKnowledgeStore
 
@@ -71,11 +72,11 @@ class KnowledgeService:
         self._stats: IndexStats | None = None
         self._lock = threading.RLock()
 
-    def build_index(self, force: bool = False) -> IndexStats:
+    def build_index(self, force: bool = False, *, reuse_unchanged: bool = False) -> IndexStats:
         """Build or reuse an index, replacing the active store only after full validation."""
         with self._lock:
             started = time.perf_counter()
-            documents = self.loader.load_directory(self.settings.knowledge_dir)
+            documents = self._load_documents()
             knowledge_hash = self._knowledge_hash(documents)
             if not force:
                 cached = self.cache.load(
@@ -86,60 +87,28 @@ class KnowledgeService:
                 if cached is not None:
                     self.store.replace_index(cached.documents, cached.chunks, cached.embeddings)
                     self._stats = self._stats_from_cache(cached.manifest)
+                    logger.info(
+                        "Loaded compatible knowledge index: documents=%d chunks=%d in %.3f seconds",
+                        self._stats.document_count,
+                        self._stats.chunk_count,
+                        time.perf_counter() - started,
+                    )
                     return self._stats
 
-            chunks = [chunk for document in documents for chunk in self.chunker.chunk(document)]
-            logger.info("Created %d structural chunks", len(chunks))
-            if chunks:
-                embeddings = self.provider.embed_documents(
-                    [chunk.embedding_text for chunk in chunks]
-                )
-            else:
-                embeddings = np.empty((0, self.provider.dimension), dtype=np.float32)
-            indexed_at = datetime.now(UTC)
-            manifest = CacheManifest(
-                cache_schema_version=CACHE_SCHEMA_VERSION,
-                created_at=indexed_at,
-                embedding_provider=self.provider.provider_name,
-                embedding_model=self.provider.model_name,
-                embedding_dimension=self.provider.dimension,
-                embedding_cache_identity=self.provider.cache_identity,
-                query_instruction=self.settings.query_instruction,
-                chunk_size=self.chunker.target_tokens,
-                chunk_overlap=self.chunker.overlap_tokens,
-                chunk_hard_max=self.chunker.hard_max_tokens,
-                knowledge_hash=knowledge_hash,
-                document_count=len(documents),
-                chunk_count=len(chunks),
-                embeddings_shape=list(embeddings.shape),
-            )
-            self.cache.save(
+            return self._build_index_locked(
                 documents=documents,
-                chunks=chunks,
-                embeddings=embeddings,
-                manifest=manifest,
-            )
-            self.store.replace_index(documents, chunks, embeddings)
-            self._stats = IndexStats(
-                document_count=len(documents),
-                chunk_count=len(chunks),
-                embedding_dimension=self.provider.dimension,
-                embedding_provider=self.provider.provider_name,
-                embedding_model=self.provider.model_name,
-                loaded_from_cache=False,
-                indexed_at=indexed_at,
                 knowledge_hash=knowledge_hash,
-                cache_schema_version=CACHE_SCHEMA_VERSION,
+                started=started,
+                reuse_cache=reuse_unchanged,
             )
-            logger.info("Index built in %.3f seconds", time.perf_counter() - started)
-            return self._stats
 
     def load_or_build_index(self) -> IndexStats:
         """Load a compatible cache; build only when explicitly allowed."""
         with self._lock:
             if self._stats is not None:
                 return self._stats
-            documents = self.loader.load_directory(self.settings.knowledge_dir)
+            started = time.perf_counter()
+            documents = self._load_documents()
             knowledge_hash = self._knowledge_hash(documents)
             cached = self.cache.load(
                 knowledge_hash=knowledge_hash,
@@ -149,12 +118,27 @@ class KnowledgeService:
             if cached is not None:
                 self.store.replace_index(cached.documents, cached.chunks, cached.embeddings)
                 self._stats = self._stats_from_cache(cached.manifest)
+                logger.info(
+                    "Loaded compatible knowledge index: documents=%d chunks=%d in %.3f seconds",
+                    self._stats.document_count,
+                    self._stats.chunk_count,
+                    time.perf_counter() - started,
+                )
                 return self._stats
             if not self.settings.auto_index:
                 raise KnowledgeIndexMissingError(
                     "Knowledge index is missing or incompatible.\nRun: ./scripts/dev.sh index"
                 )
-            return self.build_index(force=True)
+            logger.info(
+                "No compatible cache found; building index from %d documents",
+                len(documents),
+            )
+            return self._build_index_locked(
+                documents=documents,
+                knowledge_hash=knowledge_hash,
+                started=started,
+                reuse_cache=True,
+            )
 
     def search(
         self,
@@ -222,6 +206,131 @@ class KnowledgeService:
         )
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
+    def _load_documents(self) -> list[Document]:
+        """Load documents with a clear phase boundary in server logs."""
+        logger.info("Loading knowledge documents from %s", self.settings.knowledge_dir)
+        started = time.perf_counter()
+        documents = self.loader.load_directory(self.settings.knowledge_dir)
+        logger.info(
+            "Loaded %d knowledge documents in %.3f seconds",
+            len(documents),
+            time.perf_counter() - started,
+        )
+        return documents
+
+    def _build_index_locked(
+        self,
+        *,
+        documents: list[Document],
+        knowledge_hash: str,
+        started: float,
+        reuse_cache: bool,
+    ) -> IndexStats:
+        """Build an index from already-loaded documents while the service lock is held."""
+        chunk_started = time.perf_counter()
+        chunks: list[Chunk] = []
+        progress_step = max(100, len(documents) // 20 or 1)
+        for position, document in enumerate(documents, start=1):
+            chunks.extend(self.chunker.chunk(document))
+            if position == 1 or position % progress_step == 0 or position == len(documents):
+                logger.info(
+                    "Chunked knowledge documents: %d/%d (chunks=%d)",
+                    position,
+                    len(documents),
+                    len(chunks),
+                )
+        logger.info(
+            "Created %d structural chunks from %d documents in %.3f seconds",
+            len(chunks),
+            len(documents),
+            time.perf_counter() - chunk_started,
+        )
+        if chunks:
+            reusable = None
+            if reuse_cache:
+                reusable = self.cache.load_compatible(
+                    embedding_cache_identity=self.provider.cache_identity,
+                    chunking=self.chunker.identity,
+                )
+
+            embeddings = np.empty((len(chunks), self.provider.dimension), dtype=np.float32)
+            old_embeddings = {
+                chunk.chunk_id: reusable.embeddings[index]
+                for index, chunk in enumerate(reusable.chunks)
+            } if reusable is not None else {}
+            pending_positions: list[int] = []
+            pending_texts: list[str] = []
+            for position, chunk in enumerate(chunks):
+                previous = old_embeddings.get(chunk.chunk_id)
+                if previous is None:
+                    pending_positions.append(position)
+                    pending_texts.append(chunk.embedding_text)
+                else:
+                    embeddings[position] = previous
+
+            logger.info(
+                "Embedding %d chunks with provider=%s model=%s (reusing=%d)",
+                len(pending_texts),
+                self.provider.provider_name,
+                self.provider.model_name,
+                len(chunks) - len(pending_texts),
+            )
+            embedding_started = time.perf_counter()
+            if pending_texts:
+                fresh_embeddings = self.provider.embed_documents(pending_texts)
+                embeddings[np.asarray(pending_positions, dtype=np.intp)] = fresh_embeddings
+            logger.info(
+                "Embedded %d new chunks in %.3f seconds",
+                len(pending_texts),
+                time.perf_counter() - embedding_started,
+            )
+        else:
+            embeddings = np.empty((0, self.provider.dimension), dtype=np.float32)
+        indexed_at = datetime.now(UTC)
+        manifest = CacheManifest(
+            cache_schema_version=CACHE_SCHEMA_VERSION,
+            created_at=indexed_at,
+            embedding_provider=self.provider.provider_name,
+            embedding_model=self.provider.model_name,
+            embedding_dimension=self.provider.dimension,
+            embedding_cache_identity=self.provider.cache_identity,
+            query_instruction=self.settings.query_instruction,
+            chunk_size=self.chunker.target_tokens,
+            chunk_overlap=self.chunker.overlap_tokens,
+            chunk_hard_max=self.chunker.hard_max_tokens,
+            knowledge_hash=knowledge_hash,
+            document_count=len(documents),
+            chunk_count=len(chunks),
+            embeddings_shape=list(embeddings.shape),
+        )
+        cache_started = time.perf_counter()
+        self.cache.save(
+            documents=documents,
+            chunks=chunks,
+            embeddings=embeddings,
+            manifest=manifest,
+        )
+        logger.info("Saved knowledge cache in %.3f seconds", time.perf_counter() - cache_started)
+        self.store.replace_index(documents, chunks, embeddings)
+        self._stats = IndexStats(
+            document_count=len(documents),
+            chunk_count=len(chunks),
+            embedding_dimension=self.provider.dimension,
+            embedding_provider=self.provider.provider_name,
+            embedding_model=self.provider.model_name,
+            loaded_from_cache=False,
+            indexed_at=indexed_at,
+            knowledge_hash=knowledge_hash,
+            cache_schema_version=CACHE_SCHEMA_VERSION,
+        )
+        logger.info(
+            "Index built: documents=%d chunks=%d total_seconds=%.3f",
+            len(documents),
+            len(chunks),
+            time.perf_counter() - started,
+        )
+        return self._stats
+
     @staticmethod
     def _stats_from_cache(manifest: CacheManifest) -> IndexStats:
         return IndexStats(
@@ -248,6 +357,8 @@ def configure_logging(level: str) -> None:
     logging.basicConfig(
         level=numeric,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+        force=True,
     )
 
 

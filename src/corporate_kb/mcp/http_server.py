@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 
@@ -119,7 +120,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/health", methods=["GET"], include_in_schema=False)
     async def health_check(_request: Request) -> JSONResponse:
-        stats = service.stats()
+        stats = await asyncio.to_thread(service.stats)
         return JSONResponse(
             {
                 "status": "ok",
@@ -137,19 +138,19 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             query = request.query_params.get("query", "")
             if not query.strip():
                 raise ValueError("query must not be empty")
-            return JSONResponse(
-                tools.search(
-                    query=query,
-                    top_k=_integer_query(request, "top_k", 5, minimum=1, maximum=20),
-                    min_score=_float_query(request, "min_score"),
-                    service=_optional_query(request, "service"),
-                    domain=_optional_query(request, "domain"),
-                    document_type=_optional_query(request, "document_type"),
-                    status=_optional_query(request, "status", "current"),
-                    authority=_optional_query(request, "authority"),
-                    source_type=_optional_query(request, "source_type"),
-                )
+            payload = await asyncio.to_thread(
+                tools.search,
+                query=query,
+                top_k=_integer_query(request, "top_k", 5, minimum=1, maximum=20),
+                min_score=_float_query(request, "min_score"),
+                service=_optional_query(request, "service"),
+                domain=_optional_query(request, "domain"),
+                document_type=_optional_query(request, "document_type"),
+                status=_optional_query(request, "status", "current"),
+                authority=_optional_query(request, "authority"),
+                source_type=_optional_query(request, "source_type"),
             )
+            return JSONResponse(payload)
         except Exception as exc:
             return _api_error(exc)
 
@@ -161,7 +162,8 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             document_id = request.query_params.get("document_id", "")
             if not document_id:
                 raise ValueError("document_id must not be empty")
-            return JSONResponse(tools.get_document(document_id))
+            payload = await asyncio.to_thread(tools.get_document, document_id)
+            return JSONResponse(payload)
         except Exception as exc:
             return _api_error(exc)
 
@@ -170,15 +172,15 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         if not _authorized(request, token):
             return _unauthorized_response()
         try:
-            return JSONResponse(
-                tools.list_documents(
-                    service=_optional_query(request, "service"),
-                    domain=_optional_query(request, "domain"),
-                    document_type=_optional_query(request, "document_type"),
-                    status=_optional_query(request, "status"),
-                    limit=_integer_query(request, "limit", 50, minimum=1, maximum=500),
-                )
+            payload = await asyncio.to_thread(
+                tools.list_documents,
+                service=_optional_query(request, "service"),
+                domain=_optional_query(request, "domain"),
+                document_type=_optional_query(request, "document_type"),
+                status=_optional_query(request, "status"),
+                limit=_integer_query(request, "limit", 50, minimum=1, maximum=500),
             )
+            return JSONResponse(payload)
         except Exception as exc:
             return _api_error(exc)
 
@@ -187,7 +189,8 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         if not _authorized(request, token):
             return _unauthorized_response()
         try:
-            return JSONResponse(tools.stats())
+            payload = await asyncio.to_thread(tools.stats)
+            return JSONResponse(payload)
         except Exception as exc:
             return _api_error(exc)
 

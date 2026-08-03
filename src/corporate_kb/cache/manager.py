@@ -62,7 +62,34 @@ class CacheManager:
     def load(
         self,
         *,
-        knowledge_hash: str,
+        knowledge_hash: str | None,
+        embedding_cache_identity: str,
+        chunking: dict[str, int],
+    ) -> CachedIndex | None:
+        """Load a cache, optionally requiring an exact knowledge hash."""
+        return self._load(
+            knowledge_hash=knowledge_hash,
+            embedding_cache_identity=embedding_cache_identity,
+            chunking=chunking,
+        )
+
+    def load_compatible(
+        self,
+        *,
+        embedding_cache_identity: str,
+        chunking: dict[str, int],
+    ) -> CachedIndex | None:
+        """Load a structurally compatible cache even when its documents are stale."""
+        return self.load(
+            knowledge_hash=None,
+            embedding_cache_identity=embedding_cache_identity,
+            chunking=chunking,
+        )
+
+    def _load(
+        self,
+        *,
+        knowledge_hash: str | None,
         embedding_cache_identity: str,
         chunking: dict[str, int],
     ) -> CachedIndex | None:
@@ -85,8 +112,9 @@ class CacheManager:
                 raise ValueError("documents.json and chunks.json must contain JSON arrays")
             documents = [Document.model_validate(item) for item in documents_raw]
             chunks = [Chunk.model_validate(item) for item in chunks_raw]
-            with self.embeddings_path.open("rb") as handle:
-                embeddings = np.load(handle, allow_pickle=False)
+            # Memory-map the matrix so startup does not allocate a second full copy of a
+            # large index before the in-memory store takes ownership of the read-only view.
+            embeddings = np.load(self.embeddings_path, mmap_mode="r", allow_pickle=False)
             matrix = np.asarray(embeddings, dtype=np.float32)
             expected_shape = (manifest.chunk_count, manifest.embedding_dimension)
             if matrix.shape != expected_shape or list(matrix.shape) != manifest.embeddings_shape:
@@ -159,16 +187,17 @@ class CacheManager:
         self,
         manifest: CacheManifest,
         *,
-        knowledge_hash: str,
+        knowledge_hash: str | None,
         embedding_cache_identity: str,
         chunking: dict[str, int],
     ) -> None:
         expected: dict[str, Any] = {
             "cache_schema_version": CACHE_SCHEMA_VERSION,
-            "knowledge_hash": knowledge_hash,
             "embedding_cache_identity": embedding_cache_identity,
             **chunking,
         }
+        if knowledge_hash is not None:
+            expected["knowledge_hash"] = knowledge_hash
         actual = manifest.model_dump()
         for key, value in expected.items():
             if actual.get(key) != value:

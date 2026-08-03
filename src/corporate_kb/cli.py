@@ -44,9 +44,14 @@ def _document_summary(document: Document) -> dict[str, Any]:
 @app.command()
 def index(
     force: bool = typer.Option(False, "--force", help="Перестроить даже валидный кэш."),
+    incremental: bool = typer.Option(
+        False,
+        "--incremental",
+        help="Переиспользовать embeddings неизменившихся chunks.",
+    ),
 ) -> None:
     """Построить индекс и записать кэш."""
-    stats = _service().build_index(force=force)
+    stats = _service().build_index(force=force, reuse_unchanged=incremental)
     typer.echo(
         f"Индекс готов: documents={stats.document_count}, chunks={stats.chunk_count}, "
         f"provider={stats.embedding_provider}, cache={stats.loaded_from_cache}"
