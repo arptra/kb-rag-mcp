@@ -213,7 +213,7 @@ def main() -> None:
     validate_http_settings(settings)
 
     service = create_service(settings)
-    stats = service.load_or_build_index()
+    stats = service.load_read_index()
     logger.info(
         "Preloaded knowledge index: documents=%d chunks=%d provider=%s",
         stats.document_count,

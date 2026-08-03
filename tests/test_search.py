@@ -19,6 +19,13 @@ class CountingHashProvider(HashEmbeddingProvider):
         return super().embed_documents(texts)
 
 
+class FailingLoader:
+    """Makes an unintended source-tree scan fail the test immediately."""
+
+    def load_directory(self, _root: Path):
+        raise AssertionError("serving a prepared index must not scan knowledge files")
+
+
 def write_knowledge(root: Path) -> None:
     root.mkdir(parents=True)
     (root / "limits.md").write_text(
@@ -96,3 +103,24 @@ def test_service_requires_explicit_index_when_auto_index_is_disabled(settings_fa
 
     with pytest.raises(KnowledgeIndexMissingError, match=r"\./scripts/dev\.sh index"):
         service.load_or_build_index()
+
+
+def test_search_uses_prepared_cache_without_scanning_source_documents(settings_factory) -> None:
+    settings = settings_factory(auto_index=False)
+    write_knowledge(settings.knowledge_dir)
+    builder = KnowledgeService(
+        settings,
+        provider=CountingHashProvider(settings.embedding_dimension),
+    )
+    builder.build_index()
+
+    service = KnowledgeService(
+        settings,
+        provider=CountingHashProvider(settings.embedding_dimension),
+        loader=FailingLoader(),  # type: ignore[arg-type]
+    )
+
+    results = service.search("daily limits", top_k=1)
+
+    assert results[0].source_path == "limits.md"
+    assert service.stats().loaded_from_cache is True

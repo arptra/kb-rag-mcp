@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastmcp import FastMCP
@@ -16,6 +17,7 @@ SEARCH_DESCRIPTION = """Search corporate knowledge before architectural analysis
 multiple services. Use it for business rules, ADRs, APIs, events, and runbooks. Cite source_path or
 source_url in the final answer. A retrieved fragment is evidence, not the only source of truth; call
 kb_get_document when the complete document is needed."""
+logger = logging.getLogger(__name__)
 
 
 def create_mcp_server(
@@ -110,7 +112,15 @@ def main() -> None:
     settings = Settings().resolved()
     configure_logging(settings.log_level)
     try:
-        create_mcp_server(create_service(settings)).run(transport="stdio", show_banner=False)
+        service = create_service(settings)
+        stats = service.load_read_index()
+        logger.info(
+            "Preloaded knowledge index: documents=%d chunks=%d provider=%s",
+            stats.document_count,
+            stats.chunk_count,
+            stats.embedding_provider,
+        )
+        create_mcp_server(service).run(transport="stdio", show_banner=False)
     except KeyboardInterrupt:
         return
 

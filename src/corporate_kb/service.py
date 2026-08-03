@@ -140,6 +140,43 @@ class KnowledgeService:
                 reuse_cache=True,
             )
 
+    def load_cached_index(self) -> IndexStats:
+        """Load the prepared cache without walking the source-document tree.
+
+        Read-only MCP servers call this path in the normal production configuration. Freshness is
+        established by the explicit indexing job; serving a query must not scan thousands of source
+        documents just to recompute their hash.
+        """
+        with self._lock:
+            if self._stats is not None:
+                return self._stats
+            started = time.perf_counter()
+            logger.info("Loading prepared knowledge index from %s", self.settings.cache_dir)
+            cached = self.cache.load_compatible(
+                embedding_cache_identity=self.provider.cache_identity,
+                chunking=self.chunker.identity,
+            )
+            if cached is None:
+                raise KnowledgeIndexMissingError(
+                    "Prepared knowledge index is missing or incompatible.\n"
+                    "Run: ./scripts/dev.sh index"
+                )
+            self.store.replace_index(cached.documents, cached.chunks, cached.embeddings)
+            self._stats = self._stats_from_cache(cached.manifest)
+            logger.info(
+                "Loaded prepared knowledge index: documents=%d chunks=%d in %.3f seconds",
+                self._stats.document_count,
+                self._stats.chunk_count,
+                time.perf_counter() - started,
+            )
+            return self._stats
+
+    def load_read_index(self) -> IndexStats:
+        """Load the serving index, rebuilding only when explicitly enabled."""
+        if self.settings.auto_index:
+            return self.load_or_build_index()
+        return self.load_cached_index()
+
     def search(
         self,
         query: str,
@@ -148,7 +185,7 @@ class KnowledgeService:
         min_score: float | None = None,
         filters: SearchFilters | None = None,
     ) -> list[SearchResult]:
-        self.load_or_build_index()
+        self.load_read_index()
         if not query.strip():
             raise ValueError("query must not be empty")
         started = time.perf_counter()
@@ -170,7 +207,7 @@ class KnowledgeService:
         return results
 
     def get_document(self, document_id: str) -> Document:
-        self.load_or_build_index()
+        self.load_read_index()
         document = self.store.get_document(document_id)
         if document is None:
             raise KeyError(f"Unknown document_id: {document_id}")
@@ -182,11 +219,11 @@ class KnowledgeService:
         filters: SearchFilters | None = None,
         limit: int = 50,
     ) -> list[Document]:
-        self.load_or_build_index()
+        self.load_read_index()
         return self.store.list_documents(filters or SearchFilters(), limit=limit)
 
     def stats(self) -> IndexStats:
-        return self.load_or_build_index()
+        return self.load_read_index()
 
     def _knowledge_hash(self, documents: list[Document]) -> str:
         payload = {
