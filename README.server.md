@@ -19,6 +19,11 @@ GET /api/v1/* с Bearer-токеном
 локальные stdio MCP-клиенты сотрудников
 ```
 
+Поиск ограничивает ответ для LLM: внутри индекс ищет до 12 кандидатов, но наружу возвращаются до
+3 разных документов, выдержки до 260 условных токенов и суммарно до 1000. Для деталей клиент
+запрашивает только выбранный `/api/v1/chunk`; все лимиты можно изменить через `KB_SEARCH_*` и
+`KB_DOCUMENT_CONTEXT_TOKENS`.
+
 На сервере также остаётся `/mcp` для новых клиентов с нативным Streamable HTTP. Старые Qwen и
 корпоративные сети могут использовать только JSON API через однофайловый stdio proxy.
 
@@ -167,7 +172,7 @@ curl -G \
   'http://127.0.0.1:8000/api/v1/search' \
   -H 'Authorization: Bearer REPLACE_WITH_GENERATED_TOKEN' \
   --data-urlencode 'query=какой сервис владеет дневными лимитами' \
-  --data-urlencode 'top_k=5'
+  --data-urlencode 'top_k=3'
 ```
 
 Ожидается `HTTP 200` и JSON. Затем повторите команды с клиентского компьютера, используя сетевой IP
@@ -180,7 +185,8 @@ curl -G \
 | Endpoint | Назначение | Основные параметры |
 | --- | --- | --- |
 | `/api/v1/search` | Поиск релевантных фрагментов | `query`, `top_k`, filters |
-| `/api/v1/document` | Полный документ | `document_id` |
+| `/api/v1/document` | Ограниченная выдержка документа | `document_id`, `max_tokens` |
+| `/api/v1/chunk` | Ограниченная выдержка найденного чанка | `chunk_id`, `max_tokens` |
 | `/api/v1/documents` | Список metadata | filters, `limit` |
 | `/api/v1/stats` | Состояние индекса | нет |
 
@@ -197,6 +203,11 @@ KB_MCP_HTTP_PORT=8000
 KB_MCP_HTTP_BEARER_TOKEN=REPLACE_WITH_GENERATED_TOKEN
 KB_AUTO_INDEX=false
 KB_EMBEDDING_PROVIDER=hash
+KB_SEARCH_CANDIDATE_K=12
+KB_SEARCH_EXCERPT_TOKENS=260
+KB_SEARCH_CONTEXT_TOKENS=1000
+KB_SEARCH_MAX_CHUNKS_PER_DOCUMENT=1
+KB_DOCUMENT_CONTEXT_TOKENS=800
 KB_LOG_LEVEL=INFO
 ```
 

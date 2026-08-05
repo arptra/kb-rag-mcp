@@ -51,6 +51,18 @@ Qwen CLI ─┘
 В RAM находятся документы, чанки, отображение `chunk_id -> index` и нормализованная NumPy-матрица
 `[chunk_count, embedding_dimension]`. Cosine similarity считается как `matrix @ query_vector`.
 
+### Экономия контекста Qwen
+
+Поиск не передаёт модели все найденные тексты. Сервер сначала находит до 12 кандидатов внутри
+индекса, затем отдаёт максимум 3 наиболее релевантные выдержки из разных документов: до 260
+условных токенов на выдержку и до 1000 на один ответ инструмента. Выдержка выбирается по словам
+вопроса и сохраняет ссылку на источник. Это ограничивает расход контекста, даже если в базе десятки
+тысяч страниц.
+
+Если выбранный результат требует деталей, Qwen вызывает `kb_get_chunk` с `chunk_id`; полный текст
+не загружается автоматически. `kb_get_document` также возвращает ограниченный извлекаемый фрагмент.
+Лимиты настраиваются через `KB_SEARCH_*` и `KB_DOCUMENT_CONTEXT_TOKENS` в `.env.example`.
+
 На диске в `.cache/kb/` находятся только:
 
 - `manifest.json` — версии схемы, идентичность модели, chunking config и knowledge hash;
@@ -219,7 +231,7 @@ activation или wrapper-скрипта.
 qwen mcp add \
   --scope project \
   --timeout 120000 \
-  --include-tools kb_search,kb_get_document,kb_list_documents,kb_stats \
+  --include-tools kb_search,kb_get_document,kb_get_chunk,kb_list_documents,kb_stats \
   -e KB_KNOWLEDGE_DIR=/absolute/path/to/repository/knowledge \
   -e KB_CACHE_DIR=/absolute/path/to/repository/.cache/kb \
   -e KB_EMBEDDING_PROVIDER=hash \
@@ -238,7 +250,7 @@ qwen mcp add \
 `stdio` — транспорт по умолчанию, поэтому `--transport http` здесь не нужен. Синтаксис команды
 сверен с [официальной документацией Qwen Code](https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/),
 но в среде разработки этого репозитория `qwen` не был установлен, и команда локально не выполнялась.
-JSON-конфигурация также задаёт `cwd`, `trust: false` и клиентский фильтр из четырёх tools.
+JSON-конфигурация также задаёт `cwd`, `trust: false` и клиентский фильтр из пяти tools.
 
 Проверка подключения:
 
@@ -257,8 +269,9 @@ qwen
 
 Сервер предоставляет только:
 
-- `kb_search` — поиск с `top_k`, `min_score` и metadata filters;
-- `kb_get_document` — полный нормализованный документ по `document_id`;
+- `kb_search` — поиск с `top_k`, `min_score`, metadata filters и компактными выдержками;
+- `kb_get_chunk` — лениво загружает один ограниченный фрагмент по `chunk_id`;
+- `kb_get_document` — ограниченный извлекаемый фрагмент документа по `document_id`;
 - `kb_list_documents` — metadata документов без embeddings;
 - `kb_stats` — состояние индекса и абсолютные пути.
 
@@ -317,10 +330,10 @@ curl http://10.0.0.5:8000/health
 curl -G 'http://10.0.0.5:8000/api/v1/search' \
   -H 'Authorization: Bearer PASTE_GENERATED_TOKEN' \
   --data-urlencode 'query=какой сервис владеет дневными лимитами' \
-  --data-urlencode 'top_k=5'
+  --data-urlencode 'top_k=3'
 ```
 
-Доступны `/api/v1/search`, `/api/v1/document`, `/api/v1/documents` и `/api/v1/stats`. Они используют
+Доступны `/api/v1/search`, `/api/v1/document`, `/api/v1/chunk`, `/api/v1/documents` и `/api/v1/stats`. Они используют
 тот же прогретый индекс, что и MCP tools, не строят embeddings на клиенте и не изменяют документы.
 
 Сам `/mcp` требует заголовок `Authorization: Bearer ...`. Ограничения по Host, Origin, домену или IP

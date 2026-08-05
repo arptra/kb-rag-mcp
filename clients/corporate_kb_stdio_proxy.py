@@ -24,7 +24,7 @@ from fastmcp.exceptions import ToolError
 
 SEARCH_DESCRIPTION = """Search remote corporate knowledge before architectural analysis or changes
 spanning multiple services. Cite source_path or source_url from the returned results. Call
-kb_get_document when the complete document is needed."""
+kb_get_chunk when a selected result needs more context."""
 
 
 class JsonApi(Protocol):
@@ -114,7 +114,7 @@ def create_stdio_server(api: JsonApi) -> FastMCP:
     )
     def kb_search(
         query: str,
-        top_k: int = 5,
+        top_k: int = 3,
         min_score: float | None = None,
         service: str | None = None,
         domain: str | None = None,
@@ -140,11 +140,31 @@ def create_stdio_server(api: JsonApi) -> FastMCP:
 
     @server.tool(
         name="kb_get_document",
-        description="Return one complete document selected by document_id from kb_search.",
+        description="Return a bounded document extract selected by document_id from kb_search.",
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
-    def kb_get_document(document_id: str) -> dict[str, Any]:
-        return api.get_json("/api/v1/document", {"document_id": document_id})
+    def kb_get_document(
+        document_id: str,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        return api.get_json(
+            "/api/v1/document",
+            {"document_id": document_id, "max_tokens": max_tokens},
+        )
+
+    @server.tool(
+        name="kb_get_chunk",
+        description="Return a bounded source chunk selected by chunk_id from kb_search.",
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def kb_get_chunk(
+        chunk_id: str,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        return api.get_json(
+            "/api/v1/chunk",
+            {"chunk_id": chunk_id, "max_tokens": max_tokens},
+        )
 
     @server.tool(
         name="kb_list_documents",

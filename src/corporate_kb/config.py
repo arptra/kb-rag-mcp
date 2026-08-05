@@ -37,7 +37,12 @@ class Settings(BaseSettings):
     chunk_size_tokens: int = Field(default=700, ge=1)
     chunk_hard_max_tokens: int = Field(default=900, ge=1)
     chunk_overlap_tokens: int = Field(default=80, ge=0)
-    default_top_k: int = Field(default=5, ge=1, le=20)
+    default_top_k: int = Field(default=3, ge=1, le=20)
+    search_candidate_k: int = Field(default=12, ge=1, le=20)
+    search_excerpt_tokens: int = Field(default=260, ge=40, le=900)
+    search_context_tokens: int = Field(default=1000, ge=100, le=4000)
+    search_max_chunks_per_document: int = Field(default=1, ge=1, le=5)
+    document_context_tokens: int = Field(default=800, ge=100, le=4000)
     auto_index: bool = False
     log_level: str = "INFO"
     mcp_http_host: str = "127.0.0.1"

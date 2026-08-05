@@ -15,8 +15,9 @@ from corporate_kb.service import KnowledgeService, configure_logging, create_ser
 
 SEARCH_DESCRIPTION = """Search corporate knowledge before architectural analysis or changes spanning
 multiple services. Use it for business rules, ADRs, APIs, events, and runbooks. Cite source_path or
-source_url in the final answer. A retrieved fragment is evidence, not the only source of truth; call
-kb_get_document when the complete document is needed."""
+source_url in the final answer. Results are compact, diverse excerpts under a token budget. A
+retrieved fragment is evidence, not the only source of truth; call kb_get_chunk when a specific
+chunk needs more context, or kb_get_document for document-level context."""
 logger = logging.getLogger(__name__)
 
 
@@ -32,7 +33,8 @@ def create_mcp_server(
         "corporate-knowledge",
         instructions=(
             "Search corporate knowledge before cross-service or architectural work, and cite the "
-            "returned source_path or source_url. Read full documents when context is incomplete."
+            "returned source_path or source_url. Search returns compact excerpts; use kb_get_chunk "
+            "only for a selected chunk when additional context is needed."
         ),
         version=__version__,
         auth=auth,
@@ -45,7 +47,7 @@ def create_mcp_server(
     )
     def kb_search(
         query: str,
-        top_k: int = 5,
+        top_k: int = 3,
         min_score: float | None = None,
         service: str | None = None,
         domain: str | None = None,
@@ -69,12 +71,30 @@ def create_mcp_server(
     @server.tool(
         name="kb_get_document",
         description=(
-            "Return one complete normalized document after kb_search identifies its document_id."
+            "Return a bounded extract from one normalized document after kb_search identifies its "
+            "document_id."
         ),
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
-    def kb_get_document(document_id: str) -> dict[str, Any]:
-        return tools.get_document(document_id)
+    def kb_get_document(
+        document_id: str,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        return tools.get_document(document_id, max_tokens=max_tokens)
+
+    @server.tool(
+        name="kb_get_chunk",
+        description=(
+            "Return a bounded source chunk selected by chunk_id from kb_search. Prefer this over "
+            "kb_get_document when only one search result needs more context."
+        ),
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def kb_get_chunk(
+        chunk_id: str,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        return tools.get_chunk(chunk_id, max_tokens=max_tokens)
 
     @server.tool(
         name="kb_list_documents",

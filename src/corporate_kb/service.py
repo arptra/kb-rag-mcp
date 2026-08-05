@@ -213,6 +213,13 @@ class KnowledgeService:
             raise KeyError(f"Unknown document_id: {document_id}")
         return document
 
+    def get_chunk(self, chunk_id: str) -> Chunk:
+        self.load_read_index()
+        chunk = self.store.get_chunk(chunk_id)
+        if chunk is None:
+            raise KeyError(f"Unknown chunk_id: {chunk_id}")
+        return chunk
+
     def list_documents(
         self,
         *,

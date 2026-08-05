@@ -80,6 +80,15 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
         )
         assert api_search.status_code == 200
         assert api_search.json()["results"][0]["source_path"] == "limits.md"
+        assert "text" not in api_search.json()["results"][0]
+
+        api_chunk = await anonymous_client.get(
+            "/api/v1/chunk",
+            params={"chunk_id": api_search.json()["results"][0]["chunk_id"]},
+            headers=api_headers,
+        )
+        assert api_chunk.status_code == 200
+        assert api_chunk.json()["text_tokens"] <= settings.document_context_tokens
 
         missing_query = await anonymous_client.get(
             "/api/v1/search",
@@ -106,6 +115,7 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
             assert {tool.name for tool in listed.tools} == {
                 "kb_search",
                 "kb_get_document",
+                "kb_get_chunk",
                 "kb_list_documents",
                 "kb_stats",
             }

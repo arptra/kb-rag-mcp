@@ -36,7 +36,7 @@ def test_remote_api_rejects_mcp_endpoint_as_base_url() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stdio_proxy_exposes_remote_json_api_as_four_tools() -> None:
+async def test_stdio_proxy_exposes_remote_json_api_as_five_tools() -> None:
     module = _load_proxy_module()
     api = StubApi()
     server = module.create_stdio_server(api)
@@ -46,6 +46,7 @@ async def test_stdio_proxy_exposes_remote_json_api_as_four_tools() -> None:
         assert {tool.name for tool in listed} == {
             "kb_search",
             "kb_get_document",
+            "kb_get_chunk",
             "kb_list_documents",
             "kb_stats",
         }
@@ -59,6 +60,10 @@ async def test_stdio_proxy_exposes_remote_json_api_as_four_tools() -> None:
         document = await client.call_tool("kb_get_document", {"document_id": "doc-1"})
         assert document.data["path"] == "/api/v1/document"
         assert document.data["params"]["document_id"] == "doc-1"
+
+        chunk = await client.call_tool("kb_get_chunk", {"chunk_id": "chunk-1"})
+        assert chunk.data["path"] == "/api/v1/chunk"
+        assert chunk.data["params"]["chunk_id"] == "chunk-1"
 
         documents = await client.call_tool("kb_list_documents", {"limit": 10})
         assert documents.data["path"] == "/api/v1/documents"

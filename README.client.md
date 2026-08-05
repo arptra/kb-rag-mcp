@@ -79,7 +79,7 @@ curl -G \
   'http://SERVER_IP:8000/api/v1/search' \
   -H 'Authorization: Bearer SERVER_TOKEN' \
   --data-urlencode 'query=какой сервис владеет дневными лимитами' \
-  --data-urlencode 'top_k=5'
+  --data-urlencode 'top_k=3'
 ```
 
 Оба запроса должны вернуть `HTTP 200` и JSON. Если получен `401`, проверьте токен.
@@ -158,14 +158,18 @@ qwen
 /mcp
 ```
 
-Сервер `corporate-kb` должен показать четыре инструмента:
+Сервер `corporate-kb` должен показать пять инструментов:
 
 ```text
 kb_search
 kb_get_document
+kb_get_chunk
 kb_list_documents
 kb_stats
 ```
+
+`kb_search` возвращает короткие выдержки, а не полные страницы Confluence. Если Qwen нужен текст
+конкретного результата, он сам вызывает `kb_get_chunk` с `chunk_id` — это сохраняет контекст диалога.
 
 Кнопка OAuth-аутентификации не нужна: Bearer-токен уже передаётся локальному Python-процессу через
 Qwen settings.

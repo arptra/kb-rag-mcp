@@ -139,6 +139,10 @@ class InMemoryKnowledgeStore:
     def get_document(self, document_id: str) -> Document | None:
         return self._documents.get(document_id)
 
+    def get_chunk(self, chunk_id: str) -> Chunk | None:
+        index = self._chunk_index.get(chunk_id)
+        return self._chunks[index] if index is not None else None
+
     def list_documents(self, filters: SearchFilters, *, limit: int) -> list[Document]:
         if not 1 <= limit <= 200:
             raise ValueError("limit must be between 1 and 200")

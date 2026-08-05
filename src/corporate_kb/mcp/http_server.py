@@ -141,7 +141,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             payload = await asyncio.to_thread(
                 tools.search,
                 query=query,
-                top_k=_integer_query(request, "top_k", 5, minimum=1, maximum=20),
+                top_k=_integer_query(request, "top_k", 3, minimum=1, maximum=20),
                 min_score=_float_query(request, "min_score"),
                 service=_optional_query(request, "service"),
                 domain=_optional_query(request, "domain"),
@@ -162,7 +162,40 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             document_id = request.query_params.get("document_id", "")
             if not document_id:
                 raise ValueError("document_id must not be empty")
-            payload = await asyncio.to_thread(tools.get_document, document_id)
+            payload = await asyncio.to_thread(
+                tools.get_document,
+                document_id,
+                _integer_query(
+                    request,
+                    "max_tokens",
+                    settings.document_context_tokens,
+                    minimum=1,
+                    maximum=settings.document_context_tokens,
+                ),
+            )
+            return JSONResponse(payload)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/api/v1/chunk", methods=["GET"], include_in_schema=False)
+    async def api_chunk(request: Request) -> JSONResponse:
+        if not _authorized(request, token):
+            return _unauthorized_response()
+        try:
+            chunk_id = request.query_params.get("chunk_id", "")
+            if not chunk_id:
+                raise ValueError("chunk_id must not be empty")
+            payload = await asyncio.to_thread(
+                tools.get_chunk,
+                chunk_id,
+                _integer_query(
+                    request,
+                    "max_tokens",
+                    settings.document_context_tokens,
+                    minimum=1,
+                    maximum=settings.document_context_tokens,
+                ),
+            )
             return JSONResponse(payload)
         except Exception as exc:
             return _api_error(exc)

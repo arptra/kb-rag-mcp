@@ -45,7 +45,7 @@ qwen mcp add \
   --scope user \
   --transport http \
   --timeout 120000 \
-  --include-tools kb_search,kb_get_document,kb_list_documents,kb_stats \
+  --include-tools kb_search,kb_get_document,kb_get_chunk,kb_list_documents,kb_stats \
   --header "Authorization: Bearer ${mcp_token}" \
   --description "Удалённая корпоративная база знаний" \
   "${server_name}" \

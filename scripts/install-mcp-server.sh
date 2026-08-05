@@ -119,6 +119,7 @@ entry = {
     "includeTools": [
         "kb_search",
         "kb_get_document",
+        "kb_get_chunk",
         "kb_list_documents",
         "kb_stats",
     ],
