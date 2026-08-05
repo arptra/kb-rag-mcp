@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import ssl
@@ -21,6 +22,9 @@ from urllib.request import Request, urlopen
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.tools import Tool, ToolResult
+from mcp.types import ToolAnnotations
+from pydantic import PrivateAttr
 
 SEARCH_DESCRIPTION = """Search remote corporate knowledge before architectural analysis or changes
 spanning multiple services. Cite source_path or source_url from the returned results. Call
@@ -31,6 +35,13 @@ class JsonApi(Protocol):
     """Minimal interface used by the MCP tools and test doubles."""
 
     def get_json(self, path: str, params: Mapping[str, object | None]) -> dict[str, Any]: ...
+
+    def post_json(
+        self,
+        path: str,
+        payload: Mapping[str, object | None],
+        headers: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]: ...
 
 
 class RemoteKnowledgeApi:
@@ -68,14 +79,47 @@ class RemoteKnowledgeApi:
         url = f"{self._base_url}{path}"
         if query:
             url = f"{url}?{query}"
+        return self._request_json(url, method="GET")
+
+    def post_json(
+        self,
+        path: str,
+        payload: Mapping[str, object | None],
+        headers: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        body = json.dumps(
+            {key: value for key, value in payload.items() if value is not None},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return self._request_json(
+            f"{self._base_url}{path}",
+            method="POST",
+            body=body,
+            extra_headers=headers,
+        )
+
+    def _request_json(
+        self,
+        url: str,
+        *,
+        method: str,
+        body: bytes | None = None,
+        extra_headers: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self._token}",
+            "User-Agent": "corporate-kb-stdio-proxy/1.0",
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        if extra_headers:
+            headers.update(extra_headers)
         request = Request(
             url,
-            method="GET",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {self._token}",
-                "User-Agent": "corporate-kb-stdio-proxy/1.0",
-            },
+            data=body,
+            method=method,
+            headers=headers,
         )
         try:
             with urlopen(
@@ -95,6 +139,41 @@ class RemoteKnowledgeApi:
         if not isinstance(payload, dict):
             raise ToolError("Remote RAG returned JSON that is not an object")
         return payload
+
+
+class RemoteManagedTool(Tool):
+    """Dynamic MCP tool whose schema is provided by the remote RAG server."""
+
+    _api: JsonApi = PrivateAttr()
+
+    def __init__(self, definition: Mapping[str, Any], api: JsonApi) -> None:
+        name = definition.get("name")
+        description = definition.get("description")
+        parameters = definition.get("input_schema")
+        if not isinstance(name, str) or not isinstance(description, str):
+            raise ValueError("Remote managed tool is missing name or description")
+        if not isinstance(parameters, dict):
+            raise ValueError("Remote managed tool is missing input_schema")
+        super().__init__(
+            name=name,
+            description=description,
+            parameters=parameters,
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        self._api = api
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        payload = await asyncio.to_thread(
+            self._api.post_json,
+            "/api/v1/tools/call",
+            {"name": self.name, "arguments": arguments},
+        )
+        return self.convert_result(payload)
 
 
 def create_stdio_server(api: JsonApi) -> FastMCP:
@@ -167,6 +246,21 @@ def create_stdio_server(api: JsonApi) -> FastMCP:
         )
 
     @server.tool(
+        name="kb_run_context_benchmark",
+        description=(
+            "Run the protected context benchmark. Ask the user for the separate benchmark "
+            "password immediately before calling; never use the normal API token."
+        ),
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def kb_run_context_benchmark(password: str) -> dict[str, Any]:
+        return api.post_json(
+            "/api/v1/admin/context-benchmark",
+            {},
+            {"X-KB-Benchmark-Password": password},
+        )
+
+    @server.tool(
         name="kb_list_documents",
         description="List filtered remote document metadata without document bodies.",
         annotations={"readOnlyHint": True, "openWorldHint": False},
@@ -196,6 +290,16 @@ def create_stdio_server(api: JsonApi) -> FastMCP:
     )
     def kb_stats() -> dict[str, Any]:
         return api.get_json("/api/v1/stats", {})
+
+    try:
+        catalog = api.get_json("/api/v1/tools", {})
+        definitions = catalog.get("tools", [])
+        if isinstance(definitions, list):
+            for definition in definitions:
+                if isinstance(definition, dict):
+                    server.add_tool(RemoteManagedTool(definition, api))
+    except Exception as exc:
+        print(f"Managed MCP tool discovery failed: {exc}", file=sys.stderr)
 
     return server
 

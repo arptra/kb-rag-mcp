@@ -127,6 +127,20 @@ openssl rand -hex 32
 Сохраните значение как секрет. Один и тот же токен должен быть установлен на сервере и передан
 авторизованным клиентам. Не добавляйте реальный токен в Git.
 
+Для административного benchmark создайте второй, отдельный пароль:
+
+```bash
+openssl rand -hex 32
+```
+
+Запишите его в `KB_BENCHMARK_PASSWORD`. Этот пароль не заменяет Bearer-токен и не должен храниться
+в клиентском settings: Qwen запрашивает его у администратора непосредственно перед запуском
+`kb_run_context_benchmark`.
+
+Для web-панели создайте третий отдельный секрет и установите `KB_ADMIN_PASSWORD`. Он даёт право
+загружать документы, запускать переиндексацию и менять опубликованные MCP schemas, поэтому не
+раздавайте его обычным пользователям.
+
 ## 5. Запустить сервер вручную
 
 ```bash
@@ -135,6 +149,8 @@ cd /opt/corporate-kb
 export KB_MCP_HTTP_HOST='0.0.0.0'
 export KB_MCP_HTTP_PORT='8000'
 export KB_MCP_HTTP_BEARER_TOKEN='REPLACE_WITH_GENERATED_TOKEN'
+export KB_BENCHMARK_PASSWORD='REPLACE_WITH_SEPARATE_BENCHMARK_PASSWORD'
+export KB_ADMIN_PASSWORD='REPLACE_WITH_SEPARATE_ADMIN_PASSWORD'
 export KB_AUTO_INDEX='false'
 
 ./scripts/start-mcp-http.sh
@@ -178,20 +194,53 @@ curl -G \
 Ожидается `HTTP 200` и JSON. Затем повторите команды с клиентского компьютера, используя сетевой IP
 сервера.
 
-## Read-only JSON API
+## Client JSON API
 
-Все endpoints используют `GET` и один Bearer-токен:
+Все endpoints требуют один Bearer-токен; чтение использует `GET`, вызов управляемого tool и
+benchmark — `POST`:
 
 | Endpoint | Назначение | Основные параметры |
 | --- | --- | --- |
 | `/api/v1/search` | Поиск релевантных фрагментов | `query`, `top_k`, filters |
 | `/api/v1/document` | Ограниченная выдержка документа | `document_id`, `max_tokens` |
 | `/api/v1/chunk` | Ограниченная выдержка найденного чанка | `chunk_id`, `max_tokens` |
+| `/api/v1/tools` | Каталог управляемых MCP schemas | нет |
+| `/api/v1/tools/call` | Выполнение управляемого search-tool | POST JSON |
+| `/api/v1/admin/context-benchmark` | Парольный замер качества и сжатия | POST + password header |
 | `/api/v1/documents` | Список metadata | filters, `limit` |
 | `/api/v1/stats` | Состояние индекса | нет |
 
-API не изменяет документы и не запускает команды. Поисковый запрос передаётся в URL и может
+Client API не изменяет документы и не запускает команды. Поисковый запрос передаётся в URL и может
 попадать в access logs; ограничьте доступ к журналам сервера.
+
+Ручная проверка benchmark:
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/api/v1/admin/context-benchmark' \
+  -H 'Authorization: Bearer REPLACE_WITH_GENERATED_TOKEN' \
+  -H 'X-KB-Benchmark-Password: REPLACE_WITH_SEPARATE_BENCHMARK_PASSWORD'
+```
+
+Ответ содержит только агрегаты и вопросы, на которых сжатый `Hit@3` промахнулся; тексты документов
+в результат benchmark не включаются.
+
+## Admin UI
+
+После запуска откройте:
+
+```text
+http://SERVER_IP:8000/admin
+```
+
+Панель показывает process-local usage MCP tools, документы и состояние индекса. Через неё можно
+загрузить `.md`, `.markdown`, `.html`, `.htm` или `.txt`, затем запустить фоновую сборку нового
+индекса. Неизменившиеся embeddings переиспользуются, а активный store заменяется только после
+успешного сохранения нового cache.
+
+Редактор MCP tools создаёт только декларативные поисковые инструменты: имя `kb_*`, описание для LLM,
+безопасную JSON Schema и фиксированные metadata filters. Произвольный Python/shell не исполняется.
+Новые schemas сохраняются в `KB_MANAGED_TOOLS_PATH`. Подключённому прямому MCP-клиенту нужно
+обновить discovery; однофайловому proxy — перезапустить Qwen.
 
 ## 7. Запустить как systemd service
 
@@ -208,6 +257,12 @@ KB_SEARCH_EXCERPT_TOKENS=260
 KB_SEARCH_CONTEXT_TOKENS=1000
 KB_SEARCH_MAX_CHUNKS_PER_DOCUMENT=1
 KB_DOCUMENT_CONTEXT_TOKENS=800
+KB_BENCHMARK_QUESTIONS_PATH=/opt/corporate-kb/evaluation/questions.json
+KB_BENCHMARK_PASSWORD=REPLACE_WITH_SEPARATE_BENCHMARK_PASSWORD
+KB_BENCHMARK_MAX_QUESTIONS=100
+KB_ADMIN_PASSWORD=REPLACE_WITH_SEPARATE_ADMIN_PASSWORD
+KB_ADMIN_MAX_UPLOAD_BYTES=10000000
+KB_MANAGED_TOOLS_PATH=/opt/corporate-kb/.cache/kb/managed_tools.json
 KB_LOG_LEVEL=INFO
 ```
 

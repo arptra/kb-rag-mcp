@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     search_context_tokens: int = Field(default=1000, ge=100, le=4000)
     search_max_chunks_per_document: int = Field(default=1, ge=1, le=5)
     document_context_tokens: int = Field(default=800, ge=100, le=4000)
+    benchmark_questions_path: Path = Path("evaluation/questions.json")
+    benchmark_password: SecretStr | None = None
+    benchmark_max_questions: int = Field(default=100, ge=1, le=1000)
+    admin_password: SecretStr | None = None
+    admin_max_upload_bytes: int = Field(default=10_000_000, ge=1, le=100_000_000)
+    managed_tools_path: Path = Path(".cache/kb/managed_tools.json")
     auto_index: bool = False
     log_level: str = "INFO"
     mcp_http_host: str = "127.0.0.1"
@@ -80,5 +86,7 @@ class Settings(BaseSettings):
             update={
                 "knowledge_dir": resolve(self.knowledge_dir),
                 "cache_dir": resolve(self.cache_dir),
+                "benchmark_questions_path": resolve(self.benchmark_questions_path),
+                "managed_tools_path": resolve(self.managed_tools_path),
             }
         )

@@ -21,3 +21,7 @@ def test_context_defaults_keep_mcp_search_output_small() -> None:
     assert Settings.model_fields["search_context_tokens"].default == 1000
     assert Settings.model_fields["search_max_chunks_per_document"].default == 1
     assert Settings.model_fields["document_context_tokens"].default == 800
+    assert Settings.model_fields["benchmark_password"].default is None
+    assert Settings.model_fields["benchmark_max_questions"].default == 100
+    assert Settings.model_fields["admin_password"].default is None
+    assert Settings.model_fields["admin_max_upload_bytes"].default == 10_000_000

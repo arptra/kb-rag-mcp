@@ -171,6 +171,12 @@ class KnowledgeService:
             )
             return self._stats
 
+    def reload_cached_index(self) -> IndexStats:
+        """Atomically replace the serving store from a newly prepared compatible cache."""
+        with self._lock:
+            self._stats = None
+            return self.load_cached_index()
+
     def load_read_index(self) -> IndexStats:
         """Load the serving index, rebuilding only when explicitly enabled."""
         if self.settings.auto_index:

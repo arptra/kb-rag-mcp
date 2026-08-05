@@ -32,6 +32,14 @@ class EvaluationReport(BaseModel):
     results: list[QuestionResult]
 
 
+def load_evaluation_questions(questions_path: Path) -> list[EvaluationQuestion]:
+    """Load and validate a curated benchmark without accepting client-controlled paths."""
+    raw = json.loads(questions_path.resolve().read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise ValueError("Evaluation questions file must contain a JSON array")
+    return [EvaluationQuestion.model_validate(item) for item in raw]
+
+
 class Evaluator:
     def __init__(self, service: KnowledgeService, questions_path: Path) -> None:
         self._service = service
@@ -40,10 +48,7 @@ class Evaluator:
     def evaluate(self, *, top_k: int = 5) -> EvaluationReport:
         if not 1 <= top_k <= 20:
             raise ValueError("top_k must be between 1 and 20")
-        raw = json.loads(self._questions_path.read_text(encoding="utf-8"))
-        if not isinstance(raw, list):
-            raise ValueError("Evaluation questions file must contain a JSON array")
-        questions = [EvaluationQuestion.model_validate(item) for item in raw]
+        questions = load_evaluation_questions(self._questions_path)
         cutoffs = [cutoff for cutoff in (1, 3, 5) if cutoff <= top_k]
         hit_counts = {cutoff: 0 for cutoff in cutoffs}
         question_results: list[QuestionResult] = []

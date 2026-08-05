@@ -63,6 +63,15 @@ Qwen CLI ─┘
 не загружается автоматически. `kb_get_document` также возвращает ограниченный извлекаемый фрагмент.
 Лимиты настраиваются через `KB_SEARCH_*` и `KB_DOCUMENT_CONTEXT_TOKENS` в `.env.example`.
 
+Защищённый `kb_run_context_benchmark` сравнивает прежние `top-5` полных чанков с текущими `top-3`
+выдержками: Hit@K, оценку токенов, точные JSON bytes, процент сжатия и latency. Инструмент требует
+отдельный `KB_BENCHMARK_PASSWORD`, который Qwen запрашивает перед каждым вызовом.
+
+В HTTP-режиме по `/admin` доступна встроенная парольная панель: usage-счётчики, список документов,
+загрузка Markdown/HTML/TXT, фоновая инкрементальная переиндексация и создание декларативных MCP
+search-tools. Имя, описание и JSON Schema такого инструмента публикуются через `tools/list`; Python
+или shell-код через UI создавать нельзя.
+
 На диске в `.cache/kb/` находятся только:
 
 - `manifest.json` — версии схемы, идентичность модели, chunking config и knowledge hash;
@@ -231,7 +240,6 @@ activation или wrapper-скрипта.
 qwen mcp add \
   --scope project \
   --timeout 120000 \
-  --include-tools kb_search,kb_get_document,kb_get_chunk,kb_list_documents,kb_stats \
   -e KB_KNOWLEDGE_DIR=/absolute/path/to/repository/knowledge \
   -e KB_CACHE_DIR=/absolute/path/to/repository/.cache/kb \
   -e KB_EMBEDDING_PROVIDER=hash \
@@ -250,7 +258,7 @@ qwen mcp add \
 `stdio` — транспорт по умолчанию, поэтому `--transport http` здесь не нужен. Синтаксис команды
 сверен с [официальной документацией Qwen Code](https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/),
 но в среде разработки этого репозитория `qwen` не был установлен, и команда локально не выполнялась.
-JSON-конфигурация также задаёт `cwd`, `trust: false` и клиентский фильтр из пяти tools.
+JSON-конфигурация также задаёт `cwd` и `trust: false`; статического фильтра tools в ней нет.
 
 Проверка подключения:
 
@@ -267,13 +275,18 @@ qwen
 объясни правило и обязательно укажи использованные источники.
 ```
 
-Сервер предоставляет только:
+Встроенные tools сервера:
 
 - `kb_search` — поиск с `top_k`, `min_score`, metadata filters и компактными выдержками;
 - `kb_get_chunk` — лениво загружает один ограниченный фрагмент по `chunk_id`;
+- `kb_run_context_benchmark` — защищённый паролем read-only замер качества и сжатия;
 - `kb_get_document` — ограниченный извлекаемый фрагмент документа по `document_id`;
 - `kb_list_documents` — metadata документов без embeddings;
 - `kb_stats` — состояние индекса и абсолютные пути.
+
+Не задавайте статический `includeTools` в Qwen settings, если используете управляемые tools из UI:
+клиентский allowlist скроет новые схемы от LLM. Прямой HTTP-клиент обновляет `/mcp` discovery, а
+однофайловый stdio proxy перечитывает каталог после перезапуска Qwen.
 
 Ручной запуск stdio server:
 
@@ -333,7 +346,8 @@ curl -G 'http://10.0.0.5:8000/api/v1/search' \
   --data-urlencode 'top_k=3'
 ```
 
-Доступны `/api/v1/search`, `/api/v1/document`, `/api/v1/chunk`, `/api/v1/documents` и `/api/v1/stats`. Они используют
+Доступны `/api/v1/search`, `/api/v1/document`, `/api/v1/chunk`, защищённый
+`/api/v1/admin/context-benchmark`, `/api/v1/documents` и `/api/v1/stats`. Они используют
 тот же прогретый индекс, что и MCP tools, не строят embeddings на клиенте и не изменяют документы.
 
 Сам `/mcp` требует заголовок `Authorization: Bearer ...`. Ограничения по Host, Origin, домену или IP

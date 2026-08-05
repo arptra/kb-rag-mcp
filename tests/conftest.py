@@ -19,6 +19,8 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
             "chunk_size_tokens": 40,
             "chunk_hard_max_tokens": 60,
             "chunk_overlap_tokens": 8,
+            "benchmark_questions_path": tmp_path / "evaluation" / "questions.json",
+            "managed_tools_path": tmp_path / ".cache" / "kb" / "managed_tools.json",
             "auto_index": False,
         }
         values.update(overrides)

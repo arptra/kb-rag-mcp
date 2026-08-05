@@ -10,13 +10,6 @@
       "headers": {
         "Authorization": "Bearer REPLACE_WITH_THE_SERVER_TOKEN"
       },
-      "includeTools": [
-        "kb_search",
-        "kb_get_document",
-        "kb_get_chunk",
-        "kb_list_documents",
-        "kb_stats"
-      ],
       "discoveryTimeoutMs": 10000,
       "timeout": 120000,
       "trust": false

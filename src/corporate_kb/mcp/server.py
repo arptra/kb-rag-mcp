@@ -10,6 +10,7 @@ from fastmcp.server.auth import AuthProvider
 
 from corporate_kb import __version__
 from corporate_kb.config import Settings
+from corporate_kb.mcp.managed_tools import ManagedToolRegistry
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeService, configure_logging, create_service
 
@@ -25,10 +26,13 @@ def create_mcp_server(
     service: KnowledgeService | None = None,
     *,
     auth: AuthProvider | None = None,
+    knowledge_tools: KnowledgeTools | None = None,
+    managed_tools: ManagedToolRegistry | None = None,
 ) -> FastMCP:
     """Create a FastMCP server without eagerly loading a model or index."""
     kb_service = service or create_service()
-    tools = KnowledgeTools(kb_service)
+    tools = knowledge_tools or KnowledgeTools(kb_service)
+    registry = managed_tools or ManagedToolRegistry(kb_service.settings.managed_tools_path, tools)
     server = FastMCP(
         "corporate-knowledge",
         instructions=(
@@ -97,6 +101,17 @@ def create_mcp_server(
         return tools.get_chunk(chunk_id, max_tokens=max_tokens)
 
     @server.tool(
+        name="kb_run_context_benchmark",
+        description=(
+            "Run the protected read-only context benchmark. Before calling, ask the user to enter "
+            "the separate benchmark password; never guess or reuse the normal API Bearer token."
+        ),
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def kb_run_context_benchmark(password: str) -> dict[str, Any]:
+        return tools.run_context_benchmark(password)
+
+    @server.tool(
         name="kb_list_documents",
         description="List filtered document metadata without document bodies or embeddings.",
         annotations={"readOnlyHint": True, "openWorldHint": False},
@@ -123,6 +138,9 @@ def create_mcp_server(
     )
     def kb_stats() -> dict[str, Any]:
         return tools.stats()
+
+    for definition in registry.list():
+        server.add_tool(registry.create_tool(definition))
 
     return server
 

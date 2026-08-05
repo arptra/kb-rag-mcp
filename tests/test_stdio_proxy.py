@@ -25,6 +25,33 @@ class StubApi:
 
     def get_json(self, path: str, params: dict[str, object | None]) -> dict[str, Any]:
         self.calls.append((path, params))
+        if path == "/api/v1/tools":
+            return {
+                "tool_count": 1,
+                "tools": [
+                    {
+                        "name": "kb_search_limits",
+                        "description": "Search current limits knowledge with compact citations.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"],
+                            "additionalProperties": False,
+                        },
+                        "defaults": {"top_k": 3, "status": "current"},
+                    }
+                ],
+            }
+        return {"path": path, "params": params}
+
+    def post_json(
+        self,
+        path: str,
+        payload: dict[str, object | None],
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, object | None] = {"payload": payload, "headers": headers or {}}
+        self.calls.append((path, params))
         return {"path": path, "params": params}
 
 
@@ -36,7 +63,7 @@ def test_remote_api_rejects_mcp_endpoint_as_base_url() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stdio_proxy_exposes_remote_json_api_as_five_tools() -> None:
+async def test_stdio_proxy_exposes_static_and_managed_remote_tools() -> None:
     module = _load_proxy_module()
     api = StubApi()
     server = module.create_stdio_server(api)
@@ -47,8 +74,10 @@ async def test_stdio_proxy_exposes_remote_json_api_as_five_tools() -> None:
             "kb_search",
             "kb_get_document",
             "kb_get_chunk",
+            "kb_run_context_benchmark",
             "kb_list_documents",
             "kb_stats",
+            "kb_search_limits",
         }
 
         search = await client.call_tool("kb_search", {"query": "daily limits", "top_k": 3})
@@ -64,6 +93,22 @@ async def test_stdio_proxy_exposes_remote_json_api_as_five_tools() -> None:
         chunk = await client.call_tool("kb_get_chunk", {"chunk_id": "chunk-1"})
         assert chunk.data["path"] == "/api/v1/chunk"
         assert chunk.data["params"]["chunk_id"] == "chunk-1"
+
+        benchmark = await client.call_tool(
+            "kb_run_context_benchmark",
+            {"password": "separate-benchmark-password"},
+        )
+        assert benchmark.data["path"] == "/api/v1/admin/context-benchmark"
+        assert benchmark.data["params"]["headers"] == {
+            "X-KB-Benchmark-Password": "separate-benchmark-password"
+        }
+
+        managed = await client.call_tool("kb_search_limits", {"query": "daily limits"})
+        assert managed.data["path"] == "/api/v1/tools/call"
+        assert managed.data["params"]["payload"] == {
+            "name": "kb_search_limits",
+            "arguments": {"query": "daily limits"},
+        }
 
         documents = await client.call_tool("kb_list_documents", {"limit": 10})
         assert documents.data["path"] == "/api/v1/documents"

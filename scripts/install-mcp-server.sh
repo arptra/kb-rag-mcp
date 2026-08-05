@@ -59,10 +59,12 @@ printf 'Installing corporate-kb into %s\n' "${install_dir}"
 mkdir -p -- \
   "${install_dir}/src" \
   "${install_dir}/scripts" \
-  "${install_dir}/knowledge"
+  "${install_dir}/knowledge" \
+  "${install_dir}/evaluation"
 
 cp -R "${project_root}/src/." "${install_dir}/src/"
 cp -R "${project_root}/knowledge/." "${install_dir}/knowledge/"
+cp -R "${project_root}/evaluation/." "${install_dir}/evaluation/"
 cp "${project_root}/pyproject.toml" "${install_dir}/pyproject.toml"
 cp "${project_root}/uv.lock" "${install_dir}/uv.lock"
 cp "${project_root}/README.md" "${install_dir}/README.md"
@@ -116,13 +118,6 @@ entry = {
         "DO_NOT_TRACK": "1",
         "KB_LOG_LEVEL": "INFO",
     },
-    "includeTools": [
-        "kb_search",
-        "kb_get_document",
-        "kb_get_chunk",
-        "kb_list_documents",
-        "kb_stats",
-    ],
     "discoveryTimeoutMs": 30000,
     "timeout": 120000,
     "trust": False,

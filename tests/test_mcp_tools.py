@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastmcp import Client
 
@@ -12,8 +14,23 @@ from corporate_kb.service import KnowledgeService
 async def test_mcp_returns_compact_context_and_supports_lazy_chunk_loading(
     settings_factory,
 ) -> None:
-    settings = settings_factory()
+    password = "separate-benchmark-password"
+    settings = settings_factory(benchmark_password=password)
+    settings.benchmark_questions_path.parent.mkdir(parents=True)
+    settings.benchmark_questions_path.write_text(
+        json.dumps(
+            [
+                {
+                    "question": "Кто владеет дневными лимитами?",
+                    "expected_documents": ["limits.md"],
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     settings.knowledge_dir.mkdir(parents=True)
+    repeated_rules = "Daily limits are checked by limits-service before payment.\n\n" * 80
     (settings.knowledge_dir / "limits.md").write_text(
         """---
 document_type: service
@@ -24,7 +41,9 @@ status: current
 # Limits Service
 
 limits-service owns daily limits.
-""",
+
+"""
+        + repeated_rules,
         encoding="utf-8",
     )
     service = KnowledgeService(
@@ -40,6 +59,7 @@ limits-service owns daily limits.
             "kb_search",
             "kb_get_document",
             "kb_get_chunk",
+            "kb_run_context_benchmark",
             "kb_list_documents",
             "kb_stats",
         }
@@ -62,6 +82,21 @@ limits-service owns daily limits.
         chunk = await client.call_tool("kb_get_chunk", {"chunk_id": hit["chunk_id"]})
         assert chunk.data["document_id"] == hit["document_id"]
         assert chunk.data["text_tokens"] <= settings.document_context_tokens
+
+        denied = await client.call_tool(
+            "kb_run_context_benchmark",
+            {"password": "wrong-password-value"},
+            raise_on_error=False,
+        )
+        assert denied.is_error is True
+
+        benchmark = await client.call_tool(
+            "kb_run_context_benchmark",
+            {"password": password},
+        )
+        assert benchmark.data["status"] == "passed"
+        assert benchmark.data["quality"]["packed_hit_at_3_percent"] == 100.0
+        assert benchmark.data["context"]["token_reduction_percent"] > 0
 
         stats = await client.call_tool("kb_stats", {})
         assert stats.data["document_count"] == 1
