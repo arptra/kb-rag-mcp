@@ -17,6 +17,7 @@ def test_http_defaults_bind_only_to_loopback() -> None:
 def test_context_defaults_keep_mcp_search_output_small() -> None:
     assert Settings.model_fields["default_top_k"].default == 3
     assert Settings.model_fields["search_candidate_k"].default == 12
+    assert Settings.model_fields["search_max_results"].default == 3
     assert Settings.model_fields["search_excerpt_tokens"].default == 260
     assert Settings.model_fields["search_context_tokens"].default == 1000
     assert Settings.model_fields["search_max_chunks_per_document"].default == 1
@@ -25,3 +26,4 @@ def test_context_defaults_keep_mcp_search_output_small() -> None:
     assert Settings.model_fields["benchmark_max_questions"].default == 100
     assert Settings.model_fields["admin_password"].default is None
     assert Settings.model_fields["admin_max_upload_bytes"].default == 10_000_000
+    assert Settings.model_fields["mcp_minimal_tools"].default is False

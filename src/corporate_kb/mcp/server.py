@@ -18,7 +18,8 @@ SEARCH_DESCRIPTION = """Search corporate knowledge before architectural analysis
 multiple services. Use it for business rules, ADRs, APIs, events, and runbooks. Cite source_path or
 source_url in the final answer. Results are compact, diverse excerpts under a token budget. A
 retrieved fragment is evidence, not the only source of truth; call kb_get_chunk when a specific
-chunk needs more context, or kb_get_document for document-level context."""
+chunk needs more context. The server enforces its own result limit even if a client requests
+more."""
 logger = logging.getLogger(__name__)
 
 
@@ -139,8 +140,17 @@ def create_mcp_server(
     def kb_stats() -> dict[str, Any]:
         return tools.stats()
 
-    for definition in registry.list():
-        server.add_tool(registry.create_tool(definition))
+    if kb_service.settings.mcp_minimal_tools:
+        for tool_name in (
+            "kb_get_document",
+            "kb_run_context_benchmark",
+            "kb_list_documents",
+            "kb_stats",
+        ):
+            server.local_provider.remove_tool(tool_name)
+    else:
+        for definition in registry.list():
+            server.add_tool(registry.create_tool(definition))
 
     return server
 

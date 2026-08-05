@@ -220,10 +220,11 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             definition = ManagedToolDefinition.model_validate(payload)
             replacement = managed_tools.create_tool(definition)
             existing = {item.name for item in managed_tools.list()}
-            if definition.name in existing:
-                server.remove_tool(definition.name)
+            if definition.name in existing and not settings.mcp_minimal_tools:
+                server.local_provider.remove_tool(definition.name)
             managed_tools.upsert(definition)
-            server.add_tool(replacement)
+            if not settings.mcp_minimal_tools:
+                server.add_tool(replacement)
             return JSONResponse(definition.model_dump(mode="json"), status_code=201)
         except Exception as exc:
             return _api_error(exc)
@@ -238,7 +239,8 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             if not isinstance(name, str) or not name:
                 raise ValueError("name must be a non-empty string")
             managed_tools.delete(name)
-            server.remove_tool(name)
+            if not settings.mcp_minimal_tools:
+                server.local_provider.remove_tool(name)
             return JSONResponse({"status": "deleted", "name": name})
         except Exception as exc:
             return _api_error(exc)

@@ -103,6 +103,13 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
         assert api_search.status_code == 200
         assert api_search.json()["results"][0]["source_path"] == "limits.md"
         assert "text" not in api_search.json()["results"][0]
+        wide_search = await anonymous_client.get(
+            "/api/v1/search",
+            params={"query": "daily limits", "top_k": 10},
+            headers=api_headers,
+        )
+        assert wide_search.status_code == 200
+        assert wide_search.json()["result_count"] <= settings.search_max_results
 
         admin_page = await anonymous_client.get("/admin")
         assert admin_page.status_code == 200
@@ -114,7 +121,7 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
             headers=admin_headers,
         )
         assert admin_overview.status_code == 200
-        assert admin_overview.json()["usage"]["search_count"] == 1
+        assert admin_overview.json()["usage"]["search_count"] == 2
         assert admin_overview.json()["usage"]["calls_last_minute"] >= 1
         server_metrics = admin_overview.json()["server_metrics"]
         assert server_metrics["cpu_cores"] >= 1
