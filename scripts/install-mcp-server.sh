@@ -68,6 +68,7 @@ cp -R "${project_root}/evaluation/." "${install_dir}/evaluation/"
 cp "${project_root}/pyproject.toml" "${install_dir}/pyproject.toml"
 cp "${project_root}/uv.lock" "${install_dir}/uv.lock"
 cp "${project_root}/README.md" "${install_dir}/README.md"
+cp "${project_root}/README.low-context.md" "${install_dir}/README.low-context.md"
 cp "${project_root}/.env.example" "${install_dir}/.env.example"
 cp "${project_root}/scripts/setup-venv.sh" "${install_dir}/scripts/setup-venv.sh"
 cp "${project_root}/scripts/setup-pip.sh" "${install_dir}/scripts/setup-pip.sh"
@@ -75,6 +76,7 @@ cp "${project_root}/scripts/activate-venv.sh" "${install_dir}/scripts/activate-v
 cp "${project_root}/scripts/dev.sh" "${install_dir}/scripts/dev.sh"
 cp "${project_root}/scripts/start-mcp.sh" "${install_dir}/scripts/start-mcp.sh"
 cp "${project_root}/scripts/start-mcp-http.sh" "${install_dir}/scripts/start-mcp-http.sh"
+cp "${project_root}/scripts/rag-low-context.sh" "${install_dir}/scripts/rag-low-context.sh"
 chmod +x "${install_dir}/scripts/"*.sh
 
 if [[ "${install_mode}" == uv ]]; then
