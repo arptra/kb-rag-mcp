@@ -13,6 +13,7 @@ from corporate_kb.context import ContextCompressor, ContextExcerpt
 from corporate_kb.evaluation.evaluator import load_evaluation_questions
 from corporate_kb.models import Document, SearchFilters, SearchResult
 from corporate_kb.service import KnowledgeService
+from corporate_kb.ssot import SsotContextBuilder
 from corporate_kb.usage import UsageTracker
 
 _BENCHMARK_LOCK = Lock()
@@ -27,11 +28,30 @@ class KnowledgeTools:
         self,
         service: KnowledgeService,
         *,
+        ssot_service: KnowledgeService | None = None,
         usage: UsageTracker | None = None,
     ) -> None:
         self._service = service
         self._compressor = ContextCompressor()
+        self._ssot = SsotContextBuilder(ssot_service or service)
         self.usage = usage or UsageTracker()
+
+    def ssot_context(
+        self,
+        *,
+        question: str,
+        mode: str = "implementation",
+    ) -> dict[str, Any]:
+        """Return one current cross-service SSOT brief assembled by internal searches."""
+        if mode not in {"business", "implementation"}:
+            raise ValueError("mode must be business or implementation")
+        payload = self._ssot.build(question=question, mode=mode)
+        self.usage.record(
+            "ssot_context",
+            context_tokens=int(payload["context_token_count"]),
+            result_count=int(payload["service_count"]),
+        )
+        return payload
 
     def search(
         self,

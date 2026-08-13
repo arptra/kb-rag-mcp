@@ -30,7 +30,9 @@ Commands:
   index-hash    Rebuild the offline hash index
   search-hash   Search with hash embeddings; accepts an optional query
   index         Rebuild using the configured provider (hash by default)
+  index-ssot    Rebuild the separate global SSOT index incrementally
   search        Search using the configured provider; accepts an optional query
+  ssot          Build one cross-service SSOT context; accepts a question
   index-semantic
                 Rebuild with an explicitly configured local semantic model
   eval          Run retrieval evaluation
@@ -92,12 +94,22 @@ case "${command_name}" in
   index)
     "${python_runtime[@]}" -m corporate_kb.cli index --force --incremental "$@"
     ;;
+  index-ssot)
+    "${python_runtime[@]}" -m corporate_kb.cli index-ssot "$@"
+    ;;
   search)
     query="${1:-Какой сервис владеет дневными лимитами?}"
     if [[ $# -gt 0 ]]; then
       shift
     fi
     "${python_runtime[@]}" -m corporate_kb.cli search "${query}" --top-k 5 "$@"
+    ;;
+  ssot)
+    question="${1:-Какие сервисы участвуют в проверке дневного лимита?}"
+    if [[ $# -gt 0 ]]; then
+      shift
+    fi
+    "${python_runtime[@]}" -m corporate_kb.cli ssot "${question}" "$@"
     ;;
   index-semantic)
     "${python_runtime[@]}" -m corporate_kb.cli index --force --incremental "$@"

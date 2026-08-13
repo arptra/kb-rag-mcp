@@ -12,13 +12,22 @@ from corporate_kb import __version__
 from corporate_kb.config import Settings
 from corporate_kb.mcp.managed_tools import ManagedToolRegistry
 from corporate_kb.mcp.tools import KnowledgeTools
-from corporate_kb.service import KnowledgeService, configure_logging, create_service
+from corporate_kb.service import (
+    KnowledgeService,
+    configure_logging,
+    create_service,
+    create_ssot_service,
+)
 
 SEARCH_DESCRIPTION = """Search corporate knowledge before architectural analysis or changes spanning
 multiple services. Use it for business rules, ADRs, APIs, events, and runbooks. Cite source_path or
 source_url in the final answer. Results are compact, diverse excerpts under a token budget. A
 retrieved fragment is evidence, not the only source of truth; call kb_get_chunk when a specific
 chunk needs more context, or kb_get_document for document-level context."""
+SSOT_DESCRIPTION = """Answer a current business or implementation question from service SSOTs.
+Use this as one self-contained call for a feature spanning services: the server discovers involved
+services, performs additional filtered searches internally, and returns one compact grouped brief.
+Do not call kb_search repeatedly to reconstruct the same SSOT context."""
 logger = logging.getLogger(__name__)
 
 
@@ -43,6 +52,17 @@ def create_mcp_server(
         version=__version__,
         auth=auth,
     )
+
+    @server.tool(
+        name="ssot_context",
+        description=SSOT_DESCRIPTION,
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def ssot_context(
+        question: str,
+        mode: str = "implementation",
+    ) -> dict[str, Any]:
+        return tools.ssot_context(question=question, mode=mode)
 
     @server.tool(
         name="kb_search",
@@ -158,7 +178,20 @@ def main() -> None:
             stats.chunk_count,
             stats.embedding_provider,
         )
-        create_mcp_server(service).run(transport="stdio", show_banner=False)
+        ssot_service = None
+        if settings.ssot_enabled:
+            ssot_service = create_ssot_service(settings, provider=service.provider)
+            ssot_stats = ssot_service.load_read_index()
+            logger.info(
+                "Preloaded global SSOT index: documents=%d chunks=%d",
+                ssot_stats.document_count,
+                ssot_stats.chunk_count,
+            )
+        tools = KnowledgeTools(service, ssot_service=ssot_service)
+        create_mcp_server(service, knowledge_tools=tools).run(
+            transport="stdio",
+            show_banner=False,
+        )
     except KeyboardInterrupt:
         return
 

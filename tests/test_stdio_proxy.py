@@ -71,6 +71,7 @@ async def test_stdio_proxy_exposes_static_and_managed_remote_tools() -> None:
     async with Client(server) as client:
         listed = await client.list_tools()
         assert {tool.name for tool in listed} == {
+            "ssot_context",
             "kb_search",
             "kb_get_document",
             "kb_get_chunk",
@@ -85,6 +86,16 @@ async def test_stdio_proxy_exposes_static_and_managed_remote_tools() -> None:
         assert search.data["path"] == "/api/v1/search"
         assert search.data["params"]["query"] == "daily limits"
         assert search.data["params"]["top_k"] == 3
+
+        ssot = await client.call_tool(
+            "ssot_context",
+            {"question": "How should payment check limits?", "mode": "implementation"},
+        )
+        assert ssot.data["path"] == "/api/v1/ssot/context"
+        assert ssot.data["params"] == {
+            "question": "How should payment check limits?",
+            "mode": "implementation",
+        }
 
         document = await client.call_tool("kb_get_document", {"document_id": "doc-1"})
         assert document.data["path"] == "/api/v1/document"

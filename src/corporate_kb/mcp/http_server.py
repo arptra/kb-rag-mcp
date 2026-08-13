@@ -18,7 +18,12 @@ from corporate_kb.mcp.admin_ui import ADMIN_HTML
 from corporate_kb.mcp.managed_tools import ManagedToolDefinition, ManagedToolRegistry
 from corporate_kb.mcp.server import create_mcp_server
 from corporate_kb.mcp.tools import KnowledgeTools
-from corporate_kb.service import KnowledgeService, configure_logging, create_service
+from corporate_kb.service import (
+    KnowledgeService,
+    configure_logging,
+    create_service,
+    create_ssot_service,
+)
 from corporate_kb.usage import UsageTracker
 
 logger = logging.getLogger(__name__)
@@ -142,7 +147,16 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
     """Create an authenticated FastMCP server with a public health route."""
     token = validate_http_settings(settings)
     usage = UsageTracker()
-    tools = KnowledgeTools(service, usage=usage)
+    ssot_service = None
+    if settings.ssot_enabled:
+        ssot_service = create_ssot_service(settings, provider=service.provider)
+        ssot_stats = ssot_service.load_read_index()
+        logger.info(
+            "Preloaded global SSOT index: documents=%d chunks=%d",
+            ssot_stats.document_count,
+            ssot_stats.chunk_count,
+        )
+    tools = KnowledgeTools(service, ssot_service=ssot_service, usage=usage)
     managed_tools = ManagedToolRegistry(settings.managed_tools_path, tools)
     admin = AdminController(service, usage)
     server = create_mcp_server(
@@ -274,6 +288,24 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 status=_optional_query(request, "status", "current"),
                 authority=_optional_query(request, "authority"),
                 source_type=_optional_query(request, "source_type"),
+            )
+            return JSONResponse(payload)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/api/v1/ssot/context", methods=["GET"], include_in_schema=False)
+    async def api_ssot_context(request: Request) -> JSONResponse:
+        if not _authorized(request, token):
+            return _unauthorized_response()
+        try:
+            question = request.query_params.get("question", "")
+            if not question.strip():
+                raise ValueError("question must not be empty")
+            mode = _optional_query(request, "mode", "implementation") or "implementation"
+            payload = await asyncio.to_thread(
+                tools.ssot_context,
+                question=question,
+                mode=mode,
             )
             return JSONResponse(payload)
         except Exception as exc:

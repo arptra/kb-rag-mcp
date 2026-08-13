@@ -104,6 +104,21 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
         assert api_search.json()["results"][0]["source_path"] == "limits.md"
         assert "text" not in api_search.json()["results"][0]
 
+        empty_ssot = await anonymous_client.get(
+            "/api/v1/ssot/context",
+            params={"question": "Who owns daily limits?"},
+            headers=api_headers,
+        )
+        assert empty_ssot.status_code == 200
+        assert empty_ssot.json()["service_count"] == 0
+        assert (
+            await anonymous_client.get(
+                "/api/v1/ssot/context",
+                params={"question": "daily limits", "mode": "invalid"},
+                headers=api_headers,
+            )
+        ).status_code == 400
+
         admin_page = await anonymous_client.get("/admin")
         assert admin_page.status_code == 200
         assert "Corporate RAG Admin" in admin_page.text
@@ -220,6 +235,7 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
             await session.initialize()
             listed = await session.list_tools()
             assert {tool.name for tool in listed.tools} == {
+                "ssot_context",
                 "kb_search",
                 "kb_get_document",
                 "kb_get_chunk",

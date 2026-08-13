@@ -26,6 +26,9 @@ class Settings(BaseSettings):
 
     knowledge_dir: Path = Path("knowledge")
     cache_dir: Path = Path(".cache/kb")
+    ssot_enabled: bool = False
+    ssot_knowledge_dir: Path = Path("ssot")
+    ssot_cache_dir: Path = Path(".cache/ssot")
     embedding_provider: Literal["sentence_transformers", "hash"] = "hash"
     embedding_model: str = "./models/Qwen3-Embedding-0.6B"
     embedding_local_files_only: bool = True
@@ -43,6 +46,12 @@ class Settings(BaseSettings):
     search_context_tokens: int = Field(default=1000, ge=100, le=4000)
     search_max_chunks_per_document: int = Field(default=1, ge=1, le=5)
     document_context_tokens: int = Field(default=800, ge=100, le=4000)
+    ssot_document_type: str = "ssot"
+    ssot_candidate_k: int = Field(default=20, ge=3, le=20)
+    ssot_max_services: int = Field(default=6, ge=1, le=12)
+    ssot_facts_per_service: int = Field(default=3, ge=1, le=6)
+    ssot_fact_tokens: int = Field(default=100, ge=40, le=300)
+    ssot_context_tokens: int = Field(default=1000, ge=300, le=4000)
     benchmark_questions_path: Path = Path("evaluation/questions.json")
     benchmark_password: SecretStr | None = None
     benchmark_max_questions: int = Field(default=100, ge=1, le=1000)
@@ -86,6 +95,8 @@ class Settings(BaseSettings):
             update={
                 "knowledge_dir": resolve(self.knowledge_dir),
                 "cache_dir": resolve(self.cache_dir),
+                "ssot_knowledge_dir": resolve(self.ssot_knowledge_dir),
+                "ssot_cache_dir": resolve(self.ssot_cache_dir),
                 "benchmark_questions_path": resolve(self.benchmark_questions_path),
                 "managed_tools_path": resolve(self.managed_tools_path),
             }

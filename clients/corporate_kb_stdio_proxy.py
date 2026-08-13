@@ -29,6 +29,9 @@ from pydantic import PrivateAttr
 SEARCH_DESCRIPTION = """Search remote corporate knowledge before architectural analysis or changes
 spanning multiple services. Cite source_path or source_url from the returned results. Call
 kb_get_chunk when a selected result needs more context."""
+SSOT_DESCRIPTION = """Answer a current business or implementation question from all service SSOTs
+with one call. The remote RAG discovers related services and performs expansion internally; do not
+repeat kb_search to reconstruct the same feature context."""
 
 
 class JsonApi(Protocol):
@@ -185,6 +188,20 @@ def create_stdio_server(api: JsonApi) -> FastMCP:
             "source_path or source_url from the results."
         ),
     )
+
+    @server.tool(
+        name="ssot_context",
+        description=SSOT_DESCRIPTION,
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def ssot_context(
+        question: str,
+        mode: str = "implementation",
+    ) -> dict[str, Any]:
+        return api.get_json(
+            "/api/v1/ssot/context",
+            {"question": question, "mode": mode},
+        )
 
     @server.tool(
         name="kb_search",

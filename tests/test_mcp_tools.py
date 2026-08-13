@@ -56,6 +56,7 @@ limits-service owns daily limits.
     async with Client(server) as client:
         listed = await client.list_tools()
         assert {tool.name for tool in listed} == {
+            "ssot_context",
             "kb_search",
             "kb_get_document",
             "kb_get_chunk",
@@ -104,3 +105,54 @@ limits-service owns daily limits.
 
         documents = await client.call_tool("kb_list_documents", {})
         assert documents.data["document_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_exposes_one_cross_service_ssot_tool(settings_factory) -> None:
+    settings = settings_factory(ssot_context_tokens=600)
+    settings.knowledge_dir.mkdir(parents=True)
+    (settings.knowledge_dir / "payments.md").write_text(
+        """---
+document_type: ssot
+service: payments-service
+status: current
+---
+# Payments
+
+payments-service calls limits-service before committing a payment.
+""",
+        encoding="utf-8",
+    )
+    (settings.knowledge_dir / "limits.md").write_text(
+        """---
+document_type: ssot
+service: limits-service
+status: current
+---
+# Limits
+
+limits-service owns the daily limit decision for payments.
+""",
+        encoding="utf-8",
+    )
+    service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    service.build_index(force=True)
+
+    async with Client(create_mcp_server(service)) as client:
+        result = await client.call_tool(
+            "ssot_context",
+            {
+                "question": "How should payment use the daily limit?",
+                "mode": "implementation",
+            },
+        )
+
+    assert result.is_error is False
+    assert {item["service"] for item in result.data["services"]} == {
+        "payments-service",
+        "limits-service",
+    }
+    assert result.data["context_token_count"] <= 600

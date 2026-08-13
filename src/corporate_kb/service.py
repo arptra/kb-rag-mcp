@@ -401,6 +401,24 @@ def create_service(settings: Settings | None = None) -> KnowledgeService:
     return KnowledgeService((settings or Settings()).resolved())
 
 
+def create_ssot_service(
+    settings: Settings | None = None,
+    *,
+    provider: EmbeddingProvider | None = None,
+) -> KnowledgeService:
+    """Construct the separate global index containing current SSOTs of every service."""
+    resolved = (settings or Settings()).resolved()
+    return KnowledgeService(
+        resolved.model_copy(
+            update={
+                "knowledge_dir": resolved.ssot_knowledge_dir,
+                "cache_dir": resolved.ssot_cache_dir,
+            }
+        ),
+        provider=provider,
+    )
+
+
 def configure_logging(level: str) -> None:
     """Configure application logs on stderr (the logging default stream)."""
     numeric = getattr(logging, level.upper(), logging.INFO)

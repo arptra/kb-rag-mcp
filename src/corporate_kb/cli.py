@@ -11,7 +11,13 @@ import typer
 from corporate_kb.config import Settings
 from corporate_kb.evaluation.evaluator import Evaluator
 from corporate_kb.models import Document, SearchFilters, SearchResult
-from corporate_kb.service import KnowledgeService, configure_logging, create_service
+from corporate_kb.service import (
+    KnowledgeService,
+    configure_logging,
+    create_service,
+    create_ssot_service,
+)
+from corporate_kb.ssot import SsotContextBuilder
 
 app = typer.Typer(no_args_is_help=True, help="Локальная корпоративная база знаний.")
 DEFAULT_QUESTIONS_PATH = Path("evaluation/questions.json")
@@ -54,6 +60,44 @@ def index(
     stats = _service().build_index(force=force, reuse_unchanged=incremental)
     typer.echo(
         f"Индекс готов: documents={stats.document_count}, chunks={stats.chunk_count}, "
+        f"provider={stats.embedding_provider}, cache={stats.loaded_from_cache}"
+    )
+
+
+@app.command()
+def ssot(
+    question: str = typer.Argument(..., help="Вопрос по актуальным SSOT сервисов."),
+    mode: str = typer.Option("implementation", "--mode", help="business или implementation."),
+) -> None:
+    """Собрать один межсервисный SSOT-контекст так же, как MCP tool."""
+    if mode not in {"business", "implementation"}:
+        raise ValueError("mode must be business or implementation")
+    settings = Settings().resolved()
+    configure_logging(settings.log_level)
+    typer.echo(
+        _json_dump(
+            SsotContextBuilder(create_ssot_service(settings)).build(
+                question=question,
+                mode=mode,
+            )
+        )
+    )
+
+
+@app.command(name="index-ssot")
+def index_ssot(
+    force: bool = typer.Option(True, "--force/--no-force"),
+    incremental: bool = typer.Option(True, "--incremental/--no-incremental"),
+) -> None:
+    """Построить отдельный общий индекс SSOT всех сервисов."""
+    settings = Settings().resolved()
+    configure_logging(settings.log_level)
+    stats = create_ssot_service(settings).build_index(
+        force=force,
+        reuse_unchanged=incremental,
+    )
+    typer.echo(
+        f"SSOT индекс готов: documents={stats.document_count}, chunks={stats.chunk_count}, "
         f"provider={stats.embedding_provider}, cache={stats.loaded_from_cache}"
     )
 

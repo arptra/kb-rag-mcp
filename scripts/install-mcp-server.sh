@@ -60,15 +60,18 @@ mkdir -p -- \
   "${install_dir}/src" \
   "${install_dir}/scripts" \
   "${install_dir}/knowledge" \
+  "${install_dir}/ssot" \
   "${install_dir}/evaluation"
 
 cp -R "${project_root}/src/." "${install_dir}/src/"
 cp -R "${project_root}/knowledge/." "${install_dir}/knowledge/"
+cp -R "${project_root}/ssot/." "${install_dir}/ssot/"
 cp -R "${project_root}/evaluation/." "${install_dir}/evaluation/"
 cp "${project_root}/pyproject.toml" "${install_dir}/pyproject.toml"
 cp "${project_root}/uv.lock" "${install_dir}/uv.lock"
 cp "${project_root}/README.md" "${install_dir}/README.md"
 cp "${project_root}/README.low-context.md" "${install_dir}/README.low-context.md"
+cp "${project_root}/README.ssot.md" "${install_dir}/README.ssot.md"
 cp "${project_root}/.env.example" "${install_dir}/.env.example"
 cp "${project_root}/scripts/setup-venv.sh" "${install_dir}/scripts/setup-venv.sh"
 cp "${project_root}/scripts/setup-pip.sh" "${install_dir}/scripts/setup-pip.sh"
