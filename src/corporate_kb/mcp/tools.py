@@ -48,9 +48,7 @@ class KnowledgeTools:
     ) -> dict[str, Any]:
         if not 1 <= top_k <= 20:
             raise ValueError("top_k must be between 1 and 20")
-        settings = self._service.settings
-        effective_top_k = min(top_k, settings.search_max_results)
-        candidate_k = min(20, max(effective_top_k, settings.search_candidate_k))
+        candidate_k = min(20, max(top_k, self._service.settings.search_candidate_k))
         results = self._service.search(
             query,
             top_k=candidate_k,
@@ -67,18 +65,15 @@ class KnowledgeTools:
         packed_results, context_token_count = self._pack_search_results(
             query=query,
             results=results,
-            requested_top_k=effective_top_k,
+            requested_top_k=top_k,
         )
-        payload: dict[str, Any] = {
+        payload = {
+            "query": query,
             "result_count": len(packed_results),
+            "retrieved_candidate_count": len(results),
             "context_token_count": context_token_count,
             "results": packed_results,
         }
-        if not settings.mcp_minimal_tools:
-            payload.update(
-                query=query,
-                retrieved_candidate_count=len(results),
-            )
         self.usage.record(
             "kb_search",
             context_tokens=context_token_count,
@@ -351,7 +346,14 @@ class KnowledgeTools:
             )
             if not excerpt.text:
                 continue
-            packed.append(self._search_result(result, excerpt))
+            packed.append(
+                self._search_result(
+                    result,
+                    excerpt.text,
+                    excerpt.token_count,
+                    excerpt.truncated,
+                )
+            )
             chunks_per_document[result.document_id] = seen + 1
             remaining -= excerpt.token_count
         return packed, settings.search_context_tokens - remaining
@@ -371,24 +373,15 @@ class KnowledgeTools:
             )
         return self._compressor.excerpt(query=query, text=text, max_tokens=limit)
 
+    @staticmethod
     def _search_result(
-        self,
         result: SearchResult,
-        excerpt: ContextExcerpt,
+        excerpt: str,
+        excerpt_tokens: int,
+        truncated: bool,
     ) -> dict[str, Any]:
         location = result.source_url or result.source_path
         section = f" — {result.heading_path}" if result.heading_path else ""
-        citation = f"{result.title}{section} ({location})"
-        if self._service.settings.mcp_minimal_tools:
-            payload = {
-                "chunk_id": result.chunk_id,
-                "excerpt": excerpt.text,
-                "source_path": result.source_path,
-                "citation": citation,
-            }
-            if result.source_url is not None:
-                payload["source_url"] = result.source_url
-            return payload
         return {
             "rank": result.rank,
             "score": round(result.score, 6),
@@ -396,12 +389,12 @@ class KnowledgeTools:
             "document_id": result.document_id,
             "title": result.title,
             "heading_path": result.heading_path,
-            "excerpt": excerpt.text,
-            "excerpt_tokens": excerpt.token_count,
-            "truncated": excerpt.truncated,
+            "excerpt": excerpt,
+            "excerpt_tokens": excerpt_tokens,
+            "truncated": truncated,
             "source_path": result.source_path,
             "source_url": result.source_url,
-            "citation": citation,
+            "citation": f"{result.title}{section} ({location})",
         }
 
     @staticmethod

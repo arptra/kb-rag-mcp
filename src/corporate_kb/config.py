@@ -39,7 +39,6 @@ class Settings(BaseSettings):
     chunk_overlap_tokens: int = Field(default=80, ge=0)
     default_top_k: int = Field(default=3, ge=1, le=20)
     search_candidate_k: int = Field(default=12, ge=1, le=20)
-    search_max_results: int = Field(default=3, ge=1, le=5)
     search_excerpt_tokens: int = Field(default=260, ge=40, le=900)
     search_context_tokens: int = Field(default=1000, ge=100, le=4000)
     search_max_chunks_per_document: int = Field(default=1, ge=1, le=5)
@@ -50,7 +49,6 @@ class Settings(BaseSettings):
     admin_password: SecretStr | None = None
     admin_max_upload_bytes: int = Field(default=10_000_000, ge=1, le=100_000_000)
     managed_tools_path: Path = Path(".cache/kb/managed_tools.json")
-    mcp_minimal_tools: bool = False
     auto_index: bool = False
     log_level: str = "INFO"
     mcp_http_host: str = "127.0.0.1"

@@ -108,9 +108,7 @@ curl -G \
       "env": {
         "CORPORATE_KB_API_URL": "http://SERVER_IP:8000",
         "CORPORATE_KB_API_TOKEN": "SERVER_TOKEN",
-        "CORPORATE_KB_API_TIMEOUT": "30",
-        "CORPORATE_KB_MINIMAL_TOOLS": "true",
-        "CORPORATE_KB_MAX_RESULTS": "2"
+        "CORPORATE_KB_API_TIMEOUT": "30"
       },
       "timeout": 120000,
       "trust": false
@@ -135,9 +133,7 @@ curl -G \
       "env": {
         "CORPORATE_KB_API_URL": "http://SERVER_IP:8000",
         "CORPORATE_KB_API_TOKEN": "SERVER_TOKEN",
-        "CORPORATE_KB_API_TIMEOUT": "30",
-        "CORPORATE_KB_MINIMAL_TOOLS": "true",
-        "CORPORATE_KB_MAX_RESULTS": "2"
+        "CORPORATE_KB_API_TIMEOUT": "30"
       },
       "timeout": 120000,
       "trust": false
@@ -162,19 +158,28 @@ qwen
 /mcp
 ```
 
-В экономном режиме сервер `corporate-kb` должен показать ровно два инструмента:
+Сервер `corporate-kb` должен показать шесть инструментов:
 
 ```text
 kb_search
+kb_get_document
 kb_get_chunk
+kb_run_context_benchmark
+kb_list_documents
+kb_stats
 ```
 
 `kb_search` возвращает короткие выдержки, а не полные страницы Confluence. Если Qwen нужен текст
 конкретного результата, он сам вызывает `kb_get_chunk` с `chunk_id` — это сохраняет контекст диалога.
 
-Benchmark запускается администратором через защищённый HTTP endpoint, а не из обычного Qwen.
-Если специально нужны административные и управляемые tools, установите
-`CORPORATE_KB_MINIMAL_TOOLS=false` и полностью перезапустите Qwen; это увеличит стартовый контекст.
+`kb_run_context_benchmark` — отдельный административный прогон. При его вызове Qwen должен сначала
+спросить отдельный benchmark-пароль. Не сохраняйте этот пароль в Qwen settings и не используйте
+вместо него обычный `CORPORATE_KB_API_TOKEN`.
+
+Администратор может создавать дополнительные search-tools через защищённый серверный API.
+Однофайловый proxy получает их имена, описания и JSON Schema при старте. Чтобы увидеть новый tool,
+полностью перезапустите Qwen. Не добавляйте `includeTools` в settings — статический список скроет
+новые tools.
 
 Кнопка OAuth-аутентификации не нужна: Bearer-токен уже передаётся локальному Python-процессу через
 Qwen settings.

@@ -176,15 +176,8 @@ class RemoteManagedTool(Tool):
         return self.convert_result(payload)
 
 
-def create_stdio_server(
-    api: JsonApi,
-    *,
-    minimal_tools: bool = False,
-    max_results: int = 3,
-) -> FastMCP:
+def create_stdio_server(api: JsonApi) -> FastMCP:
     """Expose the remote JSON API as a local read-only stdio MCP server."""
-    if not 1 <= max_results <= 5:
-        raise ValueError("max_results must be between 1 and 5")
     server = FastMCP(
         "corporate-knowledge-stdio-proxy",
         instructions=(
@@ -213,7 +206,7 @@ def create_stdio_server(
             "/api/v1/search",
             {
                 "query": query,
-                "top_k": min(top_k, max_results),
+                "top_k": top_k,
                 "min_score": min_score,
                 "service": service,
                 "domain": domain,
@@ -298,24 +291,15 @@ def create_stdio_server(
     def kb_stats() -> dict[str, Any]:
         return api.get_json("/api/v1/stats", {})
 
-    if minimal_tools:
-        for tool_name in (
-            "kb_get_document",
-            "kb_run_context_benchmark",
-            "kb_list_documents",
-            "kb_stats",
-        ):
-            server.local_provider.remove_tool(tool_name)
-    else:
-        try:
-            catalog = api.get_json("/api/v1/tools", {})
-            definitions = catalog.get("tools", [])
-            if isinstance(definitions, list):
-                for definition in definitions:
-                    if isinstance(definition, dict):
-                        server.add_tool(RemoteManagedTool(definition, api))
-        except Exception as exc:
-            print(f"Managed MCP tool discovery failed: {exc}", file=sys.stderr)
+    try:
+        catalog = api.get_json("/api/v1/tools", {})
+        definitions = catalog.get("tools", [])
+        if isinstance(definitions, list):
+            for definition in definitions:
+                if isinstance(definition, dict):
+                    server.add_tool(RemoteManagedTool(definition, api))
+    except Exception as exc:
+        print(f"Managed MCP tool discovery failed: {exc}", file=sys.stderr)
 
     return server
 
@@ -327,12 +311,6 @@ def main() -> None:
     ca_file = os.environ.get("CORPORATE_KB_API_CA_FILE") or None
     try:
         timeout_seconds = float(os.environ.get("CORPORATE_KB_API_TIMEOUT", "30"))
-        max_results = int(os.environ.get("CORPORATE_KB_MAX_RESULTS", "2"))
-        if not 1 <= max_results <= 5:
-            raise ValueError("CORPORATE_KB_MAX_RESULTS must be between 1 and 5")
-        minimal_raw = os.environ.get("CORPORATE_KB_MINIMAL_TOOLS", "true").strip().lower()
-        if minimal_raw not in {"true", "false"}:
-            raise ValueError("CORPORATE_KB_MINIMAL_TOOLS must be true or false")
         api = RemoteKnowledgeApi(
             base_url,
             token,
@@ -344,11 +322,7 @@ def main() -> None:
         raise SystemExit(2) from exc
 
     try:
-        create_stdio_server(
-            api,
-            minimal_tools=minimal_raw == "true",
-            max_results=max_results,
-        ).run(transport="stdio", show_banner=False)
+        create_stdio_server(api).run(transport="stdio", show_banner=False)
     except KeyboardInterrupt:
         return
 

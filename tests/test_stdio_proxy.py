@@ -116,20 +116,3 @@ async def test_stdio_proxy_exposes_static_and_managed_remote_tools() -> None:
 
         stats = await client.call_tool("kb_stats", {})
         assert stats.data["path"] == "/api/v1/stats"
-
-
-@pytest.mark.asyncio
-async def test_stdio_proxy_minimal_mode_caps_results_and_exposes_two_tools() -> None:
-    module = _load_proxy_module()
-    api = StubApi()
-    server = module.create_stdio_server(api, minimal_tools=True, max_results=2)
-
-    async with Client(server) as client:
-        listed = await client.list_tools()
-        assert {tool.name for tool in listed} == {"kb_search", "kb_get_chunk"}
-
-        search = await client.call_tool("kb_search", {"query": "daily limits", "top_k": 10})
-        assert search.is_error is False
-        assert search.data["params"]["top_k"] == 2
-
-    assert not any(path == "/api/v1/tools" for path, _params in api.calls)
