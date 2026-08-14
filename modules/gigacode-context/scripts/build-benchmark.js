@@ -65,15 +65,14 @@ function main() {
     const results = [];
     
     // Clean first
-    results.push(measureBuildTime('pnpm clean', 'Clean all packages'));
+    results.push(measureBuildTime('npm run clean', 'Clean active workspaces'));
     
     // Build individual packages
-    results.push(measureBuildTime('pnpm build:core', 'Build core package'));
-    results.push(measureBuildTime('pnpm build:mcp', 'Build MCP package'));
-    results.push(measureBuildTime('pnpm build:vscode', 'Build VSCode extension'));
-    
-    // Full build
-    results.push(measureBuildTime('pnpm -r --filter="./packages/chrome-extension" build', 'Build Chrome extension'));
+    results.push(measureBuildTime('npm run build:core', 'Build core package'));
+    results.push(measureBuildTime('npm run build:mcp', 'Build MCP package'));
+
+    // Full runtime build
+    results.push(measureBuildTime('npm run build', 'Build core and MCP'));
     
     const totalTime = results.reduce((sum, result) => sum + result.duration, 0);
     const successCount = results.filter(r => r.success).length;

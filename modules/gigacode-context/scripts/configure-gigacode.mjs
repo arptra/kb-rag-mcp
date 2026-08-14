@@ -58,7 +58,7 @@ const milvusLiteCommand = path.resolve(
     ?? path.join(projectRoot, '.venv', process.platform === 'win32' ? 'Scripts/milvus-lite.exe' : 'bin/milvus-lite')
 );
 if (!fs.existsSync(serverPath)) {
-  throw new Error(`MCP build is missing: ${serverPath}. Run pnpm build:core && pnpm build:mcp first.`);
+  throw new Error(`MCP build is missing: ${serverPath}. Run npm run build first.`);
 }
 if (!fs.existsSync(milvusLiteCommand)) {
   throw new Error(`Milvus Lite executable is missing: ${milvusLiteCommand}. Run scripts/setup-gigacode.sh first.`);

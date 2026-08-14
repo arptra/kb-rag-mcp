@@ -11,7 +11,7 @@ MCP сам запускает локальный gRPC-процесс базы; D
 [`README.md`](../../README.md). Самостоятельный запуск после сборки:
 
 ```bash
-pnpm start:offline
+npm run start:offline --workspace=@zilliz/claude-context-mcp
 ```
 
 Обязательные переменные runtime:

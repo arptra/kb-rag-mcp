@@ -11,11 +11,10 @@ Transformers.js/ONNX-модель строит эмбеддинги внутри
 ## Что требуется
 
 - Node.js 20 или 22;
-- pnpm 10;
+- npm 9+;
 - Python 3.10+ с `venv`;
 - доступ из корпоративного контура к разрешённым NPM и PyPI-репозиториям;
-- ONNX-модель из каталога `models/multilingual-e5-small`, хранящаяся вместе с
-  кодом этого репозитория.
+- локально скачанная ONNX-модель в каталоге `models/multilingual-e5-small`.
 
 Никакой `OPENAI_API_KEY` и никакой API-ключ GigaCode для MCP не нужны.
 Авторизация самого GigaCode CLI остаётся его внутренней настройкой и не
@@ -27,12 +26,15 @@ Transformers.js/ONNX-модель строит эмбеддинги внутри
 git clone <internal-git-url> gigacode-context
 cd gigacode-context
 
+GIGACODE_MODEL_BASE_URL=https://models.company.local/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78 \
+  ./scripts/download-model.sh
+
 NPM_CONFIG_REGISTRY=https://npm.company.local/repository/npm/ \
 PIP_INDEX_URL=https://pypi.company.local/simple/ \
   ./scripts/setup-gigacode.sh
 ```
 
-`setup-gigacode.sh` выполняет `pnpm install` по lockfile, собирает только
+`setup-gigacode.sh` выполняет `npm ci` по lockfile, собирает только
 `packages/core` и `packages/mcp`, создаёт локальную `.venv`, устанавливает
 `milvus-lite` из PyPI, прогоняет реальные embedding/index/search/MCP проверки и
 добавляет `gigacode-context` в `~/.gigacode/settings.json`.

@@ -7,7 +7,7 @@
     "types": "dist/index.d.ts",
     "bin": "dist/index.js",
     "scripts": {
-        "build": "pnpm clean && tsc --build --force",
+        "build": "npm run clean && tsc --build --force",
         "dev": "tsx --watch src/index.ts",
         "clean": "rimraf dist",
         "lint": "eslint src --ext .ts",
@@ -16,10 +16,10 @@
         "test": "node --import tsx --test src/*.test.ts",
         "start": "tsx src/index.ts",
         "start:offline": "../../scripts/run-gigacode-mcp.sh",
-        "prepublishOnly": "pnpm build"
+        "prepublishOnly": "npm run build"
     },
     "dependencies": {
-        "@zilliz/claude-context-core": "workspace:*",
+        "@zilliz/claude-context-core": "0.1.15",
         "@modelcontextprotocol/sdk": "^1.12.1",
         "zod": "^3.25.55"
     },

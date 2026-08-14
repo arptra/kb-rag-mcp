@@ -16,7 +16,7 @@ This directory contains a basic bridge that allows you to run Claude Context Typ
 
 ```bash
 # Make sure you have Node.js dependencies installed
-cd .. && pnpm install
+cd .. && npm ci
 
 # Set your OpenAI API key (required for actual indexing)
 export OPENAI_API_KEY="your-openai-api-key"
@@ -65,4 +65,4 @@ print(result)
 3. Captures JSON output and returns to Python
 4. Supports async functions and complex parameters
 
-That's it! This is just a simple bridge for testing purposes. 
+That's it! This is just a simple bridge for testing purposes.

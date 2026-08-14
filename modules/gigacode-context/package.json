@@ -3,31 +3,37 @@
     "version": "0.1.15",
     "description": "Local code indexing and MCP integration for GigaCode CLI",
     "private": true,
+    "workspaces": [
+        "packages/core",
+        "packages/mcp"
+    ],
     "scripts": {
-        "build": "pnpm -r build",
-        "build:core": "pnpm --filter @zilliz/claude-context-core build",
-        "build:mcp": "pnpm --filter @zilliz/claude-context-mcp build",
-        "dev": "pnpm -r dev",
-        "dev:core": "pnpm --filter @zilliz/claude-context-core dev",
-        "dev:mcp": "pnpm --filter @zilliz/claude-context-mcp dev",
-        "clean": "pnpm -r clean",
-        "lint": "pnpm -r lint",
-        "lint:fix": "pnpm -r run lint:fix",
-        "typecheck": "pnpm -r run typecheck",
-        "release:core": "pnpm --filter @zilliz/claude-context-core... run build && pnpm --filter @zilliz/claude-context-core publish --access public --no-git-checks",
-        "release:mcp": "pnpm --filter @zilliz/claude-context-mcp... run build && pnpm --filter @zilliz/claude-context-mcp publish --access public --no-git-checks"
+        "build": "npm run build:core && npm run build:mcp",
+        "build:core": "npm run build --workspace=@zilliz/claude-context-core",
+        "build:mcp": "npm run build --workspace=@zilliz/claude-context-mcp",
+        "dev:core": "npm run dev --workspace=@zilliz/claude-context-core",
+        "dev:mcp": "npm run dev --workspace=@zilliz/claude-context-mcp",
+        "clean": "npm run clean --workspaces --if-present",
+        "lint": "npm run lint --workspaces --if-present",
+        "lint:fix": "npm run lint:fix --workspaces --if-present",
+        "typecheck": "npm run typecheck --workspaces --if-present",
+        "test": "npm run test:core && npm run test:mcp",
+        "test:core": "npm test --workspace=@zilliz/claude-context-core",
+        "test:mcp": "npm test --workspace=@zilliz/claude-context-mcp",
+        "release:core": "npm run build:core && npm publish --workspace=@zilliz/claude-context-core --access public",
+        "release:mcp": "npm run build && npm publish --workspace=@zilliz/claude-context-mcp --access public"
     },
     "devDependencies": {
-        "@types/node": "^20.0.0",
-        "@typescript-eslint/eslint-plugin": "^8.31.1",
-        "@typescript-eslint/parser": "^8.31.1",
-        "eslint": "^9.25.1",
-        "rimraf": "^6.0.1",
-        "typescript": "^5.8.3"
+        "@types/node": "20.17.32",
+        "@typescript-eslint/eslint-plugin": "8.31.1",
+        "@typescript-eslint/parser": "8.31.1",
+        "eslint": "9.25.1",
+        "rimraf": "6.0.1",
+        "typescript": "5.8.3"
     },
     "engines": {
         "node": ">=20.0.0 <24.0.0",
-        "pnpm": ">=10.0.0"
+        "npm": ">=9.0.0"
     },
     "repository": {
         "type": "git",

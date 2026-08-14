@@ -6,7 +6,7 @@ project_root="$(cd "${script_dir}/.." && pwd)"
 settings_path="${1:-${GIGACODE_SETTINGS_PATH:-${HOME}/.gigacode/settings.json}}"
 model_path="${project_root}/models/multilingual-e5-small"
 
-for required_command in node pnpm; do
+for required_command in node npm; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
     echo "Required command is not installed: ${required_command}" >&2
     exit 1
@@ -39,17 +39,17 @@ fi
 
 if [[ ! -f "${model_path}/onnx/model_quantized.onnx" ]]; then
   echo "Repository ONNX model is missing: ${model_path}" >&2
+  echo "Download it first with: ./scripts/download-model.sh" >&2
   exit 1
 fi
 
 cd "${project_root}"
-pnpm install --frozen-lockfile --filter @zilliz/claude-context-mcp...
+npm ci
 if [[ ! -x "${project_root}/.venv/bin/python" ]]; then
   "${python_command}" -m venv "${project_root}/.venv"
 fi
 "${project_root}/.venv/bin/python" -m pip install -r requirements-milvus-lite.txt
-pnpm build:core
-pnpm build:mcp
+npm run build
 node scripts/smoke-local-embedding.mjs
 node scripts/smoke-mcp.mjs
 node scripts/configure-gigacode.mjs \

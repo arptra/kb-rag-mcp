@@ -8,7 +8,7 @@ Claude Context is an MCP plugin that adds semantic code search to AI coding agen
 
 ## Monorepo Layout
 
-pnpm workspace (`packages/*`, `examples/*`). Requires Node >=20 <24 and pnpm >=10.
+npm workspace (`packages/core`, `packages/mcp`). Requires Node >=20 <24 and npm >=9.
 
 - `packages/core` (`@zilliz/claude-context-core`) — the indexing engine. All real logic lives here; the other packages are thin frontends over it.
 - `packages/mcp` (`@zilliz/claude-context-mcp`) — stdio MCP server, the primary product. ESM (`"type": "module"`).
@@ -19,34 +19,36 @@ pnpm workspace (`packages/*`, `examples/*`). Requires Node >=20 <24 and pnpm >=1
 ## Commands
 
 ```bash
-pnpm install
-pnpm build                 # build all packages (examples built last)
-pnpm build:core            # build a single package: also build:mcp, build:vscode
-pnpm dev                   # watch all; or dev:core / dev:mcp / dev:vscode
-pnpm lint                  # eslint across packages; lint:fix to autofix
-pnpm typecheck             # tsc --noEmit across packages
-pnpm clean                 # rimraf dist in every package
+npm ci
+npm run build              # build core, then MCP
+npm run build:core
+npm run build:mcp
+npm run dev:core           # watch core
+npm run dev:mcp            # watch MCP
+npm run lint               # eslint across active workspaces
+npm run typecheck          # tsc --noEmit across active workspaces
+npm run clean              # rimraf dist in active workspaces
 ```
 
-Packages depend on `core` via `workspace:*`, so **rebuild core (`pnpm build:core`) before testing mcp/vscode against core changes** — they consume `core/dist`, not its source.
+MCP depends on the local `core` npm workspace, so **rebuild core (`npm run build:core`) before testing MCP against core changes** — it consumes `core/dist`, not its source.
 
 ### Tests
 
 - **core** uses Jest + ts-jest. Test files are colocated as `*.test.ts` in `src/`.
   ```bash
-  pnpm --filter @zilliz/claude-context-core test                     # all (runs in band)
-  pnpm --filter @zilliz/claude-context-core test -- context.abort    # by filename
-  pnpm --filter @zilliz/claude-context-core test -- -t "pattern"     # by test name
+  npm run test:core                                                  # all (runs in band)
+  npm test --workspace=@zilliz/claude-context-core -- context.abort  # by filename
+  npm test --workspace=@zilliz/claude-context-core -- -t "pattern"   # by test name
   ```
 - **mcp** uses the Node built-in test runner via tsx (no Jest):
   ```bash
-  pnpm --filter @zilliz/claude-context-mcp test                      # runs src/**/*.test.ts
+  npm run test:mcp                                                   # runs src/**/*.test.ts
   ```
 
 ### Running the MCP server locally
 
 ```bash
-pnpm --filter @zilliz/claude-context-mcp start        # tsx src/index.ts
+npm start --workspace=@zilliz/claude-context-mcp      # tsx src/index.ts
 ```
 Configuration is entirely via environment variables (see `.env.example` and `packages/mcp/src/config.ts`). The GigaCode MCP accepts only `EMBEDDING_PROVIDER=LocalTransformer`, a local model path/dimension and a loopback `MILVUS_ADDRESS`. No cloud provider key is accepted by this runtime.
 

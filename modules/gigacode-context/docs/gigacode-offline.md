@@ -12,15 +12,16 @@ AST/tree-sitter chunking, Merkle-инкрементальная индексац
 - дополнительный runtime guard блокирует `fetch` и TCP за пределы loopback;
 - MCP подключается к GigaCode локальным `node .../dist/index.js`, без `npx`.
 
-## Что уже включено
+## Локальная модель
 
-В `models/multilingual-e5-small` уже лежат tokenizer и реальный quantized ONNX
-`Xenova/multilingual-e5-small` ревизии
+Скрипт `scripts/download-model.sh` скачивает tokenizer и quantized ONNX
+`Xenova/multilingual-e5-small` зафиксированной ревизии
 `761b726dd34fb83930e26aab4e9ac3899aa1fa78`. Размерность — 384, dtype — q8.
-SHA-256 и параметры зафиксированы в `MODEL_MANIFEST.json`. Никаких загрузок
-модели при запуске не выполняется.
+SHA-256 ONNX проверяется скриптом. При запуске MCP никаких загрузок модели не
+выполняется. Для закрытого контура задайте `GIGACODE_MODEL_BASE_URL` с адресом
+внутреннего зеркала.
 
-Для работы требуются Node.js 20/22, pnpm 10, Python 3.10+ и доступ к
+Для работы требуются Node.js 20/22, npm 9+, Python 3.10+ и доступ к
 разрешённым внутренним NPM/PyPI-репозиториям. Docker не используется.
 
 ## Полностью автоматический локальный запуск
@@ -45,13 +46,16 @@ SHA-256 и параметры зафиксированы в `MODEL_MANIFEST.json
 ```bash
 git clone <internal-git-url> gigacode-context
 cd gigacode-context
+GIGACODE_MODEL_BASE_URL=https://models.company.local/Xenova/multilingual-e5-small/resolve/761b726dd34fb83930e26aab4e9ac3899aa1fa78 \
+  ./scripts/download-model.sh
 NPM_CONFIG_REGISTRY=https://npm.company.local/repository/npm/ \
 PIP_INDEX_URL=https://pypi.company.local/simple/ \
   ./scripts/setup-gigacode.sh
 ```
 
-Установщик выполняет отфильтрованный `pnpm install`, создаёт `.venv` и ставит
-версии из `requirements-milvus-lite.txt`. Модель хранится в Git вместе с кодом.
+Установщик выполняет `npm ci` только для npm workspaces `core` и `mcp`, создаёт
+`.venv` и ставит версии из `requirements-milvus-lite.txt`. Модель хранится
+локально вне Git.
 При старте MCP автоматически запускает `.venv/bin/milvus-lite server` только на
 `127.0.0.1:19530`; данные сохраняются в `.runtime/milvus-lite`. Docker, etcd и
 MinIO отсутствуют. MCP дополнительно блокирует внешний TCP/fetch на уровне
@@ -87,8 +91,8 @@ node ./scripts/configure-gigacode.mjs \
 node ./scripts/smoke-local-embedding.mjs
 node ./scripts/smoke-index-search.mjs
 node ./scripts/smoke-mcp.mjs
-pnpm --filter @zilliz/claude-context-core test
-pnpm --filter @zilliz/claude-context-mcp test
+npm run test:core
+npm run test:mcp
 ```
 
 MCP завершится с ошибкой до запуска, если модель отсутствует, размерность не

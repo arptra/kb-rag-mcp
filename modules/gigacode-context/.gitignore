@@ -27,6 +27,7 @@ pids
 *.seed
 *.pid.lock
 .runtime/
+models/
 
 
 
