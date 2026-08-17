@@ -276,6 +276,50 @@ embedding:
 
 Python-пакет `sentence-transformers` не содержит веса модели. Каталог модели должен быть доставлен во внутренний контур отдельно и полностью.
 
+В этом модуле есть универсальный загрузчик `download-hf-model.sh`. Он использует `curl`, получает список файлов модели через Hugging Face API, скачивает настоящие LFS/Xet-веса, проверяет наличие `model.safetensors`/`pytorch_model.bin`, формирует `SHA256SUMS` и при необходимости создаёт переносимый `tar.gz`.
+
+Подготовка:
+
+```bash
+chmod +x modules/cocoindex-gigacode-offline/download-hf-model.sh
+```
+
+Скачать стандартную модель CocoIndex:
+
+```bash
+modules/cocoindex-gigacode-offline/download-hf-model.sh \
+  Snowflake/snowflake-arctic-embed-xs \
+  ./models/snowflake-arctic-embed-xs \
+  --archive ./snowflake-arctic-embed-xs.tar.gz
+```
+
+Скачать multilingual-модель для русского текста и кода:
+
+```bash
+modules/cocoindex-gigacode-offline/download-hf-model.sh \
+  ibm-granite/granite-embedding-97m-multilingual-r2 \
+  ./models/granite-embedding-multilingual \
+  --archive ./granite-embedding-multilingual.tar.gz
+```
+
+Для внутреннего Hugging Face mirror:
+
+```bash
+HF_ENDPOINT=https://huggingface.internal.example \
+  modules/cocoindex-gigacode-offline/download-hf-model.sh \
+  organization/model-name \
+  ./models/model-name
+```
+
+По умолчанию профиль `sentence-transformers` пропускает альтернативные ONNX, OpenVINO, TensorFlow и Flax exports. Скачать весь репозиторий модели можно через `--profile all`. Посмотреть выбранные файлы без скачивания — через `--dry-run`.
+
+Если Hugging Face недоступен с банковского ноутбука, скрипт запускается на разрешённой машине. Готовый `tar.gz` переносится внутрь контура и распаковывается:
+
+```bash
+mkdir -p /absolute/path/models
+tar -xzf snowflake-arctic-embed-xs.tar.gz -C /absolute/path/models
+```
+
 Пример каталога:
 
 ```text
@@ -745,4 +789,3 @@ ccc search "нужная бизнес-логика"
 - ответ GigaCode содержит evidence из репозитория;
 - при отключённой сети индексирование и поиск продолжают работать;
 - внешний firewall не фиксирует исходящих соединений от процесса.
-
