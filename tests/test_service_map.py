@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
+import pytest
+
 from gigacode_graph.config import GraphSettings
-from service_map import JsonServiceMapStore, RepositoryInput, ServiceMapBuilder
+from service_map import (
+    JsonServiceMapStore,
+    RepositoryInput,
+    ServiceMapBuildCancelled,
+    ServiceMapBuilder,
+    ServiceMapBuildTimedOut,
+    ServiceMapProcessRunner,
+)
 
 
 def _write(root: Path, relative: str, content: str) -> None:
@@ -138,3 +148,67 @@ def test_empty_service_map_is_a_valid_file_snapshot(tmp_path: Path) -> None:
 
     assert store.load().overview()["service_count"] == 0
     assert result.graph.nodes == []
+
+
+def test_service_map_process_honours_cancellation_before_start(tmp_path: Path) -> None:
+    settings = GraphSettings(store_path=tmp_path / "system-graph.json").resolved(tmp_path)
+    cancel = threading.Event()
+    cancel.set()
+
+    with pytest.raises(ServiceMapBuildCancelled):
+        ServiceMapProcessRunner(settings, timeout_seconds=10).build([], cancel=cancel)
+
+
+def test_service_map_process_has_a_hard_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HangingProcess:
+        exitcode = None
+
+        def __init__(self) -> None:
+            self.alive = True
+            self.started = False
+            self.terminated = False
+
+        def start(self) -> None:
+            self.started = True
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.alive = False
+
+        def kill(self) -> None:
+            self.alive = False
+
+    process = HangingProcess()
+
+    class FakeContext:
+        @staticmethod
+        def Process(**_kwargs: object) -> HangingProcess:
+            return process
+
+    monkeypatch.setattr(
+        "service_map.runner.multiprocessing.get_context",
+        lambda _method: FakeContext(),
+    )
+    monotonic_values = iter([0.0, 11.0])
+    monkeypatch.setattr(
+        "service_map.runner.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+    settings = GraphSettings(store_path=tmp_path / "system-graph.json").resolved(tmp_path)
+
+    with pytest.raises(ServiceMapBuildTimedOut, match="10 seconds"):
+        ServiceMapProcessRunner(settings, timeout_seconds=10).build(
+            [RepositoryInput(path=tmp_path, name="slow-service")]
+        )
+
+    assert process.started is True
+    assert process.terminated is True

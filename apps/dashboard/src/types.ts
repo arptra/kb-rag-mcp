@@ -31,7 +31,7 @@ export interface RepositorySource {
 export interface CatalogJob {
   id: string;
   type: "index" | "repository" | "graph";
-  status: "queued" | "running" | "completed" | "failed";
+  status: "queued" | "running" | "cancelling" | "cancelled" | "completed" | "failed";
   index_id: string | null;
   message: string;
   started_at: string | null;

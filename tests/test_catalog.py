@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import threading
 import time
 
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
+from corporate_kb.index_runner import IndexBuildCancelled, IndexBuildProcessRunner
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeService
 from corporate_kb.usage import UsageTracker
+from service_map import ServiceMapBuildCancelled, ServiceMapProcessRunner
 
 
 def test_catalog_creates_index_and_imports_local_openspec(settings_factory, tmp_path) -> None:
@@ -154,3 +157,96 @@ public class StatusController {
     service_map = catalog.service_map()
     assert service_map["services"][0]["id"] == "source-only-service"
     assert service_map["services"][0]["entrypoints"][0]["operation"] == "GET /status"
+
+
+def test_catalog_cancels_running_graph_job_without_blocking_api(
+    settings_factory,
+    monkeypatch,
+) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    entered = threading.Event()
+
+    def cancellable_build(self, repositories, *, cancel=None):
+        del self, repositories
+        assert cancel is not None
+        entered.set()
+        while not cancel.is_set():
+            time.sleep(0.01)
+        raise ServiceMapBuildCancelled("cancelled in test")
+
+    monkeypatch.setattr(ServiceMapProcessRunner, "build", cancellable_build)
+    job = catalog.start_graph_build()
+    assert entered.wait(timeout=2)
+
+    cancellation = catalog.cancel_job(job.id)
+    assert cancellation.status == "cancelling"
+    for _ in range(200):
+        current = next(
+            item for item in catalog.payload()["jobs"] if item["id"] == job.id
+        )
+        if current["status"] == "cancelled":
+            break
+        time.sleep(0.01)
+
+    assert current["status"] == "cancelled"
+    assert current["completed_at"] is not None
+
+
+def test_catalog_cancels_running_index_process(
+    settings_factory,
+    monkeypatch,
+) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    entered = threading.Event()
+
+    def cancellable_build(self, *, cancel=None):
+        del self
+        assert cancel is not None
+        entered.set()
+        while not cancel.is_set():
+            time.sleep(0.01)
+        raise IndexBuildCancelled("cancelled in test")
+
+    monkeypatch.setattr(IndexBuildProcessRunner, "build", cancellable_build)
+    job = catalog.start_index_build("default")
+    assert entered.wait(timeout=2)
+
+    cancellation = catalog.cancel_job(job.id)
+    assert cancellation.status == "cancelling"
+    for _ in range(200):
+        current = next(
+            item for item in catalog.payload()["jobs"] if item["id"] == job.id
+        )
+        if current["status"] == "cancelled":
+            break
+        time.sleep(0.01)
+
+    assert current["status"] == "cancelled"
+    refreshed = next(item for item in catalog.payload()["indexes"] if item["id"] == "default")
+    assert refreshed["status"] == "ready"

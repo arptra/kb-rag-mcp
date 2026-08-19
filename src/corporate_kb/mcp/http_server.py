@@ -415,6 +415,24 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             return _api_error(exc)
 
     @server.custom_route(
+        "/admin/api/jobs/cancel",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_cancel_job(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            job_id = payload.get("job_id") if isinstance(payload, dict) else None
+            if not isinstance(job_id, str) or not job_id:
+                raise ValueError("job_id must be a non-empty string")
+            job = await asyncio.to_thread(catalog.cancel_job, job_id)
+            return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
         "/admin/api/graph/rebuild",
         methods=["POST"],
         include_in_schema=False,

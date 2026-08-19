@@ -2,12 +2,20 @@
 
 from service_map.builder import RepositoryInput, ServiceMapBuilder, ServiceMapBuildResult
 from service_map.models import ServiceMapSnapshot
+from service_map.runner import (
+    ServiceMapBuildCancelled,
+    ServiceMapBuildTimedOut,
+    ServiceMapProcessRunner,
+)
 from service_map.store import JsonServiceMapStore
 
 __all__ = [
     "JsonServiceMapStore",
     "RepositoryInput",
+    "ServiceMapBuildCancelled",
     "ServiceMapBuildResult",
+    "ServiceMapBuildTimedOut",
     "ServiceMapBuilder",
+    "ServiceMapProcessRunner",
     "ServiceMapSnapshot",
 ]

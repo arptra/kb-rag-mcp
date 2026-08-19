@@ -15,10 +15,23 @@ export async function api<T>(
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
   if (password) headers.set("X-KB-Admin-Password", password);
-  const response = await fetch(path, {
-    ...init,
-    headers,
-  });
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 8000);
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...init,
+      headers,
+      signal: init.signal || controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new ApiError("Сервер не ответил за 8 секунд", 504);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
   const text = await response.text();
   let payload: unknown = {};
   if (text) {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 import httpx
@@ -15,7 +16,7 @@ from gigacode_graph.http_server import create_http_app
 from gigacode_graph.mcp_server import create_mcp_server
 from gigacode_graph.scanner import RepositoryScanner
 from gigacode_graph.service import GraphService
-from gigacode_graph.sources import RepositorySourceManager
+from gigacode_graph.sources import RepositoryOperationCancelled, RepositorySourceManager
 from gigacode_graph.store import JsonGraphStore
 
 
@@ -287,6 +288,11 @@ def test_git_timeout_terminates_the_complete_process_group(
 
     terminated: list[object] = []
     monkeypatch.setattr("gigacode_graph.sources.subprocess.Popen", fake_popen)
+    monotonic_values = iter([0.0, 11.0])
+    monkeypatch.setattr(
+        "gigacode_graph.sources.time.monotonic",
+        lambda: next(monotonic_values),
+    )
     monkeypatch.setattr(
         RepositorySourceManager,
         "_terminate_process_tree",
@@ -310,6 +316,53 @@ def test_git_timeout_terminates_the_complete_process_group(
     assert isinstance(environment, dict)
     assert environment["GIT_TERMINAL_PROMPT"] == "0"
     assert environment["GCM_INTERACTIVE"] == "Never"
+
+
+def test_git_cancellation_terminates_the_complete_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancel_event = threading.Event()
+
+    class HangingGit:
+        def __init__(self) -> None:
+            self.args = ["git", "fetch"]
+            self.pid = 12345
+            self.returncode = -15
+
+        def communicate(self, timeout: float) -> tuple[str, str]:
+            cancel_event.set()
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+        def poll(self) -> None:
+            return None
+
+    process = HangingGit()
+    terminated: list[object] = []
+    monkeypatch.setattr(
+        "gigacode_graph.sources.subprocess.Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    monkeypatch.setattr(
+        RepositorySourceManager,
+        "_terminate_process_tree",
+        staticmethod(terminated.append),
+    )
+    settings = GraphSettings(
+        store_path=tmp_path / "graph.json",
+        git_timeout_seconds=10,
+    ).resolved(tmp_path)
+    manager = RepositorySourceManager(settings)
+    manager._cancel_event = cancel_event
+
+    with pytest.raises(RepositoryOperationCancelled):
+        manager._git(
+            ["fetch"],
+            cwd=tmp_path,
+            source="https://git.example.test/service.git",
+        )
+
+    assert terminated == [process]
 
 
 def test_cli_git_url_clones_updates_and_reloads_artifacts(

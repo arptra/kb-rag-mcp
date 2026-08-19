@@ -17,19 +17,35 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from corporate_kb.config import Settings
+from corporate_kb.index_runner import IndexBuildCancelled, IndexBuildProcessRunner
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeIndexMissingError, KnowledgeService
 from corporate_kb.usage import UsageTracker
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.models import GraphSnapshot
 from gigacode_graph.service import GraphService
-from gigacode_graph.sources import RepositorySourceManager, RepositorySpec
+from gigacode_graph.sources import (
+    RepositoryOperationCancelled,
+    RepositorySourceManager,
+    RepositorySpec,
+)
 from gigacode_graph.store import JsonGraphStore
-from service_map import JsonServiceMapStore, RepositoryInput, ServiceMapBuilder, ServiceMapSnapshot
+from service_map import (
+    JsonServiceMapStore,
+    RepositoryInput,
+    ServiceMapBuildCancelled,
+    ServiceMapBuilder,
+    ServiceMapProcessRunner,
+    ServiceMapSnapshot,
+)
 
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SUPPORTED_DOCUMENT_SUFFIXES = {".md", ".markdown", ".html", ".htm", ".txt"}
 logger = logging.getLogger(__name__)
+
+
+class CatalogJobCancelled(RuntimeError):
+    """Internal control-flow exception for cooperative job cancellation."""
 
 
 def _now() -> datetime:
@@ -84,7 +100,14 @@ class RepositorySource(CatalogModel):
 class CatalogJob(CatalogModel):
     id: str
     type: Literal["index", "repository", "graph"]
-    status: Literal["queued", "running", "completed", "failed"] = "queued"
+    status: Literal[
+        "queued",
+        "running",
+        "cancelling",
+        "cancelled",
+        "completed",
+        "failed",
+    ] = "queued"
     index_id: str | None = None
     message: str = "Queued"
     started_at: datetime | None = None
@@ -118,6 +141,7 @@ class RagCatalog:
         self._services: dict[str, KnowledgeService] = {"default": default_service}
         self._tools: dict[str, KnowledgeTools] = {"default": default_tools}
         self._jobs: dict[str, CatalogJob] = {item.id: item for item in self._state.jobs}
+        self._job_cancellations: dict[str, threading.Event] = {}
         self._graph_store = JsonGraphStore(settings.graph_store_path)
         self._service_map_store = JsonServiceMapStore(settings.service_map_path)
         if not settings.graph_store_path.is_file():
@@ -247,6 +271,32 @@ class RagCatalog:
         threading.Thread(target=self._run_graph_job, args=(job.id,), daemon=True).start()
         return job
 
+    def cancel_job(self, job_id: str) -> CatalogJob:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(f"Unknown job: {job_id}")
+            if job.status in {"completed", "failed", "cancelled"}:
+                return job.model_copy(deep=True)
+            cancel_event = self._job_cancellations.setdefault(job_id, threading.Event())
+            cancel_event.set()
+            if job.status == "queued":
+                replacement = job.model_copy(
+                    update={
+                        "status": "cancelled",
+                        "message": "Cancelled before execution",
+                        "completed_at": _now(),
+                        "error": None,
+                    }
+                )
+            else:
+                replacement = job.model_copy(
+                    update={"status": "cancelling", "message": "Cancellation requested"}
+                )
+            self._jobs[job_id] = replacement
+            self._save_locked()
+            return replacement.model_copy(deep=True)
+
     def graph_overview(self) -> dict[str, Any]:
         return self._graph_service.overview()
 
@@ -268,20 +318,39 @@ class RagCatalog:
         return self._service_map_store.load().model_dump(mode="json")
 
     def _run_index_job(self, job_id: str, index_id: str) -> None:
+        cancel_event = self._cancel_event(job_id)
         try:
             with self._work_lock:
-                self._execute_index_job(job_id, index_id)
+                self._raise_if_cancelled(cancel_event)
+                self._execute_index_job(job_id, index_id, cancel_event)
+        except (
+            CatalogJobCancelled,
+            IndexBuildCancelled,
+            RepositoryOperationCancelled,
+            ServiceMapBuildCancelled,
+        ):
+            self._finish_cancelled_job(job_id, index_id)
         except Exception as exc:
             self._fail_background_job(job_id, index_id, "Index build failed", exc)
+        finally:
+            self._release_cancel_event(job_id)
 
-    def _execute_index_job(self, job_id: str, index_id: str) -> None:
+    def _execute_index_job(
+        self,
+        job_id: str,
+        index_id: str,
+        cancel_event: threading.Event,
+    ) -> None:
         self._update_job(job_id, status="running", message="Building embeddings", started_at=_now())
         self._update_index(index_id, status="indexing", error=None)
         try:
-            stats = self.service_for(index_id).build_index(
-                force=True,
-                reuse_unchanged=True,
-            )
+            self._raise_if_cancelled(cancel_event)
+            service = self.service_for(index_id)
+            IndexBuildProcessRunner(
+                service.settings,
+                timeout_seconds=self.settings.index_build_timeout_seconds,
+            ).build(cancel=cancel_event)
+            stats = service.reload_cached_index()
             self._update_index(
                 index_id,
                 status="ready",
@@ -296,6 +365,8 @@ class RagCatalog:
                 message=f"Indexed {stats.document_count} documents",
                 completed_at=_now(),
             )
+        except (CatalogJobCancelled, IndexBuildCancelled):
+            raise
         except Exception as exc:
             self._update_index(index_id, status="error", error=str(exc), updated_at=_now())
             self._update_job(
@@ -314,11 +385,29 @@ class RagCatalog:
         ref: str | None,
         index_id: str,
     ) -> None:
+        cancel_event = self._cancel_event(job_id)
         try:
             with self._work_lock:
-                self._execute_repository_job(job_id, name, git_url, ref, index_id)
+                self._raise_if_cancelled(cancel_event)
+                self._execute_repository_job(
+                    job_id,
+                    name,
+                    git_url,
+                    ref,
+                    index_id,
+                    cancel_event,
+                )
+        except (
+            CatalogJobCancelled,
+            IndexBuildCancelled,
+            RepositoryOperationCancelled,
+            ServiceMapBuildCancelled,
+        ):
+            self._finish_cancelled_job(job_id, index_id)
         except Exception as exc:
             self._fail_background_job(job_id, index_id, "Repository import failed", exc)
+        finally:
+            self._release_cancel_event(job_id)
 
     def _execute_repository_job(
         self,
@@ -327,6 +416,7 @@ class RagCatalog:
         git_url: str,
         ref: str | None,
         index_id: str,
+        cancel_event: threading.Event,
     ) -> None:
         self._update_job(job_id, status="running", message="Cloning repository", started_at=_now())
         self._update_index(index_id, status="indexing", error=None)
@@ -336,11 +426,13 @@ class RagCatalog:
             paths, records = manager.materialize(
                 [RepositorySpec(source=git_url, ref=ref)],
                 refresh=True,
+                cancel_event=cancel_event,
             )
+            self._raise_if_cancelled(cancel_event)
             checkout = paths[0]
             ingestion = records[0]
             self._update_job(job_id, message="Reading OpenSpec and source interfaces")
-            openspec = self._find_openspec(checkout)
+            openspec = self._find_openspec(checkout, cancel_event=cancel_event)
             repository_id = self._repository_id(name, git_url, ref, index_id)
             document_count = self._sync_openspec(
                 source=openspec,
@@ -348,7 +440,9 @@ class RagCatalog:
                 / "repositories"
                 / repository_id
                 / "openspec",
+                cancel_event=cancel_event,
             )
+            self._raise_if_cancelled(cancel_event)
             repository = RepositorySource(
                 id=repository_id,
                 name=name,
@@ -368,10 +462,13 @@ class RagCatalog:
                 self._refresh_source_counts_locked()
                 self._save_locked()
             self._update_job(job_id, message=f"Building RAG index from {document_count} documents")
-            stats = self.service_for(index_id).build_index(
-                force=True,
-                reuse_unchanged=True,
-            )
+            self._raise_if_cancelled(cancel_event)
+            service = self.service_for(index_id)
+            IndexBuildProcessRunner(
+                service.settings,
+                timeout_seconds=self.settings.index_build_timeout_seconds,
+            ).build(cancel=cancel_event)
+            stats = service.reload_cached_index()
             self._update_index(
                 index_id,
                 status="ready",
@@ -383,16 +480,26 @@ class RagCatalog:
             graph_note = ""
             try:
                 self._update_job(job_id, message="Building service graph")
-                self._build_graph()
+                self._build_graph(cancel_event=cancel_event)
                 graph_note = " and refreshed the system graph"
+            except (CatalogJobCancelled, ServiceMapBuildCancelled):
+                raise
             except Exception as graph_exc:
                 graph_note = f"; graph refresh needs attention: {graph_exc}"
+            self._raise_if_cancelled(cancel_event)
             self._update_job(
                 job_id,
                 status="completed",
                 message=f"Imported {document_count} OpenSpec documents{graph_note}",
                 completed_at=_now(),
             )
+        except (
+            CatalogJobCancelled,
+            IndexBuildCancelled,
+            RepositoryOperationCancelled,
+            ServiceMapBuildCancelled,
+        ):
+            raise
         except Exception as exc:
             self._update_index(index_id, status="error", error=str(exc), updated_at=_now())
             self._update_job(
@@ -404,13 +511,19 @@ class RagCatalog:
             )
 
     def _run_graph_job(self, job_id: str) -> None:
+        cancel_event = self._cancel_event(job_id)
         try:
             with self._work_lock:
-                self._execute_graph_job(job_id)
+                self._raise_if_cancelled(cancel_event)
+                self._execute_graph_job(job_id, cancel_event)
+        except (CatalogJobCancelled, RepositoryOperationCancelled, ServiceMapBuildCancelled):
+            self._finish_cancelled_job(job_id, None)
         except Exception as exc:
             self._fail_background_job(job_id, None, "Graph build failed", exc)
+        finally:
+            self._release_cancel_event(job_id)
 
-    def _execute_graph_job(self, job_id: str) -> None:
+    def _execute_graph_job(self, job_id: str, cancel_event: threading.Event) -> None:
         self._update_job(
             job_id,
             status="running",
@@ -418,13 +531,16 @@ class RagCatalog:
             started_at=_now(),
         )
         try:
-            snapshot = self._build_graph()
+            snapshot = self._build_graph(cancel_event=cancel_event)
+            self._raise_if_cancelled(cancel_event)
             self._update_job(
                 job_id,
                 status="completed",
                 message=f"Built {len(snapshot.nodes)} nodes and {len(snapshot.edges)} edges",
                 completed_at=_now(),
             )
+        except (CatalogJobCancelled, ServiceMapBuildCancelled):
+            raise
         except Exception as exc:
             self._update_job(
                 job_id,
@@ -434,11 +550,18 @@ class RagCatalog:
                 completed_at=_now(),
             )
 
-    def _build_graph(self) -> GraphSnapshot:
+    def _build_graph(
+        self,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> GraphSnapshot:
         with self._lock:
             repositories = [item.model_copy(deep=True) for item in self._state.repositories]
         inputs = self._repository_inputs(repositories)
-        result = ServiceMapBuilder(self._graph_settings()).build(inputs)
+        result = ServiceMapProcessRunner(
+            self._graph_settings(),
+            timeout_seconds=self.settings.repository_analysis_timeout_seconds,
+        ).build(inputs, cancel=cancel_event)
         self._service_map_store.save(result.service_map)
         self._graph_store.save(result.graph)
         return result.graph
@@ -455,12 +578,21 @@ class RagCatalog:
             for item in repositories
         ]
 
-    def _find_openspec(self, checkout: Path) -> Path | None:
+    def _find_openspec(
+        self,
+        checkout: Path,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> Path | None:
+        if cancel_event is not None:
+            self._raise_if_cancelled(cancel_event)
         direct = checkout / "openspec"
         if direct.is_dir() and not direct.is_symlink():
             return direct.resolve()
         matches: list[Path] = []
         for current, directories, _files in os.walk(checkout, followlinks=False):
+            if cancel_event is not None:
+                self._raise_if_cancelled(cancel_event)
             root = Path(current)
             directories[:] = [
                 item
@@ -478,11 +610,19 @@ class RagCatalog:
             return None
         return sorted(matches, key=lambda item: (len(item.parts), str(item)))[0]
 
-    def _sync_openspec(self, *, source: Path | None, destination: Path) -> int:
+    def _sync_openspec(
+        self,
+        *,
+        source: Path | None,
+        destination: Path,
+        cancel_event: threading.Event | None = None,
+    ) -> int:
         source = source.resolve() if source else None
         files: list[Path] = []
         if source is not None:
             for current, directories, names in os.walk(source, followlinks=False):
+                if cancel_event is not None:
+                    self._raise_if_cancelled(cancel_event)
                 root = Path(current)
                 directories[:] = [
                     item
@@ -508,6 +648,8 @@ class RagCatalog:
         temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent))
         try:
             for path in files:
+                if cancel_event is not None:
+                    self._raise_if_cancelled(cancel_event)
                 assert source is not None
                 relative = path.relative_to(source)
                 target = temporary / relative
@@ -594,8 +736,49 @@ class RagCatalog:
         )
         with self._lock:
             self._jobs[job.id] = job
+            self._job_cancellations[job.id] = threading.Event()
             self._save_locked()
         return job.model_copy(deep=True)
+
+    def _cancel_event(self, job_id: str) -> threading.Event:
+        with self._lock:
+            return self._job_cancellations.setdefault(job_id, threading.Event())
+
+    @staticmethod
+    def _raise_if_cancelled(cancel_event: threading.Event) -> None:
+        if cancel_event.is_set():
+            raise CatalogJobCancelled("Operation was cancelled")
+
+    def _release_cancel_event(self, job_id: str) -> None:
+        with self._lock:
+            self._job_cancellations.pop(job_id, None)
+
+    def _finish_cancelled_job(self, job_id: str, index_id: str | None) -> None:
+        if index_id is not None:
+            try:
+                stats = self.service_for(index_id).stats()
+                self._update_index(
+                    index_id,
+                    status="ready",
+                    document_count=stats.document_count,
+                    chunk_count=stats.chunk_count,
+                    error=None,
+                    updated_at=_now(),
+                )
+            except Exception:
+                self._update_index(
+                    index_id,
+                    status="empty",
+                    error=None,
+                    updated_at=_now(),
+                )
+        self._update_job(
+            job_id,
+            status="cancelled",
+            message="Operation cancelled",
+            error=None,
+            completed_at=_now(),
+        )
 
     def _update_job(self, job_id: str, **values: Any) -> None:
         with self._lock:
@@ -627,7 +810,9 @@ class RagCatalog:
 
     def _recover_interrupted_jobs(self) -> None:
         interrupted = [
-            job for job in self._jobs.values() if job.status in {"queued", "running"}
+            job
+            for job in self._jobs.values()
+            if job.status in {"queued", "running", "cancelling"}
         ]
         if not interrupted:
             return

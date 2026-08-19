@@ -94,6 +94,12 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
         assert overview.json()["index"]["document_count"] == 1
         assert overview.json()["service_map"]["service_count"] == 0
         assert (await client.get("/admin/api/service-map")).status_code == 200
+        assert (
+            await client.post(
+                "/admin/api/jobs/cancel",
+                json={"job_id": "missing-job"},
+            )
+        ).status_code == 404
         local_server = overview.json()["mcp_servers"]["servers"][0]
         assert local_server["name"] == "corporate-knowledge"
         assert local_server["status"] == "online"

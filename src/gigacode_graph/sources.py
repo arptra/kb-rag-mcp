@@ -10,6 +10,8 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +23,10 @@ from gigacode_graph.models import GraphSnapshot, IngestionManifest, IngestionRec
 _MANAGED_MARKER = ".gigacode-graph-source.json"
 _URL_PATTERN = re.compile(r"^(?:https?|ssh|git|file)://", re.I)
 _SCP_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:.+")
+
+
+class RepositoryOperationCancelled(RuntimeError):
+    """Raised when an active repository materialization is cancelled."""
 
 
 @dataclass(frozen=True)
@@ -35,26 +41,34 @@ class RepositorySourceManager:
 
     def __init__(self, settings: GraphSettings) -> None:
         self.settings = settings
+        self._cancel_event: threading.Event | None = None
 
     def materialize(
         self,
         specs: list[RepositorySpec],
         *,
         refresh: bool = True,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[list[Path], list[IngestionRecord]]:
         if not specs:
             raise ValueError("At least one repository path or Git URL is required")
-        paths: list[Path] = []
-        records: list[IngestionRecord] = []
-        seen: set[Path] = set()
-        for spec in specs:
-            path, record = self._materialize_one(spec, refresh=refresh)
-            if path in seen:
-                continue
-            seen.add(path)
-            paths.append(path)
-            records.append(record)
-        return paths, records
+        previous_cancel_event = self._cancel_event
+        self._cancel_event = cancel_event
+        try:
+            paths: list[Path] = []
+            records: list[IngestionRecord] = []
+            seen: set[Path] = set()
+            for spec in specs:
+                self._raise_if_cancelled()
+                path, record = self._materialize_one(spec, refresh=refresh)
+                if path in seen:
+                    continue
+                seen.add(path)
+                paths.append(path)
+                records.append(record)
+            return paths, records
+        finally:
+            self._cancel_event = previous_cancel_event
 
     def save_manifest(
         self,
@@ -80,6 +94,7 @@ class RepositorySourceManager:
         *,
         refresh: bool,
     ) -> tuple[Path, IngestionRecord]:
+        self._raise_if_cancelled()
         raw = spec.source.strip()
         if not raw:
             raise ValueError("Repository source must not be empty")
@@ -114,6 +129,7 @@ class RepositorySourceManager:
             action = "cloned"
         self._write_marker(destination, source, spec.ref)
         commit = self._git_output(["rev-parse", "HEAD"], cwd=destination, source=source)
+        self._raise_if_cancelled()
         return destination, IngestionRecord(
             source_type="git",
             source=source,
@@ -286,14 +302,23 @@ class RepositorySourceManager:
             )
         except FileNotFoundError as exc:
             raise RuntimeError("git executable is required for Git URL ingestion") from exc
-        try:
-            stdout, stderr = process.communicate(timeout=self.settings.git_timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
-            self._terminate_process_tree(process)
-            raise RuntimeError(f"Git operation timed out for {source}") from exc
-        except BaseException:
-            self._terminate_process_tree(process)
-            raise
+        deadline = time.monotonic() + self.settings.git_timeout_seconds
+        while True:
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                self._terminate_process_tree(process)
+                raise RepositoryOperationCancelled("Repository operation was cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._terminate_process_tree(process)
+                raise RuntimeError(f"Git operation timed out for {source}")
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+            except BaseException:
+                self._terminate_process_tree(process)
+                raise
         result = subprocess.CompletedProcess(
             process.args,
             process.returncode,
@@ -305,6 +330,10 @@ class RepositorySourceManager:
             message = message.replace(source, "<repository-url>")
             raise RuntimeError(f"Git operation failed for {source}: {message}")
         return result
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise RepositoryOperationCancelled("Repository operation was cancelled")
 
     @staticmethod
     def _terminate_process_tree(process: subprocess.Popen[str]) -> None:

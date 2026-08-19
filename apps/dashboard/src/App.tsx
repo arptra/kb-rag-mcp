@@ -60,6 +60,14 @@ function Status({ value }: { value: string }) {
   const labels: Record<string, string> = {
     ready: "готов",
     completed: "готов",
+    queued: "в очереди",
+    running: "выполняется",
+    cancelled: "отменено",
+    cancelling: "отмена",
+    failed: "ошибка",
+    error: "ошибка",
+    indexing: "индексация",
+    empty: "ожидает",
     online: "в сети",
     offline: "не в сети",
     unchecked: "не проверен",
@@ -174,11 +182,20 @@ export default function App() {
 
   useEffect(() => void load(), [load]);
   const hasActiveJobs = Boolean(
-    overview?.catalog.jobs.some((job) => ["queued", "running"].includes(job.status)),
+    overview?.catalog.jobs.some((job) => ["queued", "running", "cancelling"].includes(job.status)),
   );
   useEffect(() => {
-    const timer = window.setInterval(load, hasActiveJobs ? 1500 : 10000);
-    return () => window.clearInterval(timer);
+    let disposed = false;
+    let timer = 0;
+    const poll = async () => {
+      await load();
+      if (!disposed) timer = window.setTimeout(poll, hasActiveJobs ? 1000 : 5000);
+    };
+    timer = window.setTimeout(poll, hasActiveJobs ? 1000 : 5000);
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+    };
   }, [hasActiveJobs, load]);
   useEffect(() => {
     if (!toast) return;
@@ -265,7 +282,7 @@ export default function App() {
         </header>
 
         <section className="content">
-          {page === "overview" && <OverviewPage data={overview} onNavigate={setPage} />}
+          {page === "overview" && <OverviewPage data={overview} password={password} onNavigate={setPage} onAction={action} />}
           {page === "indexes" && (
             <IndexesPage
               data={overview}
@@ -345,8 +362,8 @@ export default function App() {
   );
 }
 
-function OverviewPage({ data, onNavigate }: { data: Overview; onNavigate: (page: Page) => void }) {
-  const activeJobs = data.catalog.jobs.filter((job) => ["queued", "running"].includes(job.status));
+function OverviewPage({ data, password, onNavigate, onAction }: { data: Overview; password: string; onNavigate: (page: Page) => void; onAction: (run: () => Promise<unknown>, message: string) => Promise<void> }) {
+  const activeJobs = data.catalog.jobs.filter((job) => ["queued", "running", "cancelling"].includes(job.status));
   return (
     <>
       <section className="hero-panel">
@@ -382,7 +399,7 @@ function OverviewPage({ data, onNavigate }: { data: Overview; onNavigate: (page:
         </section>
         <section className="panel span-3">
           <PanelHeader title="Последние операции" kicker={activeJobs.length ? `${activeJobs.length} выполняется` : "Очередь свободна"} />
-          <JobList jobs={data.catalog.jobs.slice(0, 6)} />
+          <JobList jobs={data.catalog.jobs.slice(0, 6)} onCancel={(job) => void onAction(() => post("/admin/api/jobs/cancel", password, { job_id: job.id }), "Отмена запрошена")} />
         </section>
       </div>
     </>
@@ -409,13 +426,14 @@ function IndexRow({ index }: { index: RagIndex }) {
   );
 }
 
-function JobList({ jobs }: { jobs: CatalogJob[] }) {
+function JobList({ jobs, onCancel }: { jobs: CatalogJob[]; onCancel?: (job: CatalogJob) => void }) {
   if (!jobs.length) return <div className="empty-state compact">Операций пока не было</div>;
   return <div className="job-list">{jobs.map((job) => (
     <div className="job-row" key={job.id}>
       <span className={`job-icon ${job.type}`}>{job.type === "repository" ? "↗" : job.type === "graph" ? "⌘" : "◇"}</span>
       <div className="grow"><b>{job.message}</b><small>{job.error || `${job.type} · ${relativeDate(job.completed_at || job.started_at)}`}</small></div>
       <Status value={job.status} />
+      {onCancel && ["queued", "running", "cancelling"].includes(job.status) && <button className="job-cancel" disabled={job.status === "cancelling"} onClick={() => onCancel(job)}>{job.status === "cancelling" ? "Отменяем…" : "Отменить"}</button>}
     </div>
   ))}</div>;
 }
@@ -453,7 +471,7 @@ function IndexesPage({ data, password, onCreate, onRepository, onAction }: {
           </tbody></table></div>
         ) : <div className="empty-state"><div>↗</div><h3>Подключите первый репозиторий</h3><p>Сервис проанализирует исходники, найдёт openspec при наличии, обновит индекс и карту.</p><button className="button primary" onClick={onRepository}>Подключить Git</button></div>}
       </section>
-      {data.catalog.jobs.length > 0 && <section className="panel"><PanelHeader title="Очередь операций" kicker="Фоновые задачи" /><JobList jobs={data.catalog.jobs} /></section>}
+      {data.catalog.jobs.length > 0 && <section className="panel"><PanelHeader title="Очередь операций" kicker="Фоновые задачи" /><JobList jobs={data.catalog.jobs} onCancel={(job) => void onAction(() => post("/admin/api/jobs/cancel", password, { job_id: job.id }), "Отмена запрошена")} /></section>}
     </>
   );
 }
@@ -492,7 +510,7 @@ function ServicesPage({ data, onGraph }: { data: Overview; onGraph: () => void }
             const mappedService = mapByRepository.get(repository.name);
             const activeJob = data.catalog.jobs.find(
               (job) => job.index_id === repository.index_id
-                && ["queued", "running"].includes(job.status),
+                && ["queued", "running", "cancelling"].includes(job.status),
             );
             return (
               <article className="service-card" key={repository.id}>
