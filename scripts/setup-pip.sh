@@ -70,7 +70,7 @@ if [[ "${with_semantic}" == true ]]; then
   install_target="${project_root}[semantic]"
 fi
 
-"${venv_dir}/bin/python" -m pip install --editable "${install_target}"
+"${venv_dir}/bin/python" -m pip install --upgrade "${install_target}"
 
 if [[ "${with_dev}" == true ]]; then
   "${venv_dir}/bin/python" -m pip install \
