@@ -9,7 +9,7 @@
 Qwen Code
     ↓ stdio
 локальный corporate_kb_stdio_proxy.py
-    ↓ обычные авторизованные HTTP GET-запросы
+    ↓ обычные HTTP GET-запросы
 удалённый RAG API
     ↓
 корпоративные документы
@@ -22,7 +22,7 @@ Qwen сам запускает локальный MCP-процесс. Отдел
 
 1. Один файл `corporate_kb_stdio_proxy.py`.
 2. Адрес сервера без `/mcp`, например `http://10.20.30.40:8000`.
-3. Bearer-токен доступа.
+3. Bearer-токен — только если администратор включил защиту на сервере.
 
 На клиентском компьютере должны быть установлены Qwen Code и `uv`. Node.js, `npx`, `mcp-remote`,
 Nginx и отдельное Python-окружение не нужны.
@@ -68,8 +68,7 @@ where uv
 
 ```bash
 curl -i \
-  'http://SERVER_IP:8000/api/v1/stats' \
-  -H 'Authorization: Bearer SERVER_TOKEN'
+  'http://SERVER_IP:8000/api/v1/stats'
 ```
 
 Проверка поиска:
@@ -77,12 +76,12 @@ curl -i \
 ```bash
 curl -G \
   'http://SERVER_IP:8000/api/v1/search' \
-  -H 'Authorization: Bearer SERVER_TOKEN' \
   --data-urlencode 'query=какой сервис владеет дневными лимитами' \
   --data-urlencode 'top_k=3'
 ```
 
-Оба запроса должны вернуть `HTTP 200` и JSON. Если получен `401`, проверьте токен.
+Оба запроса должны вернуть `HTTP 200` и JSON. Если администратор всё же включил Bearer-защиту,
+добавьте к командам `-H 'Authorization: Bearer SERVER_TOKEN'`.
 
 ## 4. Добавить MCP в Qwen
 
@@ -107,7 +106,6 @@ curl -G \
       ],
       "env": {
         "CORPORATE_KB_API_URL": "http://SERVER_IP:8000",
-        "CORPORATE_KB_API_TOKEN": "SERVER_TOKEN",
         "CORPORATE_KB_API_TIMEOUT": "30"
       },
       "timeout": 120000,
@@ -132,7 +130,6 @@ curl -G \
       ],
       "env": {
         "CORPORATE_KB_API_URL": "http://SERVER_IP:8000",
-        "CORPORATE_KB_API_TOKEN": "SERVER_TOKEN",
         "CORPORATE_KB_API_TIMEOUT": "30"
       },
       "timeout": 120000,
@@ -182,8 +179,8 @@ ssot_context
 полностью перезапустите Qwen. Не добавляйте `includeTools` в settings — статический список скроет
 новые tools.
 
-Кнопка OAuth-аутентификации не нужна: Bearer-токен уже передаётся локальному Python-процессу через
-Qwen settings.
+Кнопка OAuth-аутентификации не нужна. В стандартном режиме токена нет; при включённой серверной
+защите Bearer-токен передаётся локальному Python-процессу через Qwen settings.
 
 Тестовый запрос:
 
@@ -224,8 +221,8 @@ http://SERVER_IP:8000/mcp
 
 ### Remote RAG returned HTTP 401
 
-Токен отсутствует, устарел или скопирован с лишними символами. Запросите новый токен у
-администратора.
+На сервере включена опциональная Bearer-защита. Запросите токен у администратора и добавьте
+`CORPORATE_KB_API_TOKEN` в `env` MCP-настройки.
 
 ### uv не может скачать FastMCP
 

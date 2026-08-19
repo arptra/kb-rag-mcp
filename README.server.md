@@ -1,7 +1,7 @@
 # Развёртывание корпоративной RAG-базы на сервере
 
 Эта инструкция предназначена для администратора удалённого сервера. Сервер хранит документы,
-строит индекс один раз, загружает его в память и отдаёт результаты поиска авторизованным клиентам.
+строит индекс один раз, загружает его в память и отдаёт результаты поиска HTTP/MCP-клиентам.
 
 ## Архитектура
 
@@ -14,7 +14,7 @@ embeddings + файловый кэш .cache/kb
         ↓
 прогретый индекс в RAM
         ↓
-GET /api/v1/* с Bearer-токеном
+GET /api/v1/* (Bearer опционален)
         ↓
 локальные stdio MCP-клиенты сотрудников
 ```
@@ -118,14 +118,21 @@ export KB_EMBEDDING_BATCH_SIZE=32
 sudo journalctl -u corporate-kb -f
 ```
 
-## 4. Создать токен
+## 4. Авторизация необязательна
+
+Для локального или доверенного контура ничего создавать не нужно: оставьте
+`KB_MCP_HTTP_BEARER_TOKEN` и `KB_ADMIN_PASSWORD` пустыми. `/mcp`, JSON API и `/admin` будут
+доступны без экрана входа и дополнительных заголовков.
+
+Если сервер публикуется в недоверенную сеть, защиту можно включить отдельно. Создайте токен:
 
 ```bash
 openssl rand -hex 32
 ```
 
-Сохраните значение как секрет. Один и тот же токен должен быть установлен на сервере и передан
-авторизованным клиентам. Не добавляйте реальный токен в Git.
+Сохраните его в `KB_MCP_HTTP_BEARER_TOKEN`. Для защиты web-панели можно отдельно задать
+`KB_ADMIN_PASSWORD`; оба значения включают соответствующую проверку только когда они непустые.
+Не добавляйте реальные секреты в Git.
 
 Для административного benchmark создайте второй, отдельный пароль:
 
@@ -137,27 +144,20 @@ openssl rand -hex 32
 в клиентском settings: Qwen запрашивает его у администратора непосредственно перед запуском
 `kb_run_context_benchmark`.
 
-Для web-панели создайте третий отдельный секрет и установите `KB_ADMIN_PASSWORD`. Он даёт право
-загружать документы, запускать переиндексацию и менять опубликованные MCP schemas, поэтому не
-раздавайте его обычным пользователям.
-
 ## 5. Запустить сервер вручную
 
 ```bash
 cd /opt/corporate-kb
 
-export KB_MCP_HTTP_HOST='0.0.0.0'
+export KB_MCP_HTTP_HOST='127.0.0.1'
 export KB_MCP_HTTP_PORT='8000'
-export KB_MCP_HTTP_BEARER_TOKEN='REPLACE_WITH_GENERATED_TOKEN'
-export KB_BENCHMARK_PASSWORD='REPLACE_WITH_SEPARATE_BENCHMARK_PASSWORD'
-export KB_ADMIN_PASSWORD='REPLACE_WITH_SEPARATE_ADMIN_PASSWORD'
 export KB_AUTO_INDEX='false'
 
 ./scripts/start-mcp-http.sh
 ```
 
-Allowlist адресов не используется. Сервер принимает запросы с любых адресов, которые доступны по
-сети, но защищённые endpoints требуют правильный Bearer-токен.
+Это открытый локальный запуск без паролей. Для сетевого режима явно задайте `0.0.0.0`; если сеть
+недоверенная, одновременно установите `KB_MCP_HTTP_BEARER_TOKEN` и `KB_ADMIN_PASSWORD`.
 
 При старте готовый индекс загружается в RAM до открытия порта. При
 `KB_AUTO_INDEX=false` сервер **не обходит `knowledge/`** и не пересчитывает hash 11 000 документов:
@@ -173,12 +173,11 @@ Allowlist адресов не используется. Сервер прини�
 curl -i 'http://127.0.0.1:8000/health'
 ```
 
-Проверка авторизации и индекса:
+Проверка индекса:
 
 ```bash
 curl -i \
-  'http://127.0.0.1:8000/api/v1/stats' \
-  -H 'Authorization: Bearer REPLACE_WITH_GENERATED_TOKEN'
+  'http://127.0.0.1:8000/api/v1/stats'
 ```
 
 Проверка поиска:
@@ -186,7 +185,6 @@ curl -i \
 ```bash
 curl -G \
   'http://127.0.0.1:8000/api/v1/search' \
-  -H 'Authorization: Bearer REPLACE_WITH_GENERATED_TOKEN' \
   --data-urlencode 'query=какой сервис владеет дневными лимитами' \
   --data-urlencode 'top_k=3'
 ```
@@ -196,8 +194,9 @@ curl -G \
 
 ## Client JSON API
 
-Все endpoints требуют один Bearer-токен; чтение использует `GET`, вызов управляемого tool и
-benchmark — `POST`:
+В открытом режиме endpoints не требуют Bearer-токен. Если задан
+`KB_MCP_HTTP_BEARER_TOKEN`, тот же API автоматически начинает требовать его; чтение использует
+`GET`, вызов управляемого tool и benchmark — `POST`:
 
 | Endpoint | Назначение | Основные параметры |
 | --- | --- | --- |
@@ -217,7 +216,6 @@ Client API не изменяет документы и не запускает �
 
 ```bash
 curl -X POST 'http://127.0.0.1:8000/api/v1/admin/context-benchmark' \
-  -H 'Authorization: Bearer REPLACE_WITH_GENERATED_TOKEN' \
   -H 'X-KB-Benchmark-Password: REPLACE_WITH_SEPARATE_BENCHMARK_PASSWORD'
 ```
 
@@ -375,7 +373,8 @@ sudo systemctl restart corporate-kb
 
 ### `/health` работает, `/api/v1/*` возвращает `401`
 
-Проверьте точное совпадение Bearer-токена на сервере и клиенте.
+На сервере задан `KB_MCP_HTTP_BEARER_TOKEN`. Проверьте его совпадение на сервере и клиенте либо
+очистите переменную, чтобы вернуть открытый режим.
 
 ### Сервер не стартует: knowledge index is missing or incompatible
 

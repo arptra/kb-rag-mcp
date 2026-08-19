@@ -62,6 +62,14 @@ def test_remote_api_rejects_mcp_endpoint_as_base_url() -> None:
         module.RemoteKnowledgeApi("http://kb.example/mcp", "token")
 
 
+def test_remote_api_allows_password_free_access() -> None:
+    module = _load_proxy_module()
+
+    api = module.RemoteKnowledgeApi("http://kb.example")
+
+    assert api._token == ""
+
+
 @pytest.mark.asyncio
 async def test_stdio_proxy_exposes_static_and_managed_remote_tools() -> None:
     module = _load_proxy_module()

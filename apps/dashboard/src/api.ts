@@ -12,13 +12,12 @@ export async function api<T>(
   password: string,
   init: RequestInit = {},
 ): Promise<T> {
+  const headers = new Headers(init.headers);
+  headers.set("Content-Type", "application/json");
+  if (password) headers.set("X-KB-Admin-Password", password);
   const response = await fetch(path, {
     ...init,
-    headers: {
-      "Content-Type": "application/json",
-      "X-KB-Admin-Password": password,
-      ...init.headers,
-    },
+    headers,
   });
   const text = await response.text();
   let payload: unknown = {};

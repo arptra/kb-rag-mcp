@@ -42,7 +42,7 @@ Qwen Code CLI
 
 ```text
 Qwen CLI ─┐
-Qwen CLI ─┼─ HTTPS / Bearer token ─ MCP Streamable HTTP ─ in-memory index
+Qwen CLI ─┼─ HTTP(S), Bearer optional ─ MCP Streamable HTTP ─ in-memory index
 Qwen CLI ─┘
 ```
 
@@ -109,11 +109,11 @@ Qwen запускает его локально через `uv` как stdio MCP
 - `REPLACE_WITH_ABSOLUTE_UV_PATH` — результат `which uv` или `where uv` (в Windows `uv.exe`);
 - `REPLACE_WITH_ABSOLUTE_PATH` — каталог, в котором сотрудник сохранил единственный `.py`-файл;
 - `REPLACE_WITH_SERVER_IP_OR_DOMAIN` — адрес удалённого сервера;
-- `REPLACE_WITH_SERVER_TOKEN` — Bearer-токен.
+- `REPLACE_WITH_SERVER_TOKEN` — только если на сервере включена Bearer-защита.
 
 Qwen запускает этот файл как локальный MCP по `stdio` командой `uv run`. Скрипт содержит inline
 dependency на FastMCP, поэтому `uv` сам создаёт изолированное кэшированное окружение. Локальный MCP
-обращается к удалённому RAG только через обычные авторизованные JSON GET endpoints `/api/v1/*`.
+обращается к удалённому RAG только через обычные JSON GET endpoints `/api/v1/*`.
 `node`, `npx`, `mcp-remote`, локальная копия документов и локальный индекс не нужны.
 
 ### Установка серверной части
@@ -332,18 +332,10 @@ cd /opt/corporate-kb
 ./scripts/dev.sh index-hash
 ```
 
-Сгенерируйте отдельный секрет длиной не менее 32 символов:
+Для локального запуска пароль и токен не нужны:
 
 ```bash
-openssl rand -hex 32
-```
-
-Для прямого запуска внутри доверенной сети или VPN задайте секрет и запустите listener на всех
-сетевых интерфейсах:
-
-```bash
-export KB_MCP_HTTP_BEARER_TOKEN='PASTE_GENERATED_TOKEN'
-export KB_MCP_HTTP_HOST='0.0.0.0'
+export KB_MCP_HTTP_HOST='127.0.0.1'
 export KB_MCP_HTTP_PORT='8000'
 export KB_AUTO_INDEX='false'
 
@@ -356,12 +348,11 @@ export KB_AUTO_INDEX='false'
 curl http://10.0.0.5:8000/health
 ```
 
-Для stdio-клиента сервер также предоставляет защищённый read-only JSON API. Например, проверка
-поиска использует обычный GET и тот же Bearer-токен:
+Для stdio-клиента сервер также предоставляет read-only JSON API. В стандартном локальном режиме
+поиск работает без токена:
 
 ```bash
 curl -G 'http://10.0.0.5:8000/api/v1/search' \
-  -H 'Authorization: Bearer PASTE_GENERATED_TOKEN' \
   --data-urlencode 'query=какой сервис владеет дневными лимитами' \
   --data-urlencode 'top_k=3'
 ```
@@ -370,33 +361,33 @@ curl -G 'http://10.0.0.5:8000/api/v1/search' \
 `/api/v1/admin/context-benchmark`, `/api/v1/documents` и `/api/v1/stats`. Они используют
 тот же прогретый индекс, что и MCP tools, не строят embeddings на клиенте и не изменяют документы.
 
-Сам `/mcp` требует заголовок `Authorization: Bearer ...`. Ограничения по Host, Origin, домену или IP
-нет: сервер принимает клиента с любого адреса, если передан правильный токен. `KB_AUTO_INDEX=false`
-гарантирует, что удалённый процесс не начнёт неожиданную переиндексацию.
+Сам `/mcp` также работает без заголовка авторизации. Если задать
+`KB_MCP_HTTP_BEARER_TOKEN`, Bearer-проверка включится одновременно для `/mcp` и JSON API.
+`KB_AUTO_INDEX=false` гарантирует, что удалённый процесс не начнёт неожиданную переиндексацию.
 
 Проверяйте с клиентской машины не только `/health`, но и настоящий MCP `initialize`:
 
 ```bash
 curl -i --max-time 15 \
   'http://10.0.0.5:8000/mcp' \
-  -H 'Authorization: Bearer PASTE_GENERATED_TOKEN' \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"curl-test","version":"1.0"}}}'
 ```
 
-Ожидается `HTTP/1.1 200`. `401` означает неверный токен, `404` — неверный путь, а `421` — что
+Ожидается `HTTP/1.1 200`. При включённой защите `401` означает неверный токен, `404` — неверный путь, а `421` — что
 запущена старая сборка с Host allowlist. Прямой FastMCP listener, запущенный через Python или `uv`,
 использует обычный HTTP. `https://` указывайте только при наличии TLS reverse proxy; иначе Qwen
 обычно сообщает `TypeError: fetch failed`.
 
 ### 2. Подключить Qwen CLI
 
-Перед раздачей впишите в корневой `install.sh` публичный HTTPS-адрес сервера и созданный токен:
+Перед раздачей впишите в корневой `install.sh` адрес сервера. Токен оставьте пустым, если защита
+на сервере не включена:
 
 ```bash
 default_mcp_url="https://kb.company.example/mcp"
-default_mcp_token="THE_SERVER_TOKEN"
+default_mcp_token=""
 ```
 
 Сотруднику передаётся только этот один файл. В любом каталоге он выполняет:
@@ -409,8 +400,7 @@ bash install.sh
 только добавляет подключение `corporate-kb` в пользовательскую конфигурацию уже установленного
 Qwen Code. После запуска сотрудник перезапускает `qwen` и проверяет соединение через `/mcp`.
 
-Bearer-токен внутри готового скрипта является секретом: раздавайте файл через защищённый
-корпоративный канал. Для отзыва доступа замените токен на сервере и выпустите новый скрипт.
+Если опциональный Bearer-токен всё же задан, раздавайте файл через защищённый корпоративный канал.
 
 ### 3. Доступ через интернет
 
@@ -498,7 +488,7 @@ custom_field: "неизвестные поля тоже сохраняются"
   `KB_CHUNK_OVERLAP_TOKENS=80`;
 - `KB_AUTO_INDEX=false`.
 - `KB_MCP_HTTP_HOST`, `KB_MCP_HTTP_PORT`, `KB_MCP_HTTP_PATH`;
-- `KB_MCP_HTTP_BEARER_TOKEN` — обязательный секрет для HTTP-режима;
+- `KB_MCP_HTTP_BEARER_TOKEN` — опциональная защита HTTP/MCP; пустое значение включает открытый режим;
 
 Относительные пути разрешаются относительно текущего project working directory; `kb stats`
 показывает итоговые абсолютные пути.

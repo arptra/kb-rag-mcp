@@ -15,11 +15,4 @@ export KB_MCP_HTTP_HOST="${KB_MCP_HTTP_HOST:-0.0.0.0}"
 export KB_MCP_HTTP_PORT="${KB_MCP_HTTP_PORT:-8000}"
 export KB_MCP_HTTP_PATH="${KB_MCP_HTTP_PATH:-/mcp}"
 
-if [[ -z "${KB_MCP_HTTP_BEARER_TOKEN:-}" ]]; then
-  printf '%s\n' \
-    "KB_MCP_HTTP_BEARER_TOKEN is required." \
-    "Generate one with: openssl rand -hex 32" >&2
-  exit 2
-fi
-
 exec "${VIRTUAL_ENV}/bin/python" -m corporate_kb.mcp.http_server "$@"

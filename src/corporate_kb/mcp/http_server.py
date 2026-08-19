@@ -32,7 +32,9 @@ _READ_SCOPE = "kb:read"
 _ADMIN_DIST = Path(__file__).with_name("admin_dist")
 
 
-def _authorized(request: Request, token: str) -> bool:
+def _authorized(request: Request, token: str | None) -> bool:
+    if token is None:
+        return True
     scheme, separator, supplied = request.headers.get("authorization", "").partition(" ")
     return (
         bool(separator)
@@ -98,30 +100,26 @@ def _api_error(exc: Exception) -> JSONResponse:
 def _admin_authorized(request: Request, settings: Settings) -> bool:
     configured = settings.admin_password
     if configured is None:
-        return False
+        return True
     expected = configured.get_secret_value()
+    if not expected:
+        return True
     supplied = request.headers.get("x-kb-admin-password", "")
     return len(expected) >= 16 and bool(supplied) and secrets.compare_digest(supplied, expected)
 
 
 def _admin_denied(settings: Settings) -> JSONResponse:
-    message = (
-        "admin dashboard is disabled"
-        if settings.admin_password is None
-        else "invalid admin password"
-    )
-    return JSONResponse({"error": message}, status_code=403)
+    return JSONResponse({"error": "invalid admin password"}, status_code=403)
 
 
-def validate_http_settings(settings: Settings) -> str:
-    """Validate authenticated remote-server settings and return the raw token."""
+def validate_http_settings(settings: Settings) -> str | None:
+    """Return an optional validated token; no token means open HTTP access."""
     secret = settings.mcp_http_bearer_token
     if secret is None:
-        raise ValueError(
-            "KB_MCP_HTTP_BEARER_TOKEN is required for HTTP mode. "
-            "Generate one with: openssl rand -hex 32"
-        )
+        return None
     token = secret.get_secret_value()
+    if not token:
+        return None
     if len(token) < 32:
         raise ValueError("KB_MCP_HTTP_BEARER_TOKEN must contain at least 32 characters")
     return token
@@ -146,7 +144,7 @@ class ConstantTimeTokenVerifier(TokenVerifier):
 
 
 def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP:
-    """Create an authenticated FastMCP server with a public health route."""
+    """Create a FastMCP server with optional token and admin authentication."""
     token = validate_http_settings(settings)
     usage = UsageTracker()
     ssot_service = None
@@ -169,7 +167,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
     admin = AdminController(service, usage)
     server = create_mcp_server(
         service,
-        auth=ConstantTimeTokenVerifier(token),
+        auth=ConstantTimeTokenVerifier(token) if token is not None else None,
         knowledge_tools=tools,
         managed_tools=managed_tools,
     )
@@ -599,7 +597,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
 
 def create_http_app(service: KnowledgeService, settings: Settings) -> ASGIApp:
-    """Build the authenticated FastMCP ASGI app for tests or external ASGI servers."""
+    """Build the FastMCP ASGI app for tests or external ASGI servers."""
     server = create_http_server(service, settings)
     return server.http_app(
         path=settings.mcp_http_path,
@@ -608,7 +606,7 @@ def create_http_app(service: KnowledgeService, settings: Settings) -> ASGIApp:
 
 
 def main() -> None:
-    """Preload the index, then serve authenticated FastMCP Streamable HTTP."""
+    """Preload the index, then serve FastMCP Streamable HTTP."""
     settings = Settings().resolved()
     configure_logging(settings.log_level)
     validate_http_settings(settings)
@@ -623,10 +621,11 @@ def main() -> None:
     )
     server = create_http_server(service, settings)
     logger.info(
-        "Starting authenticated FastMCP HTTP server on %s:%d%s",
+        "Starting FastMCP HTTP server on %s:%d%s (authentication=%s)",
         settings.mcp_http_host,
         settings.mcp_http_port,
         settings.mcp_http_path,
+        "enabled" if settings.mcp_http_bearer_token else "disabled",
     )
     try:
         server.run(

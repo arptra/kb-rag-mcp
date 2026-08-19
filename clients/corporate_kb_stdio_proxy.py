@@ -53,7 +53,7 @@ class RemoteKnowledgeApi:
     def __init__(
         self,
         base_url: str,
-        token: str,
+        token: str = "",
         *,
         timeout_seconds: float = 30.0,
         ca_file: str | None = None,
@@ -64,8 +64,6 @@ class RemoteKnowledgeApi:
             raise ValueError("CORPORATE_KB_API_URL must be an http:// or https:// server URL")
         if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
             raise ValueError("CORPORATE_KB_API_URL must not include /mcp, a query, or a fragment")
-        if not token:
-            raise ValueError("CORPORATE_KB_API_TOKEN must not be empty")
         if timeout_seconds <= 0:
             raise ValueError("CORPORATE_KB_API_TIMEOUT must be greater than zero")
 
@@ -111,9 +109,10 @@ class RemoteKnowledgeApi:
     ) -> dict[str, Any]:
         headers = {
             "Accept": "application/json",
-            "Authorization": f"Bearer {self._token}",
             "User-Agent": "corporate-kb-stdio-proxy/1.0",
         }
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
         if body is not None:
             headers["Content-Type"] = "application/json"
         if extra_headers:

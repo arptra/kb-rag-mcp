@@ -2,12 +2,12 @@
 
 set -euo pipefail
 
-# Администратор заполняет эти два значения перед раздачей файла сотрудникам.
-# Их также можно передать через CORPORATE_KB_MCP_URL и CORPORATE_KB_MCP_TOKEN.
+# Администратор заполняет адрес перед раздачей файла сотрудникам.
+# Токен опционален и нужен только если защита включена на сервере.
+# Значения также можно передать через CORPORATE_KB_MCP_URL и CORPORATE_KB_MCP_TOKEN.
 default_mcp_url="https://KB-SERVER.EXAMPLE.COM/mcp"
-default_mcp_token="REPLACE_WITH_SERVER_TOKEN"
+default_mcp_token=""
 placeholder_mcp_url="https://KB-SERVER.EXAMPLE.COM/mcp"
-placeholder_mcp_token="REPLACE_WITH_SERVER_TOKEN"
 
 server_name="corporate-kb"
 mcp_url="${CORPORATE_KB_MCP_URL:-${default_mcp_url}}"
@@ -30,9 +30,8 @@ if [[ "${mcp_url}" != http://* && "${mcp_url}" != https://* ]]; then
   exit 2
 fi
 
-if [[ "${mcp_token}" == "${placeholder_mcp_token}" || ${#mcp_token} -lt 32 ]]; then
-  printf '%s\n' 'Ошибка: в install.sh не указан корректный Bearer-токен.' >&2
-  printf '%s\n' 'Администратор должен заполнить default_mcp_token перед раздачей файла.' >&2
+if [[ -n "${mcp_token}" && ${#mcp_token} -lt 32 ]]; then
+  printf '%s\n' 'Ошибка: заданный Bearer-токен должен содержать не менее 32 символов.' >&2
   exit 2
 fi
 
@@ -41,11 +40,17 @@ printf 'Подключаю Qwen Code к %s...\n' "${mcp_url}"
 # Повторный запуск обновляет только нашу запись и не затрагивает другие MCP-серверы.
 qwen mcp remove "${server_name}" >/dev/null 2>&1 || true
 
+qwen_args=(
+  --scope user
+  --transport http
+  --timeout 120000
+)
+if [[ -n "${mcp_token}" ]]; then
+  qwen_args+=(--header "Authorization: Bearer ${mcp_token}")
+fi
+
 qwen mcp add \
-  --scope user \
-  --transport http \
-  --timeout 120000 \
-  --header "Authorization: Bearer ${mcp_token}" \
+  "${qwen_args[@]}" \
   --description "Удалённая корпоративная база знаний" \
   "${server_name}" \
   "${mcp_url}"

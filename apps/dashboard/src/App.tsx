@@ -112,6 +112,21 @@ function Login({ error, onSubmit }: { error: string; onSubmit: (password: string
   );
 }
 
+function Startup({ error, loading, onRetry }: { error: string; loading: boolean; onRetry: () => void }) {
+  return (
+    <main className="login-shell">
+      <section className="login-card">
+        <div className="brand-mark large">R</div>
+        <span className="eyebrow">Corporate knowledge infrastructure</span>
+        <h1>RAG Control Plane</h1>
+        <p>{loading ? "Подключаемся к локальному RAG-серверу…" : "Сервер пока недоступен."}</p>
+        {error && <div className="form-error">{error}</div>}
+        {!loading && <button className="button primary wide" onClick={onRetry}>Повторить <span>→</span></button>}
+      </section>
+    </main>
+  );
+}
+
 export default function App() {
   const [password, setPassword] = useState(() => sessionStorage.getItem("rag-admin-password") || "");
   const [overview, setOverview] = useState<Overview | null>(null);
@@ -122,21 +137,27 @@ export default function App() {
   const [indexModal, setIndexModal] = useState(false);
   const [repositoryModal, setRepositoryModal] = useState(false);
   const [toolModal, setToolModal] = useState<ManagedTool | "new" | null>(null);
+  const [booting, setBooting] = useState(true);
+  const [accessDenied, setAccessDenied] = useState(false);
 
   const load = useCallback(async () => {
-    if (!password) return;
     try {
       const payload = await api<Overview>("/admin/api/overview", password);
       setOverview(payload);
       setError("");
+      setAccessDenied(false);
     } catch (caught) {
       if (caught instanceof ApiError && caught.status === 403) {
         sessionStorage.removeItem("rag-admin-password");
         setOverview(null);
+        setAccessDenied(true);
         setError(caught.message);
       } else {
+        setAccessDenied(false);
         setError(caught instanceof Error ? caught.message : "Не удалось загрузить панель");
       }
+    } finally {
+      setBooting(false);
     }
   }, [password]);
 
@@ -154,7 +175,10 @@ export default function App() {
 
   const submitPassword = (value: string) => {
     sessionStorage.setItem("rag-admin-password", value);
-    setPassword(value);
+    setAccessDenied(false);
+    setBooting(true);
+    if (value === password) void load();
+    else setPassword(value);
   };
 
   const action = async (run: () => Promise<unknown>, message: string) => {
@@ -170,7 +194,19 @@ export default function App() {
     }
   };
 
-  if (!overview) return <Login error={error} onSubmit={submitPassword} />;
+  if (!overview) {
+    if (accessDenied) return <Login error={error} onSubmit={submitPassword} />;
+    return (
+      <Startup
+        error={error}
+        loading={booting}
+        onRetry={() => {
+          setBooting(true);
+          void load();
+        }}
+      />
+    );
+  }
 
   const title = NAV.find((item) => item.id === page)?.label ?? "RAG Control Plane";
   return (
@@ -188,14 +224,17 @@ export default function App() {
         </nav>
         <div className="sidebar-foot">
           <div className="server-state"><span className="pulse" /><div><b>MCP online</b><small>{overview.index.embedding_provider} embeddings</small></div></div>
-          <button
-            className="logout"
-            onClick={() => {
-              sessionStorage.removeItem("rag-admin-password");
-              setPassword("");
-              setOverview(null);
-            }}
-          >Сменить доступ</button>
+          {password && (
+            <button
+              className="logout"
+              onClick={() => {
+                sessionStorage.removeItem("rag-admin-password");
+                setPassword("");
+                setOverview(null);
+                setBooting(true);
+              }}
+            >Сменить доступ</button>
+          )}
         </div>
       </aside>
 

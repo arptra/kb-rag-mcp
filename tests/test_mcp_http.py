@@ -21,12 +21,17 @@ BENCHMARK_PASSWORD = "separate-benchmark-password"
 ADMIN_PASSWORD = "separate-admin-password"
 
 
-def _indexed_service(settings_factory) -> tuple[KnowledgeService, Settings]:
-    settings = settings_factory(
-        mcp_http_bearer_token=TOKEN,
-        benchmark_password=BENCHMARK_PASSWORD,
-        admin_password=ADMIN_PASSWORD,
+def _indexed_service(
+    settings_factory,
+    *,
+    protected: bool = True,
+) -> tuple[KnowledgeService, Settings]:
+    auth = (
+        {"mcp_http_bearer_token": TOKEN, "admin_password": ADMIN_PASSWORD}
+        if protected
+        else {}
     )
+    settings = settings_factory(benchmark_password=BENCHMARK_PASSWORD, **auth)
     settings.benchmark_questions_path.parent.mkdir(parents=True)
     settings.benchmark_questions_path.write_text(
         json.dumps(
@@ -53,11 +58,11 @@ def _indexed_service(settings_factory) -> tuple[KnowledgeService, Settings]:
     return service, settings
 
 
-def test_http_settings_require_a_strong_token_but_allow_any_external_host(
+def test_http_settings_allow_open_access_or_a_strong_token(
     settings_factory,
 ) -> None:
-    with pytest.raises(ValueError, match="KB_MCP_HTTP_BEARER_TOKEN is required"):
-        validate_http_settings(settings_factory())
+    assert validate_http_settings(settings_factory()) is None
+    assert validate_http_settings(settings_factory(mcp_http_bearer_token="")) is None
     with pytest.raises(ValueError, match="at least 32"):
         validate_http_settings(settings_factory(mcp_http_bearer_token="short"))
     assert (
@@ -66,6 +71,35 @@ def test_http_settings_require_a_strong_token_but_allow_any_external_host(
         )
         == TOKEN
     )
+
+
+@pytest.mark.asyncio
+async def test_http_mcp_and_admin_allow_password_free_local_access(settings_factory) -> None:
+    service, settings = _indexed_service(settings_factory, protected=False)
+    app = create_http_app(service, settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
+    ):
+        stats = await client.get("/api/v1/stats")
+        assert stats.status_code == 200
+        assert stats.json()["document_count"] == 1
+
+        overview = await client.get("/admin/api/overview")
+        assert overview.status_code == 200
+        assert overview.json()["index"]["document_count"] == 1
+
+        async with streamable_http_client(
+            "http://testserver/mcp",
+            http_client=client,
+        ) as (read_stream, write_stream, _get_session_id), ClientSession(
+            read_stream, write_stream
+        ) as session:
+            await session.initialize()
+            listed = await session.list_tools()
+            assert "kb_search" in {tool.name for tool in listed.tools}
 
 
 @pytest.mark.asyncio
