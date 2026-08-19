@@ -58,10 +58,16 @@ def test_catalog_creates_index_and_imports_local_openspec(settings_factory, tmp_
     assert {item["label"] for item in catalog.graph_overview()["services"]} == {
         "payments-service"
     }
+    assert settings.service_map_path.is_file()
+    assert catalog.service_map_overview()["service_count"] == 1
+    service_map = catalog.service_map()
+    assert {item["name"] for item in service_map["services"]} == {"payments-service"}
 
+    settings.service_map_path.unlink()
     reloaded = RagCatalog(settings, default_service, default_tools, usage)
     restored_job = next(item for item in reloaded.payload()["jobs"] if item["id"] == job.id)
     assert restored_job["status"] == "completed"
+    assert reloaded.service_map_overview()["service_count"] == 1
 
 
 def test_catalog_marks_interrupted_jobs_failed_after_restart(settings_factory) -> None:
@@ -88,3 +94,63 @@ def test_catalog_marks_interrupted_jobs_failed_after_restart(settings_factory) -
     assert restored_job["status"] == "failed"
     assert restored_job["message"] == "Interrupted by server restart"
     assert restored_index["status"] == "error"
+
+
+def test_catalog_maps_repository_without_openspec(settings_factory, tmp_path) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    default_tools = KnowledgeTools(default_service, usage=usage)
+    catalog = RagCatalog(settings, default_service, default_tools, usage)
+    index = catalog.create_index(name="Source-only services")
+
+    repository = tmp_path / "source-only-repository"
+    resources = repository / "src" / "main" / "resources"
+    sources = repository / "src" / "main" / "java" / "example"
+    resources.mkdir(parents=True)
+    sources.mkdir(parents=True)
+    (resources / "application.properties").write_text(
+        "spring.application.name=source-only-service\n",
+        encoding="utf-8",
+    )
+    (sources / "StatusController.java").write_text(
+        """
+package example;
+@RestController
+@RequestMapping("/status")
+public class StatusController {
+  @GetMapping
+  public String status() { return "ok"; }
+}
+""",
+        encoding="utf-8",
+    )
+
+    job = catalog.start_repository_ingestion(
+        name="Source only",
+        git_url=str(repository),
+        index_id=index.id,
+    )
+    for _ in range(200):
+        payload = catalog.payload()
+        current = next(item for item in payload["jobs"] if item["id"] == job.id)
+        if current["status"] not in {"queued", "running"}:
+            break
+        time.sleep(0.01)
+
+    assert current["status"] == "completed"
+    imported = next(
+        item
+        for item in catalog.payload()["repositories"]
+        if item["name"] == "Source only"
+    )
+    assert imported["openspec_path"] is None
+    assert imported["document_count"] == 0
+    service_map = catalog.service_map()
+    assert service_map["services"][0]["id"] == "source-only-service"
+    assert service_map["services"][0]["entrypoints"][0]["operation"] == "GET /status"

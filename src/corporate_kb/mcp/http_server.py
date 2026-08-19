@@ -228,6 +228,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             payload["mcp_servers"] = current_mcp_servers(request)
             payload["catalog"] = catalog.payload()
             payload["graph"] = await asyncio.to_thread(catalog.graph_overview)
+            payload["service_map"] = await asyncio.to_thread(catalog.service_map_overview)
             return JSONResponse(payload)
         except Exception as exc:
             return _api_error(exc)
@@ -446,6 +447,28 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 limit=_integer_query(request, "limit", 3000, minimum=1, maximum=20_000),
             )
             return JSONResponse(payload)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/service-map/overview",
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    async def admin_service_map_overview(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            return JSONResponse(await asyncio.to_thread(catalog.service_map_overview))
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/admin/api/service-map", methods=["GET"], include_in_schema=False)
+    async def admin_service_map(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            return JSONResponse(await asyncio.to_thread(catalog.service_map))
         except Exception as exc:
             return _api_error(exc)
 

@@ -74,8 +74,13 @@ Qwen CLI ─┘
 отдельные RAG-индексы и MCP search-tools, tools привязываются к одному или нескольким индексам,
 а Git-репозитории подключаются по URL и ref. Сервер сам обновляет управляемый checkout, находит
 `openspec/`, переносит поддерживаемые документы в выбранный индекс, перестраивает embeddings и
-обновляет evidence-backed граф системы. Отдельная страница графа показывает найденные сервисы,
-вызовы, события, таблицы и бизнес-правила.
+обновляет evidence-backed граф системы. Отдельный модуль `service_map` без LLM и SSOT быстро
+извлекает из исходников сервисы, точки входа, исходящие HTTP/Kafka-интерфейсы и предполагаемые
+межсервисные зависимости. Карта атомарно хранится в `.cache/kb/service_map.json` и доступна через
+`GET /admin/api/service-map`; краткая статистика — через `GET /admin/api/service-map/overview`.
+Если `openspec/` отсутствует, импорт всё равно завершается: сервис попадает в карту, а в RAG для
+этого источника добавляется 0 документов.
+Отдельная страница графа показывает найденные сервисы, вызовы, события, таблицы и бизнес-правила.
 
 На диске в `.cache/kb/` находятся только:
 
@@ -341,6 +346,23 @@ export KB_AUTO_INDEX='false'
 
 ./scripts/start-mcp-http.sh
 ```
+
+Без аргументов сервер работает в foreground и корректно завершает дочерние Git-процессы по
+`Ctrl+C`. Для управляемого фонового запуска используйте PID-файл и команды lifecycle:
+
+```bash
+./scripts/start-mcp-http.sh start
+./scripts/start-mcp-http.sh status
+./scripts/start-mcp-http.sh logs
+./scripts/start-mcp-http.sh stop
+./scripts/start-mcp-http.sh restart
+```
+
+PID и лог находятся в `.cache/kb/runtime/`. `stop` сначала отправляет `SIGTERM`, а через пять
+секунд при необходимости — `SIGKILL`, поэтому зависший HTTP shutdown не оставляет занятый порт.
+Git fetch/clone запускаются в отдельной process group: timeout или остановка сервера завершают
+также credential helper, SSH и остальные дочерние процессы. По умолчанию Git timeout равен 60
+секундам и настраивается через `KB_REPOSITORY_GIT_TIMEOUT_SECONDS`.
 
 Публичный health check не раскрывает тексты документов:
 

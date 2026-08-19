@@ -156,6 +156,20 @@ export KB_AUTO_INDEX='false'
 ./scripts/start-mcp-http.sh
 ```
 
+Для фонового режима с предсказуемой остановкой:
+
+```bash
+./scripts/start-mcp-http.sh start
+./scripts/start-mcp-http.sh status
+./scripts/start-mcp-http.sh logs
+./scripts/start-mcp-http.sh stop
+```
+
+Скрипт хранит PID и лог в `.cache/kb/runtime/`; `stop` принудительно завершает процесс после
+пяти секунд, если штатный shutdown завис. Запускайте скрипт из любого каталога — рабочей
+директорией всегда становится корень проекта, поэтому jobs и индексы не расползаются по разным
+`.cache`.
+
 Это открытый локальный запуск без паролей. Для сетевого режима явно задайте `0.0.0.0`; если сеть
 недоверенная, одновременно установите `KB_MCP_HTTP_BEARER_TOKEN` и `KB_ADMIN_PASSWORD`.
 

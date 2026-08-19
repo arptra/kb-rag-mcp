@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 from collections.abc import Iterator
@@ -1343,11 +1344,17 @@ class RepositoryScanner:
 
     @staticmethod
     def _files(root: Path, suffixes: set[str]) -> Iterator[Path]:
-        for path in root.rglob("*"):
-            if any(part in _IGNORED_DIRECTORIES for part in path.relative_to(root).parts):
-                continue
-            if path.is_file() and path.suffix.lower() in suffixes:
-                yield path
+        for current, directories, files in os.walk(root, followlinks=False):
+            directory = Path(current)
+            directories[:] = [
+                name
+                for name in directories
+                if name not in _IGNORED_DIRECTORIES and not (directory / name).is_symlink()
+            ]
+            for name in files:
+                path = directory / name
+                if not path.is_symlink() and path.suffix.lower() in suffixes:
+                    yield path
 
     @staticmethod
     def _normalize_target(value: str) -> str:

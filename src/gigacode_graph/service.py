@@ -42,7 +42,7 @@ class GraphService:
         self._snapshot = self._store.load()
         self._store_revision = self._store.revision()
         self._rebuild_indexes()
-        return self._overview_payload()
+        return self._overview
 
     def _maybe_reload(self) -> None:
         revision = self._store.revision()
@@ -59,12 +59,13 @@ class GraphService:
         for edge in self._snapshot.edges:
             self._edges_by_source.setdefault(edge.source, []).append(edge)
             self._edges_by_target.setdefault(edge.target, []).append(edge)
+        self._overview = self._build_overview_payload()
 
     def overview(self) -> dict[str, Any]:
         self._maybe_reload()
-        return self._overview_payload()
+        return self._overview
 
-    def _overview_payload(self) -> dict[str, Any]:
+    def _build_overview_payload(self) -> dict[str, Any]:
         payload = self._snapshot.stats()
         payload["services"] = [
             {

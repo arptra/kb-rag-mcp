@@ -15,6 +15,7 @@ from gigacode_graph.http_server import create_http_app
 from gigacode_graph.mcp_server import create_mcp_server
 from gigacode_graph.scanner import RepositoryScanner
 from gigacode_graph.service import GraphService
+from gigacode_graph.sources import RepositorySourceManager
 from gigacode_graph.store import JsonGraphStore
 
 
@@ -259,6 +260,56 @@ def test_external_http_bind_requires_strong_token(tmp_path: Path) -> None:
         GraphSettings(http_host="0.0.0.0", store_path=tmp_path / "x.json").validate_http_security()
     with pytest.raises(ValueError, match="at least 32"):
         GraphSettings(bearer_token="short", store_path=tmp_path / "x.json").validate_http_security()
+
+
+def test_git_timeout_terminates_the_complete_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HangingGit:
+        def __init__(self) -> None:
+            self.args = ["git", "fetch"]
+            self.pid = 12345
+            self.returncode = -15
+
+        def communicate(self, timeout: int) -> tuple[str, str]:
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+        def poll(self) -> None:
+            return None
+
+    process = HangingGit()
+    popen_options: dict[str, object] = {}
+
+    def fake_popen(*_args: object, **kwargs: object) -> HangingGit:
+        popen_options.update(kwargs)
+        return process
+
+    terminated: list[object] = []
+    monkeypatch.setattr("gigacode_graph.sources.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        RepositorySourceManager,
+        "_terminate_process_tree",
+        staticmethod(terminated.append),
+    )
+    settings = GraphSettings(
+        store_path=tmp_path / "graph.json",
+        git_timeout_seconds=10,
+    ).resolved(tmp_path)
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        RepositorySourceManager(settings)._git(
+            ["fetch"],
+            cwd=tmp_path,
+            source="https://git.example.test/service.git",
+        )
+
+    assert terminated == [process]
+    assert popen_options["start_new_session"] is True
+    environment = popen_options["env"]
+    assert isinstance(environment, dict)
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+    assert environment["GCM_INTERACTIVE"] == "Never"
 
 
 def test_cli_git_url_clones_updates_and_reloads_artifacts(

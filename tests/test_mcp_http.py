@@ -92,6 +92,8 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
         overview = await client.get("/admin/api/overview")
         assert overview.status_code == 200
         assert overview.json()["index"]["document_count"] == 1
+        assert overview.json()["service_map"]["service_count"] == 0
+        assert (await client.get("/admin/api/service-map")).status_code == 200
         local_server = overview.json()["mcp_servers"]["servers"][0]
         assert local_server["name"] == "corporate-knowledge"
         assert local_server["status"] == "online"
@@ -447,5 +449,16 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
         assert graph.status_code == 200
         assert graph.json()["node_count"] >= 2
         assert {service["label"] for service in graph.json()["services"]} == {
+            "payments-service"
+        }
+        service_map_overview = await client.get(
+            "/admin/api/service-map/overview",
+            headers=admin_headers,
+        )
+        assert service_map_overview.status_code == 200
+        assert service_map_overview.json()["service_count"] == 1
+        service_map = await client.get("/admin/api/service-map", headers=admin_headers)
+        assert service_map.status_code == 200
+        assert {item["name"] for item in service_map.json()["services"]} == {
             "payments-service"
         }

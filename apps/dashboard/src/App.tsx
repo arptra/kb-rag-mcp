@@ -231,7 +231,7 @@ export default function App() {
           {NAV.map((item) => (
             <button key={item.id} className={page === item.id ? "active" : ""} onClick={() => setPage(item.id)}>
               <span className="nav-mark">{item.mark}</span>{item.label}
-              {item.id === "services" && <em>{Math.max(overview.graph.services.length, overview.catalog.repository_count)}</em>}
+              {item.id === "services" && <em>{Math.max(overview.service_map.service_count, overview.catalog.repository_count)}</em>}
               {item.id === "servers" && <em>{overview.mcp_servers.server_count}</em>}
               {item.id === "tools" && <em>{overview.managed_tools.tool_count + 7}</em>}
             </button>
@@ -451,7 +451,7 @@ function IndexesPage({ data, password, onCreate, onRepository, onAction }: {
           <div className="table-wrap"><table><thead><tr><th>Репозиторий</th><th>Ветка / commit</th><th>Индекс</th><th>OpenSpec</th><th>Синхронизация</th></tr></thead><tbody>
             {data.catalog.repositories.map((repo) => <tr key={repo.id}><td><b>{repo.name}</b><small title={repo.git_url}>{short(repo.git_url, 56)}</small></td><td><code>{repo.ref || "HEAD"}</code><small>{repo.commit?.slice(0, 9) || "—"}</small></td><td><span className="tag">{nameById[repo.index_id] || repo.index_id}</span></td><td><b>{repo.document_count}</b><small>документов</small></td><td>{relativeDate(repo.synced_at)}</td></tr>)}
           </tbody></table></div>
-        ) : <div className="empty-state"><div>↗</div><h3>Подключите первый репозиторий</h3><p>Сервис найдёт каталог openspec, обновит индекс и построит граф.</p><button className="button primary" onClick={onRepository}>Подключить Git</button></div>}
+        ) : <div className="empty-state"><div>↗</div><h3>Подключите первый репозиторий</h3><p>Сервис проанализирует исходники, найдёт openspec при наличии, обновит индекс и карту.</p><button className="button primary" onClick={onRepository}>Подключить Git</button></div>}
       </section>
       {data.catalog.jobs.length > 0 && <section className="panel"><PanelHeader title="Очередь операций" kicker="Фоновые задачи" /><JobList jobs={data.catalog.jobs} /></section>}
     </>
@@ -462,35 +462,34 @@ function ServicesPage({ data, onGraph }: { data: Overview; onGraph: () => void }
   const indexNames = Object.fromEntries(
     data.catalog.indexes.map((index) => [index.id, index.name]),
   );
-  const graphByCatalogName = new Map(
-    data.graph.services
-      .filter((service) => service.catalog_name)
-      .map((service) => [service.catalog_name as string, service]),
+  const mapByRepository = new Map(
+    data.service_map.services.map((service) => [service.repository, service]),
   );
   const repositoryNames = new Set(data.catalog.repositories.map((repository) => repository.name));
-  const standaloneGraphServices = data.graph.services.filter(
-    (service) => !service.catalog_name || !repositoryNames.has(service.catalog_name),
+  const standaloneMapServices = data.service_map.services.filter(
+    (service) => !repositoryNames.has(service.repository),
   );
 
   return (
     <>
       <div className="section-intro">
         <div>
-          <span className="eyebrow">Repository-derived inventory</span>
+          <span className="eyebrow">File-backed source map</span>
           <h2>Сервисы системы</h2>
-          <p>Репозиторий появляется здесь после чтения OpenSpec. После анализа исходников карточка связывается с узлом системного графа.</p>
+          <p>Карта быстро строится по исходникам без SSOT: точки входа, исходящие интерфейсы и предполагаемые связи сохраняются в service_map.json.</p>
         </div>
         <div className="server-summary">
-          <span><b>{data.catalog.repositories.length}</b> репозиториев</span>
-          <span><b>{data.graph.services.length}</b> в графе</span>
-          <span><b>{data.graph.issue_count}</b> замечаний</span>
+          <span><b>{data.service_map.service_count}</b> сервисов</span>
+          <span><b>{data.service_map.entrypoint_count}</b> входов</span>
+          <span><b>{data.service_map.dependency_count}</b> связей</span>
+          <span><b>{data.service_map.unresolved_dependency_count}</b> не определено</span>
         </div>
       </div>
 
-      {data.catalog.repositories.length || standaloneGraphServices.length ? (
+      {data.catalog.repositories.length || standaloneMapServices.length ? (
         <div className="service-grid">
           {data.catalog.repositories.map((repository) => {
-            const graphService = graphByCatalogName.get(repository.name);
+            const mappedService = mapByRepository.get(repository.name);
             const activeJob = data.catalog.jobs.find(
               (job) => job.index_id === repository.index_id
                 && ["queued", "running"].includes(job.status),
@@ -499,33 +498,34 @@ function ServicesPage({ data, onGraph }: { data: Overview; onGraph: () => void }
               <article className="service-card" key={repository.id}>
                 <header>
                   <span className="service-mark">S</span>
-                  <Status value={graphService ? "ready" : activeJob ? "running" : "empty"} />
+                  <Status value={mappedService ? "ready" : activeJob ? "running" : "empty"} />
                 </header>
-                <span className="eyebrow">{graphService ? "Graph connected" : "Awaiting graph"}</span>
+                <span className="eyebrow">{mappedService ? "Service map ready" : "Awaiting analysis"}</span>
                 <h3>{repository.name}</h3>
-                <code>{graphService?.service_id || repository.commit?.slice(0, 12) || "service pending"}</code>
+                <code>{mappedService?.id || repository.commit?.slice(0, 12) || "service pending"}</code>
                 <dl>
                   <div><dt>Индекс</dt><dd>{indexNames[repository.index_id] || repository.index_id}</dd></div>
                   <div><dt>OpenSpec</dt><dd>{number(repository.document_count)} документов</dd></div>
+                  <div><dt>Интерфейсы</dt><dd>{mappedService ? `${mappedService.entrypoint_count} входов · ${mappedService.outbound_interface_count} выходов` : "—"}</dd></div>
                   <div><dt>Синхронизация</dt><dd>{relativeDate(repository.synced_at)}</dd></div>
                 </dl>
-                <footer><span>{graphService?.owner || "Владелец не определён"}</span><button onClick={onGraph}>Открыть граф →</button></footer>
+                <footer><span>{mappedService?.owner || "Владелец не определён"}</span><button onClick={onGraph}>Открыть граф →</button></footer>
               </article>
             );
           })}
-          {standaloneGraphServices.map((service) => (
+          {standaloneMapServices.map((service) => (
             <article className="service-card" key={service.id}>
               <header><span className="service-mark">S</span><Status value="ready" /></header>
-              <span className="eyebrow">Graph discovered</span>
-              <h3>{service.label}</h3>
-              <code>{service.service_id}</code>
-              <dl><div><dt>Репозиторий</dt><dd>{service.repository || "—"}</dd></div></dl>
+              <span className="eyebrow">Source map discovered</span>
+              <h3>{service.name}</h3>
+              <code>{service.id}</code>
+              <dl><div><dt>Репозиторий</dt><dd>{service.repository || "—"}</dd></div><div><dt>Интерфейсы</dt><dd>{service.entrypoint_count} входов · {service.outbound_interface_count} выходов</dd></div></dl>
               <footer><span>{service.owner || "Владелец не определён"}</span><button onClick={onGraph}>Открыть граф →</button></footer>
             </article>
           ))}
         </div>
       ) : (
-        <div className="empty-state services-empty"><div>▦</div><h3>Сервисов пока нет</h3><p>Подключите Git-репозиторий. Сервис появится после чтения каталога openspec.</p></div>
+        <div className="empty-state services-empty"><div>▦</div><h3>Сервисов пока нет</h3><p>Подключите Git-репозиторий. Сервис появится после быстрого анализа исходников, даже без SSOT.</p></div>
       )}
     </>
   );
@@ -721,7 +721,7 @@ function RepositoryForm({ password, indexes, onClose, onSaved }: { password: str
       onSaved();
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Не удалось подключить репозиторий"); }
   };
-  return <Modal title="Подключить Git-репозиторий" onClose={onClose}><form className="modal-form" onSubmit={submit}><div className="field-row"><label>Название<input required minLength={2} value={name} onChange={(event) => setName(event.target.value)} placeholder="payments-service" /></label><label>Ref, необязательно<input value={ref} onChange={(event) => setRef(event.target.value)} placeholder="main / tag / commit" /></label></div><label>Git URL<input required value={gitUrl} onChange={(event) => setGitUrl(event.target.value)} placeholder="https://git.company.local/team/service.git" /></label><label>Целевой индекс<select value={target} onChange={(event) => setTarget(event.target.value)}>{indexes.map((index) => <option key={index.id} value={index.id}>{index.name}</option>)}<option value="__new__">＋ Создать новый индекс</option></select></label>{target === "__new__" && <label>Название нового индекса<input value={indexName} onChange={(event) => setIndexName(event.target.value)} placeholder={name || "System knowledge"} /></label>}<div className="flow-preview"><span>Git checkout</span><i>→</i><span>openspec/**</span><i>→</i><span>RAG index</span><i>＋</i><span>System graph</span></div>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary">Подключить и индексировать</button></div></form></Modal>;
+  return <Modal title="Подключить Git-репозиторий" onClose={onClose}><form className="modal-form" onSubmit={submit}><div className="field-row"><label>Название<input required minLength={2} value={name} onChange={(event) => setName(event.target.value)} placeholder="payments-service" /></label><label>Ref, необязательно<input value={ref} onChange={(event) => setRef(event.target.value)} placeholder="main / tag / commit" /></label></div><label>Git URL<input required value={gitUrl} onChange={(event) => setGitUrl(event.target.value)} placeholder="https://git.company.local/team/service.git" /></label><label>Целевой индекс<select value={target} onChange={(event) => setTarget(event.target.value)}>{indexes.map((index) => <option key={index.id} value={index.id}>{index.name}</option>)}<option value="__new__">＋ Создать новый индекс</option></select></label>{target === "__new__" && <label>Название нового индекса<input value={indexName} onChange={(event) => setIndexName(event.target.value)} placeholder={name || "System knowledge"} /></label>}<div className="flow-preview"><span>Git checkout</span><i>→</i><span>исходники</span><i>→</i><span>Service map</span><i>＋</i><span>RAG из openspec</span></div>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary">Подключить и индексировать</button></div></form></Modal>;
 }
 
 function ToolForm({ password, indexes, tool, onClose, onSaved }: { password: string; indexes: RagIndex[]; tool: ManagedTool | null; onClose: () => void; onSaved: () => void }) {

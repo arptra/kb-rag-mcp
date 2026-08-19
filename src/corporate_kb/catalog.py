@@ -22,10 +22,10 @@ from corporate_kb.service import KnowledgeIndexMissingError, KnowledgeService
 from corporate_kb.usage import UsageTracker
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.models import GraphSnapshot
-from gigacode_graph.scanner import RepositoryScanner
 from gigacode_graph.service import GraphService
 from gigacode_graph.sources import RepositorySourceManager, RepositorySpec
 from gigacode_graph.store import JsonGraphStore
+from service_map import JsonServiceMapStore, RepositoryInput, ServiceMapBuilder, ServiceMapSnapshot
 
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SUPPORTED_DOCUMENT_SUFFIXES = {".md", ".markdown", ".html", ".htm", ".txt"}
@@ -75,7 +75,7 @@ class RepositorySource(CatalogModel):
     ref: str | None = None
     index_id: str
     checkout_path: str
-    openspec_path: str
+    openspec_path: str | None = None
     commit: str | None = None
     document_count: int = 0
     synced_at: datetime = Field(default_factory=_now)
@@ -119,8 +119,22 @@ class RagCatalog:
         self._tools: dict[str, KnowledgeTools] = {"default": default_tools}
         self._jobs: dict[str, CatalogJob] = {item.id: item for item in self._state.jobs}
         self._graph_store = JsonGraphStore(settings.graph_store_path)
+        self._service_map_store = JsonServiceMapStore(settings.service_map_path)
         if not settings.graph_store_path.is_file():
             self._graph_store.save(GraphSnapshot())
+        self._graph_service = GraphService(self._graph_store)
+        if not settings.service_map_path.is_file():
+            try:
+                repositories = self._repository_inputs(self._state.repositories)
+                existing_graph = self._graph_store.load()
+                result = ServiceMapBuilder(self._graph_settings()).from_graph(
+                    existing_graph,
+                    repositories,
+                )
+                self._service_map_store.save(result.service_map)
+            except Exception:
+                logger.exception("Could not initialize the service map from the stored graph")
+                self._service_map_store.save(ServiceMapSnapshot())
         self._ensure_default_index()
         self._load_managed_services()
         self._recover_interrupted_jobs()
@@ -234,10 +248,10 @@ class RagCatalog:
         return job
 
     def graph_overview(self) -> dict[str, Any]:
-        return GraphService(self._graph_store).overview()
+        return self._graph_service.overview()
 
     def graph(self, *, view: str, service: str | None, depth: int, limit: int) -> dict[str, Any]:
-        return GraphService(self._graph_store).graph(
+        return self._graph_service.graph(
             view=view,
             service=service,
             depth=depth,
@@ -245,7 +259,13 @@ class RagCatalog:
         )
 
     def graph_evidence(self, evidence_ids: list[str]) -> dict[str, Any]:
-        return GraphService(self._graph_store).evidence(evidence_ids)
+        return self._graph_service.evidence(evidence_ids)
+
+    def service_map_overview(self) -> dict[str, object]:
+        return self._service_map_store.load().overview()
+
+    def service_map(self) -> dict[str, Any]:
+        return self._service_map_store.load().model_dump(mode="json")
 
     def _run_index_job(self, job_id: str, index_id: str) -> None:
         try:
@@ -319,7 +339,7 @@ class RagCatalog:
             )
             checkout = paths[0]
             ingestion = records[0]
-            self._update_job(job_id, message="Reading OpenSpec documents")
+            self._update_job(job_id, message="Reading OpenSpec and source interfaces")
             openspec = self._find_openspec(checkout)
             repository_id = self._repository_id(name, git_url, ref, index_id)
             document_count = self._sync_openspec(
@@ -336,7 +356,7 @@ class RagCatalog:
                 ref=ref,
                 index_id=index_id,
                 checkout_path=str(checkout),
-                openspec_path=str(openspec),
+                openspec_path=str(openspec) if openspec else None,
                 commit=ingestion.commit,
                 document_count=document_count,
             )
@@ -417,32 +437,25 @@ class RagCatalog:
     def _build_graph(self) -> GraphSnapshot:
         with self._lock:
             repositories = [item.model_copy(deep=True) for item in self._state.repositories]
-            paths = sorted({Path(item.checkout_path).resolve() for item in repositories})
-        snapshot = (
-            RepositoryScanner(self._graph_settings()).scan(paths) if paths else GraphSnapshot()
-        )
-        names_by_path = {
-            str(Path(item.checkout_path).resolve()): item.name for item in repositories
-        }
-        snapshot.nodes = [
-            node.model_copy(
-                update={
-                    "label": names_by_path.get(str(node.metadata.get("path")), node.label),
-                    "metadata": {
-                        **node.metadata,
-                        "catalog_name": names_by_path.get(str(node.metadata.get("path"))),
-                    },
-                }
-            )
-            if node.type in {"Repository", "Service"}
-            and names_by_path.get(str(node.metadata.get("path")))
-            else node
-            for node in snapshot.nodes
-        ]
-        self._graph_store.save(snapshot)
-        return snapshot
+        inputs = self._repository_inputs(repositories)
+        result = ServiceMapBuilder(self._graph_settings()).build(inputs)
+        self._service_map_store.save(result.service_map)
+        self._graph_store.save(result.graph)
+        return result.graph
 
-    def _find_openspec(self, checkout: Path) -> Path:
+    @staticmethod
+    def _repository_inputs(repositories: list[RepositorySource]) -> list[RepositoryInput]:
+        return [
+            RepositoryInput(
+                path=Path(item.checkout_path),
+                name=item.name,
+                source_url=item.git_url,
+                commit=item.commit,
+            )
+            for item in repositories
+        ]
+
+    def _find_openspec(self, checkout: Path) -> Path | None:
         direct = checkout / "openspec"
         if direct.is_dir() and not direct.is_symlink():
             return direct.resolve()
@@ -462,29 +475,30 @@ class RagCatalog:
             if matches:
                 break
         if not matches:
-            raise ValueError("Repository does not contain an openspec directory")
+            return None
         return sorted(matches, key=lambda item: (len(item.parts), str(item)))[0]
 
-    def _sync_openspec(self, *, source: Path, destination: Path) -> int:
-        source = source.resolve()
+    def _sync_openspec(self, *, source: Path | None, destination: Path) -> int:
+        source = source.resolve() if source else None
         files: list[Path] = []
-        for current, directories, names in os.walk(source, followlinks=False):
-            root = Path(current)
-            directories[:] = [
-                item
-                for item in directories
-                if not item.startswith(".") and not (root / item).is_symlink()
-            ]
-            for name in names:
-                path = root / name
-                if (
-                    not name.startswith(".")
-                    and path.is_file()
-                    and not path.is_symlink()
-                    and path.suffix.lower() in _SUPPORTED_DOCUMENT_SUFFIXES
-                    and path.resolve().is_relative_to(source)
-                ):
-                    files.append(path)
+        if source is not None:
+            for current, directories, names in os.walk(source, followlinks=False):
+                root = Path(current)
+                directories[:] = [
+                    item
+                    for item in directories
+                    if not item.startswith(".") and not (root / item).is_symlink()
+                ]
+                for name in names:
+                    path = root / name
+                    if (
+                        not name.startswith(".")
+                        and path.is_file()
+                        and not path.is_symlink()
+                        and path.suffix.lower() in _SUPPORTED_DOCUMENT_SUFFIXES
+                        and path.resolve().is_relative_to(source)
+                    ):
+                        files.append(path)
         if len(files) > self.settings.repository_max_files:
             raise ValueError(
                 f"OpenSpec contains {len(files)} documents; maximum is "
@@ -494,6 +508,7 @@ class RagCatalog:
         temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent))
         try:
             for path in files:
+                assert source is not None
                 relative = path.relative_to(source)
                 target = temporary / relative
                 target.parent.mkdir(parents=True, exist_ok=True)

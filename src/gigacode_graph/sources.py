@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -266,22 +267,64 @@ class RepositorySourceManager:
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment["GCM_INTERACTIVE"] = "Never"
+        environment["GIT_ASKPASS"] = shutil.which("false") or "false"
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 ["git", *arguments],
                 cwd=cwd,
-                check=False,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=self.settings.git_timeout_seconds,
                 env=environment,
+                start_new_session=os.name != "nt",
+                creationflags=(
+                    int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                    if os.name == "nt"
+                    else 0
+                ),
             )
         except FileNotFoundError as exc:
             raise RuntimeError("git executable is required for Git URL ingestion") from exc
+        try:
+            stdout, stderr = process.communicate(timeout=self.settings.git_timeout_seconds)
         except subprocess.TimeoutExpired as exc:
+            self._terminate_process_tree(process)
             raise RuntimeError(f"Git operation timed out for {source}") from exc
+        except BaseException:
+            self._terminate_process_tree(process)
+            raise
+        result = subprocess.CompletedProcess(
+            process.args,
+            process.returncode,
+            stdout,
+            stderr,
+        )
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "git command failed").strip()
             message = message.replace(source, "<repository-url>")
             raise RuntimeError(f"Git operation failed for {source}: {message}")
         return result
+
+    @staticmethod
+    def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+        """Stop Git and credential/transport children so timeout never leaks a process."""
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=2)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass

@@ -22,7 +22,7 @@ export interface RepositorySource {
   ref: string | null;
   index_id: string;
   checkout_path: string;
-  openspec_path: string;
+  openspec_path: string | null;
   commit: string | null;
   document_count: number;
   synced_at: string;
@@ -112,6 +112,27 @@ export interface Overview {
   mcp_servers: McpServers;
   catalog: Catalog;
   graph: GraphOverview;
+  service_map: ServiceMapOverview;
+}
+
+export interface ServiceMapOverview {
+  schema_version: number;
+  generated_at: string;
+  service_count: number;
+  entrypoint_count: number;
+  outbound_interface_count: number;
+  dependency_count: number;
+  unresolved_dependency_count: number;
+  evidence_count: number;
+  issue_count: number;
+  services: Array<{
+    id: string;
+    name: string;
+    repository: string;
+    owner: string | null;
+    entrypoint_count: number;
+    outbound_interface_count: number;
+  }>;
 }
 
 export interface GraphNode {
