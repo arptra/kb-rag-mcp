@@ -55,3 +55,36 @@ def test_catalog_creates_index_and_imports_local_openspec(settings_factory, tmp_
     result = catalog.tools_for(index.id).search(query="payment limits", top_k=1)
     assert result["results"][0]["source_path"].endswith("openspec/current/limits.md")
     assert catalog.graph_overview()["node_count"] >= 2
+    assert {item["label"] for item in catalog.graph_overview()["services"]} == {
+        "payments-service"
+    }
+
+    reloaded = RagCatalog(settings, default_service, default_tools, usage)
+    restored_job = next(item for item in reloaded.payload()["jobs"] if item["id"] == job.id)
+    assert restored_job["status"] == "completed"
+
+
+def test_catalog_marks_interrupted_jobs_failed_after_restart(settings_factory) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    default_tools = KnowledgeTools(default_service, usage=usage)
+    catalog = RagCatalog(settings, default_service, default_tools, usage)
+    index = catalog.create_index(name="Interrupted index")
+    job = catalog._new_job("repository", index_id=index.id, message="Repository import queued")
+    catalog._update_index(index.id, status="indexing")
+    catalog._update_job(job.id, status="running", message="Cloning repository")
+
+    reloaded = RagCatalog(settings, default_service, default_tools, usage)
+    restored_job = next(item for item in reloaded.payload()["jobs"] if item["id"] == job.id)
+    restored_index = next(
+        item for item in reloaded.payload()["indexes"] if item["id"] == index.id
+    )
+    assert restored_job["status"] == "failed"
+    assert restored_job["message"] == "Interrupted by server restart"
+    assert restored_index["status"] == "error"

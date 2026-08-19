@@ -257,8 +257,8 @@ class RepositorySourceManager:
         result = self._git(arguments, cwd=cwd, source=source)
         return result.stdout.strip()
 
-    @staticmethod
     def _git(
+        self,
         arguments: list[str],
         *,
         cwd: Path,
@@ -273,7 +273,7 @@ class RepositorySourceManager:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=self.settings.git_timeout_seconds,
                 env=environment,
             )
         except FileNotFoundError as exc:

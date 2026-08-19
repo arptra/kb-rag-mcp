@@ -13,6 +13,7 @@ import type {
   GraphOverview,
   GraphPayload,
   ManagedTool,
+  McpServer,
   Overview,
   Page,
   RagIndex,
@@ -21,6 +22,8 @@ import type {
 const NAV: Array<{ id: Page; label: string; mark: string }> = [
   { id: "overview", label: "Обзор", mark: "◫" },
   { id: "indexes", label: "Индексы", mark: "◇" },
+  { id: "services", label: "Сервисы", mark: "▦" },
+  { id: "servers", label: "MCP servers", mark: "◉" },
   { id: "tools", label: "MCP tools", mark: "⌁" },
   { id: "graph", label: "Граф системы", mark: "⌘" },
 ];
@@ -54,9 +57,16 @@ function short(value: string, limit = 48): string {
 }
 
 function Status({ value }: { value: string }) {
+  const labels: Record<string, string> = {
+    ready: "готов",
+    completed: "готов",
+    online: "в сети",
+    offline: "не в сети",
+    unchecked: "не проверен",
+  };
   return (
     <span className={`status status-${value}`}>
-      <span /> {value === "ready" || value === "completed" ? "готов" : value}
+      <span /> {labels[value] || value}
     </span>
   );
 }
@@ -137,6 +147,7 @@ export default function App() {
   const [indexModal, setIndexModal] = useState(false);
   const [repositoryModal, setRepositoryModal] = useState(false);
   const [toolModal, setToolModal] = useState<ManagedTool | "new" | null>(null);
+  const [serverModal, setServerModal] = useState(false);
   const [booting, setBooting] = useState(true);
   const [accessDenied, setAccessDenied] = useState(false);
 
@@ -162,11 +173,13 @@ export default function App() {
   }, [password]);
 
   useEffect(() => void load(), [load]);
+  const hasActiveJobs = Boolean(
+    overview?.catalog.jobs.some((job) => ["queued", "running"].includes(job.status)),
+  );
   useEffect(() => {
-    if (!overview?.catalog.jobs.some((job) => ["queued", "running"].includes(job.status))) return;
-    const timer = window.setInterval(load, 2200);
+    const timer = window.setInterval(load, hasActiveJobs ? 1500 : 10000);
     return () => window.clearInterval(timer);
-  }, [overview, load]);
+  }, [hasActiveJobs, load]);
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(""), 3600);
@@ -218,7 +231,9 @@ export default function App() {
           {NAV.map((item) => (
             <button key={item.id} className={page === item.id ? "active" : ""} onClick={() => setPage(item.id)}>
               <span className="nav-mark">{item.mark}</span>{item.label}
-              {item.id === "tools" && <em>{overview.managed_tools.tool_count}</em>}
+              {item.id === "services" && <em>{Math.max(overview.graph.services.length, overview.catalog.repository_count)}</em>}
+              {item.id === "servers" && <em>{overview.mcp_servers.server_count}</em>}
+              {item.id === "tools" && <em>{overview.managed_tools.tool_count + 7}</em>}
             </button>
           ))}
         </nav>
@@ -244,6 +259,7 @@ export default function App() {
           <div className="top-actions">
             <button className="button quiet" onClick={() => void load()} disabled={loading}>↻ Обновить</button>
             {page === "indexes" && <button className="button primary" onClick={() => setRepositoryModal(true)}>＋ Подключить репозиторий</button>}
+            {page === "servers" && <button className="button primary" onClick={() => setServerModal(true)}>＋ Добавить MCP server</button>}
             {page === "tools" && <button className="button primary" onClick={() => setToolModal("new")}>＋ Новый MCP tool</button>}
           </div>
         </header>
@@ -258,6 +274,12 @@ export default function App() {
               onRepository={() => setRepositoryModal(true)}
               onAction={action}
             />
+          )}
+          {page === "services" && (
+            <ServicesPage data={overview} onGraph={() => setPage("graph")} />
+          )}
+          {page === "servers" && (
+            <ServersPage data={overview} password={password} onAction={action} />
           )}
           {page === "tools" && (
             <ToolsPage
@@ -303,6 +325,17 @@ export default function App() {
           onSaved={() => {
             setToolModal(null);
             setToast("MCP tool сохранён");
+            void load();
+          }}
+        />
+      )}
+      {serverModal && (
+        <ServerForm
+          password={password}
+          onClose={() => setServerModal(false)}
+          onSaved={() => {
+            setServerModal(false);
+            setToast("MCP server добавлен и проверен");
             void load();
           }}
         />
@@ -425,6 +458,183 @@ function IndexesPage({ data, password, onCreate, onRepository, onAction }: {
   );
 }
 
+function ServicesPage({ data, onGraph }: { data: Overview; onGraph: () => void }) {
+  const indexNames = Object.fromEntries(
+    data.catalog.indexes.map((index) => [index.id, index.name]),
+  );
+  const graphByCatalogName = new Map(
+    data.graph.services
+      .filter((service) => service.catalog_name)
+      .map((service) => [service.catalog_name as string, service]),
+  );
+  const repositoryNames = new Set(data.catalog.repositories.map((repository) => repository.name));
+  const standaloneGraphServices = data.graph.services.filter(
+    (service) => !service.catalog_name || !repositoryNames.has(service.catalog_name),
+  );
+
+  return (
+    <>
+      <div className="section-intro">
+        <div>
+          <span className="eyebrow">Repository-derived inventory</span>
+          <h2>Сервисы системы</h2>
+          <p>Репозиторий появляется здесь после чтения OpenSpec. После анализа исходников карточка связывается с узлом системного графа.</p>
+        </div>
+        <div className="server-summary">
+          <span><b>{data.catalog.repositories.length}</b> репозиториев</span>
+          <span><b>{data.graph.services.length}</b> в графе</span>
+          <span><b>{data.graph.issue_count}</b> замечаний</span>
+        </div>
+      </div>
+
+      {data.catalog.repositories.length || standaloneGraphServices.length ? (
+        <div className="service-grid">
+          {data.catalog.repositories.map((repository) => {
+            const graphService = graphByCatalogName.get(repository.name);
+            const activeJob = data.catalog.jobs.find(
+              (job) => job.index_id === repository.index_id
+                && ["queued", "running"].includes(job.status),
+            );
+            return (
+              <article className="service-card" key={repository.id}>
+                <header>
+                  <span className="service-mark">S</span>
+                  <Status value={graphService ? "ready" : activeJob ? "running" : "empty"} />
+                </header>
+                <span className="eyebrow">{graphService ? "Graph connected" : "Awaiting graph"}</span>
+                <h3>{repository.name}</h3>
+                <code>{graphService?.service_id || repository.commit?.slice(0, 12) || "service pending"}</code>
+                <dl>
+                  <div><dt>Индекс</dt><dd>{indexNames[repository.index_id] || repository.index_id}</dd></div>
+                  <div><dt>OpenSpec</dt><dd>{number(repository.document_count)} документов</dd></div>
+                  <div><dt>Синхронизация</dt><dd>{relativeDate(repository.synced_at)}</dd></div>
+                </dl>
+                <footer><span>{graphService?.owner || "Владелец не определён"}</span><button onClick={onGraph}>Открыть граф →</button></footer>
+              </article>
+            );
+          })}
+          {standaloneGraphServices.map((service) => (
+            <article className="service-card" key={service.id}>
+              <header><span className="service-mark">S</span><Status value="ready" /></header>
+              <span className="eyebrow">Graph discovered</span>
+              <h3>{service.label}</h3>
+              <code>{service.service_id}</code>
+              <dl><div><dt>Репозиторий</dt><dd>{service.repository || "—"}</dd></div></dl>
+              <footer><span>{service.owner || "Владелец не определён"}</span><button onClick={onGraph}>Открыть граф →</button></footer>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <div className="empty-state services-empty"><div>▦</div><h3>Сервисов пока нет</h3><p>Подключите Git-репозиторий. Сервис появится после чтения каталога openspec.</p></div>
+      )}
+    </>
+  );
+}
+
+function ServersPage({ data, password, onAction }: {
+  data: Overview;
+  password: string;
+  onAction: (run: () => Promise<unknown>, message: string) => Promise<void>;
+}) {
+  const [expanded, setExpanded] = useState<string | null>("local");
+  const servers = data.mcp_servers.servers;
+  const totalTools = servers.reduce((sum, server) => sum + server.tool_count, 0);
+
+  return (
+    <>
+      <div className="section-intro">
+        <div>
+          <span className="eyebrow">MCP topology</span>
+          <h2>Подключённые MCP-серверы</h2>
+          <p>Здесь виден локальный RAG MCP endpoint и внешние Streamable HTTP серверы. Проверка выполняет настоящее MCP discovery и сохраняет найденные tools.</p>
+        </div>
+        <div className="server-summary">
+          <span><b>{data.mcp_servers.online_count}</b> в сети</span>
+          <span><b>{data.mcp_servers.server_count}</b> всего</span>
+          <span><b>{totalTools}</b> tools</span>
+        </div>
+      </div>
+
+      <div className="server-grid">
+        {servers.map((server) => (
+          <ServerCard
+            key={server.id}
+            server={server}
+            expanded={expanded === server.id}
+            onToggle={() => setExpanded((current) => current === server.id ? null : server.id)}
+            onCheck={() => void onAction(
+              () => post("/admin/api/mcp-servers/check", password, { id: server.id }),
+              `${server.name}: discovery завершён`,
+            )}
+            onDelete={() => {
+              if (!window.confirm(`Удалить MCP server «${server.name}» из реестра?`)) return;
+              void onAction(
+                () => post("/admin/api/mcp-servers/delete", password, { id: server.id }),
+                "MCP server удалён",
+              );
+            }}
+          />
+        ))}
+      </div>
+
+      <div className="server-note">
+        <span>i</span>
+        <p>Реестр хранит только адреса серверов. Секреты в URL не сохраняются; для защищённого endpoint используйте клиентский proxy.</p>
+      </div>
+    </>
+  );
+}
+
+function ServerCard({ server, expanded, onToggle, onCheck, onDelete }: {
+  server: McpServer;
+  expanded: boolean;
+  onToggle: () => void;
+  onCheck: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <article className={`server-card ${server.kind === "local" ? "local" : ""}`}>
+      <header>
+        <div className="server-mark">{server.kind === "local" ? "R" : "M"}</div>
+        <div className="grow">
+          <div className="server-title"><h3>{server.name}</h3><span className="tag">{server.kind === "local" ? "LOCAL" : "EXTERNAL"}</span></div>
+          <code title={server.url}>{server.url}</code>
+        </div>
+        <Status value={server.status} />
+      </header>
+
+      <div className="server-facts">
+        <span><b>{server.tool_count}</b> MCP tools</span>
+        <span><b>HTTP</b> transport</span>
+        <span><b>{relativeDate(server.checked_at)}</b> проверка</span>
+      </div>
+
+      {server.error && <div className="server-error">{server.error}</div>}
+
+      {expanded && (
+        <div className="server-tools">
+          <div className="server-tools-head"><span>DISCOVERED TOOLS</span><b>{server.tool_count}</b></div>
+          {server.tools.length ? server.tools.map((tool) => (
+            <div className="server-tool-row" key={tool.name}>
+              <span className="tool-dot">⌁</span>
+              <div className="grow"><code>{tool.name}</code><small>{tool.description || "Описание не предоставлено сервером"}</small></div>
+              {tool.kind && <span className={`tag ${tool.kind === "managed" ? "managed" : ""}`}>{tool.kind}</span>}
+            </div>
+          )) : <div className="empty-tools">Tools не найдены. Запустите проверку endpoint.</div>}
+        </div>
+      )}
+
+      <footer>
+        <button onClick={onToggle}>{expanded ? "Скрыть tools" : "Показать tools"} {expanded ? "↑" : "↓"}</button>
+        <div>
+          <button onClick={onCheck}>↻ Проверить</button>
+          {server.deletable && <button className="danger" onClick={onDelete}>Удалить</button>}
+        </div>
+      </footer>
+    </article>
+  );
+}
+
 function ToolsPage({ data, password, onEdit, onAction }: {
   data: Overview;
   password: string;
@@ -465,6 +675,36 @@ function IndexForm({ password, onClose, onSaved }: { password: string; onClose: 
     catch (caught) { setError(caught instanceof Error ? caught.message : "Не удалось создать индекс"); }
   };
   return <Modal title="Новый индекс" onClose={onClose}><form className="modal-form" onSubmit={submit}><label>Название<input required minLength={2} value={name} onChange={(event) => setName(event.target.value)} placeholder="Architecture decisions" /></label><label>Описание<textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Какой слой знаний хранится в этом индексе" /></label><div className="callout">Индекс создаётся пустым. Добавьте Git/OpenSpec-источник или загрузите документы через API.</div>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary">Создать индекс</button></div></form></Modal>;
+}
+
+function ServerForm({ password, onClose, onSaved }: { password: string; onClose: () => void; onSaved: () => void }) {
+  const [name, setName] = useState("");
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      await post("/admin/api/mcp-servers", password, { name, url });
+      onSaved();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось добавить MCP server");
+      setSaving(false);
+    }
+  };
+  return (
+    <Modal title="Добавить MCP server" onClose={onClose}>
+      <form className="modal-form" onSubmit={submit}>
+        <label>Название<input required minLength={2} value={name} onChange={(event) => setName(event.target.value)} placeholder="architecture-mcp" /></label>
+        <label>Streamable HTTP endpoint<input required type="url" value={url} onChange={(event) => setUrl(event.target.value)} placeholder="http://127.0.0.1:9000/mcp" /><small>Укажите полный URL MCP endpoint, включая путь `/mcp`.</small></label>
+        <div className="flow-preview"><span>RAG Control Plane</span><i>→</i><span>MCP initialize</span><i>→</i><span>tools/list</span></div>
+        <div className="callout">После сохранения сервер сразу проверяется. Даже недоступный endpoint останется в реестре со статусом «не в сети».</div>
+        {error && <div className="form-error">{error}</div>}
+        <div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary" disabled={saving}>{saving ? "Проверяем…" : "Добавить и проверить"}</button></div>
+      </form>
+    </Modal>
+  );
 }
 
 function RepositoryForm({ password, indexes, onClose, onSaved }: { password: string; indexes: RagIndex[]; onClose: () => void; onSaved: () => void }) {

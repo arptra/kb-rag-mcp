@@ -73,6 +73,7 @@ class GraphService:
                 "label": node.label,
                 "owner": node.metadata.get("owner"),
                 "repository": node.metadata.get("repository"),
+                "catalog_name": node.metadata.get("catalog_name"),
             }
             for node in self._snapshot.nodes
             if node.type == "Service"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from corporate_kb.mcp.http_server import (
     create_http_app,
     validate_http_settings,
 )
+from corporate_kb.mcp.servers import McpServerRegistry
 from corporate_kb.service import KnowledgeService
 
 TOKEN = "test-token-that-is-at-least-32-characters-long"
@@ -90,6 +92,15 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
         overview = await client.get("/admin/api/overview")
         assert overview.status_code == 200
         assert overview.json()["index"]["document_count"] == 1
+        local_server = overview.json()["mcp_servers"]["servers"][0]
+        assert local_server["name"] == "corporate-knowledge"
+        assert local_server["status"] == "online"
+        assert local_server["url"] == "http://testserver/mcp"
+        assert {tool["name"] for tool in local_server["tools"]} >= {
+            "kb_search",
+            "kb_get_document",
+            "kb_stats",
+        }
 
         async with streamable_http_client(
             "http://testserver/mcp",
@@ -100,6 +111,54 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
             await session.initialize()
             listed = await session.list_tools()
             assert "kb_search" in {tool.name for tool in listed.tools}
+
+
+@pytest.mark.asyncio
+async def test_admin_registers_checks_and_deletes_external_mcp_servers(
+    settings_factory,
+    monkeypatch,
+) -> None:
+    async def fake_probe(self: McpServerRegistry, server_id: str):
+        return self.update_probe(
+            server_id,
+            status="online",
+            tools=[{"name": "remote_search", "description": "Search a remote index."}],
+            error=None,
+        )
+
+    monkeypatch.setattr(McpServerRegistry, "probe", fake_probe)
+    service, settings = _indexed_service(settings_factory, protected=False)
+    app = create_http_app(service, settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
+    ):
+        created = await client.post(
+            "/admin/api/mcp-servers",
+            json={"name": "Remote docs", "url": "http://mcp.example.test/mcp"},
+        )
+        assert created.status_code == 201
+        assert created.json()["status"] == "online"
+        server_id = created.json()["id"]
+
+        listing = (await client.get("/admin/api/mcp-servers")).json()
+        assert listing["server_count"] == 2
+        assert listing["online_count"] == 2
+        assert listing["servers"][1]["tools"][0]["name"] == "remote_search"
+
+        local_delete = await client.post(
+            "/admin/api/mcp-servers/delete",
+            json={"id": "local"},
+        )
+        assert local_delete.status_code == 400
+        deleted = await client.post(
+            "/admin/api/mcp-servers/delete",
+            json={"id": server_id},
+        )
+        assert deleted.status_code == 200
+        assert (await client.get("/admin/api/mcp-servers")).json()["server_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -290,6 +349,23 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
         "# System state\n\npayments-service delegates limits to limits-service.",
         encoding="utf-8",
     )
+    subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "rag-control-plane@example.test"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "RAG Control Plane Test"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(["git", "add", "openspec/system.md"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "--quiet", "-m", "Add OpenSpec"],
+        cwd=repository,
+        check=True,
+    )
     app = create_http_app(service, settings)
     transport = httpx.ASGITransport(app=app)
     admin_headers = {"X-KB-Admin-Password": ADMIN_PASSWORD}
@@ -301,22 +377,23 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
         created = await client.post(
             "/admin/api/indexes",
             headers=admin_headers,
-            json={"name": "System OpenSpec", "description": "Current repository state"},
+            json={"name": "Unused manual index", "description": "Manual index API check"},
         )
         assert created.status_code == 201
-        index_id = created.json()["id"]
 
         queued = await client.post(
             "/admin/api/repositories",
             headers=admin_headers,
             json={
                 "name": "payments-service",
-                "git_url": str(repository),
-                "index_id": index_id,
+                "git_url": repository.as_uri(),
+                "index_id": None,
+                "index_name": "System OpenSpec",
             },
         )
         assert queued.status_code == 202
         job_id = queued.json()["id"]
+        index_id = queued.json()["index_id"]
         for _ in range(200):
             catalog = (
                 await client.get("/admin/api/catalog", headers=admin_headers)
@@ -326,6 +403,14 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
                 break
             await asyncio.sleep(0.01)
         assert job["status"] == "completed"
+        imported_index = next(item for item in catalog["indexes"] if item["id"] == index_id)
+        assert imported_index["name"] == "System OpenSpec"
+        assert imported_index["status"] == "ready"
+        imported_repository = next(
+            item for item in catalog["repositories"] if item["name"] == "payments-service"
+        )
+        assert imported_repository["checkout_path"] != str(repository)
+        assert imported_repository["commit"]
 
         definition = {
             "name": "kb_search_system_state",
@@ -361,3 +446,6 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
         graph = await client.get("/admin/api/graph/overview", headers=admin_headers)
         assert graph.status_code == 200
         assert graph.json()["node_count"] >= 2
+        assert {service["label"] for service in graph.json()["services"]} == {
+            "payments-service"
+        }

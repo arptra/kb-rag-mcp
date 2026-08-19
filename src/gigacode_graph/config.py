@@ -23,6 +23,7 @@ class GraphSettings(BaseSettings):
     ingestion_path: Path = Path(".cache/gigacode-graph/ingestion.json")
     max_java_file_bytes: int = Field(default=2_000_000, ge=10_000, le=20_000_000)
     call_depth: int = Field(default=6, ge=1, le=20)
+    git_timeout_seconds: int = Field(default=180, ge=10, le=1800)
     http_host: str = "127.0.0.1"
     http_port: int = Field(default=8077, ge=1, le=65535)
     mcp_path: str = "/mcp"

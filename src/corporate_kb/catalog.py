@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -28,6 +29,7 @@ from gigacode_graph.store import JsonGraphStore
 
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SUPPORTED_DOCUMENT_SUFFIXES = {".md", ".markdown", ".html", ".htm", ".txt"}
+logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
@@ -94,6 +96,7 @@ class CatalogState(CatalogModel):
     schema_version: int = 1
     indexes: list[RagIndex] = Field(default_factory=list)
     repositories: list[RepositorySource] = Field(default_factory=list)
+    jobs: list[CatalogJob] = Field(default_factory=list)
 
 
 class RagCatalog:
@@ -114,12 +117,13 @@ class RagCatalog:
         self._state = self._load()
         self._services: dict[str, KnowledgeService] = {"default": default_service}
         self._tools: dict[str, KnowledgeTools] = {"default": default_tools}
-        self._jobs: dict[str, CatalogJob] = {}
+        self._jobs: dict[str, CatalogJob] = {item.id: item for item in self._state.jobs}
         self._graph_store = JsonGraphStore(settings.graph_store_path)
         if not settings.graph_store_path.is_file():
             self._graph_store.save(GraphSnapshot())
         self._ensure_default_index()
         self._load_managed_services()
+        self._recover_interrupted_jobs()
 
     def payload(self) -> dict[str, Any]:
         with self._lock:
@@ -204,6 +208,9 @@ class RagCatalog:
         clean_name = name.strip()
         if len(clean_name) < 2:
             raise ValueError("Repository name must contain at least two characters")
+        clean_url = git_url.strip()
+        if not clean_url:
+            raise ValueError("Git URL must not be empty")
         target_id = index_id
         if target_id is None:
             created = self.create_index(name=index_name or clean_name)
@@ -216,7 +223,7 @@ class RagCatalog:
         )
         threading.Thread(
             target=self._run_repository_job,
-            args=(job.id, clean_name, git_url.strip(), ref.strip() if ref else None, target_id),
+            args=(job.id, clean_name, clean_url, ref.strip() if ref else None, target_id),
             daemon=True,
         ).start()
         return job
@@ -241,8 +248,11 @@ class RagCatalog:
         return GraphService(self._graph_store).evidence(evidence_ids)
 
     def _run_index_job(self, job_id: str, index_id: str) -> None:
-        with self._work_lock:
-            self._execute_index_job(job_id, index_id)
+        try:
+            with self._work_lock:
+                self._execute_index_job(job_id, index_id)
+        except Exception as exc:
+            self._fail_background_job(job_id, index_id, "Index build failed", exc)
 
     def _execute_index_job(self, job_id: str, index_id: str) -> None:
         self._update_job(job_id, status="running", message="Building embeddings", started_at=_now())
@@ -284,8 +294,11 @@ class RagCatalog:
         ref: str | None,
         index_id: str,
     ) -> None:
-        with self._work_lock:
-            self._execute_repository_job(job_id, name, git_url, ref, index_id)
+        try:
+            with self._work_lock:
+                self._execute_repository_job(job_id, name, git_url, ref, index_id)
+        except Exception as exc:
+            self._fail_background_job(job_id, index_id, "Repository import failed", exc)
 
     def _execute_repository_job(
         self,
@@ -306,6 +319,7 @@ class RagCatalog:
             )
             checkout = paths[0]
             ingestion = records[0]
+            self._update_job(job_id, message="Reading OpenSpec documents")
             openspec = self._find_openspec(checkout)
             repository_id = self._repository_id(name, git_url, ref, index_id)
             document_count = self._sync_openspec(
@@ -333,6 +347,7 @@ class RagCatalog:
                 self._state.repositories.append(repository)
                 self._refresh_source_counts_locked()
                 self._save_locked()
+            self._update_job(job_id, message=f"Building RAG index from {document_count} documents")
             stats = self.service_for(index_id).build_index(
                 force=True,
                 reuse_unchanged=True,
@@ -347,6 +362,7 @@ class RagCatalog:
             )
             graph_note = ""
             try:
+                self._update_job(job_id, message="Building service graph")
                 self._build_graph()
                 graph_note = " and refreshed the system graph"
             except Exception as graph_exc:
@@ -368,8 +384,11 @@ class RagCatalog:
             )
 
     def _run_graph_job(self, job_id: str) -> None:
-        with self._work_lock:
-            self._execute_graph_job(job_id)
+        try:
+            with self._work_lock:
+                self._execute_graph_job(job_id)
+        except Exception as exc:
+            self._fail_background_job(job_id, None, "Graph build failed", exc)
 
     def _execute_graph_job(self, job_id: str) -> None:
         self._update_job(
@@ -397,12 +416,29 @@ class RagCatalog:
 
     def _build_graph(self) -> GraphSnapshot:
         with self._lock:
-            paths = sorted(
-                {Path(item.checkout_path).resolve() for item in self._state.repositories}
-            )
+            repositories = [item.model_copy(deep=True) for item in self._state.repositories]
+            paths = sorted({Path(item.checkout_path).resolve() for item in repositories})
         snapshot = (
             RepositoryScanner(self._graph_settings()).scan(paths) if paths else GraphSnapshot()
         )
+        names_by_path = {
+            str(Path(item.checkout_path).resolve()): item.name for item in repositories
+        }
+        snapshot.nodes = [
+            node.model_copy(
+                update={
+                    "label": names_by_path.get(str(node.metadata.get("path")), node.label),
+                    "metadata": {
+                        **node.metadata,
+                        "catalog_name": names_by_path.get(str(node.metadata.get("path"))),
+                    },
+                }
+            )
+            if node.type in {"Repository", "Service"}
+            and names_by_path.get(str(node.metadata.get("path")))
+            else node
+            for node in snapshot.nodes
+        ]
         self._graph_store.save(snapshot)
         return snapshot
 
@@ -543,12 +579,72 @@ class RagCatalog:
         )
         with self._lock:
             self._jobs[job.id] = job
+            self._save_locked()
         return job.model_copy(deep=True)
 
     def _update_job(self, job_id: str, **values: Any) -> None:
         with self._lock:
             job = self._jobs[job_id]
             self._jobs[job_id] = job.model_copy(update=values)
+            self._save_locked()
+
+    def _fail_background_job(
+        self,
+        job_id: str,
+        index_id: str | None,
+        message: str,
+        exc: Exception,
+    ) -> None:
+        logger.exception("Background catalog job %s failed", job_id, exc_info=exc)
+        error = str(exc) or type(exc).__name__
+        try:
+            if index_id is not None:
+                self._update_index(index_id, status="error", error=error, updated_at=_now())
+            self._update_job(
+                job_id,
+                status="failed",
+                message=message,
+                error=error,
+                completed_at=_now(),
+            )
+        except Exception:
+            logger.exception("Could not persist failure for catalog job %s", job_id)
+
+    def _recover_interrupted_jobs(self) -> None:
+        interrupted = [
+            job for job in self._jobs.values() if job.status in {"queued", "running"}
+        ]
+        if not interrupted:
+            return
+        completed_at = _now()
+        for job in interrupted:
+            self._jobs[job.id] = job.model_copy(
+                update={
+                    "status": "failed",
+                    "message": "Interrupted by server restart",
+                    "error": "The server restarted before this operation completed; run it again.",
+                    "completed_at": completed_at,
+                }
+            )
+            if job.index_id is not None:
+                record = next(
+                    (item for item in self._state.indexes if item.id == job.index_id),
+                    None,
+                )
+                if record is not None and record.status == "indexing":
+                    replacement = record.model_copy(
+                        update={
+                            "status": "error",
+                            "error": "Indexing was interrupted by a server restart",
+                            "updated_at": completed_at,
+                        }
+                    )
+                    self._state.indexes = [
+                        replacement if item.id == record.id else item
+                        for item in self._state.indexes
+                    ]
+        with self._lock:
+            self._save_locked()
 
     def _update_index(self, index_id: str, **values: Any) -> None:
         with self._lock:
@@ -573,6 +669,7 @@ class RagCatalog:
             store_path=self.settings.graph_store_path,
             repository_cache_path=self.settings.repository_cache_dir,
             ingestion_path=self.settings.repository_cache_dir.parent / "graph-ingestion.json",
+            git_timeout_seconds=self.settings.repository_git_timeout_seconds,
         ).resolved()
 
     @staticmethod
@@ -594,6 +691,7 @@ class RagCatalog:
     def _save_locked(self) -> None:
         path = self.settings.index_catalog_path
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._state.jobs = sorted(self._jobs.values(), key=lambda item: item.id)[-100:]
         payload = self._state.model_dump_json(indent=2).encode("utf-8")
         temporary: Path | None = None
         try:

@@ -1,4 +1,4 @@
-export type Page = "overview" | "indexes" | "tools" | "graph";
+export type Page = "overview" | "indexes" | "services" | "servers" | "tools" | "graph";
 
 export interface RagIndex {
   id: string;
@@ -64,6 +64,32 @@ export interface ManagedTool {
   index_ids: string[];
 }
 
+export interface McpServerTool {
+  name: string;
+  description: string;
+  kind?: "built-in" | "managed";
+}
+
+export interface McpServer {
+  id: string;
+  name: string;
+  url: string;
+  transport: "streamable-http";
+  kind: "local" | "external";
+  status: "unchecked" | "online" | "offline";
+  tools: McpServerTool[];
+  tool_count: number;
+  checked_at: string | null;
+  error: string | null;
+  deletable: boolean;
+}
+
+export interface McpServers {
+  server_count: number;
+  online_count: number;
+  servers: McpServer[];
+}
+
 export interface Overview {
   usage: {
     total_calls: number;
@@ -83,6 +109,7 @@ export interface Overview {
     indexed_at: string;
   };
   managed_tools: { tool_count: number; tools: ManagedTool[] };
+  mcp_servers: McpServers;
   catalog: Catalog;
   graph: GraphOverview;
 }
@@ -120,6 +147,13 @@ export interface GraphOverview {
   evidence_count: number;
   issue_count: number;
   nodes_by_type: Record<string, number>;
-  services: Array<{ id: string; label: string; service_id: string }>;
+  services: Array<{
+    id: string;
+    label: string;
+    service_id: string;
+    owner?: string | null;
+    repository?: string | null;
+    catalog_name?: string | null;
+  }>;
   issues: Array<{ repository: string; file: string | null; message: string }>;
 }

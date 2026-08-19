@@ -18,6 +18,11 @@ from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
 from corporate_kb.mcp.managed_tools import ManagedToolDefinition, ManagedToolRegistry
 from corporate_kb.mcp.server import create_mcp_server
+from corporate_kb.mcp.servers import (
+    McpServerDefinition,
+    McpServerRegistry,
+    mcp_servers_payload,
+)
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import (
     KnowledgeService,
@@ -164,6 +169,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         index_tools=catalog.tools_for,
         index_exists=catalog.has_index,
     )
+    mcp_servers = McpServerRegistry(settings.mcp_servers_path)
     admin = AdminController(service, usage)
     server = create_mcp_server(
         service,
@@ -171,6 +177,15 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         knowledge_tools=tools,
         managed_tools=managed_tools,
     )
+
+    def current_mcp_servers(request: Request) -> dict[str, object]:
+        local_url = f"{str(request.base_url).rstrip('/')}{settings.mcp_http_path}"
+        definitions = [item.model_dump(mode="json") for item in managed_tools.list()]
+        return mcp_servers_payload(
+            mcp_servers,
+            local_url=local_url,
+            managed_tools=definitions,
+        )
 
     @server.custom_route("/admin", methods=["GET"], include_in_schema=False)
     async def admin_page(_request: Request) -> Response:
@@ -210,9 +225,75 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         try:
             payload = await asyncio.to_thread(admin.overview)
             payload["managed_tools"] = managed_tools.payload()
+            payload["mcp_servers"] = current_mcp_servers(request)
             payload["catalog"] = catalog.payload()
             payload["graph"] = await asyncio.to_thread(catalog.graph_overview)
             return JSONResponse(payload)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/admin/api/mcp-servers", methods=["GET"], include_in_schema=False)
+    async def admin_mcp_servers(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        return JSONResponse(current_mcp_servers(request))
+
+    @server.custom_route("/admin/api/mcp-servers", methods=["POST"], include_in_schema=False)
+    async def admin_add_mcp_server(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Request body must be a JSON object")
+            name = payload.get("name")
+            url = payload.get("url")
+            if not isinstance(name, str) or not isinstance(url, str):
+                raise ValueError("name and url must be strings")
+            definition = mcp_servers.add(McpServerDefinition(name=name, url=url))
+            checked = await mcp_servers.probe(definition.id)
+            return JSONResponse(checked.payload(), status_code=201)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/mcp-servers/check",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_check_mcp_server(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            server_id = payload.get("id") if isinstance(payload, dict) else None
+            if not isinstance(server_id, str) or not server_id:
+                raise ValueError("id must be a non-empty string")
+            if server_id == "local":
+                local = current_mcp_servers(request)["servers"][0]  # type: ignore[index]
+                return JSONResponse(local)
+            checked = await mcp_servers.probe(server_id)
+            return JSONResponse(checked.payload())
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/mcp-servers/delete",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_delete_mcp_server(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            server_id = payload.get("id") if isinstance(payload, dict) else None
+            if not isinstance(server_id, str) or not server_id:
+                raise ValueError("id must be a non-empty string")
+            if server_id == "local":
+                raise ValueError("The local MCP server cannot be deleted")
+            mcp_servers.delete(server_id)
+            return JSONResponse({"status": "deleted", "id": server_id})
         except Exception as exc:
             return _api_error(exc)
 
