@@ -1,7 +1,0 @@
-spring:
-  datasource:
-    url: jdbc:postgresql://postgres:5432/orders
-    username: orders
-  jpa:
-    hibernate:
-      ddl-auto: validate

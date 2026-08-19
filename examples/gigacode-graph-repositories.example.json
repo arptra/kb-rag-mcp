@@ -1,0 +1,14 @@
+{
+  "repositories": [
+    {
+      "url": "git@gitlab.company.ru:commerce/order-service.git",
+      "ref": "main"
+    },
+    {
+      "url": "https://gitlab.company.ru/warehouse/inventory-service.git"
+    },
+    {
+      "path": "/absolute/local/payment-service"
+    }
+  ]
+}

@@ -158,7 +158,7 @@ qwen
 /mcp
 ```
 
-Сервер `corporate-kb` должен показать шесть инструментов:
+Сервер `corporate-kb` должен показать семь встроенных инструментов:
 
 ```text
 kb_search
@@ -167,6 +167,7 @@ kb_get_chunk
 kb_run_context_benchmark
 kb_list_documents
 kb_stats
+ssot_context
 ```
 
 `kb_search` возвращает короткие выдержки, а не полные страницы Confluence. Если Qwen нужен текст

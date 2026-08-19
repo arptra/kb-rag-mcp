@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -81,6 +81,7 @@ class ManagedToolDefinition(BaseModel):
     description: str = Field(min_length=10, max_length=2000)
     input_schema: dict[str, Any]
     defaults: ManagedToolDefaults = Field(default_factory=ManagedToolDefaults)
+    index_ids: list[str] = Field(default_factory=lambda: ["default"], max_length=20)
 
     @field_validator("name")
     @classmethod
@@ -132,6 +133,16 @@ class ManagedToolDefinition(BaseModel):
             raise ValueError("input_schema.additionalProperties must be false")
         return schema
 
+    @field_validator("index_ids")
+    @classmethod
+    def validate_index_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("index_ids must not contain duplicates")
+        for value in values:
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", value):
+                raise ValueError("index_ids contains an invalid index id")
+        return values
+
 
 class ManagedSearchTool(Tool):
     """FastMCP Tool with a persisted runtime JSON Schema."""
@@ -165,9 +176,18 @@ class ManagedSearchTool(Tool):
 class ManagedToolRegistry:
     """Persist and execute declarative search tools."""
 
-    def __init__(self, path: Path, tools: KnowledgeTools) -> None:
+    def __init__(
+        self,
+        path: Path,
+        tools: KnowledgeTools,
+        *,
+        index_tools: Callable[[str], KnowledgeTools] | None = None,
+        index_exists: Callable[[str], bool] | None = None,
+    ) -> None:
         self._path = path.resolve()
         self._tools = tools
+        self._index_tools = index_tools or self._default_index_tools
+        self._index_exists = index_exists or (lambda index_id: index_id == "default")
         self._lock = Lock()
         self._definitions = self._load()
 
@@ -186,6 +206,11 @@ class ManagedToolRegistry:
         return ManagedSearchTool(definition, self.execute)
 
     def upsert(self, definition: ManagedToolDefinition) -> ManagedToolDefinition:
+        unknown = [
+            index_id for index_id in definition.index_ids if not self._index_exists(index_id)
+        ]
+        if unknown:
+            raise ValueError(f"Unknown RAG indexes: {', '.join(unknown)}")
         with self._lock:
             if definition.name not in self._definitions and len(self._definitions) >= 50:
                 raise ValueError("Managed tool limit reached (50)")
@@ -207,19 +232,62 @@ class ManagedToolRegistry:
             raise KeyError(f"Unknown managed tool: {name}")
         values = self._validated_arguments(definition, arguments)
         defaults = definition.defaults
-        payload = self._tools.search(
-            query=values["query"],
-            top_k=values.get("top_k", defaults.top_k),
-            min_score=values.get("min_score", defaults.min_score),
-            service=values.get("service", defaults.service),
-            domain=values.get("domain", defaults.domain),
-            document_type=values.get("document_type", defaults.document_type),
-            status=values.get("status", defaults.status),
-            authority=values.get("authority", defaults.authority),
-            source_type=values.get("source_type", defaults.source_type),
-        )
+        if not definition.index_ids:
+            raise RuntimeError(f"Managed tool {name} is not bound to a RAG index")
+        top_k = values.get("top_k", defaults.top_k)
+        payloads: list[tuple[str, dict[str, Any]]] = []
+        for index_id in definition.index_ids:
+            payloads.append(
+                (
+                    index_id,
+                    self._index_tools(index_id).search(
+                        query=values["query"],
+                        top_k=top_k,
+                        min_score=values.get("min_score", defaults.min_score),
+                        service=values.get("service", defaults.service),
+                        domain=values.get("domain", defaults.domain),
+                        document_type=values.get("document_type", defaults.document_type),
+                        status=values.get("status", defaults.status),
+                        authority=values.get("authority", defaults.authority),
+                        source_type=values.get("source_type", defaults.source_type),
+                    ),
+                )
+            )
+        payload = self._merge_payloads(values["query"], top_k, payloads)
         self._tools.usage.record(name)
         return payload
+
+    def _default_index_tools(self, index_id: str) -> KnowledgeTools:
+        if index_id != "default":
+            raise KeyError(f"Unknown RAG index: {index_id}")
+        return self._tools
+
+    @staticmethod
+    def _merge_payloads(
+        query: str,
+        top_k: int,
+        payloads: Sequence[tuple[str, dict[str, Any]]],
+    ) -> dict[str, Any]:
+        results: list[dict[str, Any]] = []
+        candidate_count = 0
+        for index_id, payload in payloads:
+            candidate_count += int(payload.get("retrieved_candidate_count", 0))
+            for raw in payload.get("results", []):
+                item = dict(raw)
+                item["index_id"] = index_id
+                results.append(item)
+        results.sort(key=lambda item: (-float(item.get("score", 0.0)), str(item.get("chunk_id"))))
+        selected = results[:top_k]
+        for rank, item in enumerate(selected, start=1):
+            item["rank"] = rank
+        return {
+            "query": query,
+            "result_count": len(selected),
+            "retrieved_candidate_count": candidate_count,
+            "context_token_count": sum(int(item.get("excerpt_tokens", 0)) for item in selected),
+            "index_ids": [index_id for index_id, _payload in payloads],
+            "results": selected,
+        }
 
     @staticmethod
     def _validated_arguments(

@@ -5,16 +5,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+from pathlib import Path
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, TokenVerifier
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.types import ASGIApp
 
 from corporate_kb.admin import AdminController
+from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
-from corporate_kb.mcp.admin_ui import ADMIN_HTML
 from corporate_kb.mcp.managed_tools import ManagedToolDefinition, ManagedToolRegistry
 from corporate_kb.mcp.server import create_mcp_server
 from corporate_kb.mcp.tools import KnowledgeTools
@@ -28,6 +29,7 @@ from corporate_kb.usage import UsageTracker
 
 logger = logging.getLogger(__name__)
 _READ_SCOPE = "kb:read"
+_ADMIN_DIST = Path(__file__).with_name("admin_dist")
 
 
 def _authorized(request: Request, token: str) -> bool:
@@ -157,7 +159,13 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             ssot_stats.chunk_count,
         )
     tools = KnowledgeTools(service, ssot_service=ssot_service, usage=usage)
-    managed_tools = ManagedToolRegistry(settings.managed_tools_path, tools)
+    catalog = RagCatalog(settings, service, tools, usage)
+    managed_tools = ManagedToolRegistry(
+        settings.managed_tools_path,
+        tools,
+        index_tools=catalog.tools_for,
+        index_exists=catalog.has_index,
+    )
     admin = AdminController(service, usage)
     server = create_mcp_server(
         service,
@@ -167,17 +175,35 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
     )
 
     @server.custom_route("/admin", methods=["GET"], include_in_schema=False)
-    async def admin_page(_request: Request) -> HTMLResponse:
-        return HTMLResponse(
-            ADMIN_HTML,
+    async def admin_page(_request: Request) -> Response:
+        index_path = _ADMIN_DIST / "index.html"
+        if not index_path.is_file():
+            return HTMLResponse(
+                "<h1>RAG Control Plane UI is not built</h1><p>Run npm run dashboard:build.</p>",
+                status_code=503,
+            )
+        return FileResponse(
+            index_path,
             headers={
                 "Cache-Control": "no-store",
                 "Content-Security-Policy": (
-                    "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-                    "connect-src 'self'; img-src 'none'; frame-ancestors 'none'"
+                    "default-src 'self'; script-src 'self'; style-src 'self'; "
+                    "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'"
                 ),
             },
         )
+
+    @server.custom_route(
+        "/admin/assets/{asset_path:path}",
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    async def admin_asset(request: Request) -> Response:
+        assets = (_ADMIN_DIST / "assets").resolve()
+        candidate = (assets / request.path_params["asset_path"]).resolve()
+        if not candidate.is_relative_to(assets) or not candidate.is_file():
+            return JSONResponse({"error": "asset not found"}, status_code=404)
+        return FileResponse(candidate, headers={"Cache-Control": "public, max-age=31536000"})
 
     @server.custom_route("/admin/api/overview", methods=["GET"], include_in_schema=False)
     async def admin_overview(request: Request) -> JSONResponse:
@@ -186,6 +212,8 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         try:
             payload = await asyncio.to_thread(admin.overview)
             payload["managed_tools"] = managed_tools.payload()
+            payload["catalog"] = catalog.payload()
+            payload["graph"] = await asyncio.to_thread(catalog.graph_overview)
             return JSONResponse(payload)
         except Exception as exc:
             return _api_error(exc)
@@ -225,6 +253,134 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         except Exception as exc:
             return _api_error(exc)
 
+    @server.custom_route("/admin/api/catalog", methods=["GET"], include_in_schema=False)
+    async def admin_catalog(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        return JSONResponse(catalog.payload())
+
+    @server.custom_route("/admin/api/indexes", methods=["POST"], include_in_schema=False)
+    async def admin_create_index(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Request body must be a JSON object")
+            name = payload.get("name")
+            description = payload.get("description", "")
+            if not isinstance(name, str) or not isinstance(description, str):
+                raise ValueError("name and description must be strings")
+            index = await asyncio.to_thread(
+                catalog.create_index,
+                name=name,
+                description=description,
+            )
+            return JSONResponse(index.model_dump(mode="json"), status_code=201)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/indexes/build",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_build_index(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            index_id = payload.get("index_id") if isinstance(payload, dict) else None
+            if not isinstance(index_id, str) or not index_id:
+                raise ValueError("index_id must be a non-empty string")
+            job = catalog.start_index_build(index_id)
+            return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/repositories",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_add_repository(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Request body must be a JSON object")
+            name = payload.get("name")
+            git_url = payload.get("git_url")
+            index_id = payload.get("index_id")
+            index_name = payload.get("index_name")
+            ref = payload.get("ref")
+            if not isinstance(name, str) or not isinstance(git_url, str):
+                raise ValueError("name and git_url must be strings")
+            if index_id is not None and not isinstance(index_id, str):
+                raise ValueError("index_id must be a string or null")
+            if index_name is not None and not isinstance(index_name, str):
+                raise ValueError("index_name must be a string or null")
+            if ref is not None and not isinstance(ref, str):
+                raise ValueError("ref must be a string or null")
+            job = catalog.start_repository_ingestion(
+                name=name,
+                git_url=git_url,
+                index_id=index_id,
+                index_name=index_name,
+                ref=ref,
+            )
+            return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/graph/rebuild",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_build_graph(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        job = catalog.start_graph_build()
+        return JSONResponse(job.model_dump(mode="json"), status_code=202)
+
+    @server.custom_route("/admin/api/graph/overview", methods=["GET"], include_in_schema=False)
+    async def admin_graph_overview(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            return JSONResponse(await asyncio.to_thread(catalog.graph_overview))
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/admin/api/graph", methods=["GET"], include_in_schema=False)
+    async def admin_graph(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await asyncio.to_thread(
+                catalog.graph,
+                view=_optional_query(request, "view", "services") or "services",
+                service=_optional_query(request, "service"),
+                depth=_integer_query(request, "depth", 1, minimum=0, maximum=10),
+                limit=_integer_query(request, "limit", 3000, minimum=1, maximum=20_000),
+            )
+            return JSONResponse(payload)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/admin/api/graph/evidence", methods=["GET"], include_in_schema=False)
+    async def admin_graph_evidence(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            raw = request.query_params.get("ids", "")
+            ids = [item.strip() for item in raw.split(",") if item.strip()]
+            return JSONResponse(await asyncio.to_thread(catalog.graph_evidence, ids))
+        except Exception as exc:
+            return _api_error(exc)
+
     @server.custom_route("/admin/api/tools", methods=["POST"], include_in_schema=False)
     async def admin_save_tool(request: Request) -> JSONResponse:
         if not _admin_authorized(request, settings):
@@ -234,9 +390,9 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             definition = ManagedToolDefinition.model_validate(payload)
             replacement = managed_tools.create_tool(definition)
             existing = {item.name for item in managed_tools.list()}
+            managed_tools.upsert(definition)
             if definition.name in existing:
                 server.remove_tool(definition.name)
-            managed_tools.upsert(definition)
             server.add_tool(replacement)
             return JSONResponse(definition.model_dump(mode="json"), status_code=201)
         except Exception as exc:
@@ -254,6 +410,23 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             managed_tools.delete(name)
             server.remove_tool(name)
             return JSONResponse({"status": "deleted", "name": name})
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/admin/api/tools/test", methods=["POST"], include_in_schema=False)
+    async def admin_test_tool(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Request body must be a JSON object")
+            name = payload.get("name")
+            query = payload.get("query")
+            if not isinstance(name, str) or not isinstance(query, str):
+                raise ValueError("name and query must be strings")
+            result = await asyncio.to_thread(managed_tools.execute, name, {"query": query})
+            return JSONResponse(result)
         except Exception as exc:
             return _api_error(exc)
 

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "repository-graph": {
+      "command": "/absolute/project/.venv/bin/python",
+      "args": ["-m", "gigacode_graph.mcp_server"],
+      "cwd": "/absolute/project",
+      "env": {
+        "PYTHONPATH": "/absolute/project/src",
+        "GIGACODE_GRAPH_STORE_PATH": "/absolute/project/.cache/gigacode-graph/graph.json"
+      }
+    }
+  }
+}

@@ -1,2 +1,0 @@
-milvus-lite==3.1.0
-pymilvus==3.0.1

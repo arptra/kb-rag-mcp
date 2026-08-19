@@ -232,15 +232,23 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/admin/context-benchmark' \
 http://SERVER_IP:8000/admin
 ```
 
-Панель показывает usage MCP tools, нагрузку относительно числа CPU-ядер, load average за 1/5/15
-минут, пиковую память и uptime процесса, документы и состояние индекса. Через неё можно загрузить
-`.md`, `.markdown`, `.html`, `.htm` или `.txt`, затем запустить фоновую сборку нового индекса.
-Неизменившиеся embeddings переиспользуются, а активный store заменяется только после успешного
-сохранения нового cache.
+React/TypeScript-панель содержит три рабочих раздела:
 
-Декларативные MCP tools остаются доступны через защищённые `/admin/api/tools` и
-`/admin/api/tools/delete`. Новые schemas сохраняются в `KB_MANAGED_TOOLS_PATH`. Подключённому
-прямому MCP-клиенту нужно обновить discovery; однофайловому proxy — перезапустить Qwen.
+- **Индексы** — создание изолированных RAG-индексов, ручная пересборка и фоновые jobs;
+- **MCP tools** — создание безопасных search-tools, настройка фильтров и привязка к одному или
+  нескольким индексам; tool можно временно отвязать от всех индексов;
+- **Граф системы** — service-level или полный граф фактов, извлечённых из исходников.
+
+При подключении репозитория укажите название, Git URL, необязательный branch/tag/commit и целевой
+индекс. Сервер выполняет shallow fetch в управляемый `KB_REPOSITORY_CACHE_DIR`, не исполняет код
+репозитория, ищет каталог `openspec` без обхода `.git`, `node_modules`, `vendor`, `build`, `dist` и
+`target`, затем индексирует только Markdown/HTML/TXT. Повторное подключение того же URL/ref обновляет
+checkout и заменяет его OpenSpec-снимок в индексе. После успешной RAG-сборки сервер обновляет общий
+граф репозиториев.
+
+Декларативные schemas сохраняются в `KB_MANAGED_TOOLS_PATH`, каталог индексов — в
+`KB_INDEX_CATALOG_PATH`. Подключённому прямому MCP-клиенту после изменения tools нужно обновить
+discovery; однофайловому proxy — перезапустить Qwen.
 
 ## 7. Запустить как systemd service
 
@@ -263,6 +271,11 @@ KB_BENCHMARK_MAX_QUESTIONS=100
 KB_ADMIN_PASSWORD=REPLACE_WITH_SEPARATE_ADMIN_PASSWORD
 KB_ADMIN_MAX_UPLOAD_BYTES=10000000
 KB_MANAGED_TOOLS_PATH=/opt/corporate-kb/.cache/kb/managed_tools.json
+KB_INDEX_CATALOG_PATH=/opt/corporate-kb/.cache/kb/index_catalog.json
+KB_MANAGED_INDEXES_DIR=/opt/corporate-kb/.cache/kb/indexes
+KB_REPOSITORY_CACHE_DIR=/opt/corporate-kb/.cache/kb/repositories
+KB_GRAPH_STORE_PATH=/opt/corporate-kb/.cache/kb/system_graph.json
+KB_REPOSITORY_MAX_FILES=10000
 KB_LOG_LEVEL=INFO
 ```
 

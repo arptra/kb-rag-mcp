@@ -27,6 +27,11 @@ Commands:
   lint          Run Ruff
   typecheck     Run mypy
   check         Run lint, type checking, and tests
+  dashboard-install
+                Install React dashboard dependencies from package-lock.json
+  dashboard-dev Start the React/TypeScript dashboard development server
+  dashboard-build
+                Type-check and build dashboard assets served at /admin
   index-hash    Rebuild the offline hash index
   search-hash   Search with hash embeddings; accepts an optional query
   index         Rebuild using the configured provider (hash by default)
@@ -79,6 +84,16 @@ case "${command_name}" in
     "${python_runtime[@]}" -m ruff check .
     "${python_runtime[@]}" -m mypy src
     KB_EMBEDDING_PROVIDER=hash "${python_runtime[@]}" -m pytest -q
+    npm --prefix apps/dashboard run build
+    ;;
+  dashboard-install)
+    exec npm --prefix apps/dashboard ci "$@"
+    ;;
+  dashboard-dev)
+    exec npm --prefix apps/dashboard run dev -- "$@"
+    ;;
+  dashboard-build)
+    exec npm --prefix apps/dashboard run build -- "$@"
     ;;
   index-hash)
     KB_EMBEDDING_PROVIDER=hash "${python_runtime[@]}" -m corporate_kb.cli index --force --incremental "$@"

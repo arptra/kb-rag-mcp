@@ -121,7 +121,7 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
 
         admin_page = await anonymous_client.get("/admin")
         assert admin_page.status_code == 200
-        assert "Corporate RAG Admin" in admin_page.text
+        assert "RAG Control Plane" in admin_page.text
         assert (await anonymous_client.get("/admin/api/overview")).status_code == 403
         admin_headers = {"X-KB-Admin-Password": ADMIN_PASSWORD}
         admin_overview = await anonymous_client.get(
@@ -244,3 +244,86 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
                 "kb_stats",
                 "kb_search_limits",
             }
+
+
+@pytest.mark.asyncio
+async def test_admin_manages_indexes_repositories_and_bound_tools(settings_factory) -> None:
+    service, settings = _indexed_service(settings_factory)
+    repository = settings.cache_dir.parent / "sample-repository"
+    openspec = repository / "openspec"
+    openspec.mkdir(parents=True)
+    (openspec / "system.md").write_text(
+        "# System state\n\npayments-service delegates limits to limits-service.",
+        encoding="utf-8",
+    )
+    app = create_http_app(service, settings)
+    transport = httpx.ASGITransport(app=app)
+    admin_headers = {"X-KB-Admin-Password": ADMIN_PASSWORD}
+    api_headers = {"Authorization": f"Bearer {TOKEN}"}
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
+    ):
+        created = await client.post(
+            "/admin/api/indexes",
+            headers=admin_headers,
+            json={"name": "System OpenSpec", "description": "Current repository state"},
+        )
+        assert created.status_code == 201
+        index_id = created.json()["id"]
+
+        queued = await client.post(
+            "/admin/api/repositories",
+            headers=admin_headers,
+            json={
+                "name": "payments-service",
+                "git_url": str(repository),
+                "index_id": index_id,
+            },
+        )
+        assert queued.status_code == 202
+        job_id = queued.json()["id"]
+        for _ in range(200):
+            catalog = (
+                await client.get("/admin/api/catalog", headers=admin_headers)
+            ).json()
+            job = next(item for item in catalog["jobs"] if item["id"] == job_id)
+            if job["status"] not in {"queued", "running"}:
+                break
+            await asyncio.sleep(0.01)
+        assert job["status"] == "completed"
+
+        definition = {
+            "name": "kb_search_system_state",
+            "description": "Search the current OpenSpec state imported from service repositories.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            "defaults": {"top_k": 2, "status": "current"},
+            "index_ids": [index_id],
+        }
+        saved = await client.post(
+            "/admin/api/tools",
+            headers=admin_headers,
+            json=definition,
+        )
+        assert saved.status_code == 201
+        result = await client.post(
+            "/api/v1/tools/call",
+            headers=api_headers,
+            json={
+                "name": "kb_search_system_state",
+                "arguments": {"query": "who delegates limits"},
+            },
+        )
+        assert result.status_code == 200
+        assert result.json()["index_ids"] == [index_id]
+        assert result.json()["results"][0]["index_id"] == index_id
+        assert result.json()["results"][0]["source_path"].endswith("system.md")
+
+        graph = await client.get("/admin/api/graph/overview", headers=admin_headers)
+        assert graph.status_code == 200
+        assert graph.json()["node_count"] >= 2

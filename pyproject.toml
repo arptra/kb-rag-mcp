@@ -24,6 +24,9 @@ semantic = [
 kb = "corporate_kb.cli:main"
 kb-mcp = "corporate_kb.mcp.server:main"
 kb-mcp-http = "corporate_kb.mcp.http_server:main"
+gigacode-graph = "gigacode_graph.cli:main"
+gigacode-graph-mcp = "gigacode_graph.mcp_server:main"
+gigacode-graph-http = "gigacode_graph.http_server:main"
 
 [dependency-groups]
 dev = [
@@ -38,7 +41,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/corporate_kb"]
+packages = ["src/corporate_kb", "src/gigacode_graph"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/corporate_kb/mcp/admin_dist" = "corporate_kb/mcp/admin_dist"
 
 [tool.ruff]
 target-version = "py312"
@@ -50,7 +56,7 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["corporate_kb"]
+packages = ["corporate_kb", "gigacode_graph"]
 mypy_path = "src"
 plugins = ["pydantic.mypy"]
 

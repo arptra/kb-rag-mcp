@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     admin_password: SecretStr | None = None
     admin_max_upload_bytes: int = Field(default=10_000_000, ge=1, le=100_000_000)
     managed_tools_path: Path = Path(".cache/kb/managed_tools.json")
+    index_catalog_path: Path = Path(".cache/kb/index_catalog.json")
+    managed_indexes_dir: Path = Path(".cache/kb/indexes")
+    repository_cache_dir: Path = Path(".cache/kb/repositories")
+    graph_store_path: Path = Path(".cache/kb/system_graph.json")
+    repository_max_files: int = Field(default=10_000, ge=1, le=100_000)
     auto_index: bool = False
     log_level: str = "INFO"
     mcp_http_host: str = "127.0.0.1"
@@ -99,5 +104,9 @@ class Settings(BaseSettings):
                 "ssot_cache_dir": resolve(self.ssot_cache_dir),
                 "benchmark_questions_path": resolve(self.benchmark_questions_path),
                 "managed_tools_path": resolve(self.managed_tools_path),
+                "index_catalog_path": resolve(self.index_catalog_path),
+                "managed_indexes_dir": resolve(self.managed_indexes_dir),
+                "repository_cache_dir": resolve(self.repository_cache_dir),
+                "graph_store_path": resolve(self.graph_store_path),
             }
         )
