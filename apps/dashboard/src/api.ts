@@ -54,3 +54,28 @@ export async function api<T>(
 export function post<T>(path: string, password: string, body: unknown): Promise<T> {
   return api<T>(path, password, { method: "POST", body: JSON.stringify(body) });
 }
+
+export async function download(path: string, password: string, filename: string): Promise<void> {
+  const headers = new Headers();
+  if (password) headers.set("X-KB-Admin-Password", password);
+  const response = await fetch(path, { headers });
+  if (!response.ok) {
+    const text = await response.text();
+    let message = text || response.statusText;
+    try {
+      const payload = JSON.parse(text) as { error?: unknown };
+      if (payload.error) message = String(payload.error);
+    } catch {
+      // The response was plain text; keep it as the error message.
+    }
+    throw new ApiError(message, response.status);
+  }
+  const url = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}

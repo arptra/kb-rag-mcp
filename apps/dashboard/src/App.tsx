@@ -6,7 +6,7 @@ import {
   useMemo,
   useState,
 } from "react";
-import { ApiError, api, post } from "./api";
+import { ApiError, api, download, post } from "./api";
 import type {
   CatalogJob,
   GraphNode,
@@ -156,6 +156,10 @@ export default function App() {
   const [repositoryModal, setRepositoryModal] = useState(false);
   const [toolModal, setToolModal] = useState<ManagedTool | "new" | null>(null);
   const [serverModal, setServerModal] = useState(false);
+  const [ssotModal, setSsotModal] = useState<{
+    service: Overview["service_map"]["services"][number];
+    defaultIndexId: string;
+  } | null>(null);
   const [booting, setBooting] = useState(true);
   const [accessDenied, setAccessDenied] = useState(false);
 
@@ -293,7 +297,13 @@ export default function App() {
             />
           )}
           {page === "services" && (
-            <ServicesPage data={overview} onGraph={() => setPage("graph")} />
+            <ServicesPage
+              data={overview}
+              password={password}
+              onGraph={() => setPage("graph")}
+              onSsot={(service, defaultIndexId) => setSsotModal({ service, defaultIndexId })}
+              onAction={action}
+            />
           )}
           {page === "servers" && (
             <ServersPage data={overview} password={password} onAction={action} />
@@ -357,6 +367,20 @@ export default function App() {
           }}
         />
       )}
+      {ssotModal && (
+        <SsotModal
+          password={password}
+          service={ssotModal.service}
+          indexes={overview.catalog.indexes}
+          defaultIndexId={ssotModal.defaultIndexId}
+          onClose={() => setSsotModal(null)}
+          onImported={() => {
+            setSsotModal(null);
+            setToast("SSOT сохранён, переиндексация запущена");
+            void load();
+          }}
+        />
+      )}
       {toast && <div className="toast">{toast}</div>}
     </div>
   );
@@ -399,7 +423,7 @@ function OverviewPage({ data, password, onNavigate, onAction }: { data: Overview
         </section>
         <section className="panel span-3">
           <PanelHeader title="Последние операции" kicker={activeJobs.length ? `${activeJobs.length} выполняется` : "Очередь свободна"} />
-          <JobList jobs={data.catalog.jobs.slice(0, 6)} onCancel={(job) => void onAction(() => post("/admin/api/jobs/cancel", password, { job_id: job.id }), "Отмена запрошена")} />
+          <JobList password={password} jobs={data.catalog.jobs.slice(0, 6)} onCancel={(job) => void onAction(() => post("/admin/api/jobs/cancel", password, { job_id: job.id }), "Отмена запрошена")} />
         </section>
       </div>
     </>
@@ -426,14 +450,35 @@ function IndexRow({ index }: { index: RagIndex }) {
   );
 }
 
-function JobList({ jobs, onCancel }: { jobs: CatalogJob[]; onCancel?: (job: CatalogJob) => void }) {
+function JobList({ jobs, password, onCancel }: { jobs: CatalogJob[]; password: string; onCancel?: (job: CatalogJob) => void }) {
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [logs, setLogs] = useState<Record<string, string>>({});
+  const [logError, setLogError] = useState("");
+  const toggleLog = async (job: CatalogJob) => {
+    if (expanded === job.id) {
+      setExpanded(null);
+      return;
+    }
+    setExpanded(job.id);
+    setLogError("");
+    try {
+      const payload = await api<{ log: string }>(`/admin/api/jobs/log?job_id=${encodeURIComponent(job.id)}`, password);
+      setLogs((current) => ({ ...current, [job.id]: payload.log || "Журнал пока пуст" }));
+    } catch (caught) {
+      setLogError(caught instanceof Error ? caught.message : "Не удалось загрузить журнал");
+    }
+  };
   if (!jobs.length) return <div className="empty-state compact">Операций пока не было</div>;
   return <div className="job-list">{jobs.map((job) => (
-    <div className="job-row" key={job.id}>
-      <span className={`job-icon ${job.type}`}>{job.type === "repository" ? "↗" : job.type === "graph" ? "⌘" : "◇"}</span>
-      <div className="grow"><b>{job.message}</b><small>{job.error || `${job.type} · ${relativeDate(job.completed_at || job.started_at)}`}</small></div>
-      <Status value={job.status} />
-      {onCancel && ["queued", "running", "cancelling"].includes(job.status) && <button className="job-cancel" disabled={job.status === "cancelling"} onClick={() => onCancel(job)}>{job.status === "cancelling" ? "Отменяем…" : "Отменить"}</button>}
+    <div className="job-item" key={job.id}>
+      <div className="job-row">
+        <span className={`job-icon ${job.type}`}>{job.type === "repository" ? "↗" : job.type === "graph" || job.type === "service" ? "⌘" : job.type === "cleanup" ? "×" : "◇"}</span>
+        <div className="grow"><b>{job.message}</b><small>{job.error || `${job.type} · ${relativeDate(job.completed_at || job.started_at)}`}</small></div>
+        <Status value={job.status} />
+        <button className="job-log-button" onClick={() => void toggleLog(job)}>{expanded === job.id ? "Скрыть лог" : "Полный лог"}</button>
+        {onCancel && ["queued", "running", "cancelling"].includes(job.status) && <button className="job-cancel" disabled={job.status === "cancelling"} onClick={() => onCancel(job)}>{job.status === "cancelling" ? "Отменяем…" : "Отменить"}</button>}
+      </div>
+      {expanded === job.id && <div className="job-log"><pre>{logError || logs[job.id] || "Загружаем журнал…"}</pre></div>}
     </div>
   ))}</div>;
 }
@@ -466,26 +511,37 @@ function IndexesPage({ data, password, onCreate, onRepository, onAction }: {
       <section className="panel repositories-panel">
         <PanelHeader title="Подключённые репозитории" kicker="Git → OpenSpec → RAG" action="Подключить" onAction={onRepository} />
         {data.catalog.repositories.length ? (
-          <div className="table-wrap"><table><thead><tr><th>Репозиторий</th><th>Ветка / commit</th><th>Индекс</th><th>OpenSpec</th><th>Синхронизация</th></tr></thead><tbody>
-            {data.catalog.repositories.map((repo) => <tr key={repo.id}><td><b>{repo.name}</b><small title={repo.git_url}>{short(repo.git_url, 56)}</small></td><td><code>{repo.ref || "HEAD"}</code><small>{repo.commit?.slice(0, 9) || "—"}</small></td><td><span className="tag">{nameById[repo.index_id] || repo.index_id}</span></td><td><b>{repo.document_count}</b><small>документов</small></td><td>{relativeDate(repo.synced_at)}</td></tr>)}
+          <div className="table-wrap"><table><thead><tr><th>Репозиторий</th><th>Ветка / commit</th><th>Индекс</th><th>OpenSpec</th><th>Синхронизация</th><th /></tr></thead><tbody>
+            {data.catalog.repositories.map((repo) => <tr key={repo.id}><td><b>{repo.name}</b><small title={repo.git_url}>{short(repo.git_url, 56)}</small></td><td><code>{repo.ref || "HEAD"}</code><small>{repo.commit?.slice(0, 9) || "—"}</small></td><td><span className="tag">{nameById[repo.index_id] || repo.index_id}</span></td><td><b>{repo.document_count}</b><small>документов</small></td><td>{relativeDate(repo.synced_at)}</td><td><button className="table-danger" onClick={() => { if (!window.confirm(`Удалить repository «${repo.name}», его документы из RAG и сервисы из карты?`)) return; void onAction(() => post("/admin/api/repositories/delete", password, { repository_id: repo.id }), "Удаление repository поставлено в очередь"); }}>Удалить</button></td></tr>)}
           </tbody></table></div>
         ) : <div className="empty-state"><div>↗</div><h3>Подключите первый репозиторий</h3><p>Сервис проанализирует исходники, найдёт openspec при наличии, обновит индекс и карту.</p><button className="button primary" onClick={onRepository}>Подключить Git</button></div>}
       </section>
-      {data.catalog.jobs.length > 0 && <section className="panel"><PanelHeader title="Очередь операций" kicker="Фоновые задачи" /><JobList jobs={data.catalog.jobs} onCancel={(job) => void onAction(() => post("/admin/api/jobs/cancel", password, { job_id: job.id }), "Отмена запрошена")} /></section>}
+      {data.catalog.jobs.length > 0 && <section className="panel"><PanelHeader title="Очередь операций" kicker="Фоновые задачи" /><JobList password={password} jobs={data.catalog.jobs} onCancel={(job) => void onAction(() => post("/admin/api/jobs/cancel", password, { job_id: job.id }), "Отмена запрошена")} /></section>}
     </>
   );
 }
 
-function ServicesPage({ data, onGraph }: { data: Overview; onGraph: () => void }) {
+function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
+  data: Overview;
+  password: string;
+  onGraph: () => void;
+  onSsot: (service: Overview["service_map"]["services"][number], defaultIndexId: string) => void;
+  onAction: (run: () => Promise<unknown>, message: string) => Promise<void>;
+}) {
   const indexNames = Object.fromEntries(
     data.catalog.indexes.map((index) => [index.id, index.name]),
   );
-  const mapByRepository = new Map(
-    data.service_map.services.map((service) => [service.repository, service]),
-  );
+  const servicesByRepository = new Map<string, typeof data.service_map.services>();
+  data.service_map.services.forEach((service) => {
+    const key = service.repository_root || service.repository;
+    const current = servicesByRepository.get(key) || [];
+    servicesByRepository.set(key, [...current, service]);
+  });
   const repositoryNames = new Set(data.catalog.repositories.map((repository) => repository.name));
+  const repositoryRoots = new Set(data.catalog.repositories.map((repository) => repository.checkout_path));
   const standaloneMapServices = data.service_map.services.filter(
-    (service) => !repositoryNames.has(service.repository),
+    (service) => !repositoryNames.has(service.repository)
+      && (!service.repository_root || !repositoryRoots.has(service.repository_root)),
   );
 
   return (
@@ -504,32 +560,69 @@ function ServicesPage({ data, onGraph }: { data: Overview; onGraph: () => void }
         </div>
       </div>
 
+      <div className="server-note analysis-note">
+        <span>↧</span>
+        <p>{data.catalog.analysis.available
+          ? <>Последний полный analysis run сохранён: <code>{data.catalog.analysis.path}</code></>
+          : <>Архив анализа пока пуст. Запустите анализ любого сервиса или полную пересборку графа.</>}</p>
+      </div>
+
       {data.catalog.repositories.length || standaloneMapServices.length ? (
         <div className="service-grid">
-          {data.catalog.repositories.map((repository) => {
-            const mappedService = mapByRepository.get(repository.name);
+          {data.catalog.repositories.flatMap((repository) => {
+            const mappedServices = servicesByRepository.get(repository.checkout_path)
+              || servicesByRepository.get(repository.name)
+              || [];
             const activeJob = data.catalog.jobs.find(
               (job) => job.index_id === repository.index_id
                 && ["queued", "running", "cancelling"].includes(job.status),
             );
-            return (
+            if (!mappedServices.length) return [(
               <article className="service-card" key={repository.id}>
                 <header>
                   <span className="service-mark">S</span>
-                  <Status value={mappedService ? "ready" : activeJob ? "running" : "empty"} />
+                  <Status value={activeJob ? "running" : "empty"} />
                 </header>
-                <span className="eyebrow">{mappedService ? "Service map ready" : "Awaiting analysis"}</span>
+                <span className="eyebrow">Awaiting analysis</span>
                 <h3>{repository.name}</h3>
-                <code>{mappedService?.id || repository.commit?.slice(0, 12) || "service pending"}</code>
+                <code>{repository.commit?.slice(0, 12) || "service pending"}</code>
                 <dl>
                   <div><dt>Индекс</dt><dd>{indexNames[repository.index_id] || repository.index_id}</dd></div>
                   <div><dt>OpenSpec</dt><dd>{number(repository.document_count)} документов</dd></div>
-                  <div><dt>Интерфейсы</dt><dd>{mappedService ? `${mappedService.entrypoint_count} входов · ${mappedService.outbound_interface_count} выходов` : "—"}</dd></div>
+                  <div><dt>Интерфейсы</dt><dd>—</dd></div>
                   <div><dt>Синхронизация</dt><dd>{relativeDate(repository.synced_at)}</dd></div>
                 </dl>
-                <footer><span>{mappedService?.owner || "Владелец не определён"}</span><button onClick={onGraph}>Открыть граф →</button></footer>
+                <footer><span>Владелец не определён</span><button onClick={onGraph}>Открыть граф →</button></footer>
               </article>
-            );
+            )];
+            return mappedServices.map((mappedService) => (
+              <article className="service-card" key={`${repository.id}:${mappedService.id}`}>
+                <header>
+                  <span className="service-mark">S</span>
+                  <Status value={data.catalog.jobs.some((job) => job.target_id === mappedService.id && ["queued", "running", "cancelling"].includes(job.status)) ? "running" : mappedService.module_state === "active" ? "ready" : "empty"} />
+                </header>
+                <span className="eyebrow">
+                  {mappedService.module_path === "." ? "Repository service" : `Module · ${mappedService.module_path}`}
+                </span>
+                <h3>{mappedService.name}</h3>
+                <code>{mappedService.id}</code>
+                <dl>
+                  <div><dt>Репозиторий</dt><dd>{repository.name}</dd></div>
+                  <div><dt>Build</dt><dd>{mappedService.build_system} · {mappedService.module_state}</dd></div>
+                  <div><dt>Интерфейсы</dt><dd>{mappedService.entrypoint_count} входов · {mappedService.outbound_interface_count} выходов</dd></div>
+                  <div><dt>Индекс</dt><dd>{indexNames[repository.index_id] || repository.index_id}</dd></div>
+                </dl>
+                <footer>
+                  <span>{mappedService.owner || "Владелец не определён"}</span>
+                  <div className="card-actions">
+                    <button onClick={() => void onAction(() => post("/admin/api/services/analyze", password, { service_id: mappedService.id }), "Повторный анализ поставлен в очередь")}>↻ Анализ</button>
+                    <button onClick={() => onSsot(mappedService, repository.index_id)}>SSOT</button>
+                    <button onClick={onGraph}>Граф</button>
+                    <button className="danger" onClick={() => { if (!window.confirm(`Удалить сервис «${mappedService.name}» из карты? Модуль останется в repository как постоянное исключение.`)) return; void onAction(() => post("/admin/api/services/delete", password, { service_id: mappedService.id }), "Удаление сервиса поставлено в очередь"); }}>Удалить</button>
+                  </div>
+                </footer>
+              </article>
+            ));
           })}
           {standaloneMapServices.map((service) => (
             <article className="service-card" key={service.id}>
@@ -672,13 +765,13 @@ function ToolsPage({ data, password, onEdit, onAction }: {
             <header><span className="tool-mark">⌁</span><Status value={tool.index_ids.length ? "ready" : "empty"} /><button className="dots" onClick={() => onEdit(tool)}>•••</button></header>
             <code>{tool.name}</code><p>{tool.description}</p>
             <div className="bindings">{tool.index_ids.length ? tool.index_ids.map((id) => <span className="tag" key={id}>◇ {indexNames[id] || id}</span>) : <span className="tag warning">Не привязан</span>}</div>
-            <footer><span>top {tool.defaults.top_k} · {tool.defaults.status || "любой статус"}</span><button onClick={() => { setTesting(testing === tool.name ? null : tool.name); setResult(null); }}>Проверить →</button></footer>
+            <footer><span>top {tool.defaults.top_k} · {tool.defaults.status || "любой статус"}</span><div className="card-actions"><button onClick={() => { setTesting(testing === tool.name ? null : tool.name); setResult(null); }}>Проверить →</button><button className="danger" onClick={() => { if (!window.confirm(`Удалить MCP tool «${tool.name}»?`)) return; void onAction(() => post("/admin/api/tools/delete", password, { name: tool.name }), "Tool удалён"); }}>Удалить</button></div></footer>
             {testing === tool.name && <div className="tool-test"><input value={query} onChange={(event) => setQuery(event.target.value)} /><button className="button primary" onClick={() => void onAction(async () => { const payload = await post<Record<string, unknown>>("/admin/api/tools/test", password, { name: tool.name, query }); setResult(payload); }, "Тест завершён")}>Запустить</button>{result && <pre>{JSON.stringify(result, null, 2)}</pre>}</div>}
           </article>
         ))}
         {!data.managed_tools.tools.length && <button className="new-tool-card" onClick={() => document.querySelector<HTMLButtonElement>(".top-actions .primary")?.click()}><span>＋</span><b>Создать первый MCP tool</b><small>Выберите индексы и опишите агенту назначение поиска</small></button>}
       </div>
-      {data.managed_tools.tools.length > 0 && <div className="danger-note"><span>i</span><p>Удаление tool сразу убирает его из MCP discovery. Клиентскому stdio-прокси потребуется перезапуск.</p><button onClick={() => { const name = window.prompt("Имя tool для удаления"); if (name) void onAction(() => post("/admin/api/tools/delete", password, { name }), "Tool удалён"); }}>Удалить tool</button></div>}
+      {data.managed_tools.tools.length > 0 && <div className="danger-note"><span>i</span><p>Кнопка удаления находится на каждой карточке и сразу убирает tool из MCP discovery. Клиентскому stdio-прокси потребуется перезапуск.</p></div>}
     </>
   );
 }
@@ -740,6 +833,67 @@ function RepositoryForm({ password, indexes, onClose, onSaved }: { password: str
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Не удалось подключить репозиторий"); }
   };
   return <Modal title="Подключить Git-репозиторий" onClose={onClose}><form className="modal-form" onSubmit={submit}><div className="field-row"><label>Название<input required minLength={2} value={name} onChange={(event) => setName(event.target.value)} placeholder="payments-service" /></label><label>Ref, необязательно<input value={ref} onChange={(event) => setRef(event.target.value)} placeholder="main / tag / commit" /></label></div><label>Git URL<input required value={gitUrl} onChange={(event) => setGitUrl(event.target.value)} placeholder="https://git.company.local/team/service.git" /></label><label>Целевой индекс<select value={target} onChange={(event) => setTarget(event.target.value)}>{indexes.map((index) => <option key={index.id} value={index.id}>{index.name}</option>)}<option value="__new__">＋ Создать новый индекс</option></select></label>{target === "__new__" && <label>Название нового индекса<input value={indexName} onChange={(event) => setIndexName(event.target.value)} placeholder={name || "System knowledge"} /></label>}<div className="flow-preview"><span>Git checkout</span><i>→</i><span>исходники</span><i>→</i><span>Service map</span><i>＋</i><span>RAG из openspec</span></div>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary">Подключить и индексировать</button></div></form></Modal>;
+}
+
+function SsotModal({ password, service, indexes, defaultIndexId, onClose, onImported }: {
+  password: string;
+  service: Overview["service_map"]["services"][number];
+  indexes: RagIndex[];
+  defaultIndexId: string;
+  onClose: () => void;
+  onImported: () => void;
+}) {
+  const [indexId, setIndexId] = useState(defaultIndexId || indexes[0]?.id || "default");
+  const [content, setContent] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState<"bundle" | "import" | null>(null);
+
+  const buildBundle = async () => {
+    setBusy("bundle");
+    setError("");
+    try {
+      const bundle = await post<{ bundle_id: string; download_url: string }>(
+        "/admin/api/analysis/ssot-bundle",
+        password,
+        { service_id: service.id },
+      );
+      await download(bundle.download_url, password, `${service.id}-ssot-bundle.zip`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось подготовить SSOT-пакет");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const importSsot = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy("import");
+    setError("");
+    try {
+      await post("/admin/api/analysis/ssot-import", password, {
+        service_id: service.id,
+        index_id: indexId,
+        content,
+      });
+      onImported();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось сохранить SSOT");
+      setBusy(null);
+    }
+  };
+
+  return (
+    <Modal title={`SSOT · ${service.name}`} onClose={onClose}>
+      <form className="modal-form" onSubmit={importSsot}>
+        <div className="callout">Скачайте пакет с полным analysis JSON, срезом сервиса и skill-инструкцией. Передайте ZIP нейросети, получите `ssot.md`, проверьте его и вставьте результат ниже.</div>
+        <button type="button" className="button secondary" disabled={busy !== null} onClick={() => void buildBundle()}>{busy === "bundle" ? "Собираем пакет…" : "↓ Скачать пакет для нейросети"}</button>
+        <label>Индекс для готового SSOT<select value={indexId} onChange={(event) => setIndexId(event.target.value)}>{indexes.map((index) => <option key={index.id} value={index.id}>{index.name}</option>)}</select></label>
+        <label>Готовый SSOT Markdown<textarea className="ssot-editor" required minLength={100} value={content} onChange={(event) => setContent(event.target.value)} placeholder="---\nservice: ...\ndocument_type: ssot\n---\n\n# Service…" /><small>Документ сохранится в `knowledge/ssot/` выбранного индекса, после чего RAG автоматически пересоберётся.</small></label>
+        {error && <div className="form-error">{error}</div>}
+        <div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Закрыть</button><button className="button primary" disabled={busy !== null || content.trim().length < 100}>{busy === "import" ? "Индексируем…" : "Сохранить в индекс"}</button></div>
+      </form>
+    </Modal>
+  );
 }
 
 function ToolForm({ password, indexes, tool, onClose, onSaved }: { password: string; indexes: RagIndex[]; tool: ManagedTool | null; onClose: () => void; onSaved: () => void }) {

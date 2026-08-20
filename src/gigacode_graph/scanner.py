@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 from xml.etree import ElementTree
 
 from gigacode_graph.config import GraphSettings
+from gigacode_graph.java_syntax import JavaSyntaxParser
 from gigacode_graph.models import (
     Confidence,
     EdgeType,
@@ -168,6 +169,7 @@ class JavaClass:
     file: Path
     text: str
     line: int
+    has_syntax_errors: bool = False
 
 
 @dataclass
@@ -175,6 +177,12 @@ class ServiceScan:
     service_id: str
     repository_name: str
     repository_path: Path
+    module_root: Path
+    module_path: str
+    module_state: str
+    build_system: str
+    source_roots: tuple[Path, ...]
+    resource_roots: tuple[Path, ...]
     commit: str | None
     aliases: set[str]
     classes: dict[str, JavaClass] = field(default_factory=dict)
@@ -203,6 +211,26 @@ class TopicFact:
     operation_id: str | None
     symbol_id: str | None
     evidence_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScanTarget:
+    """One isolated service/module to scan inside a repository checkout."""
+
+    path: Path
+    repository_path: Path | None = None
+    repository_name: str | None = None
+    service_id: str | None = None
+    display_name: str | None = None
+    owner: str | None = None
+    aliases: tuple[str, ...] = ()
+    module_path: str = "."
+    module_state: str = "active"
+    build_system: str = "unknown"
+    source_roots: tuple[Path, ...] | None = None
+    resource_roots: tuple[Path, ...] | None = None
+    source_url: str | None = None
+    commit: str | None = None
 
 
 def _outbound_exit_id(fact: OutboundFact) -> str:
@@ -318,15 +346,21 @@ class RepositoryScanner:
         self._outbound: list[OutboundFact] = []
         self._topics: list[TopicFact] = []
         self._scans: dict[str, ServiceScan] = {}
+        self._java_parser = JavaSyntaxParser()
 
     def scan(self, repositories: list[Path]) -> GraphSnapshot:
         if not repositories:
             raise ValueError("At least one repository path is required")
-        resolved = [path.resolve() for path in repositories]
-        for repository in resolved:
+        return self.scan_targets([ScanTarget(path=path.resolve()) for path in repositories])
+
+    def scan_targets(self, targets: list[ScanTarget]) -> GraphSnapshot:
+        if not targets:
+            raise ValueError("At least one scan target is required")
+        for target in targets:
+            repository = target.path.resolve()
             if not repository.is_dir():
                 raise ValueError(f"Repository directory does not exist: {repository}")
-            scan = self._discover_repository(repository)
+            scan = self._discover_repository(repository, target)
             if scan.service_id in self._scans:
                 raise ValueError(f"Duplicate service id discovered: {scan.service_id}")
             self._scans[scan.service_id] = scan
@@ -335,17 +369,30 @@ class RepositoryScanner:
         self._link_topic_dependencies()
         return self._builder.snapshot()
 
-    def _discover_repository(self, repository: Path) -> ServiceScan:
+    def _discover_repository(
+        self,
+        repository: Path,
+        target: ScanTarget | None = None,
+    ) -> ServiceScan:
         manifest = self._load_manifest(repository)
-        source_metadata = self._load_source_metadata(repository)
+        repository_path = (
+            target.repository_path.resolve()
+            if target is not None and target.repository_path is not None
+            else repository
+        )
+        source_metadata = self._load_source_metadata(repository_path)
         explicit = manifest.get("service", {}) if isinstance(manifest, dict) else {}
-        service_id = str(explicit.get("id", "")).strip() if isinstance(explicit, dict) else ""
+        service_id = target.service_id if target is not None and target.service_id else ""
+        if not service_id:
+            service_id = str(explicit.get("id", "")).strip() if isinstance(explicit, dict) else ""
         aliases: set[str] = set()
-        owner: str | None = None
-        display_name: str | None = None
+        owner: str | None = target.owner if target is not None else None
+        display_name: str | None = target.display_name if target is not None else None
+        if target is not None:
+            aliases.update(target.aliases)
         if isinstance(explicit, dict):
-            owner = str(explicit.get("owner", "")).strip() or None
-            display_name = str(explicit.get("displayName", "")).strip() or None
+            owner = owner or str(explicit.get("owner", "")).strip() or None
+            display_name = display_name or str(explicit.get("displayName", "")).strip() or None
             raw_aliases = explicit.get("aliases", [])
             if isinstance(raw_aliases, list):
                 aliases.update(str(item).strip() for item in raw_aliases if str(item).strip())
@@ -354,25 +401,53 @@ class RepositoryScanner:
                 repository
             )
             service_id = discovered_id or ""
-        repository_name = str(source_metadata.get("repository_name") or repository.name)
+        repository_name = (
+            target.repository_name
+            if target is not None and target.repository_name
+            else str(source_metadata.get("repository_name") or repository_path.name)
+        )
         service_id = service_id or repository_name
         aliases.update({service_id, repository_name})
-        commit = self._git_commit(repository)
+        commit = (
+            target.commit
+            if target is not None and target.commit
+            else self._git_commit(repository_path)
+        )
+        source_roots = (
+            tuple(path.resolve() for path in target.source_roots)
+            if target is not None and target.source_roots is not None
+            else (repository,)
+        )
+        resource_roots = (
+            tuple(path.resolve() for path in target.resource_roots)
+            if target is not None and target.resource_roots is not None
+            else (repository,)
+        )
         scan = ServiceScan(
             service_id=service_id,
             repository_name=repository_name,
-            repository_path=repository,
+            repository_path=repository_path,
+            module_root=repository,
+            module_path=target.module_path if target is not None else ".",
+            module_state=target.module_state if target is not None else "active",
+            build_system=target.build_system if target is not None else "unknown",
+            source_roots=source_roots,
+            resource_roots=resource_roots,
             commit=commit,
             aliases=aliases,
         )
         repository_node = GraphNode(
-            id=f"repository:{service_id}:{repository_name}",
+            id=_stable_id("repository", repository_name, repository_path),
             type="Repository",
             label=repository_name,
             metadata={
-                "path": str(repository),
+                "path": str(repository_path),
                 "commit": commit,
-                "source": source_metadata.get("source"),
+                "source": (
+                    target.source_url
+                    if target is not None and target.source_url
+                    else source_metadata.get("source")
+                ),
                 "requested_ref": source_metadata.get("ref"),
                 "managed_checkout": bool(source_metadata.get("managed")),
             },
@@ -385,8 +460,17 @@ class RepositoryScanner:
             metadata={
                 "repository": repository_name,
                 "path": str(repository),
+                "repository_path": str(repository_path),
+                "module_path": scan.module_path,
+                "module_state": scan.module_state,
+                "build_system": scan.build_system,
+                "source_roots": [str(path) for path in scan.source_roots],
                 "commit": commit,
-                "source": source_metadata.get("source"),
+                "source": (
+                    target.source_url
+                    if target is not None and target.source_url
+                    else source_metadata.get("source")
+                ),
                 "requested_ref": source_metadata.get("ref"),
                 "owner": owner,
                 "aliases": sorted(aliases),
@@ -403,7 +487,9 @@ class RepositoryScanner:
         return scan
 
     def _scan_repository(self, scan: ServiceScan) -> None:
-        java_files = list(self._files(scan.repository_path, {".java"}))
+        java_files = sorted(
+            {path for root in scan.source_roots for path in self._files(root, {".java"})}
+        )
         for path in java_files:
             try:
                 if path.stat().st_size > self.settings.max_java_file_bytes:
@@ -418,6 +504,17 @@ class RepositoryScanner:
                 java_class = self._parse_java_class(path)
                 if java_class is not None:
                     scan.classes[java_class.name] = java_class
+                    if java_class.has_syntax_errors:
+                        self._builder.issues.append(
+                            ScanIssue(
+                                repository=scan.repository_name,
+                                file=path.relative_to(scan.repository_path).as_posix(),
+                                message=(
+                                    "Tree-sitter recovered from Java syntax errors; "
+                                    "extracted facts may be incomplete"
+                                ),
+                            )
+                        )
             except (OSError, UnicodeDecodeError, ValueError) as exc:
                 self._builder.issues.append(
                     ScanIssue(
@@ -952,7 +1049,14 @@ class RepositoryScanner:
             )
 
     def _index_migrations(self, scan: ServiceScan) -> None:
-        for path in self._files(scan.repository_path, {".sql", ".yaml", ".yml", ".xml"}):
+        paths = sorted(
+            {
+                path
+                for root in scan.resource_roots
+                for path in self._files(root, {".sql", ".yaml", ".yml", ".xml"})
+            }
+        )
+        for path in paths:
             relative = path.relative_to(scan.repository_path).as_posix().lower()
             if not any(marker in relative for marker in ("migration", "liquibase", "changelog")):
                 continue
@@ -1000,10 +1104,17 @@ class RepositoryScanner:
                 )
 
     def _link_service_dependencies(self) -> None:
-        alias_map: dict[str, str] = {}
+        alias_candidates: dict[str, set[str]] = {}
         for service_id, scan in self._scans.items():
             for alias in scan.aliases:
-                alias_map[self._normalize_target(alias)] = service_id
+                normalized_alias = self._normalize_target(alias)
+                if normalized_alias:
+                    alias_candidates.setdefault(normalized_alias, set()).add(service_id)
+        alias_map = {
+            alias: next(iter(service_ids))
+            for alias, service_ids in alias_candidates.items()
+            if len(service_ids) == 1
+        }
         for fact in self._outbound:
             normalized = self._normalize_target(fact.target_hint)
             target_service = alias_map.get(normalized)
@@ -1013,13 +1124,22 @@ class RepositoryScanner:
             else:
                 label = fact.target_hint or "unresolved target"
                 target_id = f"external:{normalized or _stable_id('unknown', label)}"
-                confidence = "UNRESOLVED" if "${" in label or not label else "LOW"
+                ambiguous_targets = sorted(alias_candidates.get(normalized, set()))
+                confidence = (
+                    "UNRESOLVED"
+                    if "${" in label or not label or len(ambiguous_targets) > 1
+                    else "LOW"
+                )
                 self._builder.add_node(
                     GraphNode(
                         id=target_id,
                         type="ExternalSystem",
                         label=label,
-                        metadata={"target_hint": fact.target_hint, "resolved": False},
+                        metadata={
+                            "target_hint": fact.target_hint,
+                            "resolved": False,
+                            "ambiguous_service_ids": ambiguous_targets,
+                        },
                         evidence_ids=[fact.evidence_id],
                     )
                 )
@@ -1129,105 +1249,45 @@ class RepositoryScanner:
                     )
 
     def _parse_java_class(self, path: Path) -> JavaClass | None:
-        text = path.read_text(encoding="utf-8")
-        package_match = re.search(r"\bpackage\s+([\w.]+)\s*;", text)
-        class_match = re.search(
-            r"(?P<header>(?:(?:^|\n)[ \t]*@[\w.]+(?:\s*\([^;]*?\))?[ \t]*\n)*)"
-            r"[ \t]*(?:public\s+|protected\s+|private\s+|abstract\s+|final\s+)*"
-            r"(?P<kind>class|interface|record)\s+(?P<name>[A-Za-z_]\w*)"
-            r"(?P<tail>[^\{]*)\{",
-            text,
-            re.M | re.S,
-        )
-        if class_match is None:
+        source = path.read_bytes()
+        parsed = self._java_parser.parse(path, source)
+        if parsed is None:
             return None
-        opening = class_match.end() - 1
-        body, _closing = _balanced_block(text, opening)
-        body_start = opening + 1
-        methods = self._parse_methods(
-            class_name=class_match.group("name"),
-            body=body,
-            body_start=body_start,
-            full_text=text,
-            path=path,
-        )
-        fields = self._parse_fields(body, body_start, text)
+        text = source.decode("utf-8")
+        fields = {
+            field.name: JavaField(
+                name=field.name,
+                type_name=field.type_name,
+                annotations=field.annotations,
+                line=field.line,
+            )
+            for field in parsed.fields
+        }
+        methods = [
+            JavaMethod(
+                class_name=parsed.name,
+                name=method.name,
+                annotations=method.annotations,
+                body=method.body,
+                line=method.line,
+                body_offset=method.body_offset,
+                file=path,
+            )
+            for method in parsed.methods
+        ]
         return JavaClass(
-            name=class_match.group("name"),
-            package=package_match.group(1) if package_match else "",
-            kind=class_match.group("kind"),
-            annotations=class_match.group("header") or "",
-            extends=class_match.group("tail") or "",
+            name=parsed.name,
+            package=parsed.package,
+            kind=parsed.kind,
+            annotations=parsed.annotations,
+            extends=parsed.extends,
             fields=fields,
             methods=methods,
             file=path,
             text=text,
-            line=_line_number(text, class_match.start()),
+            line=parsed.line,
+            has_syntax_errors=parsed.has_errors,
         )
-
-    def _parse_methods(
-        self,
-        *,
-        class_name: str,
-        body: str,
-        body_start: int,
-        full_text: str,
-        path: Path,
-    ) -> list[JavaMethod]:
-        pattern = re.compile(
-            r"(?P<annotations>(?:(?:^|\n)[ \t]*@[\w.]+(?:\s*\([^;]*?\))?[ \t]*\n)*)"
-            r"[ \t]*(?P<visibility>public|protected|private)?[ \t]*"
-            r"(?:static\s+|final\s+|abstract\s+|synchronized\s+|default\s+|native\s+)*"
-            r"(?P<return>[\w.$<>\[\],? ]+)\s+(?P<name>[A-Za-z_]\w*)\s*"
-            r"\((?P<params>[^;{}]*)\)\s*(?:throws\s+[^\{;]+)?(?P<term>\{|;)",
-            re.M,
-        )
-        methods: list[JavaMethod] = []
-        for match in pattern.finditer(body):
-            annotations = match.group("annotations") or ""
-            if not match.group("visibility") and not annotations.strip():
-                continue
-            name = match.group("name")
-            if name in {"if", "for", "while", "switch", "catch", "return", "new"}:
-                continue
-            absolute = body_start + match.start()
-            method_body = ""
-            body_offset = body_start + match.end()
-            if match.group("term") == "{":
-                opening = body_start + match.end() - 1
-                method_body, _end = _balanced_block(full_text, opening)
-                body_offset = opening + 1
-            methods.append(
-                JavaMethod(
-                    class_name=class_name,
-                    name=name,
-                    annotations=annotations,
-                    body=method_body,
-                    line=_line_number(full_text, absolute),
-                    body_offset=body_offset,
-                    file=path,
-                )
-            )
-        return methods
-
-    def _parse_fields(self, body: str, body_start: int, full_text: str) -> dict[str, JavaField]:
-        pattern = re.compile(
-            r"(?P<annotations>(?:(?:^|\n)[ \t]*@[\w.]+(?:\s*\([^;]*?\))?[ \t]*\n)*)"
-            r"[ \t]*(?:private|protected|public)\s+"
-            r"(?:static\s+|final\s+|transient\s+|volatile\s+)*"
-            r"(?P<type>[\w.$<>\[\],? ]+)\s+(?P<name>[A-Za-z_]\w*)\s*"
-            r"(?:=[^;]+)?;",
-            re.M,
-        )
-        fields: dict[str, JavaField] = {}
-        for match in pattern.finditer(body):
-            fields[match.group("name")] = JavaField(
-                name=match.group("name"),
-                type_name=" ".join(match.group("type").split()),
-                annotations=match.group("annotations") or "",
-                line=_line_number(full_text, body_start + match.start()),
-            )
-        return fields
 
     def _http_mappings(self, annotations: str, base_path: str) -> list[tuple[str, str]]:
         mappings: list[tuple[str, str]] = []

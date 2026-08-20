@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     repository_cache_dir: Path = Path(".cache/kb/repositories")
     graph_store_path: Path = Path(".cache/kb/system_graph.json")
     service_map_path: Path = Path(".cache/kb/service_map.json")
+    analysis_archive_dir: Path = Path(".cache/kb/analysis")
+    job_logs_dir: Path = Path(".cache/kb/job-logs")
+    ssot_skill_path: Path = Path("skills/build-service-ssot")
     repository_max_files: int = Field(default=10_000, ge=1, le=100_000)
     repository_git_timeout_seconds: int = Field(default=60, ge=10, le=1800)
     repository_analysis_timeout_seconds: int = Field(default=60, ge=5, le=600)
@@ -115,5 +118,8 @@ class Settings(BaseSettings):
                 "repository_cache_dir": resolve(self.repository_cache_dir),
                 "graph_store_path": resolve(self.graph_store_path),
                 "service_map_path": resolve(self.service_map_path),
+                "analysis_archive_dir": resolve(self.analysis_archive_dir),
+                "job_logs_dir": resolve(self.job_logs_dir),
+                "ssot_skill_path": resolve(self.ssot_skill_path),
             }
         )

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 import time
+import zipfile
+from pathlib import Path
 
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
@@ -10,6 +12,16 @@ from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeService
 from corporate_kb.usage import UsageTracker
 from service_map import ServiceMapBuildCancelled, ServiceMapProcessRunner
+
+
+def _wait_for_job(catalog: RagCatalog, job_id: str) -> dict[str, object]:
+    current: dict[str, object] = {}
+    for _ in range(500):
+        current = next(item for item in catalog.payload()["jobs"] if item["id"] == job_id)
+        if current["status"] not in {"queued", "running", "cancelling"}:
+            return current
+        time.sleep(0.01)
+    raise AssertionError(f"Job did not finish: {job_id} ({current})")
 
 
 def test_catalog_creates_index_and_imports_local_openspec(settings_factory, tmp_path) -> None:
@@ -58,9 +70,7 @@ def test_catalog_creates_index_and_imports_local_openspec(settings_factory, tmp_
     result = catalog.tools_for(index.id).search(query="payment limits", top_k=1)
     assert result["results"][0]["source_path"].endswith("openspec/current/limits.md")
     assert catalog.graph_overview()["node_count"] >= 2
-    assert {item["label"] for item in catalog.graph_overview()["services"]} == {
-        "payments-service"
-    }
+    assert {item["label"] for item in catalog.graph_overview()["services"]} == {"payments-service"}
     assert settings.service_map_path.is_file()
     assert catalog.service_map_overview()["service_count"] == 1
     service_map = catalog.service_map()
@@ -91,9 +101,7 @@ def test_catalog_marks_interrupted_jobs_failed_after_restart(settings_factory) -
 
     reloaded = RagCatalog(settings, default_service, default_tools, usage)
     restored_job = next(item for item in reloaded.payload()["jobs"] if item["id"] == job.id)
-    restored_index = next(
-        item for item in reloaded.payload()["indexes"] if item["id"] == index.id
-    )
+    restored_index = next(item for item in reloaded.payload()["indexes"] if item["id"] == index.id)
     assert restored_job["status"] == "failed"
     assert restored_job["message"] == "Interrupted by server restart"
     assert restored_index["status"] == "error"
@@ -148,15 +156,58 @@ public class StatusController {
 
     assert current["status"] == "completed"
     imported = next(
-        item
-        for item in catalog.payload()["repositories"]
-        if item["name"] == "Source only"
+        item for item in catalog.payload()["repositories"] if item["name"] == "Source only"
     )
     assert imported["openspec_path"] is None
     assert imported["document_count"] == 0
     service_map = catalog.service_map()
     assert service_map["services"][0]["id"] == "source-only-service"
     assert service_map["services"][0]["entrypoints"][0]["operation"] == "GET /status"
+
+
+def test_catalog_indexes_all_module_openspec_roots(settings_factory, tmp_path) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    index = catalog.create_index(name="Multi module docs")
+    repository = tmp_path / "multi-doc-repository"
+    for module, title in (("orders", "Order contract"), ("payments", "Payment contract")):
+        path = repository / module / "openspec" / "current.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(f"# {title}\n\n{title} details.", encoding="utf-8")
+
+    job = catalog.start_repository_ingestion(
+        name="Multi docs",
+        git_url=str(repository),
+        index_id=index.id,
+    )
+    for _ in range(300):
+        current = next(item for item in catalog.payload()["jobs"] if item["id"] == job.id)
+        if current["status"] not in {"queued", "running"}:
+            break
+        time.sleep(0.01)
+
+    assert current["status"] == "completed"
+    imported = next(
+        item for item in catalog.payload()["repositories"] if item["name"] == "Multi docs"
+    )
+    assert len(imported["openspec_paths"]) == 2
+    assert imported["document_count"] == 2
+    order_result = catalog.tools_for(index.id).search(query="Order contract", top_k=2)
+    payment_result = catalog.tools_for(index.id).search(query="Payment contract", top_k=2)
+    assert any("orders/current.md" in item["source_path"] for item in order_result["results"])
+    assert any("payments/current.md" in item["source_path"] for item in payment_result["results"])
 
 
 def test_catalog_cancels_running_graph_job_without_blocking_api(
@@ -194,9 +245,7 @@ def test_catalog_cancels_running_graph_job_without_blocking_api(
     cancellation = catalog.cancel_job(job.id)
     assert cancellation.status == "cancelling"
     for _ in range(200):
-        current = next(
-            item for item in catalog.payload()["jobs"] if item["id"] == job.id
-        )
+        current = next(item for item in catalog.payload()["jobs"] if item["id"] == job.id)
         if current["status"] == "cancelled":
             break
         time.sleep(0.01)
@@ -240,9 +289,7 @@ def test_catalog_cancels_running_index_process(
     cancellation = catalog.cancel_job(job.id)
     assert cancellation.status == "cancelling"
     for _ in range(200):
-        current = next(
-            item for item in catalog.payload()["jobs"] if item["id"] == job.id
-        )
+        current = next(item for item in catalog.payload()["jobs"] if item["id"] == job.id)
         if current["status"] == "cancelled":
             break
         time.sleep(0.01)
@@ -250,3 +297,129 @@ def test_catalog_cancels_running_index_process(
     assert current["status"] == "cancelled"
     refreshed = next(item for item in catalog.payload()["indexes"] if item["id"] == "default")
     assert refreshed["status"] == "ready"
+
+
+def test_catalog_service_lifecycle_analysis_archive_and_ssot(settings_factory, tmp_path) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    settings.ssot_skill_path.mkdir(parents=True)
+    (settings.ssot_skill_path / "SKILL.md").write_text(
+        "---\nname: build-service-ssot\ndescription: Test SSOT skill.\n---\n",
+        encoding="utf-8",
+    )
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    index = catalog.create_index(name="Lifecycle index")
+    repository = tmp_path / "lifecycle-repository"
+    resources = repository / "src" / "main" / "resources"
+    sources = repository / "src" / "main" / "java" / "example"
+    openspec = repository / "openspec"
+    resources.mkdir(parents=True)
+    sources.mkdir(parents=True)
+    openspec.mkdir(parents=True)
+    (resources / "application.properties").write_text(
+        "spring.application.name=lifecycle-service\n",
+        encoding="utf-8",
+    )
+    (sources / "LifecycleController.java").write_text(
+        """
+package example;
+@RestController
+public class LifecycleController {
+  @GetMapping("/lifecycle")
+  public String lifecycle() { return "ok"; }
+}
+""",
+        encoding="utf-8",
+    )
+    (openspec / "overview.md").write_text(
+        "# Lifecycle service\n\nTechnical source documentation.",
+        encoding="utf-8",
+    )
+
+    imported_job = catalog.start_repository_ingestion(
+        name="Lifecycle repository",
+        git_url=str(repository),
+        index_id=index.id,
+    )
+    assert _wait_for_job(catalog, imported_job.id)["status"] == "completed"
+    assert (settings.analysis_archive_dir / "latest.json").is_file()
+
+    analysis_job = catalog.start_service_analysis("lifecycle-service")
+    assert _wait_for_job(catalog, analysis_job.id)["status"] == "completed"
+    assert "Analysis archived at" in catalog.job_log(analysis_job.id)["log"]
+
+    bundle = catalog.create_ssot_bundle("lifecycle-service")
+    bundle_path = catalog.ssot_bundle_path(bundle["bundle_id"])
+    with zipfile.ZipFile(bundle_path) as archive:
+        assert {
+            "analysis/full-analysis.json",
+            "analysis/service-analysis.json",
+            "PROMPT.md",
+            "skill/SKILL.md",
+        }.issubset(archive.namelist())
+
+    imported = catalog.import_ssot(
+        service_id="lifecycle-service",
+        index_id=index.id,
+        content=(
+            "---\nservice: lifecycle-service\ndocument_type: ssot\nstatus: draft\n---\n\n"
+            "# Lifecycle service\n\nThis source-derived draft records the observed lifecycle API "
+            "and remains pending human review."
+        ),
+    )
+    assert Path(imported["path"]).is_file()
+    assert _wait_for_job(catalog, imported["job"]["id"])["status"] == "completed"
+
+    service_delete = catalog.start_service_delete("lifecycle-service")
+    assert _wait_for_job(catalog, service_delete.id)["status"] == "completed"
+    assert catalog.service_map_overview()["service_count"] == 0
+
+    repository_record = catalog.payload()["repositories"][0]
+    documents = (
+        Path(index.knowledge_dir) / "repositories" / repository_record["id"]
+    )
+    assert documents.is_dir()
+    repository_delete = catalog.start_repository_delete(repository_record["id"])
+    assert _wait_for_job(catalog, repository_delete.id)["status"] == "completed"
+    assert catalog.payload()["repository_count"] == 0
+    assert not documents.exists()
+
+
+def test_catalog_failure_log_contains_full_traceback(settings_factory, monkeypatch) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+
+    def fail_analysis(self, repositories, *, cancel=None):
+        del self, repositories, cancel
+        raise RuntimeError("synthetic analysis failure")
+
+    monkeypatch.setattr(ServiceMapProcessRunner, "build", fail_analysis)
+    job = catalog.start_graph_build()
+    failed = _wait_for_job(catalog, job.id)
+    assert failed["status"] == "failed"
+    log = catalog.job_log(job.id)["log"]
+    assert "Traceback (most recent call last)" in log
+    assert "RuntimeError: synthetic analysis failure" in log

@@ -415,6 +415,60 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             return _api_error(exc)
 
     @server.custom_route(
+        "/admin/api/repositories/delete",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_delete_repository(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            repository_id = payload.get("repository_id") if isinstance(payload, dict) else None
+            if not isinstance(repository_id, str) or not repository_id:
+                raise ValueError("repository_id must be a non-empty string")
+            job = catalog.start_repository_delete(repository_id)
+            return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/services/analyze",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_analyze_service(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            service_id = payload.get("service_id") if isinstance(payload, dict) else None
+            if not isinstance(service_id, str) or not service_id:
+                raise ValueError("service_id must be a non-empty string")
+            job = catalog.start_service_analysis(service_id)
+            return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/services/delete",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_delete_service(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            service_id = payload.get("service_id") if isinstance(payload, dict) else None
+            if not isinstance(service_id, str) or not service_id:
+                raise ValueError("service_id must be a non-empty string")
+            job = catalog.start_service_delete(service_id)
+            return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
         "/admin/api/jobs/cancel",
         methods=["POST"],
         include_in_schema=False,
@@ -429,6 +483,89 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 raise ValueError("job_id must be a non-empty string")
             job = await asyncio.to_thread(catalog.cancel_job, job_id)
             return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/admin/api/jobs/log", methods=["GET"], include_in_schema=False)
+    async def admin_job_log(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            job_id = _optional_query(request, "job_id")
+            if not job_id:
+                raise ValueError("job_id query parameter is required")
+            return JSONResponse(await asyncio.to_thread(catalog.job_log, job_id))
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/analysis/ssot-bundle",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_create_ssot_bundle(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            service_id = payload.get("service_id") if isinstance(payload, dict) else None
+            if not isinstance(service_id, str) or not service_id:
+                raise ValueError("service_id must be a non-empty string")
+            bundle = await asyncio.to_thread(catalog.create_ssot_bundle, service_id)
+            return JSONResponse(bundle, status_code=201)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/analysis/bundles/download",
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    async def admin_download_ssot_bundle(request: Request) -> Response:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            bundle_id = _optional_query(request, "bundle_id")
+            if not bundle_id:
+                raise ValueError("bundle_id query parameter is required")
+            path = await asyncio.to_thread(catalog.ssot_bundle_path, bundle_id)
+            return FileResponse(
+                path,
+                filename=path.name,
+                media_type="application/zip",
+                headers={"Cache-Control": "no-store"},
+            )
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/analysis/ssot-import",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_import_ssot(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Request body must be a JSON object")
+            service_id = payload.get("service_id")
+            index_id = payload.get("index_id")
+            content = payload.get("content")
+            if not isinstance(service_id, str) or not service_id:
+                raise ValueError("service_id must be a non-empty string")
+            if not isinstance(index_id, str) or not index_id:
+                raise ValueError("index_id must be a non-empty string")
+            if not isinstance(content, str) or not content:
+                raise ValueError("service_id, index_id and content must be non-empty strings")
+            result = await asyncio.to_thread(
+                catalog.import_ssot,
+                service_id=service_id,
+                index_id=index_id,
+                content=content,
+            )
+            return JSONResponse(result, status_code=202)
         except Exception as exc:
             return _api_error(exc)
 

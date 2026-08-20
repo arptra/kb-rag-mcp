@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build Service SSOT"
+  short_description: "Turn source analysis into evidence-backed SSOT"
+  default_prompt: "Use $build-service-ssot to convert this repository analysis bundle into an evidence-backed SSOT document."

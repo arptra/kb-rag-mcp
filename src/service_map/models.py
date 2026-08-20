@@ -56,6 +56,10 @@ class ServiceRecord(ServiceMapModel):
     aliases: list[str] = Field(default_factory=list)
     repository: str
     repository_path: str
+    repository_root: str | None = None
+    module_path: str = "."
+    module_state: Literal["active", "empty", "unsupported"] = "active"
+    build_system: Literal["maven", "gradle", "unknown"] = "unknown"
     source_url: str | None = None
     commit: str | None = None
     owner: str | None = None
@@ -97,6 +101,10 @@ class ServiceMapSnapshot(ServiceMapModel):
                     "id": item.id,
                     "name": item.name,
                     "repository": item.repository,
+                    "repository_root": item.repository_root,
+                    "module_path": item.module_path,
+                    "module_state": item.module_state,
+                    "build_system": item.build_system,
                     "owner": item.owner,
                     "entrypoint_count": len(item.entrypoints),
                     "outbound_interface_count": len(item.outbound_interfaces),

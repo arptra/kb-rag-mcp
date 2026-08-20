@@ -150,6 +150,109 @@ def test_empty_service_map_is_a_valid_file_snapshot(tmp_path: Path) -> None:
     assert result.graph.nodes == []
 
 
+def test_service_map_discovers_maven_modules_and_keeps_empty_modules(tmp_path: Path) -> None:
+    repository = tmp_path / "commerce-platform"
+    _write(
+        repository,
+        "pom.xml",
+        """
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>example</groupId><artifactId>commerce-platform</artifactId><version>1</version>
+  <packaging>pom</packaging>
+  <modules><module>orders</module><module>payments</module><module>empty-module</module></modules>
+</project>
+""",
+    )
+    for module in ("orders", "payments", "empty-module"):
+        _write(
+            repository,
+            f"{module}/pom.xml",
+            f"""
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>example</groupId><artifactId>{module}</artifactId><version>1</version>
+</project>
+""",
+        )
+    _write(
+        repository,
+        "orders/src/main/resources/application.properties",
+        "spring.application.name=orders-service\n",
+    )
+    _write(
+        repository,
+        "orders/src/main/java/example/StatusController.java",
+        """
+package example;
+@RestController
+@RequestMapping("/orders")
+public class StatusController {
+  @GetMapping("/status")
+  public String status() { return "ok"; }
+}
+""",
+    )
+    _write(
+        repository,
+        "payments/src/main/java/example/StatusController.java",
+        """
+package example;
+@RestController
+@RequestMapping("/payments")
+public class StatusController {
+  @GetMapping("/status")
+  public String status() { return "ok"; }
+}
+""",
+    )
+
+    settings = GraphSettings(store_path=tmp_path / "system-graph.json").resolved(tmp_path)
+    result = ServiceMapBuilder(settings).build(
+        [RepositoryInput(path=repository, name="Commerce platform")]
+    )
+
+    services = {item.id: item for item in result.service_map.services}
+    assert set(services) == {"orders-service", "payments", "empty-module"}
+    assert services["orders-service"].module_path == "orders"
+    assert services["payments"].module_path == "payments"
+    assert services["empty-module"].module_path == "empty-module"
+    assert services["empty-module"].module_state == "empty"
+    assert services["empty-module"].entrypoints == []
+    assert services["orders-service"].entrypoints[0].operation == "GET /orders/status"
+    assert services["payments"].entrypoints[0].operation == "GET /payments/status"
+
+
+def test_service_map_discovers_gradle_modules_without_running_gradle(tmp_path: Path) -> None:
+    repository = tmp_path / "gradle-platform"
+    _write(repository, "settings.gradle.kts", 'include(":api", ":empty")\n')
+    _write(repository, "api/build.gradle.kts", "plugins { java }\n")
+    (repository / "empty").mkdir(parents=True)
+    _write(
+        repository,
+        "api/src/main/java/example/ApiController.java",
+        """
+package example;
+@RestController
+public class ApiController {
+  @GetMapping("/health")
+  public String health() { return "ok"; }
+}
+""",
+    )
+
+    settings = GraphSettings(store_path=tmp_path / "system-graph.json").resolved(tmp_path)
+    result = ServiceMapBuilder(settings).build(
+        [RepositoryInput(path=repository, name="Gradle platform")]
+    )
+
+    services = {item.module_path: item for item in result.service_map.services}
+    assert set(services) == {"api", "empty"}
+    assert services["api"].build_system == "gradle"
+    assert services["api"].module_state == "active"
+    assert services["empty"].module_state == "empty"
+
+
 def test_service_map_process_honours_cancellation_before_start(tmp_path: Path) -> None:
     settings = GraphSettings(store_path=tmp_path / "system-graph.json").resolved(tmp_path)
     cancel = threading.Event()

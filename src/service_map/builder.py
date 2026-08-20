@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 from gigacode_graph.config import GraphSettings
-from gigacode_graph.models import GraphNode, GraphSnapshot
-from gigacode_graph.scanner import RepositoryScanner
+from gigacode_graph.models import GraphNode, GraphSnapshot, ScanIssue
+from gigacode_graph.scanner import RepositoryScanner, ScanTarget
+from service_map.layout import (
+    BuildSystem,
+    ModuleLayout,
+    ModuleState,
+    RepositoryLayout,
+    RepositoryLayoutAnalyzer,
+)
 from service_map.models import (
     InterfaceKind,
     ServiceDependency,
@@ -28,6 +36,7 @@ class RepositoryInput:
     name: str
     source_url: str | None = None
     commit: str | None = None
+    excluded_module_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,10 +62,83 @@ class ServiceMapBuilder:
         if not repositories:
             return ServiceMapBuildResult(GraphSnapshot(), ServiceMapSnapshot())
 
-        graph = RepositoryScanner(self._settings).scan(
-            sorted((item.path.resolve() for item in repositories), key=str)
+        layouts = [
+            (item, RepositoryLayoutAnalyzer().discover(item.path))
+            for item in sorted(repositories, key=lambda value: str(value.path.resolve()))
+        ]
+        targets, issues = self._scan_targets(layouts)
+        graph = (
+            RepositoryScanner(self._settings).scan_targets(targets)
+            if targets
+            else GraphSnapshot()
         )
+        if issues:
+            graph = graph.model_copy(update={"issues": [*graph.issues, *issues]})
         return self.from_graph(graph, repositories)
+
+    @staticmethod
+    def _scan_targets(
+        layouts: list[tuple[RepositoryInput, RepositoryLayout]],
+    ) -> tuple[list[ScanTarget], list[ScanIssue]]:
+        modules: list[tuple[RepositoryInput, ModuleLayout]] = [
+            (repository, module)
+            for repository, layout in layouts
+            for module in layout.modules
+            if module.relative_path not in repository.excluded_module_paths
+        ]
+        counts: dict[str, int] = {}
+        for _repository, module in modules:
+            counts[module.service_id] = counts.get(module.service_id, 0) + 1
+
+        targets: list[ScanTarget] = []
+        issues: list[ScanIssue] = []
+        for repository, layout in layouts:
+            for issue in layout.issues:
+                issues.append(
+                    ScanIssue(
+                        repository=repository.name,
+                        file=issue.file,
+                        message=issue.message,
+                    )
+                )
+        for repository, module in modules:
+            service_id = module.service_id
+            aliases = set(module.aliases)
+            if counts[service_id] > 1:
+                digest = hashlib.sha256(
+                    f"{repository.path.resolve()}\x1f{module.relative_path}".encode()
+                ).hexdigest()[:8]
+                service_id = f"{service_id}--{digest}"
+                aliases.add(module.service_id)
+                issues.append(
+                    ScanIssue(
+                        repository=repository.name,
+                        file=None,
+                        message=(
+                            f"Duplicate discovered service id '{module.service_id}' was "
+                            f"disambiguated as '{service_id}' for module {module.relative_path}"
+                        ),
+                    )
+                )
+            targets.append(
+                ScanTarget(
+                    path=module.root,
+                    repository_path=repository.path.resolve(),
+                    repository_name=repository.name,
+                    service_id=service_id,
+                    display_name=module.display_name,
+                    owner=module.owner,
+                    aliases=tuple(sorted(aliases)),
+                    module_path=module.relative_path,
+                    module_state=module.state,
+                    build_system=module.build_system,
+                    source_roots=module.source_roots,
+                    resource_roots=module.resource_roots,
+                    source_url=repository.source_url,
+                    commit=repository.commit,
+                )
+            )
+        return targets, issues
 
     def from_graph(
         self,
@@ -83,12 +165,22 @@ class ServiceMapBuilder:
     ) -> GraphNode:
         if node.type not in {"Repository", "Service"}:
             return node
-        repository = repositories.get(str(node.metadata.get("path")))
+        lookup_path = (
+            node.metadata.get("repository_path") or node.metadata.get("path")
+            if node.type == "Service"
+            else node.metadata.get("path")
+        )
+        repository = repositories.get(str(lookup_path))
         if repository is None:
             return node
+        module_path = str(node.metadata.get("module_path") or ".")
         return node.model_copy(
             update={
-                "label": repository.name,
+                "label": (
+                    repository.name
+                    if node.type == "Repository" or module_path == "."
+                    else node.label
+                ),
                 "metadata": {**node.metadata, "catalog_name": repository.name},
             }
         )
@@ -125,21 +217,25 @@ class ServiceMapBuilder:
                 continue
             path = str(node.metadata.get("path") or "")
             repository = repositories.get(path)
-            aliases = {
-                str(item)
-                for item in node.metadata.get("aliases", [])
-                if str(item).strip()
-            }
+            aliases = {str(item) for item in node.metadata.get("aliases", []) if str(item).strip()}
             aliases.update({node.service_id, node.label})
             services.append(
                 ServiceRecord(
                     id=node.service_id,
                     name=node.label,
                     aliases=sorted(aliases),
-                    repository=repository.name if repository else str(
-                        node.metadata.get("repository") or node.label
-                    ),
+                    repository=repository.name
+                    if repository
+                    else str(node.metadata.get("repository") or node.label),
                     repository_path=path,
+                    repository_root=self._optional_string(node.metadata.get("repository_path")),
+                    module_path=str(node.metadata.get("module_path") or "."),
+                    module_state=cast(
+                        ModuleState, str(node.metadata.get("module_state") or "active")
+                    ),
+                    build_system=cast(
+                        BuildSystem, str(node.metadata.get("build_system") or "unknown")
+                    ),
                     source_url=(
                         repository.source_url
                         if repository
@@ -193,9 +289,7 @@ class ServiceMapBuilder:
     @staticmethod
     def _exitpoint(node: GraphNode, target: GraphNode | None) -> ServiceInterface:
         kind = _interface_kind(node.metadata.get("protocol"))
-        operation = str(
-            node.metadata.get("operation") or node.metadata.get("topic") or node.label
-        )
+        operation = str(node.metadata.get("operation") or node.metadata.get("topic") or node.label)
         target_hint = ServiceMapBuilder._optional_string(node.metadata.get("target_hint"))
         if target_hint is None and target is not None:
             target_hint = target.label
@@ -227,9 +321,7 @@ class ServiceMapBuilder:
                 continue
             target_service_id = target.service_id if target.type == "Service" else None
             target_hint = str(
-                target.metadata.get("target_hint")
-                or target_service_id
-                or target.label
+                target.metadata.get("target_hint") or target_service_id or target.label
             )
             protocol = _interface_kind(edge.metadata.get("protocol"))
             operation = str(

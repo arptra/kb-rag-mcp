@@ -209,8 +209,8 @@ PYTHONPATH=src .venv/bin/python -m gigacode_graph.http_server
 
 Это архитектурный индекс, а не компилятор и не истина о runtime:
 
-- regex/source-анализ не видит вызовы через reflection, generated code, dynamic proxies и сложный
-  polymorphism;
+- Tree-sitter разбирает Java-структуру, но framework/source extractors не видят вызовы через
+  reflection, generated code, dynamic proxies и сложный polymorphism;
 - Spring profiles, conditional beans, service discovery, gateway rewrite и внешняя конфигурация
   могут менять реальный маршрут;
 - динамически собранные URL и topic names будут неполными или `UNRESOLVED`;

@@ -1,0 +1,454 @@
+# Анализ Java-репозиториев и карта сервисов
+
+Этот документ описывает фактический алгоритм RAG Control Plane после перехода на module-aware
+анализ. Он относится к страницам «Сервисы» и «Граф» в `/admin`, фоновым repository jobs и файлам
+`.cache/kb/system_graph.json` и `.cache/kb/service_map.json`.
+
+Standalone CLI графа описан отдельно в
+[README.gigacode-graph.md](README.gigacode-graph.md).
+
+## Что теперь поддерживается
+
+- один Git repository может содержать несколько Maven или Gradle modules;
+- каждый обнаруженный module анализируется как отдельный service;
+- объявленный пустой module сохраняется со статусом `empty` и не ломает общий build;
+- repository и module могут не содержать `openspec`;
+- индексируются все найденные каталоги `openspec`, а не только первый;
+- структура Java разбирается готовым `tree-sitter-java`, а не регулярными выражениями;
+- Maven/Gradle и исходный код repository не исполняются;
+- одинаковые `service_id` получают стабильные уникальные IDs и диагностический issue;
+- неоднозначный HTTP target остаётся `UNRESOLVED`, а не связывается с произвольным сервисом;
+- ошибка синтаксиса одного Java-файла не останавливает анализ остальных modules.
+
+## Почему выбран Tree-sitter, а не полностью готовая code graph система
+
+Готовые решения существуют:
+
+- [Joern](https://docs.joern.io/code-property-graph/) строит полноценный Code Property Graph;
+- [jQAssistant](https://jqassistant.github.io/jqassistant/current/) сканирует Java-структуру в Neo4j;
+- [Spoon](https://spoon.gforge.inria.fr/) предоставляет подробную Java AST/model API;
+- [CodeQL](https://docs.github.com/en/code-security/reference/code-scanning/codeql-build-options-for-compiled-languages)
+  умеет индексировать Java в no-build режиме.
+
+Они не были хорошей заменой для runtime-ядра этого сервиса:
+
+| Решение | Почему не взято как обязательное ядро |
+|---|---|
+| Joern | отдельная JVM/CLI/CPG storage и более тяжёлый lifecycle, чем минутный локальный scan |
+| jQAssistant | ориентирован на class files, Maven integration и Neo4j; для полного результата обычно нужен собранный bytecode |
+| Spoon | качественная Java-модель, но требует JDK/JVM sidecar и отдельный protocol между Python и Java |
+| CodeQL | сильная индексирующая система, но отдельный CLI/database lifecycle и licensing/distribution ограничения для такого встраивания |
+
+Для текущих требований выбран
+[Tree-sitter](https://tree-sitter.github.io/tree-sitter/) с официальной
+[Java grammar](https://github.com/tree-sitter/tree-sitter-java): он быстро строит concrete syntax
+tree, устойчив к незавершённому коду, имеет готовые Python wheels и не требует JDK, Maven, Gradle или
+скачивания dependencies анализируемого проекта.
+
+Tree-sitter решает **синтаксическую индексацию**, но сам не знает Spring, Feign, Kafka и смысл
+межсервисных вызовов. Поэтому поверх CST остаётся небольшой слой domain extractors. Регулярные
+выражения теперь используются для распознавания конкретных annotation arguments, literal URLs,
+topics и SQL, но не для поиска границ Java-классов, методов, полей и блоков.
+
+## Pipeline подключения repository
+
+```mermaid
+flowchart TD
+    UI["React UI"] --> API["POST /admin/api/repositories"]
+    API --> Queue["CatalogJob: queued"]
+    Queue --> Git["Shallow Git fetch/checkout"]
+    Git --> Layout["RepositoryLayoutAnalyzer"]
+    Layout --> Modules["Maven/Gradle/manifest modules"]
+    Layout --> Specs["Все OpenSpec roots"]
+    Specs --> RAG["Staged RAG build"]
+    Modules --> Worker["Disposable analysis process"]
+    Worker --> TS["tree-sitter-java CST"]
+    TS --> Extractors["Spring/Kafka/JPA/SQL extractors"]
+    Extractors --> Full["system_graph.json"]
+    Extractors --> Map["service_map.json"]
+    Full --> GraphUI["Страница Граф"]
+    Map --> ServicesUI["Страница Сервисы"]
+```
+
+Оркестрация находится в
+[`src/corporate_kb/catalog.py`](src/corporate_kb/catalog.py). Все тяжёлые catalog jobs используют
+один `_work_lock`, поэтому одновременно выполняется одна repository/index/graph операция.
+
+## Этап 1. Git checkout
+
+[`src/gigacode_graph/sources.py`](src/gigacode_graph/sources.py):
+
+- создаёт managed checkout в `.cache/kb/repositories/`;
+- выполняет shallow `git fetch --depth 1 --no-tags`;
+- переключается на branch, tag или commit;
+- сохраняет точный commit и source metadata;
+- завершает группу Git-процессов при cancel или timeout;
+- использует `KB_REPOSITORY_GIT_TIMEOUT_SECONDS`, по умолчанию 60 секунд.
+
+Процесс не запрашивает пароль интерактивно. Для приватного Git заранее настраивается SSH agent,
+ключ или credential helper машины.
+
+## Этап 2. Discovery modules
+
+Алгоритм находится в
+[`src/service_map/layout.py`](src/service_map/layout.py). Он только читает файлы и не запускает
+build tools.
+
+Источники module layout по приоритету:
+
+1. явная секция `modules` в корневом `gigacode-graph.json`;
+2. Maven `<modules>` из всех найденных `pom.xml`;
+3. Gradle `include(...)`/`include '...'` из `settings.gradle` и `settings.gradle.kts`;
+4. каталоги с собственным `pom.xml`, `build.gradle` или `build.gradle.kts`;
+5. если ничего не найдено — весь checkout как один fallback module.
+
+Root Maven aggregator или Gradle container не становится отдельным service, если у него нет
+собственных Java sources, `spring.application.name` или явного service manifest.
+
+Объявленный каталог без Java sources сохраняется:
+
+```json
+{
+  "module_path": "empty-module",
+  "module_state": "empty",
+  "build_system": "maven"
+}
+```
+
+Он виден на странице «Сервисы», но не запускает Java extractors и не создаёт ложные endpoints.
+
+### Явный manifest для нестандартного monorepo
+
+```json
+{
+  "modules": [
+    {
+      "path": "services/orders",
+      "service": {
+        "id": "orders-service",
+        "displayName": "Orders",
+        "owner": "commerce-platform",
+        "aliases": ["orders", "order-api"]
+      }
+    },
+    {
+      "path": "services/payments",
+      "service": {
+        "id": "payments-service",
+        "displayName": "Payments"
+      }
+    },
+    {
+      "path": "services/future-service",
+      "service": {
+        "id": "future-service"
+      }
+    }
+  ]
+}
+```
+
+Последний module может быть пустым. Его каталог должен существовать, но `src/` и `openspec/` не
+обязательны.
+
+### Как определяется service ID
+
+Для каждого module:
+
+1. `service.id` из соответствующей записи manifest;
+2. `spring.application.name` только в resources этого module;
+3. `artifactId` из `pom.xml` этого module;
+4. `rootProject.name` для корневого Gradle project;
+5. имя каталога module.
+
+Если одинаковый ID найден у нескольких modules или repositories, общий build не падает. Каждому
+конфликтующему service выдаётся стабильный ID вида `<id>--<8-char-hash>`, исходное имя остаётся
+alias, а в `issues` записывается конфликт.
+
+## Этап 3. Поиск всех OpenSpec roots
+
+Тот же `RepositoryLayoutAnalyzer` рекурсивно собирает каждый каталог с именем `openspec` без учёта
+регистра. Обход пропускает hidden directories, symlink, `.git`, build outputs, `node_modules` и
+vendor directories.
+
+Поддерживаемые документы:
+
+- `.md`;
+- `.markdown`;
+- `.html`;
+- `.htm`;
+- `.txt`.
+
+Для root `openspec/current.md` файл сохраняется по прежнему пути. Для module roots добавляется
+module prefix:
+
+```text
+orders/openspec/current.md   -> repositories/<id>/openspec/orders/current.md
+payments/openspec/api.md     -> repositories/<id>/openspec/payments/api.md
+```
+
+Так документы разных modules не перезаписывают друг друга. Коллизия целевого пути останавливает
+import с явной ошибкой. Список roots сохраняется в `RepositorySource.openspec_paths`, а старое поле
+`openspec_path` содержит первый root для обратной совместимости.
+
+Если roots нет, создаётся пустой knowledge source и `document_count=0`. Это штатный сценарий:
+source graph строится независимо от OpenSpec.
+
+## Этап 4. Java syntax index
+
+[`src/gigacode_graph/java_syntax.py`](src/gigacode_graph/java_syntax.py) использует
+`tree-sitter` и `tree-sitter-java` для извлечения:
+
+- package;
+- class/interface/record/enum;
+- annotations и modifiers;
+- fully structured method declarations и тела;
+- field declarations и types;
+- точных source positions.
+
+Java sources каждого module сканируются из его собственных source roots. Код соседнего module
+больше не смешивается с ним. Одинаковые простые имена классов в разных modules не перезаписывают
+друг друга, потому что у modules разные `ServiceScan`.
+
+Tree-sitter умеет восстановить CST при части syntax errors. В этом случае найденные факты
+сохраняются, а в graph добавляется issue о возможной неполноте.
+
+## Этап 5. Framework extractors
+
+[`src/gigacode_graph/scanner.py`](src/gigacode_graph/scanner.py) строит domain graph поверх Java
+CST.
+
+| Область | Что извлекается | Ограничение |
+|---|---|---|
+| HTTP inbound | Spring MVC `Get/Post/Put/Patch/Delete/RequestMapping` | custom composed annotations пока не раскрываются |
+| HTTP outbound | Feign clients и некоторые literal WebClient-style calls | вычисляемые URL остаются unresolved |
+| Kafka | `@KafkaListener`, literal `KafkaTemplate.send`, `StreamBridge.send` | placeholder/dynamic topics неполны |
+| Scheduled | `@Scheduled` entrypoints | cron semantics не интерпретируются |
+| Calls | простые field method calls от entrypoint, depth 6 | нет полного Java symbol solver и polymorphism |
+| Data | JPA entity/table/column и Spring Data repository access | это static indication, не runtime DB ownership |
+| Migration | `create table` и Liquibase `tableName` | SQL/YAML/XML разбираются эвристически |
+| Rules | условия `if` в достижимых methods | кандидат rule, не доказанный бизнес-смысл |
+
+HTTP target связывается с уникальным `service_id`, repository name или alias. Если alias подходит
+нескольким services, создаётся unresolved external target с `ambiguous_service_ids`.
+
+Kafka dependency создаётся между разными services, когда producer и consumer используют один
+literal topic.
+
+## Process isolation, timeout и публикация
+
+[`src/service_map/runner.py`](src/service_map/runner.py) запускает source analysis в отдельном
+Python process через `spawn`.
+
+- cancel проверяется каждые 100 ms;
+- timeout задаёт `KB_REPOSITORY_ANALYSIS_TIMEOUT_SECONDS`, по умолчанию 60 секунд;
+- при cancel/timeout worker сначала получает terminate, затем kill;
+- worker пишет результаты во временный каталог;
+- новые graph/map публикуются только после успешного завершения worker.
+
+RAG build также выполняется отдельным процессом и ограничен
+`KB_INDEX_BUILD_TIMEOUT_SECONDS=600` по умолчанию.
+
+## Artifacts и API
+
+| Путь | Содержимое |
+|---|---|
+| `.cache/kb/index_catalog.json` | indexes, repositories, OpenSpec roots, последние jobs и errors |
+| `.cache/kb/repositories/` | managed Git checkout-ы |
+| `.cache/kb/indexes/<id>/knowledge/repositories/` | скопированные OpenSpec documents |
+| `.cache/kb/system_graph.json` | полный graph: nodes, edges, evidence, issues |
+| `.cache/kb/service_map.json` | services/modules, interfaces, dependencies и module state |
+| `.cache/kb/analysis/runs/<run-id>/analysis.json` | неизменяемый полный результат каждого успешного analysis run |
+| `.cache/kb/analysis/runs/<run-id>/services/` | отдельные JSON и Markdown source summaries по сервисам |
+| `.cache/kb/analysis/latest.json` | указатель на последний успешный analysis run и его счётчики |
+| `.cache/kb/analysis/bundles/*.zip` | выгруженные пакеты для построения SSOT нейросетью |
+| `.cache/kb/job-logs/<job-id>.log` | полный журнал этапов job и Python traceback при ошибке |
+| `.cache/kb/runtime/mcp-http.log` | daemon stdout/stderr |
+
+Endpoints:
+
+```text
+GET  /admin/api/catalog
+GET  /admin/api/service-map/overview
+GET  /admin/api/service-map
+GET  /admin/api/graph/overview
+GET  /admin/api/graph
+GET  /admin/api/graph/evidence?ids=...
+POST /admin/api/graph/rebuild
+POST /admin/api/jobs/cancel
+GET  /admin/api/jobs/log?job_id=...
+POST /admin/api/services/analyze
+POST /admin/api/services/delete
+POST /admin/api/repositories/delete
+POST /admin/api/analysis/ssot-bundle
+GET  /admin/api/analysis/bundles/download?bundle_id=...
+POST /admin/api/analysis/ssot-import
+```
+
+## Lifecycle из dashboard
+
+### Повторный анализ сервиса
+
+Кнопка `↻ Анализ` на карточке сервиса создаёт cancellable job типа `service`. Сейчас публикация
+graph/map выполняется как согласованный полный snapshot всех подключённых repositories: выбранный
+service является причиной и UI target операции, но scanner пересматривает всю карту. Это немного
+дороже точечного merge, зато не оставляет устаревшие межсервисные edges. Worker по-прежнему
+изолирован отдельным процессом и ограничен общим analysis timeout.
+
+### Удаление сервиса
+
+Service — производная сущность module scanner. Поэтому физической строки сервиса в отдельной БД
+нет. Удаление сохраняет постоянное исключение `{repository_id, module_path, service_id}` в
+`index_catalog.json` и перестраивает graph/map. Исходники module и документы repository не
+удаляются. Исключение применяется при последующих полных анализах, поэтому сервис не появляется
+снова самопроизвольно.
+
+### Удаление repository
+
+Repository deletion выполняется фоновой job и:
+
+1. удаляет только управляемый каталог
+   `<knowledge_dir>/repositories/<repository-id>` с его OpenSpec documents;
+2. удаляет repository и его module exclusions из catalog;
+3. перестраивает service map/graph;
+4. перестраивает связанный RAG index;
+5. удаляет Git checkout только если это managed checkout внутри
+   `.cache/kb/repositories/` и на него больше никто не ссылается.
+
+Локальный пользовательский checkout никогда не удаляется.
+
+## Полные job logs
+
+Каждая job получает отдельный append-only log при постановке в очередь. В нём фиксируются queued,
+running, каждый переход этапа, путь опубликованного analysis run, cancel и полный traceback.
+Dashboard раскрывает журнал кнопкой `Полный лог`; тот же текст доступен через
+`GET /admin/api/jobs/log?job_id=...`. Краткое поле `job.error` оставлено для карточек и не заменяет
+полную диагностику.
+
+## SSOT workflow
+
+После каждого успешного анализа `AnalysisArchive` пишет полный snapshot и отдельные service slices.
+Кнопка `SSOT` на карточке сервиса открывает двухшаговый workflow:
+
+1. `Скачать пакет для нейросети` создаёт ZIP с `full-analysis.json`,
+   `service-analysis.json`, `PROMPT.md` и версионируемым skill
+   [`skills/build-service-ssot/SKILL.md`](skills/build-service-ssot/SKILL.md).
+2. Полученный от модели и проверенный человеком Markdown вставляется в UI. Сервер атомарно сохраняет
+   его как `<knowledge_dir>/ssot/<service-id>.md` в выбранный индекс и ставит переиндексацию в
+   очередь.
+
+Skill требует отделять observed facts от inference, не выдумывать отсутствующие business rules и
+сохранять ссылки `[evidence:<id>]`. Сам сервис намеренно не вызывает внешнюю модель: выбор модели,
+передача закрытого source analysis и human review остаются под контролем пользователя.
+
+Диагностика:
+
+```bash
+./scripts/start-mcp-http.sh logs
+curl -s http://127.0.0.1:8000/admin/api/catalog | jq '.jobs'
+curl -s 'http://127.0.0.1:8000/admin/api/jobs/log?job_id=<job-id>' | jq -r '.log'
+curl -s http://127.0.0.1:8000/admin/api/service-map | jq '.services, .issues'
+jq '.issues' .cache/kb/system_graph.json
+```
+
+## Текущие ограничения
+
+- Gradle custom `projectDir` mapping пока не поддерживается; нестандартный путь задаётся manifest;
+- Kotlin source может участвовать в layout, но Java Tree-sitter extractor его не индексирует;
+- нет полного Java type/symbol solver, classpath и dependency resolution;
+- reflection, generated code, Lombok-generated methods, runtime proxies и external configuration не
+  восстанавливаются;
+- source scan пока перестраивает общий snapshot всех repositories, а не переиспользует module
+  snapshots по commit hash;
+- один общий analysis timeout распространяется на весь snapshot;
+- Spring framework semantics всё ещё реализуются локальными extractors поверх CST.
+
+## Как расширять дальше
+
+### Добавить новый build layout
+
+Менять [`src/service_map/layout.py`](src/service_map/layout.py):
+
+1. добавить descriptor discovery;
+2. вернуть отдельный `ModuleLayout`;
+3. заполнить `source_roots`, `resource_roots`, `module_state` и `build_system`;
+4. добавить fixture в `tests/test_service_map.py`.
+
+Layout не должен выполнять скрипты repository или выходить за его корень.
+
+### Улучшить Java semantic resolution
+
+Tree-sitter следует оставить быстрым обязательным baseline. Более глубокий resolver лучше добавить
+как опциональный backend:
+
+```python
+class CodeIndexBackend(Protocol):
+    def index(self, module: ModuleLayout) -> CodeIndex: ...
+```
+
+Варианты backend:
+
+- Spoon sidecar для source-level type resolution;
+- Joern import/export для полного CPG;
+- CodeQL database для security/data-flow задач;
+- jQAssistant для уже собранных корпоративных artifacts.
+
+Результат backend нужно переводить в существующий versioned
+[`GraphSnapshot`](src/gigacode_graph/models.py), чтобы UI и MCP не зависели от конкретного parser.
+
+### Добавить framework extractor
+
+Сейчас framework logic находится в `scanner.py`. Следующий безопасный refactoring — интерфейс:
+
+```python
+class SourceExtractor(Protocol):
+    def supports(self, module: ModuleLayout) -> bool: ...
+    def extract(self, index: CodeIndex, context: ScanContext) -> ExtractorResult: ...
+```
+
+Отдельными extractors должны стать Spring HTTP, Feign, Kafka, JPA, migrations и call graph.
+
+### Сделать анализ инкрементальным
+
+Cache key module snapshot:
+
+```text
+repository commit
++ module relative path
++ build descriptor hash
++ source file hashes
++ parser version
++ extractor versions
+```
+
+После этого неизменившиеся modules можно загружать из cache, а worker запускать только для
+изменившихся. Merge должен публиковать общий snapshot только после проверки ссылочной целостности.
+
+## Карта файлов
+
+| Задача | Файл |
+|---|---|
+| Repository jobs, OpenSpec и RAG orchestration | [`src/corporate_kb/catalog.py`](src/corporate_kb/catalog.py) |
+| Maven/Gradle/manifest discovery | [`src/service_map/layout.py`](src/service_map/layout.py) |
+| Tree-sitter Java index | [`src/gigacode_graph/java_syntax.py`](src/gigacode_graph/java_syntax.py) |
+| Spring/Kafka/JPA/domain graph | [`src/gigacode_graph/scanner.py`](src/gigacode_graph/scanner.py) |
+| Full graph contract | [`src/gigacode_graph/models.py`](src/gigacode_graph/models.py) |
+| Service map projection | [`src/service_map/builder.py`](src/service_map/builder.py) |
+| Service/module contract | [`src/service_map/models.py`](src/service_map/models.py) |
+| Cancel/timeout/process supervision | [`src/service_map/runner.py`](src/service_map/runner.py) |
+| Admin HTTP API | [`src/corporate_kb/mcp/http_server.py`](src/corporate_kb/mcp/http_server.py) |
+| React service/graph pages | [`apps/dashboard/src/App.tsx`](apps/dashboard/src/App.tsx) |
+
+## Acceptance scenarios
+
+Автотесты фиксируют:
+
+- обычный single-module Spring repository;
+- Maven aggregator с двумя активными и одним пустым module;
+- Gradle multi-project с активным и пустым module;
+- одинаковые имена Java-классов в разных modules;
+- repository без OpenSpec;
+- несколько OpenSpec roots в разных modules;
+- HTTP/Kafka dependencies и unresolved external targets;
+- cancel и hard timeout analysis worker;
+- сохранение/загрузку graph и service map artifacts.

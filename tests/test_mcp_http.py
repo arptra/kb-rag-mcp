@@ -350,6 +350,11 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
 @pytest.mark.asyncio
 async def test_admin_manages_indexes_repositories_and_bound_tools(settings_factory) -> None:
     service, settings = _indexed_service(settings_factory)
+    settings.ssot_skill_path.mkdir(parents=True)
+    (settings.ssot_skill_path / "SKILL.md").write_text(
+        "---\nname: build-service-ssot\ndescription: Test skill.\n---\n",
+        encoding="utf-8",
+    )
     repository = settings.cache_dir.parent / "sample-repository"
     openspec = repository / "openspec"
     openspec.mkdir(parents=True)
@@ -468,3 +473,87 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
         assert {item["name"] for item in service_map.json()["services"]} == {
             "payments-service"
         }
+        service_id = service_map.json()["services"][0]["id"]
+
+        job_log = await client.get(
+            "/admin/api/jobs/log",
+            headers=admin_headers,
+            params={"job_id": job_id},
+        )
+        assert job_log.status_code == 200
+        assert "Analysis archived at" in job_log.json()["log"]
+
+        reanalyze = await client.post(
+            "/admin/api/services/analyze",
+            headers=admin_headers,
+            json={"service_id": service_id},
+        )
+        assert reanalyze.status_code == 202
+        analysis_job_id = reanalyze.json()["id"]
+        for _ in range(300):
+            catalog = (
+                await client.get("/admin/api/catalog", headers=admin_headers)
+            ).json()
+            analysis_job = next(
+                item for item in catalog["jobs"] if item["id"] == analysis_job_id
+            )
+            if analysis_job["status"] not in {"queued", "running", "cancelling"}:
+                break
+            await asyncio.sleep(0.01)
+        assert analysis_job["status"] == "completed"
+
+        bundle = await client.post(
+            "/admin/api/analysis/ssot-bundle",
+            headers=admin_headers,
+            json={"service_id": service_id},
+        )
+        assert bundle.status_code == 201
+        downloaded = await client.get(bundle.json()["download_url"], headers=admin_headers)
+        assert downloaded.status_code == 200
+        assert downloaded.headers["content-type"] == "application/zip"
+
+        deleted_tool = await client.post(
+            "/admin/api/tools/delete",
+            headers=admin_headers,
+            json={"name": definition["name"]},
+        )
+        assert deleted_tool.status_code == 200
+
+        deleted_service = await client.post(
+            "/admin/api/services/delete",
+            headers=admin_headers,
+            json={"service_id": service_id},
+        )
+        assert deleted_service.status_code == 202
+        service_delete_job_id = deleted_service.json()["id"]
+        for _ in range(300):
+            catalog = (
+                await client.get("/admin/api/catalog", headers=admin_headers)
+            ).json()
+            service_delete_job = next(
+                item for item in catalog["jobs"] if item["id"] == service_delete_job_id
+            )
+            if service_delete_job["status"] not in {"queued", "running", "cancelling"}:
+                break
+            await asyncio.sleep(0.01)
+        assert service_delete_job["status"] == "completed"
+
+        deleted_repository = await client.post(
+            "/admin/api/repositories/delete",
+            headers=admin_headers,
+            json={"repository_id": imported_repository["id"]},
+        )
+        assert deleted_repository.status_code == 202
+        repository_delete_job_id = deleted_repository.json()["id"]
+        for _ in range(300):
+            catalog = (
+                await client.get("/admin/api/catalog", headers=admin_headers)
+            ).json()
+            repository_delete_job = next(
+                item for item in catalog["jobs"] if item["id"] == repository_delete_job_id
+            )
+            if repository_delete_job["status"] not in {"queued", "running", "cancelling"}:
+                break
+            await asyncio.sleep(0.01)
+        assert repository_delete_job["status"] == "completed"
+        assert catalog["repository_count"] == 0

@@ -23,6 +23,7 @@ export interface RepositorySource {
   index_id: string;
   checkout_path: string;
   openspec_path: string | null;
+  openspec_paths: string[];
   commit: string | null;
   document_count: number;
   synced_at: string;
@@ -30,13 +31,15 @@ export interface RepositorySource {
 
 export interface CatalogJob {
   id: string;
-  type: "index" | "repository" | "graph";
+  type: "index" | "repository" | "graph" | "service" | "cleanup";
   status: "queued" | "running" | "cancelling" | "cancelled" | "completed" | "failed";
   index_id: string | null;
+  target_id: string | null;
   message: string;
   started_at: string | null;
   completed_at: string | null;
   error: string | null;
+  log_path: string | null;
 }
 
 export interface Catalog {
@@ -45,6 +48,15 @@ export interface Catalog {
   indexes: RagIndex[];
   repositories: RepositorySource[];
   jobs: CatalogJob[];
+  analysis: {
+    available: boolean;
+    path: string;
+    run_id?: string;
+    created_at?: string;
+    service_count?: number;
+    node_count?: number;
+    edge_count?: number;
+  };
 }
 
 export interface ManagedTool {
@@ -129,6 +141,10 @@ export interface ServiceMapOverview {
     id: string;
     name: string;
     repository: string;
+    repository_root: string | null;
+    module_path: string;
+    module_state: "active" | "empty" | "unsupported";
+    build_system: "maven" | "gradle" | "unknown";
     owner: string | null;
     entrypoint_count: number;
     outbound_interface_count: number;

@@ -133,3 +133,21 @@ input, textarea, select { min-height: 38px; padding: 8px 10px; border: 1px solid
   .graph-page { margin: -20px -16px -42px; }.graph-intro { padding: 20px 16px; flex-wrap: wrap; }.graph-layout { height: auto; min-height: 700px; display: grid; grid-template-columns: 1fr; }.graph-stats { display: none; }.graph-canvas { min-height: 520px; }.graph-details { min-height: 230px; border-top: 1px solid var(--line); border-left: 0; }
   .field-row, .field-row.three, .check-grid { grid-template-columns: 1fr; }.modal-backdrop { padding: 10px; }.modal { max-height: calc(100vh - 20px); }
 }
+
+/* Lifecycle controls, persistent logs, and SSOT workflow. */
+.job-item { border-bottom: 1px solid #1c251e; }
+.job-item:last-child { border: 0; }
+.job-item .job-row { border: 0; }
+.job-icon.service { color: var(--violet); }
+.job-icon.cleanup { color: var(--red); }
+.job-log-button { padding: 5px 8px; border: 1px solid #37443a; border-radius: 6px; background: #151d18; color: #9aa69c; font-size: 9px; cursor: pointer; }
+.job-log { padding: 0 0 12px 41px; }
+.job-log pre { max-height: 360px; margin: 0; color: #b7c2b9; }
+.table-danger { border: 0; background: none; color: #a66e68; font-size: 9px; cursor: pointer; }
+.table-danger:hover { color: var(--red); }
+.card-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; }
+.card-actions button.danger:hover { color: var(--red); }
+.service-card footer { align-items: flex-start; }
+.modal-form textarea.ssot-editor { min-height: 270px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.5; }
+.analysis-note { margin: -10px 0 18px; }
+.analysis-note code { color: #aebbb0; font-size: 9px; word-break: break-all; }
