@@ -20,6 +20,7 @@ class GraphSettings(BaseSettings):
 
     store_path: Path = Path(".cache/gigacode-graph/graph.json")
     repository_cache_path: Path = Path(".cache/gigacode-graph/repositories")
+    module_cache_path: Path = Path(".cache/gigacode-graph/module-analysis")
     ingestion_path: Path = Path(".cache/gigacode-graph/ingestion.json")
     max_java_file_bytes: int = Field(default=2_000_000, ge=10_000, le=20_000_000)
     call_depth: int = Field(default=6, ge=1, le=20)
@@ -42,6 +43,7 @@ class GraphSettings(BaseSettings):
         paths = {
             "store_path": self.store_path,
             "repository_cache_path": self.repository_cache_path,
+            "module_cache_path": self.module_cache_path,
             "ingestion_path": self.ingestion_path,
         }
         return self.model_copy(

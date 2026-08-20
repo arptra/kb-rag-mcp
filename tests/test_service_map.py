@@ -256,6 +256,107 @@ public class ApiController {
     assert services["empty"].module_state == "empty"
 
 
+def test_nested_kotlin_component_is_attached_to_service_and_scanned_once(tmp_path: Path) -> None:
+    repository = tmp_path / "mixed-platform"
+    _write(
+        repository,
+        "settings.gradle.kts",
+        'include(":orders", ":orders:payments-client")\n',
+    )
+    _write(repository, "orders/build.gradle.kts", 'plugins { kotlin("jvm") }\n')
+    _write(
+        repository,
+        "orders/src/main/kotlin/example/OrderController.kt",
+        """
+package example
+@RestController
+@RequestMapping("/orders")
+class OrderController {
+  @GetMapping("/{id}")
+  fun get(): String = "ok"
+}
+""",
+    )
+    _write(
+        repository,
+        "orders/payments-client/build.gradle.kts",
+        'plugins { kotlin("jvm") }\n',
+    )
+    _write(
+        repository,
+        "orders/payments-client/src/main/kotlin/example/PaymentsClient.kt",
+        """
+package example
+@FeignClient(name = "payments-service")
+interface PaymentsClient {
+  @PostMapping("/payments")
+  fun pay(): String
+}
+""",
+    )
+
+    settings = GraphSettings(
+        store_path=tmp_path / "system-graph.json",
+        module_cache_path=tmp_path / "module-cache",
+    ).resolved(tmp_path)
+    events: list[str] = []
+    result = ServiceMapBuilder(settings).build(
+        [RepositoryInput(path=repository, name="Mixed platform")],
+        progress=events.append,
+    )
+
+    assert len(result.service_map.services) == 1
+    service = result.service_map.services[0]
+    assert service.module_path == "orders"
+    assert {(item.kind, item.operation) for item in service.entrypoints} == {
+        ("HTTP", "GET /orders/{id}")
+    }
+    assert {item.target_hint for item in service.outbound_interfaces} == {"payments-service"}
+    assert any("java=0; kotlin=2" in event for event in events)
+    service_node = next(node for node in result.graph.nodes if node.id == f"service:{service.id}")
+    assert service_node.metadata["component_paths"] == ["orders/payments-client"]
+
+
+def test_module_cache_reuses_unchanged_services_and_forces_only_selected_service(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "cache-platform"
+    _write(repository, "settings.gradle", "include ':orders', ':payments'\n")
+    for module in ("orders", "payments"):
+        _write(repository, f"{module}/build.gradle", "plugins { id 'java' }\n")
+        _write(
+            repository,
+            f"{module}/src/main/java/example/Controller.java",
+            f"""
+@RestController
+public class Controller {{
+  @GetMapping("/{module}") public String get() {{ return "ok"; }}
+}}
+""",
+        )
+    settings = GraphSettings(
+        store_path=tmp_path / "system-graph.json",
+        module_cache_path=tmp_path / "module-cache",
+    ).resolved(tmp_path)
+    repositories = [RepositoryInput(path=repository, name="Cache platform", commit="cache-commit")]
+    ServiceMapBuilder(settings).build(repositories)
+
+    cached_events: list[str] = []
+    ServiceMapBuilder(settings).build(repositories, progress=cached_events.append)
+    assert any("Layout cache hit" in event for event in cached_events)
+    assert sum("Module cache hit" in event for event in cached_events) == 2
+    assert not any(event.startswith("Parsing ") for event in cached_events)
+
+    forced_events: list[str] = []
+    ServiceMapBuilder(settings).build(
+        repositories,
+        progress=forced_events.append,
+        force_service_ids={"orders"},
+    )
+    assert any("Module cache forced" in event and "orders" in event for event in forced_events)
+    assert any("Module cache hit" in event and "payments" in event for event in forced_events)
+
+
 def test_service_map_process_honours_cancellation_before_start(tmp_path: Path) -> None:
     settings = GraphSettings(store_path=tmp_path / "system-graph.json").resolved(tmp_path)
     cancel = threading.Event()

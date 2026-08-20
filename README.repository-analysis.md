@@ -1,4 +1,4 @@
-# Анализ Java-репозиториев и карта сервисов
+# Анализ Java/Kotlin-репозиториев и карта сервисов
 
 Этот документ описывает фактический алгоритм RAG Control Plane после перехода на module-aware
 анализ. Он относится к страницам «Сервисы» и «Граф» в `/admin`, фоновым repository jobs и файлам
@@ -10,15 +10,21 @@ Standalone CLI графа описан отдельно в
 ## Что теперь поддерживается
 
 - один Git repository может содержать несколько Maven или Gradle modules;
-- каждый обнаруженный module анализируется как отдельный service;
+- build module и service больше не считаются одним и тем же: deployable boundary определяется по
+  manifest, Spring/application markers и entrypoints, а библиотечные подмодули прикрепляются к
+  ближайшему однозначному service;
 - объявленный пустой module сохраняется со статусом `empty` и не ломает общий build;
 - repository и module могут не содержать `openspec`;
 - индексируются все найденные каталоги `openspec`, а не только первый;
-- структура Java разбирается готовым `tree-sitter-java`, а не регулярными выражениями;
+- структура Java и Kotlin разбирается готовыми `tree-sitter-java` и `tree-sitter-kotlin`;
 - Maven/Gradle и исходный код repository не исполняются;
 - одинаковые `service_id` получают стабильные уникальные IDs и диагностический issue;
 - неоднозначный HTTP target остаётся `UNRESOLVED`, а не связывается с произвольным сервисом;
-- ошибка синтаксиса одного Java-файла не останавливает анализ остальных modules.
+- ошибка синтаксиса одного Java/Kotlin-файла не останавливает анализ остальных modules;
+- layout делает один recursive inventory-проход по checkout, scanner получает готовые списки
+  файлов, а результат каждого service хранится в content-aware module cache;
+- кнопка повторного анализа bypass-ит cache только выбранного service; остальные сервисы берутся
+  из cache и затем заново линкуются в общий system graph.
 
 ## Почему выбран Tree-sitter, а не полностью готовая code graph система
 
@@ -41,7 +47,8 @@ Standalone CLI графа описан отдельно в
 
 Для текущих требований выбран
 [Tree-sitter](https://tree-sitter.github.io/tree-sitter/) с официальной
-[Java grammar](https://github.com/tree-sitter/tree-sitter-java): он быстро строит concrete syntax
+[Java grammar](https://github.com/tree-sitter/tree-sitter-java) и
+[Kotlin grammar](https://github.com/fwcd/tree-sitter-kotlin): он быстро строит concrete syntax
 tree, устойчив к незавершённому коду, имеет готовые Python wheels и не требует JDK, Maven, Gradle или
 скачивания dependencies анализируемого проекта.
 
@@ -62,8 +69,9 @@ flowchart TD
     Layout --> Specs["Все OpenSpec roots"]
     Specs --> RAG["Staged RAG build"]
     Modules --> Worker["Disposable analysis process"]
-    Worker --> TS["tree-sitter-java CST"]
-    TS --> Extractors["Spring/Kafka/JPA/SQL extractors"]
+    Worker --> TS["tree-sitter Java/Kotlin CST"]
+    TS --> Cache["Per-service module cache"]
+    Cache --> Extractors["Spring/Kafka/JPA/SQL extractors"]
     Extractors --> Full["system_graph.json"]
     Extractors --> Map["service_map.json"]
     Full --> GraphUI["Страница Граф"]
@@ -71,8 +79,9 @@ flowchart TD
 ```
 
 Оркестрация находится в
-[`src/corporate_kb/catalog.py`](src/corporate_kb/catalog.py). Все тяжёлые catalog jobs используют
-один `_work_lock`, поэтому одновременно выполняется одна repository/index/graph операция.
+[`src/corporate_kb/catalog.py`](src/corporate_kb/catalog.py). Graph publication сериализуется
+отдельным analysis lock, а RAG build — lock конкретного index. Поэтому анализ не блокирует index
+другой базы и не кладёт HTTP process; ожидающую lock job также можно отменить.
 
 ## Этап 1. Git checkout
 
@@ -88,11 +97,13 @@ flowchart TD
 Процесс не запрашивает пароль интерактивно. Для приватного Git заранее настраивается SSH agent,
 ключ или credential helper машины.
 
-## Этап 2. Discovery modules
+## Этап 2. Одноразовый inventory и discovery modules
 
 Алгоритм находится в
 [`src/service_map/layout.py`](src/service_map/layout.py). Он только читает файлы и не запускает
-build tools.
+build tools. Сначала выполняется ровно один `os.walk`: собираются descriptors, Java/Kotlin sources,
+resources и все OpenSpec roots. Затем каждый файл назначается самому глубокому module root. Поэтому
+родительский module больше не сканирует файлы вложенного module повторно.
 
 Источники module layout по приоритету:
 
@@ -103,7 +114,11 @@ build tools.
 5. если ничего не найдено — весь checkout как один fallback module.
 
 Root Maven aggregator или Gradle container не становится отдельным service, если у него нет
-собственных Java sources, `spring.application.name` или явного service manifest.
+собственных sources, `spring.application.name`, entrypoint/application marker или явного service
+manifest. Source-only library module прикрепляется к ближайшему service ancestor. При нескольких
+неоднозначных boundaries он не связывается наугад: создаётся issue с просьбой описать boundary в
+`gigacode-graph.json`. Если markers нет вообще, source modules публикуются как provisional services
+с диагностикой, чтобы repository не исчезал с карты.
 
 Объявленный каталог без Java sources сохраняется:
 
@@ -194,10 +209,11 @@ import с явной ошибкой. Список roots сохраняется �
 Если roots нет, создаётся пустой knowledge source и `document_count=0`. Это штатный сценарий:
 source graph строится независимо от OpenSpec.
 
-## Этап 4. Java syntax index
+## Этап 4. Java/Kotlin syntax index и module cache
 
-[`src/gigacode_graph/java_syntax.py`](src/gigacode_graph/java_syntax.py) использует
-`tree-sitter` и `tree-sitter-java` для извлечения:
+[`src/gigacode_graph/java_syntax.py`](src/gigacode_graph/java_syntax.py) и
+[`src/gigacode_graph/kotlin_syntax.py`](src/gigacode_graph/kotlin_syntax.py) используют Tree-sitter
+для извлечения:
 
 - package;
 - class/interface/record/enum;
@@ -206,17 +222,24 @@ source graph строится независимо от OpenSpec.
 - field declarations и types;
 - точных source positions.
 
-Java sources каждого module сканируются из его собственных source roots. Код соседнего module
+Java/Kotlin sources каждого module сканируются из готового inventory. Код соседнего module
 больше не смешивается с ним. Одинаковые простые имена классов в разных modules не перезаписывают
 друг друга, потому что у modules разные `ServiceScan`.
 
 Tree-sitter умеет восстановить CST при части syntax errors. В этом случае найденные факты
 сохраняются, а в graph добавляется issue о возможной неполноте.
 
+Для managed Git checkout сам layout также кешируется по `repository path + commit + analyzer
+version`, поэтому повторный service analysis не перечитывает всё дерево только ради прежних
+boundaries. Snapshot каждого service хранится в `.cache/kb/module-analysis/`. Cache key включает версию
+extractor, service/module identity, commit и размер/mtime всех назначенных source/resource files.
+После cache hits snapshots сливаются, HTTP aliases и Kafka producer/consumer dependencies
+перелинкуются глобально — cached module не теряет связи с сервисами из других repositories.
+
 ## Этап 5. Framework extractors
 
 [`src/gigacode_graph/scanner.py`](src/gigacode_graph/scanner.py) строит domain graph поверх Java
-CST.
+CST Java и Kotlin.
 
 | Область | Что извлекается | Ограничение |
 |---|---|---|
@@ -241,7 +264,7 @@ literal topic.
 Python process через `spawn`.
 
 - cancel проверяется каждые 100 ms;
-- timeout задаёт `KB_REPOSITORY_ANALYSIS_TIMEOUT_SECONDS`, по умолчанию 60 секунд;
+- timeout задаёт `KB_REPOSITORY_ANALYSIS_TIMEOUT_SECONDS`, по умолчанию 600 секунд;
 - при cancel/timeout worker сначала получает terminate, затем kill;
 - worker пишет результаты во временный каталог;
 - новые graph/map публикуются только после успешного завершения worker.
@@ -255,6 +278,7 @@ RAG build также выполняется отдельным процессо�
 |---|---|
 | `.cache/kb/index_catalog.json` | indexes, repositories, OpenSpec roots, последние jobs и errors |
 | `.cache/kb/repositories/` | managed Git checkout-ы |
+| `.cache/kb/module-analysis/` | versioned per-service snapshots для быстрых повторных запусков |
 | `.cache/kb/indexes/<id>/knowledge/repositories/` | скопированные OpenSpec documents |
 | `.cache/kb/system_graph.json` | полный graph: nodes, edges, evidence, issues |
 | `.cache/kb/service_map.json` | services/modules, interfaces, dependencies и module state |

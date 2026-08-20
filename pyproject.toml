@@ -14,6 +14,7 @@ dependencies = [
     "python-frontmatter>=1.1,<2",
     "tree-sitter>=0.25,<0.26",
     "tree-sitter-java>=0.23.5,<0.24",
+    "tree-sitter-kotlin>=1.1,<2",
     "typer>=0.16,<1",
 ]
 
@@ -60,7 +61,13 @@ mypy_path = "src"
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["frontmatter", "markdownify", "sentence_transformers", "sentence_transformers.*"]
+module = [
+    "frontmatter",
+    "markdownify",
+    "sentence_transformers",
+    "sentence_transformers.*",
+    "tree_sitter_kotlin",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -9,13 +9,14 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 from xml.etree import ElementTree
 
 BuildSystem = Literal["maven", "gradle", "unknown"]
 ModuleState = Literal["active", "empty", "unsupported"]
+ModuleRole = Literal["service", "component", "container"]
 
 _IGNORED_DIRECTORIES = {
     ".git",
@@ -44,10 +45,14 @@ class ModuleLayout:
     aliases: tuple[str, ...]
     build_system: BuildSystem
     state: ModuleState
+    role: ModuleRole
     declared: bool
     source_roots: tuple[Path, ...]
     resource_roots: tuple[Path, ...]
     openspec_roots: tuple[Path, ...]
+    source_files: tuple[Path, ...] = ()
+    resource_files: tuple[Path, ...] = ()
+    component_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +76,16 @@ class _Candidate:
     declared: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _RepositoryInventory:
+    """Files collected by the only recursive walk performed during layout discovery."""
+
+    descriptors: tuple[Path, ...]
+    source_files: tuple[Path, ...]
+    resource_files: tuple[Path, ...]
+    openspec_roots: tuple[Path, ...]
+
+
 class RepositoryLayoutAnalyzer:
     """Discover independently scannable modules without invoking Maven or Gradle."""
 
@@ -86,7 +101,8 @@ class RepositoryLayoutAnalyzer:
             path: _Candidate(path, declared=True) for path in manifest_modules
         }
 
-        descriptors = self._descriptor_files(root)
+        inventory = self._inventory(root)
+        descriptors = inventory.descriptors
         maven_modules: set[Path] = set()
         gradle_modules: set[Path] = set()
         for descriptor in descriptors:
@@ -108,33 +124,43 @@ class RepositoryLayoutAnalyzer:
             candidates[root] = _Candidate(root)
 
         candidate_roots = set(candidates)
+        owned_sources = self._owned_files(inventory.source_files, candidate_roots, root)
+        owned_resources = self._owned_files(inventory.resource_files, candidate_roots, root)
+        owned_openspec = self._owned_files(inventory.openspec_roots, candidate_roots, root)
         modules: list[ModuleLayout] = []
         for candidate in sorted(
             candidates.values(), key=lambda item: self._relative(root, item.root)
         ):
-            descendants = {
-                child
-                for child in candidate_roots
-                if child != candidate.root and child.is_relative_to(candidate.root)
-            }
             explicit = self._module_manifest(root, candidate.root, manifest, manifest_modules)
             source_roots = self._source_roots(candidate.root, candidate.build_system)
             resource_roots = self._resource_roots(candidate.root, candidate.build_system)
-            has_sources = any(
-                self._contains_suffix(path, ".java", descendants) for path in source_roots
+            source_files = tuple(
+                path
+                for path in owned_sources.get(candidate.root, ())
+                if any(path.is_relative_to(source_root) for source_root in source_roots)
             )
-            has_unsupported_sources = any(
-                self._contains_suffix(path, ".kt", descendants) for path in source_roots
+            resource_files = tuple(
+                path
+                for path in owned_resources.get(candidate.root, ())
+                if any(path.is_relative_to(resource_root) for resource_root in resource_roots)
             )
-            has_application = bool(self._spring_application_name(resource_roots, descendants))
-            is_container = bool(descendants) and not (has_sources or has_application or explicit)
-            if candidate.root == root and is_container and candidate.root not in manifest_modules:
-                continue
+            has_sources = bool(source_files)
+            spring_name = self._spring_application_name_files(resource_files)
+            explicit_service = isinstance(explicit, dict) and isinstance(
+                explicit.get("service"), dict
+            )
+            service_marker = bool(spring_name) or self._has_service_marker(source_files)
+            role: ModuleRole = (
+                "service"
+                if explicit_service or service_marker or (candidate.declared and not has_sources)
+                else "component"
+                if has_sources
+                else "container"
+            )
 
             relative_path = self._relative(root, candidate.root)
             service = explicit.get("service", {}) if isinstance(explicit, dict) else {}
             service = service if isinstance(service, dict) else {}
-            spring_name = self._spring_application_name(resource_roots, descendants)
             artifact = self._maven_artifact(candidate.root / "pom.xml", issues, root)
             gradle_name = self._gradle_project_name(candidate.root)
             fallback = root.name if relative_path == "." else candidate.root.name
@@ -154,9 +180,7 @@ class RepositoryLayoutAnalyzer:
                 *(str(item).strip() for item in raw_aliases if isinstance(raw_aliases, list)),
             }
             aliases.discard("")
-            state: ModuleState = (
-                "active" if has_sources else "unsupported" if has_unsupported_sources else "empty"
-            )
+            state: ModuleState = "active" if has_sources else "empty"
             modules.append(
                 ModuleLayout(
                     root=candidate.root,
@@ -167,22 +191,133 @@ class RepositoryLayoutAnalyzer:
                     aliases=tuple(sorted(aliases)),
                     build_system=candidate.build_system,
                     state=state,
+                    role=role,
                     declared=candidate.declared or candidate.root in manifest_modules,
                     source_roots=source_roots,
                     resource_roots=resource_roots,
-                    openspec_roots=self._openspec_roots(candidate.root, descendants),
+                    openspec_roots=owned_openspec.get(candidate.root, ()),
+                    source_files=source_files,
+                    resource_files=resource_files,
                 )
             )
 
         if not modules:
             modules.append(self._fallback_module(root, manifest, issues))
-        openspec_roots = self._all_openspec_roots(root)
+        modules = self._attach_components(root, modules, issues)
         return RepositoryLayout(
             root=root,
             modules=tuple(modules),
-            openspec_roots=openspec_roots,
+            openspec_roots=inventory.openspec_roots,
             issues=tuple(issues),
         )
+
+    def _attach_components(
+        self,
+        repository: Path,
+        modules: list[ModuleLayout],
+        issues: list[LayoutIssue],
+    ) -> list[ModuleLayout]:
+        """Attach library modules to a real service boundary without inventing services."""
+        service_indexes = [index for index, item in enumerate(modules) if item.role == "service"]
+        components = [item for item in modules if item.role == "component"]
+        if not service_indexes and components:
+            # There is no deployable marker to trust. Preserve useful analysis by treating only
+            # source-bearing modules as provisional boundaries and report the uncertainty.
+            promoted_paths = {item.relative_path for item in components}
+            modules = [
+                replace(item, role="service") if item.relative_path in promoted_paths else item
+                for item in modules
+            ]
+            issues.append(
+                LayoutIssue(
+                    None,
+                    "No deployable service markers were found; source modules were promoted to "
+                    "provisional services. Define gigacode-graph.json for exact boundaries.",
+                )
+            )
+            return modules
+        if not service_indexes:
+            # An empty repository still gets one visible placeholder, not one service per empty
+            # Maven/Gradle module.
+            preferred = next((item for item in modules if item.root == repository), modules[0])
+            return [replace(preferred, role="service")]
+
+        service_modules = [modules[index] for index in service_indexes]
+        attachments: dict[str, list[ModuleLayout]] = {
+            item.relative_path: [] for item in service_modules
+        }
+        for component in components:
+            ancestors = [
+                service
+                for service in service_modules
+                if component.root.is_relative_to(service.root)
+            ]
+            owner = max(ancestors, key=lambda item: len(item.root.parts)) if ancestors else None
+            if owner is None and len(service_modules) == 1:
+                owner = service_modules[0]
+            if owner is None:
+                issues.append(
+                    LayoutIssue(
+                        component.relative_path,
+                        "Library/component module is not attached because several service "
+                        "boundaries are possible; declare its service in gigacode-graph.json.",
+                    )
+                )
+                continue
+            attachments[owner.relative_path].append(component)
+
+        result: list[ModuleLayout] = []
+        for module in modules:
+            if module.role != "service":
+                continue
+            attached = attachments.get(module.relative_path, [])
+            result.append(
+                replace(
+                    module,
+                    source_roots=tuple(
+                        sorted(
+                            {
+                                *module.source_roots,
+                                *(root for item in attached for root in item.source_roots),
+                            }
+                        )
+                    ),
+                    resource_roots=tuple(
+                        sorted(
+                            {
+                                *module.resource_roots,
+                                *(root for item in attached for root in item.resource_roots),
+                            }
+                        )
+                    ),
+                    openspec_roots=tuple(
+                        sorted(
+                            {
+                                *module.openspec_roots,
+                                *(root for item in attached for root in item.openspec_roots),
+                            }
+                        )
+                    ),
+                    source_files=tuple(
+                        sorted(
+                            {
+                                *module.source_files,
+                                *(path for item in attached for path in item.source_files),
+                            }
+                        )
+                    ),
+                    resource_files=tuple(
+                        sorted(
+                            {
+                                *module.resource_files,
+                                *(path for item in attached for path in item.resource_files),
+                            }
+                        )
+                    ),
+                    component_paths=tuple(sorted(item.relative_path for item in attached)),
+                )
+            )
+        return result
 
     @staticmethod
     def _merge_candidate(
@@ -233,18 +368,147 @@ class RepositoryLayoutAnalyzer:
             build_system=build_system,
             state=(
                 "active"
-                if any(self._contains_suffix(path, ".java", set()) for path in source_roots)
-                else (
-                    "unsupported"
-                    if any(self._contains_suffix(path, ".kt", set()) for path in source_roots)
-                    else "empty"
+                if any(
+                    self._contains_suffix(path, suffix, set())
+                    for path in source_roots
+                    for suffix in (".java", ".kt")
                 )
+                else "empty"
             ),
+            role="service",
             declared=True,
             source_roots=source_roots,
             resource_roots=resource_roots,
             openspec_roots=self._openspec_roots(root, set()),
+            source_files=tuple(
+                sorted(
+                    path
+                    for source_root in source_roots
+                    for path in self._files(source_root, {".java", ".kt"})
+                )
+            ),
+            resource_files=tuple(
+                sorted(
+                    path
+                    for resource_root in resource_roots
+                    for path in self._files(
+                        resource_root, {".properties", ".yaml", ".yml", ".xml", ".sql"}
+                    )
+                )
+            ),
         )
+
+    def _inventory(self, root: Path) -> _RepositoryInventory:
+        descriptor_names = {
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+        }
+        descriptors: list[Path] = []
+        source_files: list[Path] = []
+        resource_files: list[Path] = []
+        openspec_roots: list[Path] = []
+        resource_suffixes = {".properties", ".yaml", ".yml", ".xml", ".sql"}
+        for current, directories, files in os.walk(root, followlinks=False):
+            directory = Path(current)
+            directories[:] = [
+                name
+                for name in directories
+                if name not in _IGNORED_DIRECTORIES
+                and not name.startswith(".")
+                and not (directory / name).is_symlink()
+            ]
+            for name in tuple(directories):
+                if name.lower() == "openspec":
+                    openspec_roots.append((directory / name).resolve())
+            for name in files:
+                path = (directory / name).resolve()
+                if path.is_symlink():
+                    continue
+                if name in descriptor_names:
+                    descriptors.append(path)
+                suffix = path.suffix.lower()
+                if suffix in {".java", ".kt"}:
+                    source_files.append(path)
+                elif suffix in resource_suffixes:
+                    resource_files.append(path)
+        return _RepositoryInventory(
+            descriptors=tuple(sorted(set(descriptors))),
+            source_files=tuple(sorted(set(source_files))),
+            resource_files=tuple(sorted(set(resource_files))),
+            openspec_roots=tuple(sorted(set(openspec_roots))),
+        )
+
+    @staticmethod
+    def _owned_files(
+        files: tuple[Path, ...],
+        candidate_roots: set[Path],
+        repository: Path,
+    ) -> dict[Path, tuple[Path, ...]]:
+        owned: dict[Path, list[Path]] = {path: [] for path in candidate_roots}
+        for path in files:
+            current = path if path.is_dir() else path.parent
+            while current.is_relative_to(repository):
+                if current in candidate_roots:
+                    owned[current].append(path)
+                    break
+                if current == repository:
+                    break
+                current = current.parent
+        return {key: tuple(value) for key, value in owned.items()}
+
+    @staticmethod
+    def _has_service_marker(files: tuple[Path, ...]) -> bool:
+        markers = (
+            "@SpringBootApplication",
+            "@SpringBootConfiguration",
+            "@RestController",
+            "@Controller",
+            "@KafkaListener",
+            "@GrpcService",
+            "@Scheduled",
+        )
+        for path in files:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if any(marker in text for marker in markers):
+                return True
+            if path.suffix.lower() == ".kt" and re.search(r"(?m)^\s*fun\s+main\s*\(", text):
+                return True
+            if path.suffix.lower() == ".java" and re.search(r"\bstatic\s+void\s+main\s*\(", text):
+                return True
+        return False
+
+    @staticmethod
+    def _spring_application_name_files(files: tuple[Path, ...]) -> str | None:
+        candidates = [
+            path
+            for path in files
+            if path.suffix.lower() in {".properties", ".yaml", ".yml"}
+            and path.name.startswith(_APPLICATION_NAMES)
+        ]
+        return RepositoryLayoutAnalyzer._application_name_from_paths(candidates)
+
+    @staticmethod
+    def _files(root: Path, suffixes: set[str]) -> tuple[Path, ...]:
+        if not root.is_dir():
+            return ()
+        found: list[Path] = []
+        for current, directories, files in os.walk(root, followlinks=False):
+            directory = Path(current)
+            directories[:] = [
+                name
+                for name in directories
+                if name not in _IGNORED_DIRECTORIES and not (directory / name).is_symlink()
+            ]
+            found.extend(
+                directory / name for name in files if (directory / name).suffix.lower() in suffixes
+            )
+        return tuple(found)
 
     def _descriptor_files(self, root: Path) -> tuple[Path, ...]:
         names = {
@@ -486,6 +750,10 @@ class RepositoryLayoutAnalyzer:
                         _APPLICATION_NAMES
                     ):
                         candidates.append(path)
+        return RepositoryLayoutAnalyzer._application_name_from_paths(candidates)
+
+    @staticmethod
+    def _application_name_from_paths(candidates: list[Path]) -> str | None:
         for path in sorted(candidates):
             try:
                 text = path.read_text(encoding="utf-8")

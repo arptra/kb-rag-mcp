@@ -58,6 +58,7 @@ class ServiceRecord(ServiceMapModel):
     repository_path: str
     repository_root: str | None = None
     module_path: str = "."
+    component_paths: list[str] = Field(default_factory=list)
     module_state: Literal["active", "empty", "unsupported"] = "active"
     build_system: Literal["maven", "gradle", "unknown"] = "unknown"
     source_url: str | None = None
@@ -103,6 +104,7 @@ class ServiceMapSnapshot(ServiceMapModel):
                     "repository": item.repository,
                     "repository_root": item.repository_root,
                     "module_path": item.module_path,
+                    "component_paths": item.component_paths,
                     "module_state": item.module_state,
                     "build_system": item.build_system,
                     "owner": item.owner,

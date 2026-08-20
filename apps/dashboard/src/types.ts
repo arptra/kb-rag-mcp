@@ -143,6 +143,7 @@ export interface ServiceMapOverview {
     repository: string;
     repository_root: string | null;
     module_path: string;
+    component_paths: string[];
     module_state: "active" | "empty" | "unsupported";
     build_system: "maven" | "gradle" | "unknown";
     owner: string | null;

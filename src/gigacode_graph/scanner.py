@@ -22,6 +22,7 @@ from xml.etree import ElementTree
 
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.java_syntax import JavaSyntaxParser
+from gigacode_graph.kotlin_syntax import KotlinSyntaxParser
 from gigacode_graph.models import (
     Confidence,
     EdgeType,
@@ -170,6 +171,7 @@ class JavaClass:
     file: Path
     text: str
     line: int
+    language: Literal["java", "kotlin"] = "java"
     has_syntax_errors: bool = False
 
 
@@ -184,6 +186,8 @@ class ServiceScan:
     build_system: str
     source_roots: tuple[Path, ...]
     resource_roots: tuple[Path, ...]
+    source_files: tuple[Path, ...]
+    resource_files: tuple[Path, ...]
     commit: str | None
     aliases: set[str]
     classes: dict[str, JavaClass] = field(default_factory=dict)
@@ -230,6 +234,9 @@ class ScanTarget:
     build_system: str = "unknown"
     source_roots: tuple[Path, ...] | None = None
     resource_roots: tuple[Path, ...] | None = None
+    source_files: tuple[Path, ...] | None = None
+    resource_files: tuple[Path, ...] | None = None
+    component_paths: tuple[str, ...] = ()
     source_url: str | None = None
     commit: str | None = None
 
@@ -338,6 +345,129 @@ class _GraphBuilder:
         )
 
 
+def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
+    """Merge independently cached service scans and resolve cross-service dependencies."""
+    builder = _GraphBuilder()
+    seen_issues: set[tuple[str, str | None, str, str]] = set()
+    for snapshot in snapshots:
+        for node in snapshot.nodes:
+            if node.type != "ExternalSystem":
+                builder.add_node(node)
+        for evidence in snapshot.evidence:
+            builder.evidence[evidence.id] = evidence
+        for issue in snapshot.issues:
+            key = (issue.repository, issue.file, issue.message, issue.severity)
+            if key not in seen_issues:
+                builder.issues.append(issue)
+                seen_issues.add(key)
+
+    nodes = builder.nodes
+    for snapshot in snapshots:
+        for edge in snapshot.edges:
+            if edge.type == "DEPENDS_ON":
+                continue
+            if edge.source in nodes and edge.target in nodes:
+                builder.edges[edge.id] = edge
+
+    alias_candidates: dict[str, set[str]] = {}
+    for node in nodes.values():
+        if node.type != "Service" or not node.service_id:
+            continue
+        aliases = {
+            node.service_id,
+            node.label,
+            *(str(value) for value in node.metadata.get("aliases", [])),
+        }
+        for alias in aliases:
+            normalized = RepositoryScanner._normalize_target(alias)
+            if normalized:
+                alias_candidates.setdefault(normalized, set()).add(node.service_id)
+    alias_map = {
+        alias: next(iter(service_ids))
+        for alias, service_ids in alias_candidates.items()
+        if len(service_ids) == 1
+    }
+
+    for exitpoint in list(nodes.values()):
+        if exitpoint.type != "ExitPoint" or not exitpoint.service_id:
+            continue
+        protocol = str(exitpoint.metadata.get("protocol") or "UNKNOWN").upper()
+        if protocol == "KAFKA":
+            continue
+        target_hint = str(exitpoint.metadata.get("target_hint") or "")
+        normalized = RepositoryScanner._normalize_target(target_hint)
+        target_service = alias_map.get(normalized)
+        if target_service:
+            target_id = f"service:{target_service}"
+            confidence: Confidence = "HIGH"
+        else:
+            label = target_hint or "unresolved target"
+            target_id = f"external:{normalized or _stable_id('unknown', label)}"
+            ambiguous = sorted(alias_candidates.get(normalized, set()))
+            confidence = (
+                "UNRESOLVED" if "${" in label or not target_hint or len(ambiguous) > 1 else "LOW"
+            )
+            builder.add_node(
+                GraphNode(
+                    id=target_id,
+                    type="ExternalSystem",
+                    label=label,
+                    metadata={
+                        "target_hint": target_hint,
+                        "resolved": False,
+                        "ambiguous_service_ids": ambiguous,
+                    },
+                    evidence_ids=exitpoint.evidence_ids,
+                )
+            )
+        operation = str(exitpoint.metadata.get("operation") or exitpoint.label)
+        metadata = {"protocol": protocol, "operation": operation}
+        builder.add_edge(
+            source=exitpoint.id,
+            target=target_id,
+            edge_type="DEPENDS_ON",
+            label=f"{protocol} {operation}",
+            confidence=confidence,
+            metadata=metadata,
+            evidence_ids=exitpoint.evidence_ids,
+        )
+        builder.add_edge(
+            source=f"service:{exitpoint.service_id}",
+            target=target_id,
+            edge_type="DEPENDS_ON",
+            label=f"{protocol} {operation}",
+            confidence=confidence,
+            metadata=metadata,
+            evidence_ids=exitpoint.evidence_ids,
+        )
+
+    publishers: dict[str, list[GraphEdge]] = {}
+    consumers: dict[str, list[GraphEdge]] = {}
+    for edge in builder.edges.values():
+        target_node = builder.nodes.get(edge.target)
+        if target_node is None or target_node.type != "Event":
+            continue
+        topic = str(target_node.metadata.get("topic") or target_node.label)
+        if edge.type == "PUBLISHES" and edge.source.startswith("service:"):
+            publishers.setdefault(topic, []).append(edge)
+        elif edge.type == "CONSUMES" and edge.source.startswith("service:"):
+            consumers.setdefault(topic, []).append(edge)
+    for topic, source_edges in publishers.items():
+        for source in source_edges:
+            for target_edge in consumers.get(topic, []):
+                if source.source == target_edge.source:
+                    continue
+                builder.add_edge(
+                    source=source.source,
+                    target=target_edge.source,
+                    edge_type="DEPENDS_ON",
+                    label=f"KAFKA {topic}",
+                    metadata={"protocol": "KAFKA", "topic": topic},
+                    evidence_ids=[*source.evidence_ids, *target_edge.evidence_ids],
+                )
+    return builder.snapshot()
+
+
 class RepositoryScanner:
     """Build one evidence-backed snapshot from local repository checkouts."""
 
@@ -348,6 +478,7 @@ class RepositoryScanner:
         self._topics: list[TopicFact] = []
         self._scans: dict[str, ServiceScan] = {}
         self._java_parser = JavaSyntaxParser()
+        self._kotlin_parser = KotlinSyntaxParser()
 
     def scan(self, repositories: list[Path]) -> GraphSnapshot:
         if not repositories:
@@ -480,6 +611,16 @@ class RepositoryScanner:
             if target is not None and target.resource_roots is not None
             else (repository,)
         )
+        source_files = (
+            tuple(path.resolve() for path in target.source_files)
+            if target is not None and target.source_files is not None
+            else ()
+        )
+        resource_files = (
+            tuple(path.resolve() for path in target.resource_files)
+            if target is not None and target.resource_files is not None
+            else ()
+        )
         scan = ServiceScan(
             service_id=service_id,
             repository_name=repository_name,
@@ -490,6 +631,8 @@ class RepositoryScanner:
             build_system=target.build_system if target is not None else "unknown",
             source_roots=source_roots,
             resource_roots=resource_roots,
+            source_files=source_files,
+            resource_files=resource_files,
             commit=commit,
             aliases=aliases,
         )
@@ -522,6 +665,7 @@ class RepositoryScanner:
                 "module_state": scan.module_state,
                 "build_system": scan.build_system,
                 "source_roots": [str(path) for path in scan.source_roots],
+                "component_paths": list(target.component_paths) if target is not None else [],
                 "commit": commit,
                 "source": (
                     target.source_url
@@ -549,21 +693,34 @@ class RepositoryScanner:
         *,
         progress: Callable[[str], None] | None = None,
     ) -> None:
+        started_at = time.monotonic()
         if progress is not None:
-            progress(f"Discovering Java files: {scan.service_id}")
-        java_files = sorted(
-            {path for root in scan.source_roots for path in self._files(root, {".java"})}
+            progress(f"Loading source inventory: {scan.service_id}")
+        source_files = sorted(
+            set(scan.source_files)
+            if scan.source_files
+            else {
+                path for root in scan.source_roots for path in self._files(root, {".java", ".kt"})
+            }
         )
+        java_count = sum(path.suffix.lower() == ".java" for path in source_files)
+        kotlin_count = sum(path.suffix.lower() == ".kt" for path in source_files)
         if progress is not None:
-            progress(f"Java files found: {scan.service_id}; files={len(java_files)}")
-        for position, path in enumerate(java_files, start=1):
+            progress(
+                f"Source files found: {scan.service_id}; files={len(source_files)}; "
+                f"java={java_count}; kotlin={kotlin_count}"
+            )
+            progress(f"Java files found: {scan.service_id}; files={java_count}")
+            progress(f"Kotlin files found: {scan.service_id}; files={kotlin_count}")
+        for position, path in enumerate(source_files, start=1):
             if progress is not None and (position == 1 or position % 250 == 0):
                 try:
                     current_file = path.relative_to(scan.repository_path).as_posix()
                 except ValueError:
                     current_file = str(path)
                 progress(
-                    f"Parsing Java: {scan.service_id}; file={position}/{len(java_files)}; "
+                    f"Parsing {path.suffix.lstrip('.').upper()}: {scan.service_id}; "
+                    f"file={position}/{len(source_files)}; "
                     f"path={current_file}"
                 )
             try:
@@ -572,11 +729,15 @@ class RepositoryScanner:
                         ScanIssue(
                             repository=scan.repository_name,
                             file=path.relative_to(scan.repository_path).as_posix(),
-                            message="Java file exceeded scanner size limit",
+                            message="Source file exceeded scanner size limit",
                         )
                     )
                     continue
-                java_class = self._parse_java_class(path)
+                java_class = (
+                    self._parse_kotlin_class(path)
+                    if path.suffix.lower() == ".kt"
+                    else self._parse_java_class(path)
+                )
                 if java_class is not None:
                     scan.classes[java_class.name] = java_class
                     if java_class.has_syntax_errors:
@@ -585,7 +746,8 @@ class RepositoryScanner:
                                 repository=scan.repository_name,
                                 file=path.relative_to(scan.repository_path).as_posix(),
                                 message=(
-                                    "Tree-sitter recovered from Java syntax errors; "
+                                    f"Tree-sitter recovered from {java_class.language.title()} "
+                                    "syntax errors; "
                                     "extracted facts may be incomplete"
                                 ),
                             )
@@ -595,13 +757,18 @@ class RepositoryScanner:
                     ScanIssue(
                         repository=scan.repository_name,
                         file=path.relative_to(scan.repository_path).as_posix(),
-                        message=f"Cannot parse Java source: {exc}",
+                        message=f"Cannot parse source: {exc}",
                     )
                 )
         self._index_database_model(scan)
         self._index_java_architecture(scan)
         self._index_migrations(scan)
         self._trace_operations(scan)
+        if progress is not None:
+            progress(
+                f"Module extraction complete: {scan.service_id}; "
+                f"elapsed={time.monotonic() - started_at:.3f}s"
+            )
 
     def _index_java_architecture(self, scan: ServiceScan) -> None:
         for java_class in scan.classes.values():
@@ -644,7 +811,7 @@ class RepositoryScanner:
                         file=method.file,
                         line=method.line,
                         snippet=f"{method.annotations} {method.symbol}",
-                        extractor="java-symbol",
+                        extractor=f"{java_class.language}-symbol",
                     )
                     self._builder.add_node(
                         GraphNode(
@@ -1125,7 +1292,9 @@ class RepositoryScanner:
 
     def _index_migrations(self, scan: ServiceScan) -> None:
         paths = sorted(
-            {
+            set(scan.resource_files)
+            if scan.resource_files
+            else {
                 path
                 for root in scan.resource_roots
                 for path in self._files(root, {".sql", ".yaml", ".yml", ".xml"})
@@ -1361,6 +1530,46 @@ class RepositoryScanner:
             file=path,
             text=text,
             line=parsed.line,
+            has_syntax_errors=parsed.has_errors,
+        )
+
+    def _parse_kotlin_class(self, path: Path) -> JavaClass | None:
+        source = path.read_bytes()
+        parsed = self._kotlin_parser.parse(path, source)
+        if parsed is None:
+            return None
+        text = source.decode("utf-8")
+        return JavaClass(
+            name=parsed.name,
+            package=parsed.package,
+            kind=parsed.kind,
+            annotations=parsed.annotations,
+            extends=parsed.extends,
+            fields={
+                field.name: JavaField(
+                    name=field.name,
+                    type_name=field.type_name,
+                    annotations=field.annotations,
+                    line=field.line,
+                )
+                for field in parsed.fields
+            },
+            methods=[
+                JavaMethod(
+                    class_name=parsed.name,
+                    name=method.name,
+                    annotations=method.annotations,
+                    body=method.body,
+                    line=method.line,
+                    body_offset=method.body_offset,
+                    file=path,
+                )
+                for method in parsed.methods
+            ],
+            file=path,
+            text=text,
+            line=parsed.line,
+            language="kotlin",
             has_syntax_errors=parsed.has_errors,
         )
 

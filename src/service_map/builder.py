@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,10 +12,17 @@ from typing import Any, cast
 
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.models import GraphNode, GraphSnapshot, ScanIssue
-from gigacode_graph.scanner import RepositoryScanner, ScanTarget
+from gigacode_graph.scanner import (
+    RepositoryScanner,
+    ScanTarget,
+    merge_and_relink_snapshots,
+)
+from gigacode_graph.store import JsonGraphStore
 from service_map.layout import (
     BuildSystem,
+    LayoutIssue,
     ModuleLayout,
+    ModuleRole,
     ModuleState,
     RepositoryLayout,
     RepositoryLayoutAnalyzer,
@@ -29,6 +38,7 @@ from service_map.models import (
 )
 
 _INTERFACE_KINDS = {"HTTP", "KAFKA", "SCHEDULED", "GRPC", "CLI"}
+_ANALYZER_VERSION = "service-map-v3-java-kotlin-inventory"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,23 +76,36 @@ class ServiceMapBuilder:
         *,
         progress: Callable[[str], None] | None = None,
         checkpoint: Callable[[ServiceMapBuildResult], None] | None = None,
+        force_service_ids: set[str] | None = None,
+        force_all: bool = False,
     ) -> ServiceMapBuildResult:
         if not repositories:
             return ServiceMapBuildResult(GraphSnapshot(), ServiceMapSnapshot())
 
+        build_started_at = time.monotonic()
         ordered = sorted(repositories, key=lambda value: str(value.path.resolve()))
         layouts: list[tuple[RepositoryInput, RepositoryLayout]] = []
         for position, item in enumerate(ordered, start=1):
+            layout_started_at = time.monotonic()
             if progress is not None:
                 progress(
                     f"Layout [{position}/{len(ordered)}]: {item.name}; path={item.path.resolve()}"
                 )
-            layout = RepositoryLayoutAnalyzer().discover(item.path)
+            layout_cache_path = self._layout_cache_path(item)
+            layout = self._load_layout(layout_cache_path) if layout_cache_path else None
+            if layout is None:
+                layout = RepositoryLayoutAnalyzer().discover(item.path)
+                if layout_cache_path is not None:
+                    self._save_layout(layout_cache_path, layout)
+            elif progress is not None:
+                assert layout_cache_path is not None
+                progress(f"Layout cache hit: {item.name}; path={layout_cache_path.name}")
             layouts.append((item, layout))
             if progress is not None:
                 progress(
                     f"Layout ready: {item.name}; modules={len(layout.modules)}; "
-                    f"openspec={len(layout.openspec_roots)}; issues={len(layout.issues)}"
+                    f"openspec={len(layout.openspec_roots)}; issues={len(layout.issues)}; "
+                    f"elapsed={time.monotonic() - layout_started_at:.3f}s"
                 )
         targets, issues = self._scan_targets(layouts)
         if progress is not None:
@@ -109,20 +132,44 @@ class ServiceMapBuilder:
             if checkpoint is None:
                 return
             if issues:
-                snapshot = snapshot.model_copy(
-                    update={"issues": [*snapshot.issues, *issues]}
-                )
+                snapshot = snapshot.model_copy(update={"issues": [*snapshot.issues, *issues]})
             checkpoint(self.from_graph(snapshot, repositories))
 
-        graph = (
-            RepositoryScanner(self._settings).scan_targets(
-                targets,
-                progress=progress,
-                checkpoint=publish_scan_checkpoint if checkpoint is not None else None,
-            )
-            if targets
-            else GraphSnapshot()
-        )
+        module_snapshots: list[GraphSnapshot] = []
+        last_checkpoint_at = time.monotonic()
+        forced = force_service_ids or set()
+        for position, target in enumerate(targets, start=1):
+            cache_path = self._cache_path(target)
+            use_cache = not force_all and target.service_id not in forced
+            snapshot = self._load_cached(cache_path) if use_cache else None
+            if snapshot is not None:
+                if progress is not None:
+                    progress(
+                        f"Module cache hit [{position}/{len(targets)}]: "
+                        f"{target.service_id}; path={cache_path.name}"
+                    )
+            else:
+                scan_started_at = time.monotonic()
+                if progress is not None:
+                    reason = "forced" if not use_cache else "miss"
+                    progress(
+                        f"Module cache {reason} [{position}/{len(targets)}]: {target.service_id}"
+                    )
+                snapshot = RepositoryScanner(self._settings).scan_targets(
+                    [target],
+                    progress=progress,
+                )
+                JsonGraphStore(cache_path).save(snapshot)
+                if progress is not None:
+                    progress(
+                        f"Module cached: {target.service_id}; "
+                        f"elapsed={time.monotonic() - scan_started_at:.3f}s"
+                    )
+            module_snapshots.append(snapshot)
+            if checkpoint is not None and time.monotonic() - last_checkpoint_at >= 5:
+                publish_scan_checkpoint(merge_and_relink_snapshots(module_snapshots))
+                last_checkpoint_at = time.monotonic()
+        graph = merge_and_relink_snapshots(module_snapshots) if targets else GraphSnapshot()
         if issues:
             graph = graph.model_copy(update={"issues": [*graph.issues, *issues]})
         result = self.from_graph(graph, repositories)
@@ -130,9 +177,126 @@ class ServiceMapBuilder:
             progress(
                 f"Snapshot ready: services={len(result.service_map.services)}; "
                 f"nodes={len(result.graph.nodes)}; edges={len(result.graph.edges)}; "
-                f"evidence={len(result.graph.evidence)}; issues={len(result.graph.issues)}"
+                f"evidence={len(result.graph.evidence)}; issues={len(result.graph.issues)}; "
+                f"elapsed={time.monotonic() - build_started_at:.3f}s"
             )
         return result
+
+    def _cache_path(self, target: ScanTarget) -> Path:
+        digest = hashlib.sha256()
+        digest.update(_ANALYZER_VERSION.encode())
+        digest.update(str(self._settings.call_depth).encode())
+        for value in (
+            target.repository_name,
+            target.service_id,
+            target.display_name,
+            target.owner,
+            target.module_path,
+            target.module_state,
+            target.build_system,
+            target.commit,
+            *target.aliases,
+            *target.component_paths,
+        ):
+            digest.update(str(value or "").encode())
+            digest.update(b"\x00")
+        repository = target.repository_path or target.path
+        paths = sorted({*(target.source_files or ()), *(target.resource_files or ())})
+        for path in paths:
+            try:
+                relative = path.relative_to(repository).as_posix()
+                stat = path.stat()
+            except (OSError, ValueError):
+                continue
+            digest.update(relative.encode())
+            digest.update(f"\x00{stat.st_size}\x00{stat.st_mtime_ns}\x00".encode())
+        return self._settings.module_cache_path / f"{digest.hexdigest()}.json"
+
+    def _layout_cache_path(self, repository: RepositoryInput) -> Path | None:
+        if not repository.commit:
+            return None
+        digest = hashlib.sha256(
+            f"{_ANALYZER_VERSION}\x00{repository.path.resolve()}\x00{repository.commit}".encode()
+        ).hexdigest()
+        return self._settings.module_cache_path / "layouts" / f"{digest}.json"
+
+    @staticmethod
+    def _save_layout(path: Path, layout: RepositoryLayout) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "root": str(layout.root),
+            "openspec_roots": [str(item) for item in layout.openspec_roots],
+            "issues": [{"file": item.file, "message": item.message} for item in layout.issues],
+            "modules": [
+                {
+                    "root": str(item.root),
+                    "relative_path": item.relative_path,
+                    "service_id": item.service_id,
+                    "display_name": item.display_name,
+                    "owner": item.owner,
+                    "aliases": list(item.aliases),
+                    "build_system": item.build_system,
+                    "state": item.state,
+                    "role": item.role,
+                    "declared": item.declared,
+                    "source_roots": [str(value) for value in item.source_roots],
+                    "resource_roots": [str(value) for value in item.resource_roots],
+                    "openspec_roots": [str(value) for value in item.openspec_roots],
+                    "source_files": [str(value) for value in item.source_files],
+                    "resource_files": [str(value) for value in item.resource_files],
+                    "component_paths": list(item.component_paths),
+                }
+                for item in layout.modules
+            ],
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    @staticmethod
+    def _load_layout(path: Path | None) -> RepositoryLayout | None:
+        if path is None or not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("schema_version") != 1:
+                return None
+            return RepositoryLayout(
+                root=Path(payload["root"]),
+                openspec_roots=tuple(Path(value) for value in payload["openspec_roots"]),
+                issues=tuple(LayoutIssue(**value) for value in payload["issues"]),
+                modules=tuple(
+                    ModuleLayout(
+                        root=Path(value["root"]),
+                        relative_path=value["relative_path"],
+                        service_id=value["service_id"],
+                        display_name=value["display_name"],
+                        owner=value["owner"],
+                        aliases=tuple(value["aliases"]),
+                        build_system=cast(BuildSystem, value["build_system"]),
+                        state=cast(ModuleState, value["state"]),
+                        role=cast(ModuleRole, value["role"]),
+                        declared=bool(value["declared"]),
+                        source_roots=tuple(Path(item) for item in value["source_roots"]),
+                        resource_roots=tuple(Path(item) for item in value["resource_roots"]),
+                        openspec_roots=tuple(Path(item) for item in value["openspec_roots"]),
+                        source_files=tuple(Path(item) for item in value["source_files"]),
+                        resource_files=tuple(Path(item) for item in value["resource_files"]),
+                        component_paths=tuple(value["component_paths"]),
+                    )
+                    for value in payload["modules"]
+                ),
+            )
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _load_cached(path: Path) -> GraphSnapshot | None:
+        if not path.is_file():
+            return None
+        try:
+            return JsonGraphStore(path).load()
+        except (OSError, ValueError):
+            return None
 
     @staticmethod
     def _scan_targets(
@@ -192,6 +356,9 @@ class ServiceMapBuilder:
                     build_system=module.build_system,
                     source_roots=module.source_roots,
                     resource_roots=module.resource_roots,
+                    source_files=module.source_files,
+                    resource_files=module.resource_files,
+                    component_paths=module.component_paths,
                     source_url=repository.source_url,
                     commit=repository.commit,
                 )
@@ -288,6 +455,11 @@ class ServiceMapBuilder:
                     repository_path=path,
                     repository_root=self._optional_string(node.metadata.get("repository_path")),
                     module_path=str(node.metadata.get("module_path") or "."),
+                    component_paths=[
+                        str(item)
+                        for item in node.metadata.get("component_paths", [])
+                        if str(item).strip()
+                    ],
                     module_state=cast(
                         ModuleState, str(node.metadata.get("module_state") or "active")
                     ),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
 import os
 import re
@@ -11,6 +12,8 @@ import tempfile
 import threading
 import traceback
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -152,7 +155,8 @@ class RagCatalog:
         self._default_service = default_service
         self._usage = usage
         self._lock = threading.RLock()
-        self._work_lock = threading.Lock()
+        self._analysis_lock = threading.Lock()
+        self._index_work_locks: dict[str, threading.Lock] = {}
         self._state = self._load()
         self._services: dict[str, KnowledgeService] = {"default": default_service}
         self._tools: dict[str, KnowledgeTools] = {"default": default_tools}
@@ -441,7 +445,7 @@ class RagCatalog:
     def _run_index_job(self, job_id: str, index_id: str) -> None:
         cancel_event = self._cancel_event(job_id)
         try:
-            with self._work_lock:
+            with self._cancellable_lock(self._index_work_lock(index_id), cancel_event):
                 self._raise_if_cancelled(cancel_event)
                 self._execute_index_job(job_id, index_id, cancel_event)
         except (
@@ -496,7 +500,7 @@ class RagCatalog:
     ) -> None:
         cancel_event = self._cancel_event(job_id)
         try:
-            with self._work_lock:
+            with self._cancellable_lock(self._index_work_lock(index_id), cancel_event):
                 self._raise_if_cancelled(cancel_event)
                 self._execute_repository_job(
                     job_id,
@@ -618,9 +622,8 @@ class RagCatalog:
     def _run_graph_job(self, job_id: str) -> None:
         cancel_event = self._cancel_event(job_id)
         try:
-            with self._work_lock:
-                self._raise_if_cancelled(cancel_event)
-                self._execute_graph_job(job_id, cancel_event)
+            self._raise_if_cancelled(cancel_event)
+            self._execute_graph_job(job_id, cancel_event)
         except (CatalogJobCancelled, RepositoryOperationCancelled, ServiceMapBuildCancelled):
             self._finish_cancelled_job(job_id, None)
         except Exception as exc:
@@ -635,7 +638,11 @@ class RagCatalog:
             message="Analyzing repositories",
             started_at=_now(),
         )
-        snapshot = self._build_graph(cancel_event=cancel_event, job_id=job_id)
+        snapshot = self._build_graph(
+            cancel_event=cancel_event,
+            job_id=job_id,
+            force_all=True,
+        )
         self._raise_if_cancelled(cancel_event)
         partial = self._is_partial_analysis(snapshot)
         self._update_job(
@@ -658,29 +665,29 @@ class RagCatalog:
     ) -> None:
         cancel_event = self._cancel_event(job_id)
         try:
-            with self._work_lock:
-                self._raise_if_cancelled(cancel_event)
-                self._update_job(
-                    job_id,
-                    status="running",
-                    message=f"Reanalyzing service: {service_name}",
-                    started_at=_now(),
-                )
-                snapshot = self._build_graph(cancel_event=cancel_event, job_id=job_id)
-                self._raise_if_cancelled(cancel_event)
-                self._update_job(
-                    job_id,
-                    status="completed",
-                    message=f"Service analysis completed: {service_name}",
-                    completed_at=_now(),
-                )
-                self._append_job_log(
-                    job_id,
-                    (
-                        f"Snapshot contains {len(snapshot.nodes)} nodes and "
-                        f"{len(snapshot.edges)} edges"
-                    ),
-                )
+            self._raise_if_cancelled(cancel_event)
+            self._update_job(
+                job_id,
+                status="running",
+                message=f"Reanalyzing service: {service_name}",
+                started_at=_now(),
+            )
+            snapshot = self._build_graph(
+                cancel_event=cancel_event,
+                job_id=job_id,
+                force_service_ids={service_id},
+            )
+            self._raise_if_cancelled(cancel_event)
+            self._update_job(
+                job_id,
+                status="completed",
+                message=f"Service analysis completed: {service_name}",
+                completed_at=_now(),
+            )
+            self._append_job_log(
+                job_id,
+                (f"Snapshot contains {len(snapshot.nodes)} nodes and {len(snapshot.edges)} edges"),
+            )
         except (CatalogJobCancelled, RepositoryOperationCancelled, ServiceMapBuildCancelled):
             self._finish_cancelled_job(job_id, index_id)
         except Exception as exc:
@@ -696,7 +703,7 @@ class RagCatalog:
     ) -> None:
         cancel_event = self._cancel_event(job_id)
         try:
-            with self._work_lock:
+            with self._cancellable_lock(self._index_work_lock(index_id), cancel_event):
                 self._raise_if_cancelled(cancel_event)
                 repository = self._repository(repository_id)
                 self._update_job(
@@ -762,36 +769,33 @@ class RagCatalog:
     ) -> None:
         cancel_event = self._cancel_event(job_id)
         try:
-            with self._work_lock:
-                self._raise_if_cancelled(cancel_event)
-                self._update_job(
-                    job_id,
-                    status="running",
-                    message=f"Removing service from map: {service_id}",
-                    started_at=_now(),
-                )
-                exclusion = ServiceExclusion(
-                    repository_id=repository_id,
-                    module_path=module_path,
-                    service_id=service_id,
-                )
-                with self._lock:
-                    self._state.service_exclusions = [
-                        item
-                        for item in self._state.service_exclusions
-                        if not (
-                            item.repository_id == repository_id and item.module_path == module_path
-                        )
-                    ]
-                    self._state.service_exclusions.append(exclusion)
-                    self._save_locked()
-                self._build_graph(cancel_event=cancel_event, job_id=job_id)
-                self._update_job(
-                    job_id,
-                    status="completed",
-                    message=f"Service removed from map: {service_id}",
-                    completed_at=_now(),
-                )
+            self._raise_if_cancelled(cancel_event)
+            self._update_job(
+                job_id,
+                status="running",
+                message=f"Removing service from map: {service_id}",
+                started_at=_now(),
+            )
+            exclusion = ServiceExclusion(
+                repository_id=repository_id,
+                module_path=module_path,
+                service_id=service_id,
+            )
+            with self._lock:
+                self._state.service_exclusions = [
+                    item
+                    for item in self._state.service_exclusions
+                    if not (item.repository_id == repository_id and item.module_path == module_path)
+                ]
+                self._state.service_exclusions.append(exclusion)
+                self._save_locked()
+            self._build_graph(cancel_event=cancel_event, job_id=job_id)
+            self._update_job(
+                job_id,
+                status="completed",
+                message=f"Service removed from map: {service_id}",
+                completed_at=_now(),
+            )
         except (CatalogJobCancelled, RepositoryOperationCancelled, ServiceMapBuildCancelled):
             self._finish_cancelled_job(job_id, None)
         except Exception as exc:
@@ -804,16 +808,43 @@ class RagCatalog:
         *,
         cancel_event: threading.Event | None = None,
         job_id: str | None = None,
+        force_service_ids: set[str] | None = None,
+        force_all: bool = False,
+    ) -> GraphSnapshot:
+        if job_id is not None and self._analysis_lock.locked():
+            self._append_job_log(job_id, "Waiting for another graph analysis to finish")
+        with self._cancellable_lock(self._analysis_lock, cancel_event):
+            return self._build_graph_unlocked(
+                cancel_event=cancel_event,
+                job_id=job_id,
+                force_service_ids=force_service_ids,
+                force_all=force_all,
+            )
+
+    def _build_graph_unlocked(
+        self,
+        *,
+        cancel_event: threading.Event | None,
+        job_id: str | None,
+        force_service_ids: set[str] | None,
+        force_all: bool,
     ) -> GraphSnapshot:
         with self._lock:
             repositories = [item.model_copy(deep=True) for item in self._state.repositories]
         if job_id is not None:
             self._append_job_log(job_id, f"Analyzing {len(repositories)} connected repositories")
         inputs = self._repository_inputs(repositories)
-        result = ServiceMapProcessRunner(
+        runner = ServiceMapProcessRunner(
             self._graph_settings(),
             timeout_seconds=self.settings.repository_analysis_timeout_seconds,
-        ).build(
+        )
+        build_options: dict[str, Any] = {}
+        build_parameters = inspect.signature(runner.build).parameters
+        if "force_service_ids" in build_parameters:
+            build_options["force_service_ids"] = force_service_ids
+        if "force_all" in build_parameters:
+            build_options["force_all"] = force_all
+        result = runner.build(
             inputs,
             cancel=cancel_event,
             progress=(
@@ -822,6 +853,7 @@ class RagCatalog:
                 else None
             ),
             checkpoint=self._publish_analysis_checkpoint,
+            **build_options,
         )
         self._service_map_store.save(result.service_map)
         self._graph_store.save(result.graph)
@@ -840,6 +872,28 @@ class RagCatalog:
             self._append_job_log(job_id, f"Analysis archived at {manifest['path']}")
         return result.graph
 
+    def _index_work_lock(self, index_id: str) -> threading.Lock:
+        with self._lock:
+            lock = self._index_work_locks.get(index_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._index_work_locks[index_id] = lock
+            return lock
+
+    @contextmanager
+    def _cancellable_lock(
+        self,
+        lock: threading.Lock,
+        cancel_event: threading.Event | None,
+    ) -> Iterator[None]:
+        while not lock.acquire(timeout=0.1):
+            self._raise_if_cancelled(cancel_event)
+        try:
+            self._raise_if_cancelled(cancel_event)
+            yield
+        finally:
+            lock.release()
+
     def _publish_analysis_checkpoint(self, result: ServiceMapBuildResult) -> None:
         """Expose discovered services while deeper source parsing is still running."""
         self._service_map_store.save(result.service_map)
@@ -848,8 +902,7 @@ class RagCatalog:
     @staticmethod
     def _is_partial_analysis(snapshot: GraphSnapshot) -> bool:
         return any(
-            issue.message.startswith("Partial analysis checkpoint:")
-            for issue in snapshot.issues
+            issue.message.startswith("Partial analysis checkpoint:") for issue in snapshot.issues
         )
 
     def _repository_inputs(self, repositories: list[RepositorySource]) -> list[RepositoryInput]:
@@ -1091,8 +1144,8 @@ class RagCatalog:
             return self._job_cancellations.setdefault(job_id, threading.Event())
 
     @staticmethod
-    def _raise_if_cancelled(cancel_event: threading.Event) -> None:
-        if cancel_event.is_set():
+    def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+        if cancel_event is not None and cancel_event.is_set():
             raise CatalogJobCancelled("Operation was cancelled")
 
     def _release_cancel_event(self, job_id: str) -> None:
@@ -1239,6 +1292,7 @@ class RagCatalog:
         return GraphSettings(
             store_path=self.settings.graph_store_path,
             repository_cache_path=self.settings.repository_cache_dir,
+            module_cache_path=self.settings.repository_cache_dir.parent / "module-analysis",
             ingestion_path=self.settings.repository_cache_dir.parent / "graph-ingestion.json",
             git_timeout_seconds=self.settings.repository_git_timeout_seconds,
         ).resolved()

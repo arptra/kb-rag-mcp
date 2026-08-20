@@ -76,7 +76,9 @@ Qwen CLI ─┘
 а Git-репозитории подключаются по URL и ref. Сервер сам обновляет управляемый checkout, находит все
 каталоги `openspec`, переносит поддерживаемые документы в выбранный индекс, перестраивает embeddings
 и обновляет evidence-backed граф системы. Module-aware слой читает Maven/Gradle descriptors,
-сохраняет пустые modules, а `tree-sitter-java` индексирует структуру Java без запуска build.
+сохраняет пустые modules, а `tree-sitter-java` и `tree-sitter-kotlin` индексируют Java/Kotlin без
+запуска build. Layout обходит checkout один раз, библиотечные подмодули прикрепляет к service
+boundary, а неизменившиеся services берёт из `.cache/kb/module-analysis/`.
 Отдельный модуль `service_map` без LLM и SSOT извлекает точки входа, исходящие HTTP/Kafka-интерфейсы
 и предполагаемые межсервисные зависимости. Карта хранится в `.cache/kb/service_map.json` и доступна через
 `GET /admin/api/service-map`; краткая статистика — через `GET /admin/api/service-map/overview`.
@@ -99,7 +101,8 @@ Repository и производные сервисы можно удалять и
 скачать пакет с analysis JSON и [`build-service-ssot`](skills/build-service-ssot/SKILL.md), затем
 загрузить проверенный Markdown SSOT в выбранный RAG-индекс.
 Во вкладке dashboard **«Операции и логи»** открытый журнал активной job обновляется раз в секунду:
-он показывает layout каждого repository, найденные modules, число Java-файлов, текущий этап
+он показывает layout каждого repository, найденные modules, число Java/Kotlin-файлов, cache
+hit/miss, длительность этапов и текущий этап
 парсинга, линковку зависимостей и полный traceback или системный signal при аварии worker.
 
 На диске в `.cache/kb/` находятся только:

@@ -519,7 +519,7 @@ function OperationsPage({ data, password, onAction }: {
         <div>
           <span className="eyebrow">Live diagnostics</span>
           <h2>Операции и полные логи</h2>
-          <p>Откройте job: активный лог обновляется каждую секунду и показывает репозиторий, модуль, число Java-файлов, текущий этап и полный traceback.</p>
+          <p>Откройте job: активный лог обновляется каждую секунду и показывает репозиторий, Java/Kotlin-файлы, cache hit/miss, длительность этапов и полный traceback.</p>
         </div>
         <div className="server-summary">
           <span><b>{active}</b> выполняется</span>
@@ -667,6 +667,7 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
                 <dl>
                   <div><dt>Репозиторий</dt><dd>{repository.name}</dd></div>
                   <div><dt>Build</dt><dd>{mappedService.build_system} · {mappedService.module_state}</dd></div>
+                  <div><dt>Подмодули</dt><dd>{mappedService.component_paths.length ? mappedService.component_paths.join(", ") : "—"}</dd></div>
                   <div><dt>Интерфейсы</dt><dd>{mappedService.entrypoint_count} входов · {mappedService.outbound_interface_count} выходов</dd></div>
                   <div><dt>Индекс</dt><dd>{indexNames[repository.index_id] || repository.index_id}</dd></div>
                 </dl>

@@ -52,6 +52,8 @@ def _build_worker(
     error_path: Path,
     progress_path: Path,
     checkpoint_path: Path,
+    force_service_ids: set[str],
+    force_all: bool,
 ) -> None:
     def report(message: str) -> None:
         with progress_path.open("a", encoding="utf-8") as handle:
@@ -72,6 +74,8 @@ def _build_worker(
             repositories,
             progress=report,
             checkpoint=save_checkpoint,
+            force_service_ids=force_service_ids,
+            force_all=force_all,
         )
         report("Writing system_graph.json")
         JsonGraphStore(graph_path).save(result.graph)
@@ -97,6 +101,8 @@ class ServiceMapProcessRunner:
         cancel: CancellationSignal | None = None,
         progress: Callable[[str], None] | None = None,
         checkpoint: Callable[[ServiceMapBuildResult], None] | None = None,
+        force_service_ids: set[str] | None = None,
+        force_all: bool = False,
     ) -> ServiceMapBuildResult:
         if cancel is not None and cancel.is_set():
             raise ServiceMapBuildCancelled("Repository analysis was cancelled")
@@ -121,6 +127,8 @@ class ServiceMapProcessRunner:
                     error_path,
                     progress_path,
                     checkpoint_path,
+                    force_service_ids or set(),
+                    force_all,
                 ),
                 name="service-map-analysis",
                 daemon=True,
@@ -170,9 +178,7 @@ class ServiceMapProcessRunner:
                     )
                     if partial is not None:
                         if progress is not None:
-                            progress(
-                                "Time limit reached; publishing the latest partial checkpoint"
-                            )
+                            progress("Time limit reached; publishing the latest partial checkpoint")
                         if checkpoint is not None:
                             checkpoint(partial)
                         return partial
