@@ -315,15 +315,57 @@ qwen
 ### Разработка React-панели
 
 Production assets уже входят в Python-пакет и отдаются основным HTTP-процессом по `/admin`.
-Для изменения интерфейса:
+Для изменения интерфейса frontend и backend можно запускать независимо в двух терминалах.
+
+#### Backend отдельно — терминал 1
+
+Один раз установите Python dependencies:
+
+```bash
+./scripts/setup-pip.sh
+```
+
+Затем запустите только FastAPI/FastMCP backend:
+
+```bash
+KB_MCP_HTTP_HOST=127.0.0.1 \
+KB_MCP_HTTP_PORT=8000 \
+KB_AUTO_INDEX=false \
+./scripts/start-mcp-http.sh run
+```
+
+Backend API будет доступен на `http://127.0.0.1:8000`, MCP endpoint — на
+`http://127.0.0.1:8000/mcp`. Команда работает в foreground и останавливается через `Ctrl+C`.
+
+#### Frontend отдельно — терминал 2
+
+Из корня repository один раз установите Node dependencies, затем запустите Vite:
 
 ```bash
 ./scripts/dev.sh dashboard-install
 ./scripts/dev.sh dashboard-dev
-./scripts/dev.sh dashboard-build
 ```
 
-Vite dev server работает на `127.0.0.1:5173` и проксирует `/admin/api` на RAG-сервер. Команда
+Открывайте `http://127.0.0.1:5173/admin/`. Vite автоматически проксирует `/admin/api` на backend
+`http://127.0.0.1:8000`, поэтому CORS и отдельная настройка API URL не нужны. Из каталога frontend
+эквивалентные команды выглядят так:
+
+```bash
+cd apps/dashboard
+npm ci
+npm run dev
+```
+
+#### Production: один процесс
+
+Для production отдельный frontend-процесс не нужен. Соберите React assets и запустите backend:
+
+```bash
+./scripts/dev.sh dashboard-build
+KB_MCP_HTTP_HOST=127.0.0.1 ./scripts/start-mcp-http.sh run
+```
+
+После этого вся панель доступна через backend по `http://127.0.0.1:8000/admin`. Команда
 `dashboard-build` выполняет TypeScript-проверку и складывает готовые assets внутрь
 `corporate_kb/mcp/admin_dist`, поэтому Node.js на production-сервере не требуется.
 
