@@ -109,6 +109,22 @@ read-only MCP-фасад; поиск выполняется полным cosine 
 
 ## Первый запуск
 
+### Локальный dashboard: две отдельные команды
+
+Backend и frontend запускаются независимо из корня repository:
+
+```bash
+# Терминал 1 — Python API, RAG и MCP на 127.0.0.1:8000
+./scripts/start-backend.sh
+
+# Терминал 2 — React/Vite на 127.0.0.1:5173
+./scripts/start-frontend.sh
+```
+
+Откройте `http://127.0.0.1:5173/admin/`. При первом запуске каждый скрипт сам установит недостающие
+dependencies своей части. Подробности и production-режим описаны в разделе
+[«Разработка React-панели»](#разработка-react-панели).
+
 ### Подключение сотрудника к удалённой базе
 
 RAG, индекс и документы находятся только на сервере. Для старых версий Qwen сотруднику
@@ -319,36 +335,38 @@ Production assets уже входят в Python-пакет и отдаются �
 
 #### Backend отдельно — терминал 1
 
-Один раз установите Python dependencies:
+Из корня repository выполните одну команду:
 
 ```bash
-./scripts/setup-pip.sh
+./scripts/start-backend.sh
 ```
 
-Затем запустите только FastAPI/FastMCP backend:
+Она запускает только FastAPI/FastMCP backend на `http://127.0.0.1:8000` и MCP endpoint на
+`http://127.0.0.1:8000/mcp`. Если `.venv` ещё нет, скрипт сначала сам установит Python
+dependencies. Процесс работает в foreground и останавливается через `Ctrl+C`.
+
+Порт и адрес при необходимости переопределяются environment variables:
 
 ```bash
 KB_MCP_HTTP_HOST=127.0.0.1 \
 KB_MCP_HTTP_PORT=8000 \
 KB_AUTO_INDEX=false \
-./scripts/start-mcp-http.sh run
+./scripts/start-backend.sh
 ```
-
-Backend API будет доступен на `http://127.0.0.1:8000`, MCP endpoint — на
-`http://127.0.0.1:8000/mcp`. Команда работает в foreground и останавливается через `Ctrl+C`.
 
 #### Frontend отдельно — терминал 2
 
-Из корня repository один раз установите Node dependencies, затем запустите Vite:
+Из корня repository выполните вторую команду:
 
 ```bash
-./scripts/dev.sh dashboard-install
-./scripts/dev.sh dashboard-dev
+./scripts/start-frontend.sh
 ```
 
-Открывайте `http://127.0.0.1:5173/admin/`. Vite автоматически проксирует `/admin/api` на backend
-`http://127.0.0.1:8000`, поэтому CORS и отдельная настройка API URL не нужны. Из каталога frontend
-эквивалентные команды выглядят так:
+Она запускает только React/Vite frontend. Если `node_modules` ещё нет, скрипт сначала сам выполнит
+`npm ci`. Открывайте `http://127.0.0.1:5173/admin/`. Vite автоматически проксирует `/admin/api` на
+backend `http://127.0.0.1:8000`, поэтому CORS и отдельная настройка API URL не нужны.
+
+Эквивалентный ручной запуск из каталога frontend:
 
 ```bash
 cd apps/dashboard
