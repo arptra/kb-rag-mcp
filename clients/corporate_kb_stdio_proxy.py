@@ -32,6 +32,9 @@ kb_get_chunk when a selected result needs more context."""
 SSOT_DESCRIPTION = """Answer a current business or implementation question from all service SSOTs
 with one call. The remote RAG discovers related services and performs expansion internally; do not
 repeat kb_search to reconstruct the same feature context."""
+FEATURE_CONTEXT_DESCRIPTION = """Plan a cross-service feature from the static call graph and the
+repository-scoped RAG index for every affected service. Returns callers, callees, API/event
+operations, statically linked triggers, source evidence, and compact documentation excerpts."""
 
 
 class JsonApi(Protocol):
@@ -200,6 +203,27 @@ def create_stdio_server(api: JsonApi) -> FastMCP:
         return api.get_json(
             "/api/v1/ssot/context",
             {"question": question, "mode": mode},
+        )
+
+    @server.tool(
+        name="kb_feature_context",
+        description=FEATURE_CONTEXT_DESCRIPTION,
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def kb_feature_context(
+        feature: str,
+        start_service: str | None = None,
+        max_hops: int = 2,
+        top_k_per_service: int = 2,
+    ) -> dict[str, Any]:
+        return api.post_json(
+            "/api/v1/feature-context",
+            {
+                "feature": feature,
+                "start_service": start_service,
+                "max_hops": max_hops,
+                "top_k_per_service": top_k_per_service,
+            },
         )
 
     @server.tool(

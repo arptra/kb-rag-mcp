@@ -26,6 +26,7 @@ const NAV: Array<{ id: Page; label: string; mark: string }> = [
   { id: "servers", label: "MCP servers", mark: "◉" },
   { id: "tools", label: "MCP tools", mark: "⌁" },
   { id: "graph", label: "Граф системы", mark: "⌘" },
+  { id: "operations", label: "Операции и логи", mark: "≡" },
 ];
 
 const TOOL_SCHEMA = {
@@ -40,6 +41,11 @@ const TOOL_SCHEMA = {
 
 function number(value: number): string {
   return new Intl.NumberFormat("ru-RU").format(value ?? 0);
+}
+
+function localToolCount(overview: Overview): number {
+  return overview.mcp_servers.servers.find((server) => server.id === "local")?.tool_count
+    ?? overview.managed_tools.tool_count;
 }
 
 function relativeDate(value: string | null | undefined): string {
@@ -71,6 +77,8 @@ function Status({ value }: { value: string }) {
     online: "в сети",
     offline: "не в сети",
     unchecked: "не проверен",
+    "module-empty": "пустой модуль",
+    unsupported: "не поддерживается",
   };
   return (
     <span className={`status status-${value}`}>
@@ -254,7 +262,8 @@ export default function App() {
               <span className="nav-mark">{item.mark}</span>{item.label}
               {item.id === "services" && <em>{Math.max(overview.service_map.service_count, overview.catalog.repository_count)}</em>}
               {item.id === "servers" && <em>{overview.mcp_servers.server_count}</em>}
-              {item.id === "tools" && <em>{overview.managed_tools.tool_count + 7}</em>}
+              {item.id === "tools" && <em>{localToolCount(overview)}</em>}
+              {item.id === "operations" && <em>{overview.catalog.jobs.filter((job) => ["queued", "running", "cancelling", "failed"].includes(job.status)).length}</em>}
             </button>
           ))}
         </nav>
@@ -317,6 +326,7 @@ export default function App() {
             />
           )}
           {page === "graph" && <GraphPage data={overview.graph} password={password} onAction={action} />}
+          {page === "operations" && <OperationsPage data={overview} password={password} onAction={action} />}
         </section>
       </main>
 
@@ -400,7 +410,7 @@ function OverviewPage({ data, password, onNavigate, onAction }: { data: Overview
       </section>
       <div className="metric-row">
         <Metric label="Документы" value={number(data.index.document_count)} note={`${number(data.index.chunk_count)} чанков`} tone="lime" />
-        <Metric label="MCP tools" value={number(data.managed_tools.tool_count + 7)} note={`${data.managed_tools.tool_count} управляемых`} tone="violet" />
+        <Metric label="MCP tools" value={number(localToolCount(data))} note={`${data.managed_tools.tool_count} управляемых`} tone="violet" />
         <Metric label="Git-источники" value={number(data.catalog.repository_count)} note={`${data.catalog.index_count} индексов`} tone="blue" />
         <Metric label="Вызовы" value={number(data.usage.total_calls)} note={`${data.usage.calls_last_minute} за минуту`} tone="amber" />
       </div>
@@ -454,19 +464,30 @@ function JobList({ jobs, password, onCancel }: { jobs: CatalogJob[]; password: s
   const [expanded, setExpanded] = useState<string | null>(null);
   const [logs, setLogs] = useState<Record<string, string>>({});
   const [logError, setLogError] = useState("");
-  const toggleLog = async (job: CatalogJob) => {
+  const loadLog = useCallback(async (jobId: string) => {
+    try {
+      const payload = await api<{ log: string }>(`/admin/api/jobs/log?job_id=${encodeURIComponent(jobId)}`, password);
+      setLogs((current) => ({ ...current, [jobId]: payload.log || "Журнал пока пуст" }));
+      setLogError("");
+    } catch (caught) {
+      setLogError(caught instanceof Error ? caught.message : "Не удалось загрузить журнал");
+    }
+  }, [password]);
+  const expandedStatus = jobs.find((job) => job.id === expanded)?.status;
+  useEffect(() => {
+    if (!expanded) return;
+    void loadLog(expanded);
+    if (!expandedStatus || !["queued", "running", "cancelling"].includes(expandedStatus)) return;
+    const timer = window.setInterval(() => void loadLog(expanded), 1000);
+    return () => window.clearInterval(timer);
+  }, [expanded, expandedStatus, loadLog]);
+  const toggleLog = (job: CatalogJob) => {
     if (expanded === job.id) {
       setExpanded(null);
       return;
     }
     setExpanded(job.id);
     setLogError("");
-    try {
-      const payload = await api<{ log: string }>(`/admin/api/jobs/log?job_id=${encodeURIComponent(job.id)}`, password);
-      setLogs((current) => ({ ...current, [job.id]: payload.log || "Журнал пока пуст" }));
-    } catch (caught) {
-      setLogError(caught instanceof Error ? caught.message : "Не удалось загрузить журнал");
-    }
   };
   if (!jobs.length) return <div className="empty-state compact">Операций пока не было</div>;
   return <div className="job-list">{jobs.map((job) => (
@@ -475,12 +496,48 @@ function JobList({ jobs, password, onCancel }: { jobs: CatalogJob[]; password: s
         <span className={`job-icon ${job.type}`}>{job.type === "repository" ? "↗" : job.type === "graph" || job.type === "service" ? "⌘" : job.type === "cleanup" ? "×" : "◇"}</span>
         <div className="grow"><b>{job.message}</b><small>{job.error || `${job.type} · ${relativeDate(job.completed_at || job.started_at)}`}</small></div>
         <Status value={job.status} />
-        <button className="job-log-button" onClick={() => void toggleLog(job)}>{expanded === job.id ? "Скрыть лог" : "Полный лог"}</button>
+        {job.log_path
+          ? <button className="job-log-button" onClick={() => toggleLog(job)}>{expanded === job.id ? "Скрыть лог" : "Полный лог"}</button>
+          : <span className="job-log-missing" title="Эта задача была создана до появления постоянных job-логов">Лог не сохранён</span>}
         {onCancel && ["queued", "running", "cancelling"].includes(job.status) && <button className="job-cancel" disabled={job.status === "cancelling"} onClick={() => onCancel(job)}>{job.status === "cancelling" ? "Отменяем…" : "Отменить"}</button>}
       </div>
-      {expanded === job.id && <div className="job-log"><pre>{logError || logs[job.id] || "Загружаем журнал…"}</pre></div>}
+      {expanded === job.id && <div className="job-log"><div className="job-log-meta"><code>{job.id}</code><span>{job.log_path}</span></div><pre>{logError || logs[job.id] || "Загружаем журнал…"}</pre></div>}
     </div>
   ))}</div>;
+}
+
+function OperationsPage({ data, password, onAction }: {
+  data: Overview;
+  password: string;
+  onAction: (run: () => Promise<unknown>, message: string) => Promise<void>;
+}) {
+  const active = data.catalog.jobs.filter((job) => ["queued", "running", "cancelling"].includes(job.status)).length;
+  const failed = data.catalog.jobs.filter((job) => job.status === "failed").length;
+  return (
+    <>
+      <div className="section-intro">
+        <div>
+          <span className="eyebrow">Live diagnostics</span>
+          <h2>Операции и полные логи</h2>
+          <p>Откройте job: активный лог обновляется каждую секунду и показывает репозиторий, модуль, число Java-файлов, текущий этап и полный traceback.</p>
+        </div>
+        <div className="server-summary">
+          <span><b>{active}</b> выполняется</span>
+          <span><b>{failed}</b> с ошибкой</span>
+          <span><b>{data.catalog.jobs.length}</b> всего</span>
+        </div>
+      </div>
+      <div className="log-location-grid">
+        <article className="panel log-location"><span className="eyebrow">Job logs</span><code>.cache/kb/job-logs/&lt;job-id&gt;.log</code><small>Поток анализа и полный Python traceback для каждой новой операции.</small></article>
+        <article className="panel log-location"><span className="eyebrow">Backend process</span><code>.cache/kb/runtime/mcp-http.log</code><small>Старт, HTTP-сервер и ошибки главного процесса при запуске через общий скрипт.</small></article>
+        <article className="panel log-location"><span className="eyebrow">Successful runs</span><code>.cache/kb/analysis/runs/</code><small>Полные JSON-снимки завершённых анализов для дальнейшего SSOT.</small></article>
+      </div>
+      <section className="panel operations-panel">
+        <PanelHeader title="Все фоновые задачи" kicker={active ? `Сейчас выполняется: ${active}` : "Активных задач нет"} />
+        <JobList password={password} jobs={data.catalog.jobs} onCancel={(job) => void onAction(() => post("/admin/api/jobs/cancel", password, { job_id: job.id }), "Отмена запрошена")} />
+      </section>
+    </>
+  );
 }
 
 function IndexesPage({ data, password, onCreate, onRepository, onAction }: {
@@ -574,14 +631,15 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
               || servicesByRepository.get(repository.name)
               || [];
             const activeJob = data.catalog.jobs.find(
-              (job) => job.index_id === repository.index_id
-                && ["queued", "running", "cancelling"].includes(job.status),
+              (job) => ["queued", "running", "cancelling"].includes(job.status)
+                && (job.type === "graph" || job.index_id === repository.index_id),
             );
+            const lastGraphJob = data.catalog.jobs.find((job) => job.type === "graph");
             if (!mappedServices.length) return [(
               <article className="service-card" key={repository.id}>
                 <header>
                   <span className="service-mark">S</span>
-                  <Status value={activeJob ? "running" : "empty"} />
+                  <Status value={activeJob ? "running" : lastGraphJob?.status === "failed" ? "failed" : "empty"} />
                 </header>
                 <span className="eyebrow">Awaiting analysis</span>
                 <h3>{repository.name}</h3>
@@ -599,7 +657,7 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
               <article className="service-card" key={`${repository.id}:${mappedService.id}`}>
                 <header>
                   <span className="service-mark">S</span>
-                  <Status value={data.catalog.jobs.some((job) => job.target_id === mappedService.id && ["queued", "running", "cancelling"].includes(job.status)) ? "running" : mappedService.module_state === "active" ? "ready" : "empty"} />
+                  <Status value={activeJob || data.catalog.jobs.some((job) => job.target_id === mappedService.id && ["queued", "running", "cancelling"].includes(job.status)) ? "running" : mappedService.module_state === "active" ? "ready" : mappedService.module_state === "unsupported" ? "unsupported" : "module-empty"} />
                 </header>
                 <span className="eyebrow">
                   {mappedService.module_path === "." ? "Repository service" : `Module · ${mappedService.module_path}`}

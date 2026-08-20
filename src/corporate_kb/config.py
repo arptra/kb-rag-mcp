@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     ssot_skill_path: Path = Path("skills/build-service-ssot")
     repository_max_files: int = Field(default=10_000, ge=1, le=100_000)
     repository_git_timeout_seconds: int = Field(default=60, ge=10, le=1800)
-    repository_analysis_timeout_seconds: int = Field(default=60, ge=5, le=600)
+    repository_analysis_timeout_seconds: int = Field(default=600, ge=5, le=3600)
     index_build_timeout_seconds: int = Field(default=600, ge=10, le=7200)
     auto_index: bool = False
     log_level: str = "INFO"

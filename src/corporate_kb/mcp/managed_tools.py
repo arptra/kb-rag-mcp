@@ -33,6 +33,8 @@ _ALLOWED_ARGUMENTS = {
     "source_type",
 }
 _RESERVED_NAMES = {
+    "ssot_context",
+    "kb_feature_context",
     "kb_search",
     "kb_get_document",
     "kb_get_chunk",

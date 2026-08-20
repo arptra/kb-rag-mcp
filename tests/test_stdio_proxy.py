@@ -80,6 +80,7 @@ async def test_stdio_proxy_exposes_static_and_managed_remote_tools() -> None:
         listed = await client.list_tools()
         assert {tool.name for tool in listed} == {
             "ssot_context",
+            "kb_feature_context",
             "kb_search",
             "kb_get_document",
             "kb_get_chunk",
@@ -103,6 +104,18 @@ async def test_stdio_proxy_exposes_static_and_managed_remote_tools() -> None:
         assert ssot.data["params"] == {
             "question": "How should payment check limits?",
             "mode": "implementation",
+        }
+
+        feature = await client.call_tool(
+            "kb_feature_context",
+            {"feature": "Reserve stock", "start_service": "orders"},
+        )
+        assert feature.data["path"] == "/api/v1/feature-context"
+        assert feature.data["params"]["payload"] == {
+            "feature": "Reserve stock",
+            "start_service": "orders",
+            "max_hops": 2,
+            "top_k_per_service": 2,
         }
 
         document = await client.call_tool("kb_get_document", {"document_id": "doc-1"})

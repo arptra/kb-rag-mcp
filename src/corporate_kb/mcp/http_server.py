@@ -16,6 +16,7 @@ from starlette.types import ASGIApp
 from corporate_kb.admin import AdminController
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
+from corporate_kb.feature_context import FeatureContextPlanner
 from corporate_kb.mcp.managed_tools import ManagedToolDefinition, ManagedToolRegistry
 from corporate_kb.mcp.server import create_mcp_server
 from corporate_kb.mcp.servers import (
@@ -74,6 +75,29 @@ def _integer_query(
         value = default if raw is None or raw == "" else int(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _body_integer(
+    body: dict[str, object],
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = body.get(name, default)
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        value = raw
+    elif isinstance(raw, str):
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+    else:
+        raise ValueError(f"{name} must be an integer")
     if not minimum <= value <= maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}")
     return value
@@ -163,6 +187,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         )
     tools = KnowledgeTools(service, ssot_service=ssot_service, usage=usage)
     catalog = RagCatalog(settings, service, tools, usage)
+    feature_context = FeatureContextPlanner(catalog)
     managed_tools = ManagedToolRegistry(
         settings.managed_tools_path,
         tools,
@@ -176,6 +201,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         auth=ConstantTimeTokenVerifier(token) if token is not None else None,
         knowledge_tools=tools,
         managed_tools=managed_tools,
+        feature_context=feature_context,
     )
 
     def current_mcp_servers(request: Request) -> dict[str, object]:
@@ -736,6 +762,37 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 tools.ssot_context,
                 question=question,
                 mode=mode,
+            )
+            return JSONResponse(payload)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/api/v1/feature-context", methods=["POST"], include_in_schema=False)
+    async def api_feature_context(request: Request) -> JSONResponse:
+        if not _authorized(request, token):
+            return _unauthorized_response()
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("Request body must be a JSON object")
+            feature = body.get("feature")
+            if not isinstance(feature, str) or not feature.strip():
+                raise ValueError("feature must be a non-empty string")
+            start_service = body.get("start_service")
+            if start_service is not None and not isinstance(start_service, str):
+                raise ValueError("start_service must be a string or null")
+            payload = await asyncio.to_thread(
+                feature_context.build,
+                feature=feature,
+                start_service=start_service,
+                max_hops=_body_integer(body, "max_hops", 2, minimum=0, maximum=4),
+                top_k_per_service=_body_integer(
+                    body,
+                    "top_k_per_service",
+                    2,
+                    minimum=1,
+                    maximum=5,
+                ),
             )
             return JSONResponse(payload)
         except Exception as exc:

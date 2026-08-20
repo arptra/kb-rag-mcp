@@ -37,6 +37,7 @@ from service_map import (
     RepositoryInput,
     ServiceMapBuildCancelled,
     ServiceMapBuilder,
+    ServiceMapBuildResult,
     ServiceMapProcessRunner,
     ServiceMapSnapshot,
 )
@@ -420,6 +421,17 @@ class RagCatalog:
     def graph_evidence(self, evidence_ids: list[str]) -> dict[str, Any]:
         return self._graph_service.evidence(evidence_ids)
 
+    def graph_search(self, query: str, *, limit: int = 50) -> dict[str, Any]:
+        return self._graph_service.search(query, limit=limit)
+
+    def graph_business_operations(
+        self,
+        service: str,
+        *,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        return self._graph_service.business_operations(service, limit=limit)
+
     def service_map_overview(self) -> dict[str, object]:
         return self._service_map_store.load().overview()
 
@@ -625,10 +637,15 @@ class RagCatalog:
         )
         snapshot = self._build_graph(cancel_event=cancel_event, job_id=job_id)
         self._raise_if_cancelled(cancel_event)
+        partial = self._is_partial_analysis(snapshot)
         self._update_job(
             job_id,
             status="completed",
-            message=f"Built {len(snapshot.nodes)} nodes and {len(snapshot.edges)} edges",
+            message=(
+                f"Published partial map with {len(snapshot.nodes)} nodes"
+                if partial
+                else f"Built {len(snapshot.nodes)} nodes and {len(snapshot.edges)} edges"
+            ),
             completed_at=_now(),
         )
 
@@ -796,7 +813,16 @@ class RagCatalog:
         result = ServiceMapProcessRunner(
             self._graph_settings(),
             timeout_seconds=self.settings.repository_analysis_timeout_seconds,
-        ).build(inputs, cancel=cancel_event)
+        ).build(
+            inputs,
+            cancel=cancel_event,
+            progress=(
+                (lambda message: self._append_job_log(job_id, message))
+                if job_id is not None
+                else None
+            ),
+            checkpoint=self._publish_analysis_checkpoint,
+        )
         self._service_map_store.save(result.service_map)
         self._graph_store.save(result.graph)
         manifest = self._analysis_archive.record(
@@ -806,8 +832,25 @@ class RagCatalog:
             repository_count=len(repositories),
         )
         if job_id is not None:
+            if result.partial:
+                self._append_job_log(
+                    job_id,
+                    "Analysis is partial; the latest discovered services were published",
+                )
             self._append_job_log(job_id, f"Analysis archived at {manifest['path']}")
         return result.graph
+
+    def _publish_analysis_checkpoint(self, result: ServiceMapBuildResult) -> None:
+        """Expose discovered services while deeper source parsing is still running."""
+        self._service_map_store.save(result.service_map)
+        self._graph_store.save(result.graph)
+
+    @staticmethod
+    def _is_partial_analysis(snapshot: GraphSnapshot) -> bool:
+        return any(
+            issue.message.startswith("Partial analysis checkpoint:")
+            for issue in snapshot.issues
+        )
 
     def _repository_inputs(self, repositories: list[RepositorySource]) -> list[RepositoryInput]:
         exclusions: dict[str, list[str]] = {}

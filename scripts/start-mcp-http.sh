@@ -133,14 +133,26 @@ start_server() {
   local launcher_pid="$!"
   for _attempt in {1..50}; do
     if existing="$(read_server_pid)"; then
-      sleep 0.2
-      if ! existing="$(read_server_pid)"; then
-        break
+      local stable=true
+      local current=""
+      for _stability_check in {1..10}; do
+        sleep 0.1
+        if ! kill -0 "${launcher_pid}" 2>/dev/null; then
+          stable=false
+          break
+        fi
+        if ! current="$(read_server_pid)" || [[ "${current}" != "${existing}" ]]; then
+          stable=false
+          break
+        fi
+      done
+      if [[ "${stable}" == true ]]; then
+        echo "RAG/MCP server started (PID ${existing})."
+        echo "Admin: http://${KB_MCP_HTTP_HOST}:${KB_MCP_HTTP_PORT}/admin"
+        echo "Log:   ${log_file}"
+        return 0
       fi
-      echo "RAG/MCP server started (PID ${existing})."
-      echo "Admin: http://${KB_MCP_HTTP_HOST}:${KB_MCP_HTTP_PORT}/admin"
-      echo "Log:   ${log_file}"
-      return 0
+      break
     fi
     if ! kill -0 "${launcher_pid}" 2>/dev/null; then
       break

@@ -9,7 +9,9 @@ from fastmcp import FastMCP
 from fastmcp.server.auth import AuthProvider
 
 from corporate_kb import __version__
+from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
+from corporate_kb.feature_context import FeatureContextPlanner
 from corporate_kb.mcp.managed_tools import ManagedToolRegistry
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import (
@@ -18,6 +20,7 @@ from corporate_kb.service import (
     create_service,
     create_ssot_service,
 )
+from corporate_kb.usage import UsageTracker
 
 SEARCH_DESCRIPTION = """Search corporate knowledge before architectural analysis or changes spanning
 multiple services. Use it for business rules, ADRs, APIs, events, and runbooks. Cite source_path or
@@ -28,6 +31,11 @@ SSOT_DESCRIPTION = """Answer a current business or implementation question from 
 Use this as one self-contained call for a feature spanning services: the server discovers involved
 services, performs additional filtered searches internally, and returns one compact grouped brief.
 Do not call kb_search repeatedly to reconstruct the same SSOT context."""
+FEATURE_CONTEXT_DESCRIPTION = """Plan a feature with the static service call graph and the RAG index
+owned by each affected repository. Use this before cross-service implementation work. It returns
+callers, callees, API/event operations, statically linked invocation triggers, exact source
+evidence, and compact RAG excerpts grouped by service. Supply start_service when known; otherwise
+the tool discovers likely roots. LOW/UNRESOLVED facts and runtime order must be verified."""
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +45,7 @@ def create_mcp_server(
     auth: AuthProvider | None = None,
     knowledge_tools: KnowledgeTools | None = None,
     managed_tools: ManagedToolRegistry | None = None,
+    feature_context: FeatureContextPlanner | None = None,
 ) -> FastMCP:
     """Create a FastMCP server without eagerly loading a model or index."""
     kb_service = service or create_service()
@@ -45,9 +54,10 @@ def create_mcp_server(
     server = FastMCP(
         "corporate-knowledge",
         instructions=(
-            "Search corporate knowledge before cross-service or architectural work, and cite the "
-            "returned source_path or source_url. Search returns compact excerpts; use kb_get_chunk "
-            "only for a selected chunk when additional context is needed."
+            "Call kb_feature_context before cross-service implementation work so the service "
+            "graph selects the affected RAG indexes. Cite returned source_path/source_url and "
+            "graph evidence. Use kb_search for narrower follow-up questions and kb_get_chunk only "
+            "when one selected result needs more context."
         ),
         version=__version__,
         auth=auth,
@@ -91,6 +101,26 @@ def create_mcp_server(
             authority=authority,
             source_type=source_type,
         )
+
+    if feature_context is not None:
+
+        @server.tool(
+            name="kb_feature_context",
+            description=FEATURE_CONTEXT_DESCRIPTION,
+            annotations={"readOnlyHint": True, "openWorldHint": False},
+        )
+        def kb_feature_context(
+            feature: str,
+            start_service: str | None = None,
+            max_hops: int = 2,
+            top_k_per_service: int = 2,
+        ) -> dict[str, Any]:
+            return feature_context.build(
+                feature=feature,
+                start_service=start_service,
+                max_hops=max_hops,
+                top_k_per_service=top_k_per_service,
+            )
 
     @server.tool(
         name="kb_get_document",
@@ -187,8 +217,21 @@ def main() -> None:
                 ssot_stats.document_count,
                 ssot_stats.chunk_count,
             )
-        tools = KnowledgeTools(service, ssot_service=ssot_service)
-        create_mcp_server(service, knowledge_tools=tools).run(
+        usage = UsageTracker()
+        tools = KnowledgeTools(service, ssot_service=ssot_service, usage=usage)
+        catalog = RagCatalog(settings, service, tools, usage)
+        managed_tools = ManagedToolRegistry(
+            settings.managed_tools_path,
+            tools,
+            index_tools=catalog.tools_for,
+            index_exists=catalog.has_index,
+        )
+        create_mcp_server(
+            service,
+            knowledge_tools=tools,
+            managed_tools=managed_tools,
+            feature_context=FeatureContextPlanner(catalog),
+        ).run(
             transport="stdio",
             show_banner=False,
         )

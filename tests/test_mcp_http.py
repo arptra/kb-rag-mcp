@@ -118,7 +118,15 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
         ) as session:
             await session.initialize()
             listed = await session.list_tools()
-            assert "kb_search" in {tool.name for tool in listed.tools}
+            assert {"kb_search", "kb_feature_context"} <= {
+                tool.name for tool in listed.tools
+            }
+            feature = await session.call_tool(
+                "kb_feature_context",
+                {"feature": "daily limits"},
+            )
+            assert feature.isError is False
+            assert feature.structuredContent["status"] == "empty_graph"
 
 
 @pytest.mark.asyncio
@@ -337,6 +345,7 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
             listed = await session.list_tools()
             assert {tool.name for tool in listed.tools} == {
                 "ssot_context",
+                "kb_feature_context",
                 "kb_search",
                 "kb_get_document",
                 "kb_get_chunk",

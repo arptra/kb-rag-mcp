@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from gigacode_graph.config import GraphSettings
+from gigacode_graph.models import GraphNode, GraphSnapshot
+from gigacode_graph.store import JsonGraphStore
 from service_map import (
     JsonServiceMapStore,
     RepositoryInput,
@@ -14,6 +16,7 @@ from service_map import (
     ServiceMapBuildTimedOut,
     ServiceMapProcessRunner,
 )
+from service_map.models import ServiceMapSnapshot, ServiceRecord
 
 
 def _write(root: Path, relative: str, content: str) -> None:
@@ -262,6 +265,39 @@ def test_service_map_process_honours_cancellation_before_start(tmp_path: Path) -
         ServiceMapProcessRunner(settings, timeout_seconds=10).build([], cancel=cancel)
 
 
+def test_service_map_process_streams_repository_and_module_progress(tmp_path: Path) -> None:
+    repository = tmp_path / "observable-service"
+    _write(
+        repository,
+        "src/main/java/example/StatusController.java",
+        """
+@RestController
+public class StatusController {
+  @GetMapping("/status")
+  public String status() { return "ok"; }
+}
+""",
+    )
+    settings = GraphSettings(store_path=tmp_path / "system-graph.json").resolved(tmp_path)
+    events: list[str] = []
+    checkpoints = []
+
+    result = ServiceMapProcessRunner(settings, timeout_seconds=10).build(
+        [RepositoryInput(path=repository, name="Observable service")],
+        progress=events.append,
+        checkpoint=checkpoints.append,
+    )
+
+    assert result.service_map.services
+    assert checkpoints
+    assert checkpoints[0].partial is True
+    assert checkpoints[0].service_map.services[0].id == "observable-service"
+    assert any("Layout ready: Observable service" in event for event in events)
+    assert any("Java files found:" in event and "files=1" in event for event in events)
+    assert any("Snapshot ready:" in event for event in events)
+    assert events[-1] == "Worker completed successfully"
+
+
 def test_service_map_process_has_a_hard_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -315,3 +351,89 @@ def test_service_map_process_has_a_hard_timeout(
 
     assert process.started is True
     assert process.terminated is True
+
+
+def test_service_map_process_returns_latest_checkpoint_on_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CheckpointThenHangProcess:
+        exitcode = None
+
+        def __init__(self, args: tuple[object, ...]) -> None:
+            self.args = args
+            self.alive = True
+
+        def start(self) -> None:
+            graph_path = self.args[2]
+            service_map_path = self.args[3]
+            checkpoint_path = self.args[6]
+            assert isinstance(graph_path, Path)
+            assert isinstance(service_map_path, Path)
+            assert isinstance(checkpoint_path, Path)
+            JsonGraphStore(graph_path).save(
+                GraphSnapshot(
+                    nodes=[
+                        GraphNode(
+                            id="service:slow-service",
+                            type="Service",
+                            label="slow-service",
+                            service_id="slow-service",
+                        )
+                    ]
+                )
+            )
+            JsonServiceMapStore(service_map_path).save(
+                ServiceMapSnapshot(
+                    services=[
+                        ServiceRecord(
+                            id="slow-service",
+                            name="slow-service",
+                            repository="Slow repository",
+                            repository_path=str(tmp_path),
+                        )
+                    ]
+                )
+            )
+            checkpoint_path.write_text("ready", encoding="utf-8")
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+
+        def terminate(self) -> None:
+            self.alive = False
+
+        def kill(self) -> None:
+            self.alive = False
+
+    class FakeContext:
+        @staticmethod
+        def Process(**kwargs: object) -> CheckpointThenHangProcess:
+            args = kwargs["args"]
+            assert isinstance(args, tuple)
+            return CheckpointThenHangProcess(args)
+
+    monkeypatch.setattr(
+        "service_map.runner.multiprocessing.get_context",
+        lambda _method: FakeContext(),
+    )
+    monotonic_values = iter([0.0, 11.0])
+    monkeypatch.setattr(
+        "service_map.runner.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+    settings = GraphSettings(store_path=tmp_path / "system-graph.json").resolved(tmp_path)
+    checkpoints = []
+
+    result = ServiceMapProcessRunner(settings, timeout_seconds=10).build(
+        [RepositoryInput(path=tmp_path, name="Slow repository")],
+        checkpoint=checkpoints.append,
+    )
+
+    assert result.partial is True
+    assert result.service_map.services[0].id == "slow-service"
+    assert "time limit" in result.service_map.issues[-1].message
+    assert checkpoints[-1].partial is True

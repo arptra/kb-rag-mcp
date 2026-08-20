@@ -12,7 +12,8 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -353,21 +354,77 @@ class RepositoryScanner:
             raise ValueError("At least one repository path is required")
         return self.scan_targets([ScanTarget(path=path.resolve()) for path in repositories])
 
-    def scan_targets(self, targets: list[ScanTarget]) -> GraphSnapshot:
+    def scan_targets(
+        self,
+        targets: list[ScanTarget],
+        *,
+        progress: Callable[[str], None] | None = None,
+        checkpoint: Callable[[GraphSnapshot], None] | None = None,
+    ) -> GraphSnapshot:
         if not targets:
             raise ValueError("At least one scan target is required")
-        for target in targets:
+        last_checkpoint_at = time.monotonic()
+        for position, target in enumerate(targets, start=1):
             repository = target.path.resolve()
-            if not repository.is_dir():
-                raise ValueError(f"Repository directory does not exist: {repository}")
-            scan = self._discover_repository(repository, target)
-            if scan.service_id in self._scans:
-                raise ValueError(f"Duplicate service id discovered: {scan.service_id}")
-            self._scans[scan.service_id] = scan
-            self._scan_repository(scan)
+            label = target.service_id or target.display_name or target.module_path
+            if progress is not None:
+                progress(
+                    f"Module [{position}/{len(targets)}] start: {label}; "
+                    f"repository={target.repository_name or repository.name}; "
+                    f"module={target.module_path}; state={target.module_state}; "
+                    f"build={target.build_system}"
+                )
+            scan = self._register_target(target)
+            self._scan_repository(scan, progress=progress)
+            if progress is not None:
+                progress(
+                    f"Module [{position}/{len(targets)}] ready: {scan.service_id}; "
+                    f"classes={len(scan.classes)}"
+                )
+            if checkpoint is not None and time.monotonic() - last_checkpoint_at >= 5:
+                checkpoint(self._builder.snapshot())
+                last_checkpoint_at = time.monotonic()
+        if progress is not None:
+            progress("Linking HTTP and inferred service dependencies")
         self._link_service_dependencies()
+        if progress is not None:
+            progress("Linking Kafka producers and consumers")
         self._link_topic_dependencies()
+        snapshot = self._builder.snapshot()
+        if progress is not None:
+            progress(
+                f"Source scan complete: nodes={len(snapshot.nodes)}; "
+                f"edges={len(snapshot.edges)}; issues={len(snapshot.issues)}"
+            )
+        return snapshot
+
+    def discover_targets(
+        self,
+        targets: list[ScanTarget],
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> GraphSnapshot:
+        """Create repository/service nodes without parsing source files."""
+        if not targets:
+            raise ValueError("At least one scan target is required")
+        for position, target in enumerate(targets, start=1):
+            scan = self._register_target(target)
+            if progress is not None:
+                progress(
+                    f"Layout service [{position}/{len(targets)}]: {scan.service_id}; "
+                    f"module={scan.module_path}; state={scan.module_state}"
+                )
         return self._builder.snapshot()
+
+    def _register_target(self, target: ScanTarget) -> ServiceScan:
+        repository = target.path.resolve()
+        if not repository.is_dir():
+            raise ValueError(f"Repository directory does not exist: {repository}")
+        scan = self._discover_repository(repository, target)
+        if scan.service_id in self._scans:
+            raise ValueError(f"Duplicate service id discovered: {scan.service_id}")
+        self._scans[scan.service_id] = scan
+        return scan
 
     def _discover_repository(
         self,
@@ -486,11 +543,29 @@ class RepositoryScanner:
         )
         return scan
 
-    def _scan_repository(self, scan: ServiceScan) -> None:
+    def _scan_repository(
+        self,
+        scan: ServiceScan,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> None:
+        if progress is not None:
+            progress(f"Discovering Java files: {scan.service_id}")
         java_files = sorted(
             {path for root in scan.source_roots for path in self._files(root, {".java"})}
         )
-        for path in java_files:
+        if progress is not None:
+            progress(f"Java files found: {scan.service_id}; files={len(java_files)}")
+        for position, path in enumerate(java_files, start=1):
+            if progress is not None and (position == 1 or position % 250 == 0):
+                try:
+                    current_file = path.relative_to(scan.repository_path).as_posix()
+                except ValueError:
+                    current_file = str(path)
+                progress(
+                    f"Parsing Java: {scan.service_id}; file={position}/{len(java_files)}; "
+                    f"path={current_file}"
+                )
             try:
                 if path.stat().st_size > self.settings.max_java_file_bytes:
                     self._builder.issues.append(

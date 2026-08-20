@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -43,6 +44,7 @@ class RepositoryInput:
 class ServiceMapBuildResult:
     graph: GraphSnapshot
     service_map: ServiceMapSnapshot
+    partial: bool = False
 
 
 def _interface_kind(value: object) -> InterfaceKind:
@@ -58,23 +60,79 @@ class ServiceMapBuilder:
     def __init__(self, settings: GraphSettings) -> None:
         self._settings = settings
 
-    def build(self, repositories: list[RepositoryInput]) -> ServiceMapBuildResult:
+    def build(
+        self,
+        repositories: list[RepositoryInput],
+        *,
+        progress: Callable[[str], None] | None = None,
+        checkpoint: Callable[[ServiceMapBuildResult], None] | None = None,
+    ) -> ServiceMapBuildResult:
         if not repositories:
             return ServiceMapBuildResult(GraphSnapshot(), ServiceMapSnapshot())
 
-        layouts = [
-            (item, RepositoryLayoutAnalyzer().discover(item.path))
-            for item in sorted(repositories, key=lambda value: str(value.path.resolve()))
-        ]
+        ordered = sorted(repositories, key=lambda value: str(value.path.resolve()))
+        layouts: list[tuple[RepositoryInput, RepositoryLayout]] = []
+        for position, item in enumerate(ordered, start=1):
+            if progress is not None:
+                progress(
+                    f"Layout [{position}/{len(ordered)}]: {item.name}; path={item.path.resolve()}"
+                )
+            layout = RepositoryLayoutAnalyzer().discover(item.path)
+            layouts.append((item, layout))
+            if progress is not None:
+                progress(
+                    f"Layout ready: {item.name}; modules={len(layout.modules)}; "
+                    f"openspec={len(layout.openspec_roots)}; issues={len(layout.issues)}"
+                )
         targets, issues = self._scan_targets(layouts)
+        if progress is not None:
+            active = sum(target.module_state == "active" for target in targets)
+            empty = sum(target.module_state == "empty" for target in targets)
+            unsupported = sum(target.module_state == "unsupported" for target in targets)
+            progress(
+                f"Scan plan: modules={len(targets)}; active={active}; empty={empty}; "
+                f"unsupported={unsupported}; layout_issues={len(issues)}"
+            )
+        if targets and checkpoint is not None:
+            layout_graph = RepositoryScanner(self._settings).discover_targets(
+                targets,
+                progress=progress,
+            )
+            if issues:
+                layout_graph = layout_graph.model_copy(
+                    update={"issues": [*layout_graph.issues, *issues]}
+                )
+            layout_result = self.from_graph(layout_graph, repositories)
+            checkpoint(layout_result)
+
+        def publish_scan_checkpoint(snapshot: GraphSnapshot) -> None:
+            if checkpoint is None:
+                return
+            if issues:
+                snapshot = snapshot.model_copy(
+                    update={"issues": [*snapshot.issues, *issues]}
+                )
+            checkpoint(self.from_graph(snapshot, repositories))
+
         graph = (
-            RepositoryScanner(self._settings).scan_targets(targets)
+            RepositoryScanner(self._settings).scan_targets(
+                targets,
+                progress=progress,
+                checkpoint=publish_scan_checkpoint if checkpoint is not None else None,
+            )
             if targets
             else GraphSnapshot()
         )
         if issues:
             graph = graph.model_copy(update={"issues": [*graph.issues, *issues]})
-        return self.from_graph(graph, repositories)
+        result = self.from_graph(graph, repositories)
+        if progress is not None:
+            progress(
+                f"Snapshot ready: services={len(result.service_map.services)}; "
+                f"nodes={len(result.graph.nodes)}; edges={len(result.graph.edges)}; "
+                f"evidence={len(result.graph.evidence)}; issues={len(result.graph.issues)}"
+            )
+        return result
 
     @staticmethod
     def _scan_targets(

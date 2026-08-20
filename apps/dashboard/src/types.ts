@@ -1,4 +1,4 @@
-export type Page = "overview" | "indexes" | "services" | "servers" | "tools" | "graph";
+export type Page = "overview" | "indexes" | "services" | "servers" | "tools" | "graph" | "operations";
 
 export interface RagIndex {
   id: string;

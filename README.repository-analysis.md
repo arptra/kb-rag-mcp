@@ -363,6 +363,38 @@ jq '.issues' .cache/kb/system_graph.json
 - один общий analysis timeout распространяется на весь snapshot;
 - Spring framework semantics всё ещё реализуются локальными extractors поверх CST.
 
+## Как граф используется нейросетью вместе с RAG
+
+Основной HTTP MCP server публикует встроенный tool `kb_feature_context`. Реализация находится в
+[`src/corporate_kb/feature_context.py`](src/corporate_kb/feature_context.py). Это связующий слой
+между двумя артефактами анализа и каталогом индексов:
+
+```text
+feature + start_service (optional)
+  -> найти root services в graph/service map
+  -> пройти incoming/outgoing dependencies до max_hops
+  -> восстановить caller, callee, protocol, operation и связанный trigger/handler
+  -> сопоставить service -> repository -> RAG index
+  -> выполнить ограниченный поиск в каждом индексе
+  -> вернуть единый JSON с calls, services[].rag, evidence и warnings
+```
+
+`invocation_contexts` строится только когда `BusinessOperation -> EXITS_VIA -> ExitPoint` можно
+связать с dependency по operation или evidence. Если такой связи нет, tool прямо пишет, что найден
+только статический call site. Это не distributed tracing: фактическое время, порядок сетевых
+вызовов и runtime branching без telemetry не утверждаются.
+
+Чтобы доработать маршрутизацию:
+
+1. discovery и обход service map менять в `FeatureContextPlanner._resolve_roots()` и
+   `_neighbourhood()`;
+2. правила `service -> repository -> index` менять в `_routes()`;
+3. привязку OpenSpec/SSOT-документов к сервису менять в `_document_belongs_to_service()`;
+4. восстановление причины вызова менять в `_invocation_contexts()`;
+5. стабильный MCP/HTTP-контракт менять одновременно в `mcp/server.py`, `mcp/http_server.py` и
+   `clients/corporate_kb_stdio_proxy.py`;
+6. сценарий `orders -> inventory` зафиксирован в `tests/test_feature_context.py`.
+
 ## Как расширять дальше
 
 ### Добавить новый build layout
@@ -435,6 +467,7 @@ repository commit
 | Full graph contract | [`src/gigacode_graph/models.py`](src/gigacode_graph/models.py) |
 | Service map projection | [`src/service_map/builder.py`](src/service_map/builder.py) |
 | Service/module contract | [`src/service_map/models.py`](src/service_map/models.py) |
+| Feature graph + RAG routing MCP tool | [`src/corporate_kb/feature_context.py`](src/corporate_kb/feature_context.py) |
 | Cancel/timeout/process supervision | [`src/service_map/runner.py`](src/service_map/runner.py) |
 | Admin HTTP API | [`src/corporate_kb/mcp/http_server.py`](src/corporate_kb/mcp/http_server.py) |
 | React service/graph pages | [`apps/dashboard/src/App.tsx`](apps/dashboard/src/App.tsx) |

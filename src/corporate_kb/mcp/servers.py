@@ -21,6 +21,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 BUILTIN_TOOLS: tuple[dict[str, str], ...] = (
     {"name": "ssot_context", "description": "Build compact cross-service SSOT context."},
+    {
+        "name": "kb_feature_context",
+        "description": "Join service calls and repository-scoped RAG context for a feature.",
+    },
     {"name": "kb_search", "description": "Search indexed corporate knowledge."},
     {"name": "kb_get_document", "description": "Read a bounded document extract."},
     {"name": "kb_get_chunk", "description": "Read context around one search chunk."},

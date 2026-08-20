@@ -230,8 +230,10 @@ def test_catalog_cancels_running_graph_job_without_blocking_api(
     )
     entered = threading.Event()
 
-    def cancellable_build(self, repositories, *, cancel=None):
-        del self, repositories
+    def cancellable_build(
+        self, repositories, *, cancel=None, progress=None, checkpoint=None
+    ):
+        del self, repositories, progress, checkpoint
         assert cancel is not None
         entered.set()
         while not cancel.is_set():
@@ -412,8 +414,8 @@ def test_catalog_failure_log_contains_full_traceback(settings_factory, monkeypat
         usage,
     )
 
-    def fail_analysis(self, repositories, *, cancel=None):
-        del self, repositories, cancel
+    def fail_analysis(self, repositories, *, cancel=None, progress=None, checkpoint=None):
+        del self, repositories, cancel, progress, checkpoint
         raise RuntimeError("synthetic analysis failure")
 
     monkeypatch.setattr(ServiceMapProcessRunner, "build", fail_analysis)
