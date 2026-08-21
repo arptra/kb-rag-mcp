@@ -868,21 +868,46 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
             const mappedServices = servicesByRepository.get(repository.checkout_path)
               || servicesByRepository.get(repository.name)
               || [];
-            const activeRepositoryJob = data.catalog.jobs.find(
-              (job) => ["queued", "running", "cancelling"].includes(job.status)
+            const repositoryIndex = data.catalog.indexes.find(
+              (index) => index.id === repository.index_id,
+            );
+            const repositoryJobs = data.catalog.jobs.filter(
+              (job) => job.type === "repository"
                 && (
-                  job.type === "graph"
-                  || (job.index_id === repository.index_id && job.type !== "service")
+                  job.target_id === repository.id
+                  || (!job.target_id && job.index_id === repository.index_id)
                 ),
             );
+            const activeRepositoryJob = data.catalog.jobs.find(
+              (job) => ["queued", "running", "cancelling"].includes(job.status)
+                && job.type === "repository"
+                && (
+                  job.target_id === repository.id
+                  || (!job.target_id && job.index_id === repository.index_id)
+                ),
+            );
+            const activeGraphJob = data.catalog.jobs.find(
+              (job) => job.type === "graph"
+                && ["queued", "running", "cancelling"].includes(job.status),
+            );
+            const latestRepositoryJob = repositoryJobs[0];
             const lastGraphJob = data.catalog.jobs.find((job) => job.type === "graph");
+            const graphError = lastGraphJob?.status === "failed"
+              && (!latestRepositoryJob || lastGraphJob.id > latestRepositoryJob.id)
+              ? lastGraphJob.error || lastGraphJob.message
+              : null;
+            const repositoryError = latestRepositoryJob?.status === "failed"
+              ? latestRepositoryJob.error || latestRepositoryJob.message
+              : repositoryIndex?.status === "error"
+                ? repositoryIndex.error || "Ошибка индексации"
+                : graphError;
             if (!mappedServices.length) return [(
-              <article className="service-card" key={repository.id}>
+              <article className="service-card" key={repository.id} aria-busy={Boolean(activeRepositoryJob || activeGraphJob)}>
                 <header>
                   <span className="service-mark">S</span>
-                  <Status value={activeRepositoryJob ? "running" : lastGraphJob?.status === "failed" ? "failed" : "empty"} />
+                  <Status value={activeRepositoryJob || activeGraphJob ? "running" : repositoryError ? "failed" : "empty"} />
                 </header>
-                <span className="eyebrow">Awaiting analysis</span>
+                <span className="eyebrow">{repositoryError ? "Analysis failed · retry available" : "Awaiting analysis"}</span>
                 <h3>{repository.name}</h3>
                 <code>{repository.commit?.slice(0, 12) || "service pending"}</code>
                 <dl>
@@ -890,8 +915,28 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
                   <div><dt>OpenSpec</dt><dd>{number(repository.document_count)} документов</dd></div>
                   <div><dt>Интерфейсы</dt><dd>—</dd></div>
                   <div><dt>Синхронизация</dt><dd>{relativeDate(repository.synced_at)}</dd></div>
+                  {repositoryError && <div><dt>Ошибка</dt><dd title={repositoryError}>{short(repositoryError, 100)}</dd></div>}
                 </dl>
-                <footer><span>Владелец не определён</span><button onClick={onGraph}>Открыть граф →</button></footer>
+                <footer>
+                  <span>{activeRepositoryJob?.message || "Владелец не определён"}</span>
+                  <div className="card-actions">
+                    <button
+                      className="service-rebuild"
+                      disabled={Boolean(activeRepositoryJob)}
+                      onClick={() => void onAction(
+                        () => post("/admin/api/repositories/refresh", password, { repository_id: repository.id }),
+                        `OpenSpec, RAG и анализ «${repository.name}» поставлены в очередь`,
+                      )}
+                    >
+                      {activeRepositoryJob
+                        ? "◌ OpenSpec + RAG обновляются…"
+                        : repositoryError
+                          ? "↻ Повторить OpenSpec + RAG"
+                          : "↻ OpenSpec + RAG + анализ"}
+                    </button>
+                    <button onClick={onGraph}>Граф</button>
+                  </div>
+                </footer>
               </article>
             )];
             return mappedServices.map((mappedService) => {
@@ -904,11 +949,11 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
                 <article
                   className="service-card"
                   key={`${repository.id}:${mappedService.id}`}
-                  aria-busy={Boolean(activeServiceJob)}
+                  aria-busy={Boolean(activeRepositoryJob || activeGraphJob || activeServiceJob)}
                 >
                   <header>
                     <span className="service-mark">S</span>
-                    <Status value={activeRepositoryJob || activeServiceJob ? "running" : mappedService.module_state === "active" ? "ready" : mappedService.module_state === "unsupported" ? "unsupported" : "module-empty"} />
+                    <Status value={activeRepositoryJob || activeGraphJob || activeServiceJob ? "running" : repositoryError ? "failed" : mappedService.module_state === "active" ? "ready" : mappedService.module_state === "unsupported" ? "unsupported" : "module-empty"} />
                   </header>
                   <span className="eyebrow">
                     {mappedService.module_path === "." ? "Repository service" : `Module · ${mappedService.module_path}`}
@@ -921,19 +966,33 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
                     <div><dt>Подмодули</dt><dd>{mappedService.component_paths.length ? mappedService.component_paths.join(", ") : "—"}</dd></div>
                     <div><dt>Интерфейсы</dt><dd>{mappedService.entrypoint_count} входов · {mappedService.outbound_interface_count} выходов</dd></div>
                     <div><dt>Индекс</dt><dd>{indexNames[repository.index_id] || repository.index_id}</dd></div>
+                    {repositoryError && <div><dt>Ошибка</dt><dd title={repositoryError}>{short(repositoryError, 100)}</dd></div>}
                   </dl>
                   <footer>
                     <span>{mappedService.owner || "Владелец не определён"}</span>
                     <div className="card-actions">
                       <button
                         className="service-rebuild"
-                        disabled={Boolean(activeServiceJob)}
+                        disabled={Boolean(activeRepositoryJob)}
                         onClick={() => void onAction(
-                          () => post("/admin/api/services/analyze", password, { service_id: mappedService.id }),
-                          `Пересборка OpenSpec для «${mappedService.name}» поставлена в очередь`,
+                          () => post("/admin/api/repositories/refresh", password, { repository_id: repository.id }),
+                          `OpenSpec, RAG и анализ «${repository.name}» поставлены в очередь`,
                         )}
                       >
-                        {activeServiceJob ? "◌ OpenSpec пересобирается…" : "↻ Пересобрать OpenSpec"}
+                        {activeRepositoryJob
+                          ? "◌ OpenSpec + RAG обновляются…"
+                          : repositoryError
+                            ? "↻ Повторить OpenSpec + RAG"
+                            : "↻ OpenSpec + RAG"}
+                      </button>
+                      <button
+                        disabled={Boolean(activeServiceJob || activeGraphJob)}
+                        onClick={() => void onAction(
+                          () => post("/admin/api/services/analyze", password, { service_id: mappedService.id }),
+                          `Анализ кода «${mappedService.name}» поставлен в очередь`,
+                        )}
+                      >
+                        {activeServiceJob ? "◌ Анализируется…" : "Анализ кода"}
                       </button>
                       <button onClick={() => onSsot(mappedService, repository.index_id)}>SSOT</button>
                       <button onClick={onGraph}>Граф</button>

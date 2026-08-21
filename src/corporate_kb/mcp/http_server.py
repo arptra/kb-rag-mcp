@@ -574,6 +574,24 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             return _api_error(exc)
 
     @server.custom_route(
+        "/admin/api/repositories/refresh",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_refresh_repository(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            repository_id = payload.get("repository_id") if isinstance(payload, dict) else None
+            if not isinstance(repository_id, str) or not repository_id:
+                raise ValueError("repository_id must be a non-empty string")
+            job = catalog.start_repository_refresh(repository_id)
+            return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
         "/admin/api/repositories/delete",
         methods=["POST"],
         include_in_schema=False,

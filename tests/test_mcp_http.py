@@ -609,6 +609,30 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
         assert job_log.status_code == 200
         assert "Analysis archived at" in job_log.json()["log"]
 
+        refreshed_repository = await client.post(
+            "/admin/api/repositories/refresh",
+            headers=admin_headers,
+            json={"repository_id": imported_repository["id"]},
+        )
+        assert refreshed_repository.status_code == 202
+        refresh_job_id = refreshed_repository.json()["id"]
+        assert refreshed_repository.json()["target_id"] == imported_repository["id"]
+        for _ in range(300):
+            catalog = (
+                await client.get("/admin/api/catalog", headers=admin_headers)
+            ).json()
+            refresh_job = next(item for item in catalog["jobs"] if item["id"] == refresh_job_id)
+            if refresh_job["status"] not in {"queued", "running", "cancelling"}:
+                break
+            await asyncio.sleep(0.01)
+        assert refresh_job["status"] == "completed"
+        refresh_log = await client.get(
+            "/admin/api/jobs/log",
+            headers=admin_headers,
+            params={"job_id": refresh_job_id},
+        )
+        assert "OpenSpec scan ready: roots=1" in refresh_log.json()["log"]
+
         reanalyze = await client.post(
             "/admin/api/services/analyze",
             headers=admin_headers,

@@ -17,6 +17,7 @@ from service_map import (
     ServiceMapBuildTimedOut,
     ServiceMapProcessRunner,
 )
+from service_map.layout import RepositoryLayoutAnalyzer
 from service_map.models import ServiceMapSnapshot, ServiceRecord
 
 
@@ -255,6 +256,34 @@ public class ApiController {
     assert services["api"].build_system == "gradle"
     assert services["api"].module_state == "active"
     assert services["empty"].module_state == "empty"
+
+
+def test_layout_finishes_for_unfinished_gradle_module_with_large_spring_yaml(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "unfinished-platform"
+    _write(repository, "settings.gradle.kts", 'include(":unfinished")\n')
+    _write(repository, "unfinished/build.gradle.kts", 'plugins { kotlin("jvm") }\n')
+    unrelated_spring_settings = "\n".join(
+        f"  unfinished-setting-{position}: value-{position}" for position in range(500)
+    )
+    _write(
+        repository,
+        "unfinished/src/main/resources/application.yml",
+        f"spring:\n{unrelated_spring_settings}\n",
+    )
+    events: list[str] = []
+
+    layout = RepositoryLayoutAnalyzer().discover(repository, progress=events.append)
+
+    assert len(layout.modules) == 1
+    assert layout.modules[0].relative_path == "unfinished"
+    assert layout.modules[0].service_id == "unfinished"
+    assert layout.modules[0].state == "empty"
+    assert any(
+        "Layout Spring config ready: module=unfinished; application_name=missing" in event
+        for event in events
+    )
 
 
 def test_nested_kotlin_component_is_attached_to_service_and_scanned_once(tmp_path: Path) -> None:

@@ -225,6 +225,65 @@ public class StatusController {
     assert service_map["services"][0]["entrypoints"][0]["operation"] == "GET /status"
 
 
+def test_failed_repository_import_remains_visible_and_retryable(
+    settings_factory,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    index = catalog.create_index(name="Retry failed repository")
+    repository = tmp_path / "unfinished-repository"
+    repository.mkdir()
+    original_find_openspecs = catalog._find_openspecs
+    attempts = 0
+
+    def fail_first_scan(checkout, *, cancel_event=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("unfinished repository scan failed")
+        return original_find_openspecs(checkout, cancel_event=cancel_event)
+
+    monkeypatch.setattr(catalog, "_find_openspecs", fail_first_scan)
+    failed_job = catalog.start_repository_ingestion(
+        name="Unfinished repository",
+        git_url=str(repository),
+        index_id=index.id,
+    )
+
+    failed = _wait_for_job(catalog, failed_job.id)
+    assert failed["status"] == "failed"
+    imported = next(
+        item
+        for item in catalog.payload()["repositories"]
+        if item["name"] == "Unfinished repository"
+    )
+    assert failed_job.target_id == imported["id"]
+
+    retry_job = catalog.start_repository_refresh(imported["id"])
+    retried = _wait_for_job(catalog, retry_job.id)
+
+    assert retried["status"] == "completed"
+    assert retry_job.target_id == imported["id"]
+    refreshed = next(
+        item for item in catalog.payload()["repositories"] if item["id"] == imported["id"]
+    )
+    assert refreshed["document_count"] == 0
+
+
 def test_catalog_indexes_all_module_openspec_roots(settings_factory, tmp_path) -> None:
     settings = settings_factory()
     settings.knowledge_dir.mkdir(parents=True)

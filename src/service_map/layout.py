@@ -154,6 +154,13 @@ class RepositoryLayoutAnalyzer:
             explicit = self._module_manifest(root, candidate.root, manifest, manifest_modules)
             source_roots = self._source_roots(candidate.root, candidate.build_system)
             resource_roots = self._resource_roots(candidate.root, candidate.build_system)
+            if progress is not None:
+                progress(
+                    f"Layout module files start: module={relative_path}; "
+                    f"owned_sources={len(owned_sources.get(candidate.root, ()))}; "
+                    f"owned_resources={len(owned_resources.get(candidate.root, ()))}; "
+                    f"source_roots={len(source_roots)}; resource_roots={len(resource_roots)}"
+                )
             source_files = tuple(
                 path
                 for path in owned_sources.get(candidate.root, ())
@@ -165,7 +172,16 @@ class RepositoryLayoutAnalyzer:
                 if any(path.is_relative_to(resource_root) for resource_root in resource_roots)
             )
             has_sources = bool(source_files)
-            spring_name = self._spring_application_name_files(resource_files)
+            if progress is not None:
+                progress(
+                    f"Layout module files ready: module={relative_path}; "
+                    f"sources={len(source_files)}; resources={len(resource_files)}"
+                )
+            spring_name = self._spring_application_name_files(
+                resource_files,
+                module_path=relative_path,
+                progress=progress,
+            )
             explicit_service = isinstance(explicit, dict) and isinstance(
                 explicit.get("service"), dict
             )
@@ -581,14 +597,23 @@ class RepositoryLayoutAnalyzer:
         return False
 
     @staticmethod
-    def _spring_application_name_files(files: tuple[Path, ...]) -> str | None:
+    def _spring_application_name_files(
+        files: tuple[Path, ...],
+        *,
+        module_path: str | None = None,
+        progress: Callable[[str], None] | None = None,
+    ) -> str | None:
         candidates = [
             path
             for path in files
             if path.suffix.lower() in {".properties", ".yaml", ".yml"}
             and path.name.startswith(_APPLICATION_NAMES)
         ]
-        return RepositoryLayoutAnalyzer._application_name_from_paths(candidates)
+        return RepositoryLayoutAnalyzer._application_name_from_paths(
+            candidates,
+            module_path=module_path,
+            progress=progress,
+        )
 
     @staticmethod
     def _files(root: Path, suffixes: set[str]) -> tuple[Path, ...]:
@@ -850,23 +875,80 @@ class RepositoryLayoutAnalyzer:
         return RepositoryLayoutAnalyzer._application_name_from_paths(candidates)
 
     @staticmethod
-    def _application_name_from_paths(candidates: list[Path]) -> str | None:
+    def _application_name_from_paths(
+        candidates: list[Path],
+        *,
+        module_path: str | None = None,
+        progress: Callable[[str], None] | None = None,
+    ) -> str | None:
+        if progress is not None and candidates:
+            progress(
+                f"Layout Spring config start: module={module_path or '.'}; files={len(candidates)}"
+            )
         for path in sorted(candidates):
+            if progress is not None:
+                progress(
+                    f"Layout Spring config read: module={module_path or '.'}; file={path.name}"
+                )
             try:
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            match = re.search(r"(?m)^\s*spring\.application\.name\s*[:=]\s*([^\s#]+)", text)
-            if match:
-                return match.group(1).strip().strip("\"'")
-            yaml = re.search(
-                r"(?ms)^spring\s*:\s*\n(?:(?:[ \t]+.*)?\n)*?"
-                r"[ \t]+application\s*:\s*\n(?:(?:[ \t]+.*)?\n)*?"
-                r"[ \t]+name\s*:\s*([^\s#]+)",
-                text,
+            application_name = RepositoryLayoutAnalyzer._application_name_from_text(text)
+            if application_name:
+                if progress is not None:
+                    progress(
+                        f"Layout Spring config found: module={module_path or '.'}; "
+                        f"file={path.name}; name={application_name}"
+                    )
+                return application_name
+        if progress is not None and candidates:
+            progress(
+                f"Layout Spring config ready: module={module_path or '.'}; application_name=missing"
             )
-            if yaml:
-                return yaml.group(1).strip().strip("\"'")
+        return None
+
+    @staticmethod
+    def _application_name_from_text(text: str) -> str | None:
+        """Read Spring's application name in linear time from properties or simple YAML."""
+        yaml_path: list[tuple[int, tuple[str, ...]]] = []
+        for raw_line in text.splitlines():
+            expanded = raw_line.expandtabs(2)
+            stripped = expanded.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped in {"---", "..."}:
+                yaml_path.clear()
+                continue
+            separator_positions = [
+                position for position in (stripped.find("="), stripped.find(":")) if position >= 0
+            ]
+            if not separator_positions:
+                continue
+            separator = min(separator_positions)
+            raw_key = stripped[:separator].strip()
+            if (
+                not raw_key
+                or raw_key.startswith("-")
+                or any(
+                    character
+                    not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+                    for character in raw_key
+                )
+            ):
+                continue
+            value = stripped[separator + 1 :].strip()
+            indent = len(expanded) - len(expanded.lstrip())
+            while yaml_path and indent <= yaml_path[-1][0]:
+                yaml_path.pop()
+            key_parts = tuple(part for part in raw_key.split(".") if part)
+            full_path = tuple(part for _level, parts in yaml_path for part in parts) + key_parts
+            if value:
+                if full_path[-3:] == ("spring", "application", "name"):
+                    cleaned = value.split(" #", 1)[0].strip().strip("\"'")
+                    return cleaned or None
+                continue
+            yaml_path.append((indent, key_parts))
         return None
 
     def _maven_artifact(

@@ -45,7 +45,6 @@ from service_map import (
     ServiceMapProcessRunner,
     ServiceMapSnapshot,
 )
-from service_map.layout import RepositoryLayoutAnalyzer
 from service_map.models import ServiceRecord
 
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -279,14 +278,39 @@ class RagCatalog:
             created = self.create_index(name=index_name or clean_name)
             target_id = created.id
         self._record(target_id)
+        clean_ref = ref.strip() if ref else None
+        repository_id = self._repository_id(clean_name, clean_url, clean_ref, target_id)
         job = self._new_job(
             "repository",
             index_id=target_id,
+            target_id=repository_id,
             message="Repository import queued",
         )
         threading.Thread(
             target=self._run_repository_job,
-            args=(job.id, clean_name, clean_url, ref.strip() if ref else None, target_id),
+            args=(job.id, clean_name, clean_url, clean_ref, target_id),
+            daemon=True,
+        ).start()
+        return job
+
+    def start_repository_refresh(self, repository_id: str) -> CatalogJob:
+        """Refresh Git/OpenSpec, rebuild the RAG index, and reanalyze the source map."""
+        repository = self._repository(repository_id)
+        job = self._new_job(
+            "repository",
+            index_id=repository.index_id,
+            target_id=repository.id,
+            message=f"Repository refresh queued: {repository.name}",
+        )
+        threading.Thread(
+            target=self._run_repository_job,
+            args=(
+                job.id,
+                repository.name,
+                repository.git_url,
+                repository.ref,
+                repository.index_id,
+            ),
             daemon=True,
         ).start()
         return job
@@ -680,7 +704,12 @@ class RagCatalog:
         index_id: str,
         cancel_event: threading.Event,
     ) -> None:
-        self._update_job(job_id, status="running", message="Cloning repository", started_at=_now())
+        self._update_job(
+            job_id,
+            status="running",
+            message="Refreshing repository checkout",
+            started_at=_now(),
+        )
         self._update_index(index_id, status="indexing", error=None)
         graph_settings = self._graph_settings()
         try:
@@ -693,9 +722,40 @@ class RagCatalog:
             self._raise_if_cancelled(cancel_event)
             checkout = paths[0]
             ingestion = records[0]
-            self._update_job(job_id, message="Reading OpenSpec and source interfaces")
-            openspecs = self._find_openspecs(checkout, cancel_event=cancel_event)
             repository_id = self._repository_id(name, git_url, ref, index_id)
+            try:
+                previous = self._repository(repository_id)
+                repository = previous.model_copy(
+                    update={
+                        "name": name,
+                        "git_url": git_url,
+                        "ref": ref,
+                        "checkout_path": str(checkout),
+                        "commit": ingestion.commit,
+                    }
+                )
+            except KeyError:
+                repository = RepositorySource(
+                    id=repository_id,
+                    name=name,
+                    git_url=git_url,
+                    ref=ref,
+                    index_id=index_id,
+                    checkout_path=str(checkout),
+                    commit=ingestion.commit,
+                )
+            # Persist the source before deeper inspection. Even an empty or broken
+            # repository must remain visible in the UI so the user can retry it.
+            self._upsert_repository(repository)
+            self._update_job(job_id, message="Scanning repository for OpenSpec directories")
+            openspecs = self._find_openspecs(checkout, cancel_event=cancel_event)
+            openspec_summary = (
+                ", ".join(str(path.relative_to(checkout)) for path in openspecs) or "none"
+            )
+            self._append_job_log(
+                job_id,
+                f"OpenSpec scan ready: roots={len(openspecs)}; paths={openspec_summary}",
+            )
             document_count = self._sync_openspec(
                 sources=openspecs,
                 checkout=checkout,
@@ -706,25 +766,15 @@ class RagCatalog:
                 cancel_event=cancel_event,
             )
             self._raise_if_cancelled(cancel_event)
-            repository = RepositorySource(
-                id=repository_id,
-                name=name,
-                git_url=git_url,
-                ref=ref,
-                index_id=index_id,
-                checkout_path=str(checkout),
-                openspec_path=str(openspecs[0]) if openspecs else None,
-                openspec_paths=[str(path) for path in openspecs],
-                commit=ingestion.commit,
-                document_count=document_count,
+            repository = repository.model_copy(
+                update={
+                    "openspec_path": str(openspecs[0]) if openspecs else None,
+                    "openspec_paths": [str(path) for path in openspecs],
+                    "document_count": document_count,
+                    "synced_at": _now(),
+                }
             )
-            with self._lock:
-                self._state.repositories = [
-                    item for item in self._state.repositories if item.id != repository.id
-                ]
-                self._state.repositories.append(repository)
-                self._refresh_source_counts_locked()
-                self._save_locked()
+            self._upsert_repository(repository)
             self._update_job(job_id, message=f"Building RAG index from {document_count} documents")
             self._raise_if_cancelled(cancel_event)
             service = self.service_for(index_id)
@@ -1076,12 +1126,36 @@ class RagCatalog:
         *,
         cancel_event: threading.Event | None = None,
     ) -> list[Path]:
-        if cancel_event is not None:
+        """Find OpenSpec roots without running the full source-layout analyzer twice."""
+        ignored = {
+            ".git",
+            ".gradle",
+            ".idea",
+            ".mvn",
+            ".settings",
+            "build",
+            "dist",
+            "generated",
+            "node_modules",
+            "out",
+            "target",
+            "vendor",
+        }
+        found: list[Path] = []
+        for current, directories, _files in os.walk(checkout, followlinks=False):
             self._raise_if_cancelled(cancel_event)
-        layout = RepositoryLayoutAnalyzer().discover(checkout)
-        if cancel_event is not None:
-            self._raise_if_cancelled(cancel_event)
-        return list(layout.openspec_roots)
+            root = Path(current)
+            retained: list[str] = []
+            for name in directories:
+                path = root / name
+                if path.is_symlink() or name.startswith(".") or name in ignored:
+                    continue
+                if name.lower() == "openspec":
+                    found.append(path.resolve())
+                    continue
+                retained.append(name)
+            directories[:] = retained
+        return sorted(set(found))
 
     def _sync_openspec(
         self,
@@ -1239,6 +1313,15 @@ class RagCatalog:
         if repository is None:
             raise KeyError(f"Unknown repository: {repository_id}")
         return repository.model_copy(deep=True)
+
+    def _upsert_repository(self, repository: RepositorySource) -> None:
+        with self._lock:
+            self._state.repositories = [
+                item for item in self._state.repositories if item.id != repository.id
+            ]
+            self._state.repositories.append(repository)
+            self._refresh_source_counts_locked()
+            self._save_locked()
 
     def _service_context(self, service_id: str) -> tuple[ServiceRecord, RepositorySource]:
         service = next(
