@@ -25,6 +25,10 @@ BUILTIN_TOOLS: tuple[dict[str, str], ...] = (
         "name": "kb_feature_context",
         "description": "Join service calls and repository-scoped RAG context for a feature.",
     },
+    {
+        "name": "kb_generate_system_ssot",
+        "description": "Generate service SSOT files and rebuild a selected RAG index.",
+    },
     {"name": "kb_search", "description": "Search indexed corporate knowledge."},
     {"name": "kb_get_document", "description": "Read a bounded document extract."},
     {"name": "kb_get_chunk", "description": "Read context around one search chunk."},

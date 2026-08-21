@@ -109,6 +109,12 @@ Repository и производные сервисы можно удалять и
 успешный source analysis архивируется в `.cache/kb/analysis/runs/`; с карточки сервиса можно
 скачать пакет с analysis JSON и [`build-service-ssot`](skills/build-service-ssot/SKILL.md), затем
 загрузить проверенный Markdown SSOT в выбранный RAG-индекс.
+Для автоматического режима кнопка **«Сгенерировать SSOT»** или MCP-tool
+`kb_generate_system_ssot` запускает свежий source analysis, параллельно создаёт минимальное
+описание API и функциональности каждого сервиса через OpenAI-compatible LLM, сохраняет файлы в
+`ssot/generated/<service-id>.md` выбранного индекса и только после этого перестраивает RAG.
+Настройка модели, polling job и fallback при ошибке отдельного сервиса описаны в
+[документации анализа](README.repository-analysis.md#автоматический-системный-ssot-через-llm).
 Во вкладке dashboard **«Операции и логи»** открытый журнал активной job обновляется раз в секунду:
 он показывает layout каждого repository, найденные modules, число Java/Kotlin-файлов, cache
 hit/miss, размер и отдельные фазы чтения layout-cache (`stat`, `read`, `JSON parse`, `hydrate`),
@@ -126,8 +132,9 @@ signal при аварии worker. Supervisor пишет heartbeat каждые 
 - `chunks.json` — чанки без отдельной копии embedding;
 - `embeddings.npy` — матрица без pickle.
 
-Это не Vector DB: нет отдельного сервиса хранения, индекса ANN или SQL. Удалённый HTTP — только
-read-only MCP-фасад; поиск выполняется полным cosine scan по NumPy-матрице в памяти, а диск
+Это не Vector DB: нет отдельного сервиса хранения, индекса ANN или SQL. Почти все MCP-tools
+read-only; отдельно помеченный `kb_generate_system_ssot` создаёт локальные документы и перестраивает
+выбранный индекс. Поиск выполняется полным cosine scan по NumPy-матрице в памяти, а диск
 используется для ускорения старта.
 
 ## Первый запуск
@@ -153,7 +160,9 @@ dependencies своей части. Подробности и production-реж�
 RAG, индекс и документы находятся только на сервере. Для старых версий Qwen сотруднику
 передаётся один файл [`clients/corporate_kb_stdio_proxy.py`](clients/corporate_kb_stdio_proxy.py).
 Qwen запускает его локально через `uv` как stdio MCP, а Python-процесс ходит к удалённому
-серверу через обычные HTTP GET-запросы. Node.js, `npx`, `mcp-remote`, Nginx, копия проекта,
+серверу как прозрачный Streamable HTTP MCP-клиент. На клиенте нет прошитого списка tools: при
+каждом запуске он выполняет удалённый `tools/list` и зеркалирует новые имена, схемы, annotations и
+вызовы. Node.js, `npx`, `mcp-remote`, Nginx, копия проекта,
 `.venv`, документы и индекс на клиенте не нужны.
 
 Готовый settings находится в
@@ -162,16 +171,15 @@ Qwen запускает его локально через `uv` как stdio MCP
 
 Новые версии Qwen также могут подключаться к `/mcp` напряму через Streamable HTTP; скрипт
 `install.sh` оставлен как опциональный способ для таких клиентов.
-Скопируйте из неё `mcpServers` в `~/.qwen/settings.json` и замените четыре placeholder:
+Скопируйте из неё `mcpServers` в `~/.qwen/settings.json` и замените три placeholder:
 
 - `REPLACE_WITH_ABSOLUTE_UV_PATH` — результат `which uv` или `where uv` (в Windows `uv.exe`);
 - `REPLACE_WITH_ABSOLUTE_PATH` — каталог, в котором сотрудник сохранил единственный `.py`-файл;
 - `REPLACE_WITH_SERVER_IP_OR_DOMAIN` — адрес удалённого сервера;
-- `REPLACE_WITH_SERVER_TOKEN` — только если на сервере включена Bearer-защита.
 
 Qwen запускает этот файл как локальный MCP по `stdio` командой `uv run`. Скрипт содержит inline
 dependency на FastMCP, поэтому `uv` сам создаёт изолированное кэшированное окружение. Локальный MCP
-обращается к удалённому RAG только через обычные JSON GET endpoints `/api/v1/*`.
+обращается к общему RAG-серверу через его Streamable HTTP endpoint `/mcp`.
 `node`, `npx`, `mcp-remote`, локальная копия документов и локальный индекс не нужны.
 
 ### Установка серверной части
@@ -349,6 +357,8 @@ qwen
 - `kb_run_context_benchmark` — защищённый паролем read-only замер качества и сжатия;
 - `kb_get_document` — ограниченный извлекаемый фрагмент документа по `document_id`;
 - `kb_list_documents` — metadata документов без embeddings;
+- `kb_generate_system_ssot` — показывает доступные индексы или запускает/опрашивает фоновую
+  генерацию локального SSOT всех сервисов через настроенную OpenAI-compatible модель;
 - `kb_stats` — состояние индекса и абсолютные пути.
 
 Во вкладке dashboard **«MCP tools»** отображается живой каталог FastMCP: все встроенные tools и
@@ -373,7 +383,8 @@ RAG. В неоднозначном случае ответ имеет `status: n
 
 Не задавайте статический `includeTools` в Qwen settings, если используете управляемые tools из UI:
 клиентский allowlist скроет новые схемы от LLM. Прямой HTTP-клиент обновляет `/mcp` discovery, а
-однофайловый stdio proxy перечитывает каталог после перезапуска Qwen.
+однофайловый stdio proxy выполняет тот же удалённый `tools/list` после перезапуска Qwen. Обновлять
+сам proxy-файл при добавлении server tools больше не требуется.
 
 ### Разработка React-панели
 
@@ -491,8 +502,8 @@ Git fetch/clone запускаются в отдельной process group: time
 curl http://10.0.0.5:8000/health
 ```
 
-Для stdio-клиента сервер также предоставляет read-only JSON API. В стандартном локальном режиме
-поиск работает без токена:
+Для кастомных HTTP-клиентов сервер также предоставляет read-only JSON API. В стандартном локальном
+режиме поиск работает без токена:
 
 ```bash
 curl -G 'http://10.0.0.5:8000/api/v1/search' \

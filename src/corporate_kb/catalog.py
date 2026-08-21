@@ -10,9 +10,11 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import traceback
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +27,7 @@ from corporate_kb.index_runner import IndexBuildCancelled, IndexBuildProcessRunn
 from corporate_kb.loaders.filesystem import SUPPORTED_DOCUMENT_SUFFIXES
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeIndexMissingError, KnowledgeService
+from corporate_kb.ssot import GeneratedSsot, ServiceSsotGenerator
 from corporate_kb.usage import UsageTracker
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.models import GraphSnapshot
@@ -107,7 +110,7 @@ class RepositorySource(CatalogModel):
 
 class CatalogJob(CatalogModel):
     id: str
-    type: Literal["index", "repository", "graph", "service", "cleanup"]
+    type: Literal["index", "repository", "graph", "service", "ssot", "cleanup"]
     status: Literal[
         "queued",
         "running",
@@ -123,6 +126,7 @@ class CatalogJob(CatalogModel):
     completed_at: datetime | None = None
     error: str | None = None
     log_path: str | None = None
+    result: dict[str, Any] | None = None
 
 
 class ServiceExclusion(CatalogModel):
@@ -149,6 +153,8 @@ class RagCatalog:
         default_service: KnowledgeService,
         default_tools: KnowledgeTools,
         usage: UsageTracker,
+        *,
+        ssot_generator: ServiceSsotGenerator | None = None,
     ) -> None:
         self.settings = settings
         self._default_service = default_service
@@ -167,6 +173,7 @@ class RagCatalog:
             settings.analysis_archive_dir,
             settings.ssot_skill_path,
         )
+        self._ssot_generator = ssot_generator or ServiceSsotGenerator(settings)
         if not settings.graph_store_path.is_file():
             self._graph_store.save(GraphSnapshot())
         self._graph_service = GraphService(self._graph_store)
@@ -200,6 +207,7 @@ class RagCatalog:
             "repositories": [item.model_dump(mode="json") for item in repositories],
             "jobs": [item.model_dump(mode="json") for item in jobs[:30]],
             "analysis": self._analysis_archive.overview(),
+            "ssot_generation": self._ssot_generator.status(),
         }
 
     def create_index(self, *, name: str, description: str = "") -> RagIndex:
@@ -335,6 +343,86 @@ class RagCatalog:
         ).start()
         return job
 
+    def ssot_generation_options(self) -> dict[str, Any]:
+        with self._lock:
+            indexes = [item.model_copy(deep=True) for item in self._state.indexes]
+        return {
+            "status": "selection_required",
+            "generator": self._ssot_generator.status(),
+            "indexes": [
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "description": item.description,
+                    "document_count": item.document_count,
+                    "source_count": item.source_count,
+                    "status": item.status,
+                }
+                for item in indexes
+            ],
+            "next": (
+                "Call kb_generate_system_ssot again with index_id from indexes[].id. "
+                "The server will refresh source analysis, generate local SSOT files, and "
+                "rebuild that RAG index."
+            ),
+        }
+
+    def ssot_generation_request(
+        self,
+        *,
+        index_id: str | None = None,
+        service_ids: list[str] | None = None,
+        refresh_analysis: bool = True,
+        job_id: str | None = None,
+    ) -> dict[str, Any]:
+        if job_id:
+            if index_id is not None or service_ids:
+                raise ValueError("job_id cannot be combined with index_id or service_ids")
+            return self._ssot_job_status(job_id)
+        if index_id is None:
+            return self.ssot_generation_options()
+        job = self.start_system_ssot_generation(
+            index_id=index_id,
+            service_ids=service_ids,
+            refresh_analysis=refresh_analysis,
+        )
+        return {
+            "status": "queued",
+            "job": job.model_dump(mode="json"),
+            "poll": {
+                "tool": "kb_generate_system_ssot",
+                "arguments": {"job_id": job.id},
+            },
+        }
+
+    def start_system_ssot_generation(
+        self,
+        *,
+        index_id: str,
+        service_ids: list[str] | None = None,
+        refresh_analysis: bool = True,
+    ) -> CatalogJob:
+        index = self._record(index_id)
+        generator_status = self._ssot_generator.status()
+        if not generator_status["configured"]:
+            required = ", ".join(str(item) for item in generator_status["required_settings"])
+            raise RuntimeError(f"SSOT LLM is not configured; set {required} and restart the server")
+        selected = tuple(dict.fromkeys(item.strip() for item in service_ids or [] if item.strip()))
+        if len(selected) > 500:
+            raise ValueError("No more than 500 service_ids can be generated in one job")
+        job = self._new_job(
+            "ssot",
+            index_id=index.id,
+            target_id=index.id,
+            message=f"System SSOT generation queued for index: {index.name}",
+        )
+        threading.Thread(
+            target=self._run_system_ssot_generation_job,
+            args=(job.id, index.id, selected, refresh_analysis),
+            daemon=True,
+        ).start()
+        return job
+
     def start_repository_delete(self, repository_id: str) -> CatalogJob:
         repository = self._repository(repository_id)
         job = self._new_job(
@@ -375,6 +463,18 @@ class RagCatalog:
             "job_id": job_id,
             "status": job.status,
             "log": path.read_text(encoding="utf-8") if path.is_file() else "",
+        }
+
+    def _ssot_job_status(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+        if job is None or job.type != "ssot":
+            raise KeyError(f"Unknown SSOT generation job: {job_id}")
+        log = self.job_log(job_id)["log"]
+        return {
+            "status": job.status,
+            "job": job.model_dump(mode="json"),
+            "log_tail": "\n".join(log.splitlines()[-80:]),
         }
 
     def create_ssot_bundle(self, service_id: str) -> dict[str, str]:
@@ -894,6 +994,230 @@ class RagCatalog:
         finally:
             self._release_cancel_event(job_id)
 
+    def _run_system_ssot_generation_job(
+        self,
+        job_id: str,
+        index_id: str,
+        service_ids: tuple[str, ...],
+        refresh_analysis: bool,
+    ) -> None:
+        cancel_event = self._cancel_event(job_id)
+        try:
+            with self._cancellable_lock(self._index_work_lock(index_id), cancel_event):
+                self._raise_if_cancelled(cancel_event)
+                self._execute_system_ssot_generation_job(
+                    job_id,
+                    index_id,
+                    service_ids,
+                    refresh_analysis,
+                    cancel_event,
+                )
+        except (
+            CatalogJobCancelled,
+            IndexBuildCancelled,
+            RepositoryOperationCancelled,
+            ServiceMapBuildCancelled,
+        ):
+            self._finish_cancelled_job(job_id, index_id)
+        except Exception as exc:
+            self._fail_background_job(job_id, index_id, "System SSOT generation failed", exc)
+        finally:
+            self._release_cancel_event(job_id)
+
+    def _execute_system_ssot_generation_job(
+        self,
+        job_id: str,
+        index_id: str,
+        service_ids: tuple[str, ...],
+        refresh_analysis: bool,
+        cancel_event: threading.Event,
+    ) -> None:
+        self._update_job(
+            job_id,
+            status="running",
+            message=(
+                "Refreshing source analysis before SSOT generation"
+                if refresh_analysis
+                else "Loading the latest source analysis"
+            ),
+            started_at=_now(),
+        )
+        if refresh_analysis:
+            graph = self._build_graph(
+                cancel_event=cancel_event,
+                job_id=job_id,
+                force_all=True,
+            )
+        else:
+            graph = self._graph_store.load()
+        self._raise_if_cancelled(cancel_event)
+        service_map = self._service_map_store.load()
+        selected_ids = set(service_ids)
+        services = [
+            service
+            for service in service_map.services
+            if not selected_ids or service.id in selected_ids
+        ]
+        if selected_ids:
+            missing = selected_ids - {service.id for service in services}
+            if missing:
+                raise KeyError(f"Unknown services after analysis: {', '.join(sorted(missing))}")
+        if not services:
+            raise RuntimeError("Source analysis did not discover any services to document")
+
+        index = self._record(index_id)
+        knowledge_root = Path(index.knowledge_dir).resolve()
+        knowledge_root.mkdir(parents=True, exist_ok=True)
+        destination_root = (knowledge_root / "ssot" / "generated").resolve()
+        if not destination_root.is_relative_to(knowledge_root):
+            raise RuntimeError("Invalid SSOT output directory")
+        self._update_job(
+            job_id,
+            message=(
+                f"Generating SSOT with {self._ssot_generator.model_name}: "
+                f"services={len(services)}; workers={self.settings.ssot_generation_workers}"
+            ),
+        )
+
+        def generate_one(service: ServiceRecord) -> GeneratedSsot:
+            self._raise_if_cancelled(cancel_event)
+            _mapped, repository = self._service_context(service.id)
+            payload = AnalysisArchive._service_payload(service_map, graph, service.id)
+            target = destination_root / f"{_slug(service.id)}.md"
+            self._append_job_log(
+                job_id,
+                f"SSOT started: service={service.id}; module={service.module_path}; "
+                f"checkout={repository.checkout_path}",
+            )
+            existing = None
+            if target.is_file():
+                try:
+                    existing = target.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    existing = None
+            try:
+                return self._ssot_generator.generate(
+                    payload,
+                    checkout=Path(repository.checkout_path),
+                    existing_ssot=existing,
+                    cancel=cancel_event,
+                )
+            except Exception as exc:
+                self._raise_if_cancelled(cancel_event)
+                return self._ssot_generator.fallback(
+                    payload,
+                    checkout=Path(repository.checkout_path),
+                    error=str(exc) or type(exc).__name__,
+                    cancel=cancel_event,
+                )
+
+        results: list[GeneratedSsot] = []
+        futures: dict[Future[GeneratedSsot], ServiceRecord] = {}
+        executor = ThreadPoolExecutor(
+            max_workers=self.settings.ssot_generation_workers,
+            thread_name_prefix="ssot-generation",
+        )
+        try:
+            for service in services:
+                futures[executor.submit(generate_one, service)] = service
+            pending = set(futures)
+            position = 0
+            wait_started = time.monotonic()
+            next_heartbeat = wait_started + 5
+            while pending:
+                self._raise_if_cancelled(cancel_event)
+                done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                for future in done:
+                    position += 1
+                    service = futures[future]
+                    result = future.result()
+                    results.append(result)
+                    mode = "llm" if result.used_llm else "source-fallback"
+                    self._append_job_log(
+                        job_id,
+                        f"SSOT [{position}/{len(services)}] ready: service={service.id}; "
+                        f"mode={mode}; source_files={len(result.source_files)}"
+                        + (f"; llm_error={result.error}" if result.error else ""),
+                    )
+                now = time.monotonic()
+                if pending and now >= next_heartbeat:
+                    elapsed = int(now - wait_started)
+                    heartbeat = (
+                        f"Waiting for SSOT workers: ready={position}/{len(services)}; "
+                        f"pending={len(pending)}; elapsed={elapsed}s"
+                    )
+                    self._update_job(job_id, message=heartbeat)
+                    next_heartbeat = now + 5
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        self._raise_if_cancelled(cancel_event)
+        temporary = Path(tempfile.mkdtemp(prefix=".ssot-generation-", dir=knowledge_root))
+        published: list[str] = []
+        try:
+            for result in sorted(results, key=lambda item: item.service_id):
+                filename = f"{_slug(result.service_id)}.md"
+                (temporary / filename).write_text(result.content, encoding="utf-8")
+            destination_root.mkdir(parents=True, exist_ok=True)
+            for path in sorted(temporary.glob("*.md")):
+                self._raise_if_cancelled(cancel_event)
+                target = destination_root / path.name
+                os.replace(path, target)
+                published.append(target.relative_to(knowledge_root).as_posix())
+            if not selected_ids:
+                expected = {Path(path).name for path in published}
+                for stale in destination_root.glob("*.md"):
+                    if stale.name not in expected:
+                        stale.unlink()
+                        self._append_job_log(
+                            job_id,
+                            f"Removed stale generated SSOT: {stale.name}",
+                        )
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
+
+        self._update_job(
+            job_id,
+            message=f"Building selected RAG index from {len(published)} generated SSOT files",
+        )
+        self._update_index(index_id, status="indexing", error=None)
+        IndexBuildProcessRunner(
+            self.service_for(index_id).settings,
+            timeout_seconds=self.settings.index_build_timeout_seconds,
+        ).build(cancel=cancel_event)
+        stats = self.service_for(index_id).reload_cached_index()
+        self._update_index(
+            index_id,
+            status="ready",
+            document_count=stats.document_count,
+            chunk_count=stats.chunk_count,
+            updated_at=_now(),
+            error=None,
+        )
+        llm_count = sum(result.used_llm for result in results)
+        fallback_count = len(results) - llm_count
+        result_payload = {
+            "index_id": index_id,
+            "index_name": index.name,
+            "service_count": len(results),
+            "llm_generated_count": llm_count,
+            "fallback_count": fallback_count,
+            "model": self._ssot_generator.model_name,
+            "files": published,
+            "document_count": stats.document_count,
+            "chunk_count": stats.chunk_count,
+        }
+        self._update_job(
+            job_id,
+            status="completed",
+            message=(
+                f"Generated {len(results)} service SSOTs and rebuilt index {index.name} "
+                f"(llm={llm_count}, fallback={fallback_count})"
+            ),
+            completed_at=_now(),
+            result=result_payload,
+        )
+
     def _run_repository_delete_job(
         self,
         job_id: str,
@@ -1376,7 +1700,7 @@ class RagCatalog:
 
     def _new_job(
         self,
-        job_type: Literal["index", "repository", "graph", "service", "cleanup"],
+        job_type: Literal["index", "repository", "graph", "service", "ssot", "cleanup"],
         *,
         index_id: str | None = None,
         target_id: str | None = None,

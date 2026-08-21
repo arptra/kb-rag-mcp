@@ -108,6 +108,32 @@ def _body_integer(
     return value
 
 
+def _optional_body_string(body: dict[str, object], name: str) -> str | None:
+    raw = body.get(name)
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(f"{name} must be a string or null")
+    value = raw.strip()
+    return value or None
+
+
+def _optional_body_string_list(body: dict[str, object], name: str) -> list[str] | None:
+    raw = body.get(name)
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ValueError(f"{name} must be an array of strings or null")
+    return [item.strip() for item in raw if item.strip()]
+
+
+def _body_boolean(body: dict[str, object], name: str, default: bool) -> bool:
+    raw = body.get(name, default)
+    if not isinstance(raw, bool):
+        raise ValueError(f"{name} must be a boolean")
+    return raw
+
+
 def _float_query(request: Request, name: str) -> float | None:
     raw = request.query_params.get(name)
     if raw is None or raw == "":
@@ -210,6 +236,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         knowledge_tools=tools,
         managed_tools=managed_tools,
         feature_context=feature_context,
+        catalog=catalog,
         builtin_tool_overrides=builtin_tool_overrides,
     )
 
@@ -676,6 +703,30 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             return _api_error(exc)
 
     @server.custom_route(
+        "/admin/api/analysis/ssot-generate",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_generate_system_ssot(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("Request body must be a JSON object")
+            payload = await asyncio.to_thread(
+                catalog.ssot_generation_request,
+                index_id=_optional_body_string(body, "index_id"),
+                service_ids=_optional_body_string_list(body, "service_ids"),
+                refresh_analysis=_body_boolean(body, "refresh_analysis", True),
+                job_id=_optional_body_string(body, "job_id"),
+            )
+            status_code = 202 if payload["status"] == "queued" else 200
+            return JSONResponse(payload, status_code=status_code)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
         "/admin/api/analysis/ssot-bundle",
         methods=["POST"],
         include_in_schema=False,
@@ -974,6 +1025,26 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 mode=mode,
             )
             return JSONResponse(payload)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/api/v1/ssot/generate", methods=["POST"], include_in_schema=False)
+    async def api_generate_system_ssot(request: Request) -> JSONResponse:
+        if not _authorized(request, token):
+            return _unauthorized_response()
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("Request body must be a JSON object")
+            payload = await asyncio.to_thread(
+                catalog.ssot_generation_request,
+                index_id=_optional_body_string(body, "index_id"),
+                service_ids=_optional_body_string_list(body, "service_ids"),
+                refresh_analysis=_body_boolean(body, "refresh_analysis", True),
+                job_id=_optional_body_string(body, "job_id"),
+            )
+            status_code = 202 if payload["status"] == "queued" else 200
+            return JSONResponse(payload, status_code=status_code)
         except Exception as exc:
             return _api_error(exc)
 

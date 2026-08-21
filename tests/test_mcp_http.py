@@ -106,9 +106,14 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
         assert local_server["url"] == "http://testserver/mcp"
         assert {tool["name"] for tool in local_server["tools"]} >= {
             "kb_search",
+            "kb_generate_system_ssot",
             "kb_get_document",
             "kb_stats",
         }
+        ssot_choices = await client.post("/admin/api/analysis/ssot-generate", json={})
+        assert ssot_choices.status_code == 200
+        assert ssot_choices.json()["status"] == "selection_required"
+        assert ssot_choices.json()["generator"]["configured"] is False
 
         async with streamable_http_client(
             "http://testserver/mcp",
@@ -118,7 +123,7 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
         ) as session:
             await session.initialize()
             listed = await session.list_tools()
-            assert {"kb_search", "kb_feature_context"} <= {
+            assert {"kb_search", "kb_feature_context", "kb_generate_system_ssot"} <= {
                 tool.name for tool in listed.tools
             }
             feature = await session.call_tool(
@@ -321,10 +326,11 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
         assert server_metrics["peak_rss_mb"] > 0
 
         runtime_catalog = admin_overview.json()["tool_catalog"]
-        assert runtime_catalog["built_in_count"] == 8
+        assert runtime_catalog["built_in_count"] == 9
         assert {
             "ssot_context",
             "kb_feature_context",
+            "kb_generate_system_ssot",
             "kb_search",
             "kb_get_document",
             "kb_get_chunk",
@@ -463,6 +469,7 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
             assert {tool.name for tool in listed.tools} == {
                 "ssot_context",
                 "kb_feature_context",
+                "kb_generate_system_ssot",
                 "kb_search",
                 "kb_get_document",
                 "kb_get_chunk",

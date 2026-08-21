@@ -140,6 +140,7 @@ input, textarea, select { min-height: 38px; padding: 8px 10px; border: 1px solid
 .job-item:last-child { border: 0; }
 .job-item .job-row { border: 0; }
 .job-icon.service { color: var(--violet); }
+.job-icon.ssot { color: var(--lime); }
 .job-icon.cleanup { color: var(--red); }
 .job-log-button { padding: 5px 8px; border: 1px solid #37443a; border-radius: 6px; background: #151d18; color: #9aa69c; font-size: 9px; cursor: pointer; }
 .job-log-missing { color: #556159; font-size: 9px; white-space: nowrap; }

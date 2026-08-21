@@ -312,6 +312,7 @@ POST /admin/api/repositories/delete
 POST /admin/api/analysis/ssot-bundle
 GET  /admin/api/analysis/bundles/download?bundle_id=...
 POST /admin/api/analysis/ssot-import
+POST /admin/api/analysis/ssot-generate
 ```
 
 ## Lifecycle из dashboard
@@ -367,8 +368,51 @@ Dashboard раскрывает журнал кнопкой `Полный лог`
    очередь.
 
 Skill требует отделять observed facts от inference, не выдумывать отсутствующие business rules и
-сохранять ссылки `[evidence:<id>]`. Сам сервис намеренно не вызывает внешнюю модель: выбор модели,
-передача закрытого source analysis и human review остаются под контролем пользователя.
+сохранять ссылки `[evidence:<id>]`. В ручном ZIP workflow сервер не вызывает внешнюю модель: выбор
+модели, передача закрытого source analysis и human review остаются под контролем пользователя.
+
+### Автоматический системный SSOT через LLM
+
+Встроенный MCP tool `kb_generate_system_ssot` автоматизирует тот же контракт для всех сервисов.
+Он использует OpenAI-compatible endpoint, поэтому подходит для OpenAI, Ollama, LM Studio и vLLM.
+Настройка хранится только на сервере:
+
+```bash
+KB_SSOT_LLM_BASE_URL=http://127.0.0.1:11434/v1
+KB_SSOT_LLM_MODEL=qwen2.5-coder:7b
+# KB_SSOT_LLM_API_KEY=... # необязателен для локального endpoint
+```
+
+Analysis JSON и ограниченные фрагменты исходников отправляются на этот endpoint. Для закрытого
+кода указывайте локальный Ollama/LM Studio/vLLM или корпоративный endpoint с подходящей политикой
+данных; ключ в job log и SSOT-файлы не записывается.
+
+Первый вызов без аргументов ничего не изменяет и возвращает список индексов:
+
+```json
+{"index_id": null}
+```
+
+Повторный вызов с выбранным `index_id` ставит фоновую cancellable job:
+
+```json
+{"index_id": "architecture-1234abcd", "refresh_analysis": true}
+```
+
+Один job выполняет последовательность:
+
+1. заново запускает изолированный source-analysis worker;
+2. для каждого сервиса берёт analysis slice и ограниченный набор Java/Kotlin/API-файлов;
+3. вызывает LLM параллельно с лимитом `KB_SSOT_GENERATION_WORKERS`;
+4. атомарно пишет `<knowledge_dir>/ssot/generated/<service-id>.md`, не перезаписывая ручной SSOT;
+5. перестраивает выбранный RAG-индекс;
+6. возвращает в `job.result` список файлов и число LLM/fallback документов.
+
+Статус проверяется тем же tool через `{"job_id": "..."}`. Пока модель отвечает, job log раз в
+пять секунд пишет число готовых и ожидающих сервисов. Если отдельный LLM-вызов падает,
+для этого сервиса сохраняется явно помеченный `source-analysis-fallback`; это не выдаётся за
+авторитетный бизнес-SSOT. Полный текст ошибки остаётся в job log. API для dashboard и remote proxy:
+`POST /admin/api/analysis/ssot-generate` и `POST /api/v1/ssot/generate`.
 
 Диагностика:
 

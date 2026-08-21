@@ -60,7 +60,7 @@ export interface RepositorySource {
 
 export interface CatalogJob {
   id: string;
-  type: "index" | "repository" | "graph" | "service" | "cleanup";
+  type: "index" | "repository" | "graph" | "service" | "ssot" | "cleanup";
   status: "queued" | "running" | "cancelling" | "cancelled" | "completed" | "failed";
   index_id: string | null;
   target_id: string | null;
@@ -69,6 +69,7 @@ export interface CatalogJob {
   completed_at: string | null;
   error: string | null;
   log_path: string | null;
+  result: Record<string, unknown> | null;
 }
 
 export interface Catalog {
@@ -85,6 +86,14 @@ export interface Catalog {
     service_count?: number;
     node_count?: number;
     edge_count?: number;
+  };
+  ssot_generation: {
+    configured: boolean;
+    provider: string;
+    model: string | null;
+    workers: number;
+    output_pattern: string;
+    required_settings: string[];
   };
 }
 

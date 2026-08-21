@@ -7,9 +7,9 @@
         "REPLACE_WITH_ABSOLUTE_PATH/corporate_kb_stdio_proxy.py"
       ],
       "env": {
-        "CORPORATE_KB_API_URL": "http://REPLACE_WITH_SERVER_IP_OR_DOMAIN:8000",
-        "CORPORATE_KB_API_TOKEN": "REPLACE_WITH_SERVER_TOKEN",
-        "CORPORATE_KB_API_TIMEOUT": "30"
+        "CORPORATE_KB_MCP_URL": "http://REPLACE_WITH_SERVER_IP_OR_DOMAIN:8000/mcp",
+        "CORPORATE_KB_MCP_TOKEN": "",
+        "CORPORATE_KB_MCP_TIMEOUT": "120"
       },
       "timeout": 120000,
       "trust": false

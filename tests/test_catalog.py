@@ -12,6 +12,7 @@ from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
 from corporate_kb.index_runner import IndexBuildCancelled, IndexBuildProcessRunner
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeService
+from corporate_kb.ssot import ServiceSsotGenerator
 from corporate_kb.usage import UsageTracker
 from service_map import ServiceMapBuildCancelled, ServiceMapProcessRunner
 
@@ -24,6 +25,11 @@ def _wait_for_job(catalog: RagCatalog, job_id: str) -> dict[str, object]:
             return current
         time.sleep(0.01)
     raise AssertionError(f"Job did not finish: {job_id} ({current})")
+
+
+def _write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
 
 
 def test_catalog_uploads_and_pages_documents_for_one_index(settings_factory) -> None:
@@ -282,6 +288,145 @@ def test_failed_repository_import_remains_visible_and_retryable(
         item for item in catalog.payload()["repositories"] if item["id"] == imported["id"]
     )
     assert refreshed["document_count"] == 0
+
+
+def test_system_ssot_job_generates_local_files_and_rebuilds_selected_index(
+    settings_factory,
+    tmp_path,
+) -> None:
+    class FakeSsotClient:
+        model_name = "test-neural-model"
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def generate(self, *, system_prompt, user_prompt, cancel=None):
+            assert "Never invent unsupported facts" in system_prompt
+            assert cancel is not None
+            self.prompts.append(user_prompt)
+            if "fallback-lifecycle-service" in user_prompt:
+                raise RuntimeError("test model rejected fallback service")
+            return (
+                "# Generated lifecycle service\n\n"
+                "## Functionality\n\n"
+                "Neural SSOT says this service exposes the observed lifecycle status API.\n"
+            )
+
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    fake_client = FakeSsotClient()
+    generator = ServiceSsotGenerator(settings, client=fake_client)
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+        ssot_generator=generator,
+    )
+    index = catalog.create_index(name="Generated system SSOT")
+    manual_ssot = Path(index.knowledge_dir) / "ssot" / "primary-lifecycle-service.md"
+    _write(
+        manual_ssot,
+        "---\ndocument_type: ssot\nservice: primary-lifecycle-service\nstatus: current\n"
+        "---\n\n# Human-reviewed SSOT\n\nThis manual document must never be overwritten.\n",
+    )
+    repository = tmp_path / "generated-ssot-repository"
+    _write(repository / "settings.gradle", "include 'primary', 'fallback'\n")
+    _write(repository / "primary" / "build.gradle", "plugins { id 'java' }\n")
+    _write(
+        repository / "primary" / "src" / "main" / "resources" / "application.properties",
+        "spring.application.name=primary-lifecycle-service\n",
+    )
+    _write(
+        repository
+        / "primary"
+        / "src"
+        / "main"
+        / "java"
+        / "example"
+        / "LifecycleController.java",
+        """
+package example;
+@RestController
+public class LifecycleController {
+  @GetMapping("/lifecycle/status")
+  public String status() { return "ok"; }
+}
+""",
+    )
+    _write(repository / "fallback" / "build.gradle", "plugins { id 'java' }\n")
+    _write(
+        repository / "fallback" / "src" / "main" / "resources" / "application.properties",
+        "spring.application.name=fallback-lifecycle-service\n",
+    )
+    _write(
+        repository
+        / "fallback"
+        / "src"
+        / "main"
+        / "java"
+        / "example"
+        / "FallbackController.java",
+        """
+package example;
+@RestController
+public class FallbackController {
+  @PostMapping("/fallback/retry")
+  public void retry() {}
+}
+""",
+    )
+    imported = catalog.start_repository_ingestion(
+        name="Generated lifecycle repository",
+        git_url=str(repository),
+        index_id=index.id,
+    )
+    assert _wait_for_job(catalog, imported.id)["status"] == "completed"
+
+    options = catalog.ssot_generation_request()
+    assert options["status"] == "selection_required"
+    assert options["generator"]["configured"] is True
+    assert index.id in {item["id"] for item in options["indexes"]}
+
+    queued = catalog.ssot_generation_request(index_id=index.id)
+    job_id = queued["job"]["id"]
+    completed = _wait_for_job(catalog, job_id)
+
+    assert completed["status"] == "completed"
+    assert completed["result"]["llm_generated_count"] == 1
+    assert completed["result"]["fallback_count"] == 1
+    generated_path = Path(index.knowledge_dir) / "ssot/generated/primary-lifecycle-service.md"
+    content = generated_path.read_text(encoding="utf-8")
+    assert generated_path.name == "primary-lifecycle-service.md"
+    assert 'document_type: "ssot"' in content
+    assert 'service: "primary-lifecycle-service"' in content
+    assert 'model: "test-neural-model"' in content
+    assert "Neural SSOT says" in content
+    fallback_path = Path(index.knowledge_dir) / "ssot/generated/fallback-lifecycle-service.md"
+    assert 'model: "source-analysis-fallback"' in fallback_path.read_text(encoding="utf-8")
+    assert "test model rejected fallback service" not in fallback_path.read_text(encoding="utf-8")
+    assert "Human-reviewed SSOT" in manual_ssot.read_text(encoding="utf-8")
+    assert fake_client.prompts
+    assert any("LifecycleController.java" in prompt for prompt in fake_client.prompts)
+
+    search = catalog.tools_for(index.id).search(query="Neural SSOT lifecycle", top_k=3)
+    assert any(
+        item["source_path"] == "ssot/generated/primary-lifecycle-service.md"
+        for item in search["results"]
+    )
+    polled = catalog.ssot_generation_request(job_id=job_id)
+    assert polled["status"] == "completed"
+    assert polled["job"]["result"]["files"] == [
+        "ssot/generated/fallback-lifecycle-service.md",
+        "ssot/generated/primary-lifecycle-service.md",
+    ]
+    assert "llm_error=test model rejected fallback service" in polled["log_tail"]
 
 
 def test_catalog_indexes_all_module_openspec_roots(settings_factory, tmp_path) -> None:

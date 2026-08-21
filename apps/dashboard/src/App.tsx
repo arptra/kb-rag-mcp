@@ -177,6 +177,7 @@ export default function App() {
     service: Overview["service_map"]["services"][number];
     defaultIndexId: string;
   } | null>(null);
+  const [systemSsotModal, setSystemSsotModal] = useState(false);
   const [booting, setBooting] = useState(true);
   const [accessDenied, setAccessDenied] = useState(false);
 
@@ -299,6 +300,7 @@ export default function App() {
             <button className="button quiet" onClick={() => void load()} disabled={loading}>↻ Обновить</button>
           {page === "indexes" && selectedIndexId && <button className="button quiet" onClick={() => setSelectedIndexId(null)}>← Все индексы</button>}
           {page === "indexes" && !selectedIndexId && <button className="button primary" onClick={() => setRepositoryModal(true)}>＋ Подключить репозиторий</button>}
+            {page === "services" && <button className="button primary" onClick={() => setSystemSsotModal(true)}>✦ Сгенерировать SSOT</button>}
             {page === "servers" && <button className="button primary" onClick={() => setServerModal(true)}>＋ Добавить MCP server</button>}
             {page === "tools" && <button className="button primary" onClick={() => setToolModal("new")}>＋ Новый MCP tool</button>}
           </div>
@@ -423,6 +425,20 @@ export default function App() {
           }}
         />
       )}
+      {systemSsotModal && (
+        <SystemSsotModal
+          password={password}
+          indexes={overview.catalog.indexes}
+          generator={overview.catalog.ssot_generation}
+          serviceCount={overview.service_map.service_count}
+          onClose={() => setSystemSsotModal(false)}
+          onStarted={() => {
+            setSystemSsotModal(false);
+            setToast("Генерация системного SSOT поставлена в очередь");
+            void load();
+          }}
+        />
+      )}
       {toast && <div className="toast">{toast}</div>}
     </div>
   );
@@ -525,7 +541,7 @@ function JobList({ jobs, password, onCancel }: { jobs: CatalogJob[]; password: s
   return <div className="job-list">{jobs.map((job) => (
     <div className="job-item" key={job.id}>
       <div className="job-row">
-        <span className={`job-icon ${job.type}`}>{job.type === "repository" ? "↗" : job.type === "graph" || job.type === "service" ? "⌘" : job.type === "cleanup" ? "×" : "◇"}</span>
+        <span className={`job-icon ${job.type}`}>{job.type === "repository" ? "↗" : job.type === "graph" || job.type === "service" ? "⌘" : job.type === "ssot" ? "✦" : job.type === "cleanup" ? "×" : "◇"}</span>
         <div className="grow"><b>{job.message}</b><small>{job.error || `${job.type} · ${relativeDate(job.completed_at || job.started_at)}`}</small></div>
         <Status value={job.status} />
         {job.log_path
@@ -1343,6 +1359,52 @@ function RepositoryForm({ password, indexes, onClose, onSaved }: { password: str
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Не удалось подключить репозиторий"); }
   };
   return <Modal title="Подключить Git-репозиторий" onClose={onClose}><form className="modal-form" onSubmit={submit}><div className="field-row"><label>Название<input required minLength={2} value={name} onChange={(event) => setName(event.target.value)} placeholder="payments-service" /></label><label>Ref, необязательно<input value={ref} onChange={(event) => setRef(event.target.value)} placeholder="main / tag / commit" /></label></div><label>Git URL<input required value={gitUrl} onChange={(event) => setGitUrl(event.target.value)} placeholder="https://git.company.local/team/service.git" /></label><label>Целевой индекс<select value={target} onChange={(event) => setTarget(event.target.value)}>{indexes.map((index) => <option key={index.id} value={index.id}>{index.name}</option>)}<option value="__new__">＋ Создать новый индекс</option></select></label>{target === "__new__" && <label>Название нового индекса<input value={indexName} onChange={(event) => setIndexName(event.target.value)} placeholder={name || "System knowledge"} /></label>}<div className="flow-preview"><span>Git checkout</span><i>→</i><span>исходники</span><i>→</i><span>Service map</span><i>＋</i><span>RAG из openspec</span></div>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary">Подключить и индексировать</button></div></form></Modal>;
+}
+
+function SystemSsotModal({ password, indexes, generator, serviceCount, onClose, onStarted }: {
+  password: string;
+  indexes: RagIndex[];
+  generator: Overview["catalog"]["ssot_generation"];
+  serviceCount: number;
+  onClose: () => void;
+  onStarted: () => void;
+}) {
+  const [indexId, setIndexId] = useState(indexes[0]?.id || "default");
+  const [refreshAnalysis, setRefreshAnalysis] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await post("/admin/api/analysis/ssot-generate", password, {
+        index_id: indexId,
+        refresh_analysis: refreshAnalysis,
+      });
+      onStarted();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось запустить генерацию SSOT");
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal title="Сгенерировать SSOT всей системы" onClose={onClose}>
+      <form className="modal-form" onSubmit={submit}>
+        <div className="callout">Источник → свежий analysis worker → {generator.model || "LLM"} → локальные `ssot/generated/&lt;service-id&gt;.md` → выбранный RAG-индекс. Ручные SSOT не перезаписываются. Будет обработано до {serviceCount} сервисов; отдельный сбой модели создаст помеченный source-derived draft. Фрагменты исходного кода отправляются на настроенный LLM endpoint — для закрытого кода используйте локальную модель.</div>
+        {!generator.configured && (
+          <div className="form-error">
+            LLM не настроена. Добавьте {generator.required_settings.map((item) => <code key={item}>{item} </code>)} в `.env` и перезапустите backend.
+          </div>
+        )}
+        <label>Индекс для сгенерированного SSOT<select value={indexId} onChange={(event) => setIndexId(event.target.value)}>{indexes.map((index) => <option key={index.id} value={index.id}>{index.name} · {index.document_count} документов</option>)}</select></label>
+        <label className="check"><input type="checkbox" checked={refreshAnalysis} onChange={(event) => setRefreshAnalysis(event.target.checked)} /><span>⌘</span><div><b>Сначала заново проанализировать исходники</b><small>Рекомендуется: SSOT строится из актуальной карты API и функций.</small></div></label>
+        <div className="flow-preview"><span>{serviceCount} сервисов</span><i>→</i><span>{generator.workers} LLM workers</span><i>→</i><span>{indexes.find((index) => index.id === indexId)?.name || indexId}</span></div>
+        {error && <div className="form-error">{error}</div>}
+        <div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary" disabled={busy || !generator.configured || !indexes.length}>{busy ? "Ставим в очередь…" : "Запустить генерацию"}</button></div>
+      </form>
+    </Modal>
+  );
 }
 
 function SsotModal({ password, service, indexes, defaultIndexId, onClose, onImported }: {

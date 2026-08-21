@@ -14,6 +14,7 @@ BUILTIN_TOOL_NAMES = frozenset(
     {
         "ssot_context",
         "kb_feature_context",
+        "kb_generate_system_ssot",
         "kb_search",
         "kb_get_document",
         "kb_get_chunk",

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Any
 
 import pytest
-from fastmcp import Client
+from fastmcp import Client, FastMCP
 
 
 def _load_proxy_module() -> ModuleType:
@@ -15,136 +15,81 @@ def _load_proxy_module() -> ModuleType:
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
 
-class StubApi:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, object | None]]] = []
-
-    def get_json(self, path: str, params: dict[str, object | None]) -> dict[str, Any]:
-        self.calls.append((path, params))
-        if path == "/api/v1/tools":
-            return {
-                "tool_count": 1,
-                "tools": [
-                    {
-                        "name": "kb_search_limits",
-                        "description": "Search current limits knowledge with compact citations.",
-                        "input_schema": {
-                            "type": "object",
-                            "properties": {"query": {"type": "string"}},
-                            "required": ["query"],
-                            "additionalProperties": False,
-                        },
-                        "defaults": {"top_k": 3, "status": "current"},
-                    }
-                ],
-            }
-        return {"path": path, "params": params}
-
-    def post_json(
-        self,
-        path: str,
-        payload: dict[str, object | None],
-        headers: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
-        params: dict[str, object | None] = {"payload": payload, "headers": headers or {}}
-        self.calls.append((path, params))
-        return {"path": path, "params": params}
-
-
-def test_remote_api_rejects_mcp_endpoint_as_base_url() -> None:
+def test_normalize_mcp_url_accepts_root_and_exact_endpoint() -> None:
     module = _load_proxy_module()
 
-    with pytest.raises(ValueError, match="must not include /mcp"):
-        module.RemoteKnowledgeApi("http://kb.example/mcp", "token")
+    assert (
+        module.normalize_mcp_url("http://kb.example", variable="CORPORATE_KB_MCP_URL")
+        == "http://kb.example/mcp"
+    )
+    assert (
+        module.normalize_mcp_url(
+            "https://kb.example/platform/mcp/",
+            variable="CORPORATE_KB_MCP_URL",
+        )
+        == "https://kb.example/platform/mcp"
+    )
 
 
-def test_remote_api_allows_password_free_access() -> None:
+@pytest.mark.parametrize(
+    "url",
+    [
+        "kb.example/mcp",
+        "ftp://kb.example/mcp",
+        "https://user:secret@kb.example/mcp",
+        "https://kb.example/api/v1",
+    ],
+)
+def test_normalize_mcp_url_rejects_invalid_endpoint(url: str) -> None:
     module = _load_proxy_module()
 
-    api = module.RemoteKnowledgeApi("http://kb.example")
+    with pytest.raises(ValueError, match="CORPORATE_KB_MCP_URL"):
+        module.normalize_mcp_url(url, variable="CORPORATE_KB_MCP_URL")
 
-    assert api._token == ""
+
+def test_environment_keeps_legacy_api_url_compatible(monkeypatch) -> None:
+    module = _load_proxy_module()
+    monkeypatch.delenv("CORPORATE_KB_MCP_URL", raising=False)
+    monkeypatch.setenv("CORPORATE_KB_API_URL", "http://legacy-kb.example:8000")
+    monkeypatch.setenv("CORPORATE_KB_API_TIMEOUT", "45")
+
+    config = module.config_from_environment()
+
+    assert config.url == "http://legacy-kb.example:8000/mcp"
+    assert config.timeout_seconds == 45
 
 
 @pytest.mark.asyncio
-async def test_stdio_proxy_exposes_static_and_managed_remote_tools() -> None:
+async def test_stdio_proxy_mirrors_future_tools_without_hardcoding() -> None:
     module = _load_proxy_module()
-    api = StubApi()
-    server = module.create_stdio_server(api)
+    upstream = FastMCP("future-shared-server")
 
-    async with Client(server) as client:
+    @upstream.tool(
+        name="kb_future_tool",
+        description="A tool introduced after the local proxy was distributed.",
+        annotations={"readOnlyHint": False, "openWorldHint": True},
+    )
+    def future_tool(value: str, count: int = 1) -> dict[str, object]:
+        return {"value": value, "count": count, "source": "upstream"}
+
+    proxy = module.create_stdio_server(upstream)
+    async with Client(proxy) as client:
         listed = await client.list_tools()
-        assert {tool.name for tool in listed} == {
-            "ssot_context",
-            "kb_feature_context",
-            "kb_search",
-            "kb_get_document",
-            "kb_get_chunk",
-            "kb_run_context_benchmark",
-            "kb_list_documents",
-            "kb_stats",
-            "kb_search_limits",
-        }
+        tools = {tool.name: tool for tool in listed}
 
-        search = await client.call_tool("kb_search", {"query": "daily limits", "top_k": 3})
-        assert search.is_error is False
-        assert search.data["path"] == "/api/v1/search"
-        assert search.data["params"]["query"] == "daily limits"
-        assert search.data["params"]["top_k"] == 3
-
-        ssot = await client.call_tool(
-            "ssot_context",
-            {"question": "How should payment check limits?", "mode": "implementation"},
+        assert set(tools) == {"kb_future_tool"}
+        assert tools["kb_future_tool"].description == (
+            "A tool introduced after the local proxy was distributed."
         )
-        assert ssot.data["path"] == "/api/v1/ssot/context"
-        assert ssot.data["params"] == {
-            "question": "How should payment check limits?",
-            "mode": "implementation",
-        }
+        assert tools["kb_future_tool"].inputSchema["properties"]["count"]["default"] == 1
+        assert tools["kb_future_tool"].annotations is not None
+        assert tools["kb_future_tool"].annotations.readOnlyHint is False
 
-        feature = await client.call_tool(
-            "kb_feature_context",
-            {"feature": "Reserve stock", "start_service": "orders"},
-        )
-        assert feature.data["path"] == "/api/v1/feature-context"
-        assert feature.data["params"]["payload"] == {
-            "feature": "Reserve stock",
-            "start_service": "orders",
-            "max_hops": 2,
-            "top_k_per_service": 2,
-        }
-
-        document = await client.call_tool("kb_get_document", {"document_id": "doc-1"})
-        assert document.data["path"] == "/api/v1/document"
-        assert document.data["params"]["document_id"] == "doc-1"
-
-        chunk = await client.call_tool("kb_get_chunk", {"chunk_id": "chunk-1"})
-        assert chunk.data["path"] == "/api/v1/chunk"
-        assert chunk.data["params"]["chunk_id"] == "chunk-1"
-
-        benchmark = await client.call_tool(
-            "kb_run_context_benchmark",
-            {"password": "separate-benchmark-password"},
-        )
-        assert benchmark.data["path"] == "/api/v1/admin/context-benchmark"
-        assert benchmark.data["params"]["headers"] == {
-            "X-KB-Benchmark-Password": "separate-benchmark-password"
-        }
-
-        managed = await client.call_tool("kb_search_limits", {"query": "daily limits"})
-        assert managed.data["path"] == "/api/v1/tools/call"
-        assert managed.data["params"]["payload"] == {
-            "name": "kb_search_limits",
-            "arguments": {"query": "daily limits"},
-        }
-
-        documents = await client.call_tool("kb_list_documents", {"limit": 10})
-        assert documents.data["path"] == "/api/v1/documents"
-        assert documents.data["params"]["limit"] == 10
-
-        stats = await client.call_tool("kb_stats", {})
-        assert stats.data["path"] == "/api/v1/stats"
+        result = await client.call_tool("kb_future_tool", {"value": "fresh", "count": 3})
+        assert result.is_error is False
+        assert result.data == {"value": "fresh", "count": 3, "source": "upstream"}

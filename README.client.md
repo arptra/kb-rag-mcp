@@ -9,8 +9,8 @@
 Qwen Code
     ↓ stdio
 локальный corporate_kb_stdio_proxy.py
-    ↓ обычные HTTP GET-запросы
-удалённый RAG API
+    ↓ Streamable HTTP MCP
+общий RAG endpoint /mcp
     ↓
 корпоративные документы
 ```
@@ -21,7 +21,7 @@ Qwen сам запускает локальный MCP-процесс. Отдел
 ## Что должен выдать администратор
 
 1. Один файл `corporate_kb_stdio_proxy.py`.
-2. Адрес сервера без `/mcp`, например `http://10.20.30.40:8000`.
+2. Адрес MCP endpoint, например `http://10.20.30.40:8000/mcp`.
 3. Bearer-токен — только если администратор включил защиту на сервере.
 
 На клиентском компьютере должны быть установлены Qwen Code и `uv`. Node.js, `npx`, `mcp-remote`,
@@ -105,8 +105,8 @@ curl -G \
         "/home/user/corporate_kb_stdio_proxy.py"
       ],
       "env": {
-        "CORPORATE_KB_API_URL": "http://SERVER_IP:8000",
-        "CORPORATE_KB_API_TIMEOUT": "30"
+        "CORPORATE_KB_MCP_URL": "http://SERVER_IP:8000/mcp",
+        "CORPORATE_KB_MCP_TIMEOUT": "120"
       },
       "timeout": 120000,
       "trust": false
@@ -129,8 +129,8 @@ curl -G \
         "C:/Users/User/corporate_kb_stdio_proxy.py"
       ],
       "env": {
-        "CORPORATE_KB_API_URL": "http://SERVER_IP:8000",
-        "CORPORATE_KB_API_TIMEOUT": "30"
+        "CORPORATE_KB_MCP_URL": "http://SERVER_IP:8000/mcp",
+        "CORPORATE_KB_MCP_TIMEOUT": "120"
       },
       "timeout": 120000,
       "trust": false
@@ -139,7 +139,10 @@ curl -G \
 }
 ```
 
-В `CORPORATE_KB_API_URL` не добавляйте `/mcp` или `/api/v1`: нужен только адрес сервера.
+`CORPORATE_KB_MCP_URL` должен указывать на общий сервер, а не на компьютер сотрудника. `localhost`
+подходит только если сервер запущен на той же машине или к нему настроен SSH/VPN tunnel.
+Старая переменная `CORPORATE_KB_API_URL=http://SERVER_IP:8000` продолжает работать: proxy сам
+добавит `/mcp`.
 
 ## 5. Запустить Qwen
 
@@ -155,10 +158,12 @@ qwen
 /mcp
 ```
 
-Сервер `corporate-kb` должен показать восемь встроенных инструментов:
+Сервер `corporate-kb` должен показать все инструменты, которые сейчас отдаёт общий сервер. В
+текущей версии среди них есть:
 
 ```text
 kb_feature_context
+kb_generate_system_ssot
 kb_search
 kb_get_document
 kb_get_chunk
@@ -179,12 +184,13 @@ ssot_context
 
 `kb_run_context_benchmark` — отдельный административный прогон. При его вызове Qwen должен сначала
 спросить отдельный benchmark-пароль. Не сохраняйте этот пароль в Qwen settings и не используйте
-вместо него обычный `CORPORATE_KB_API_TOKEN`.
+вместо него обычный `CORPORATE_KB_MCP_TOKEN`.
 
-Администратор может создавать дополнительные search-tools через защищённый серверный API.
-Однофайловый proxy получает их имена, описания и JSON Schema при старте. Чтобы увидеть новый tool,
-полностью перезапустите Qwen. Не добавляйте `includeTools` в settings — статический список скроет
-новые tools.
+Администратор может добавлять built-in и управляемые tools на общем сервере. Proxy не содержит их
+список: при старте он делает настоящий MCP `tools/list`, переносит имена, описания, JSON Schema и
+annotations, а `tools/call` прозрачно отправляет обратно на сервер. Чтобы клиент перечитал новый
+набор, полностью перезапустите Qwen. Заменять `corporate_kb_stdio_proxy.py` при добавлении tools не
+нужно. Не добавляйте `includeTools` в settings — статический allowlist скроет новые tools.
 
 Кнопка OAuth-аутентификации не нужна. В стандартном режиме токена нет; при включённой серверной
 защите Bearer-токен передаётся локальному Python-процессу через Qwen settings.
@@ -212,24 +218,24 @@ FastMCP и его зависимости либо быть настроен в `
 - Проверьте JSON на лишние запятые.
 - Полностью перезапустите Qwen после изменения settings.
 
-### Configuration error: URL must not include /mcp
+### Configuration error: URL must be a server root or end with /mcp
 
-Используйте:
-
-```text
-http://SERVER_IP:8000
-```
-
-а не:
+Предпочтительный вариант:
 
 ```text
 http://SERVER_IP:8000/mcp
 ```
 
+Для совместимости разрешена старая переменная:
+
+```text
+CORPORATE_KB_API_URL=http://SERVER_IP:8000
+```
+
 ### Remote RAG returned HTTP 401
 
 На сервере включена опциональная Bearer-защита. Запросите токен у администратора и добавьте
-`CORPORATE_KB_API_TOKEN` в `env` MCP-настройки.
+`CORPORATE_KB_MCP_TOKEN` в `env` MCP-настройки.
 
 ### uv не может скачать FastMCP
 
@@ -241,7 +247,8 @@ http://SERVER_IP:8000/mcp
 Запустите файл вручную той же командой из settings:
 
 ```bash
-/absolute/path/to/uv run /absolute/path/to/corporate_kb_stdio_proxy.py
+CORPORATE_KB_MCP_URL=http://SERVER_IP:8000/mcp \
+  /absolute/path/to/uv run /absolute/path/to/corporate_kb_stdio_proxy.py
 ```
 
 Процесс должен ожидать MCP-сообщения в stdin. Ошибки конфигурации выводятся в stderr. Остановить
@@ -249,7 +256,7 @@ http://SERVER_IP:8000/mcp
 
 ## Обновление и удаление
 
-Для обновления замените `corporate_kb_stdio_proxy.py` новой версией по тому же пути и перезапустите
-Qwen.
+При появлении новых server tools обновление файла не требуется — достаточно перезапустить Qwen.
+Сам `corporate_kb_stdio_proxy.py` заменяйте только при выпуске новой версии proxy transport.
 
 Для удаления удалите объект `corporate-kb` из `mcpServers`, затем удалите единственный `.py`-файл.

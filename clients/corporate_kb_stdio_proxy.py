@@ -5,364 +5,119 @@
 #   "fastmcp==3.4.4",
 # ]
 # ///
-"""One-file stdio MCP proxy for the remote corporate knowledge JSON API."""
+"""One-file stdio proxy that mirrors every tool from a remote MCP server."""
 
 from __future__ import annotations
 
-import asyncio
-import json
 import os
-import ssl
 import sys
-from collections.abc import Mapping
-from typing import Any, Protocol
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, urlopen
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urlsplit
 
-from fastmcp import FastMCP
-from fastmcp.exceptions import ToolError
-from fastmcp.tools import Tool, ToolResult
-from mcp.types import ToolAnnotations
-from pydantic import PrivateAttr
-
-SEARCH_DESCRIPTION = """Search remote corporate knowledge before architectural analysis or changes
-spanning multiple services. Cite source_path or source_url from the returned results. Call
-kb_get_chunk when a selected result needs more context."""
-SSOT_DESCRIPTION = """Answer a current business or implementation question from all service SSOTs
-with one call. The remote RAG discovers related services and performs expansion internally; do not
-repeat kb_search to reconstruct the same feature context."""
-FEATURE_CONTEXT_DESCRIPTION = """Plan a cross-service feature from the static call graph and the
-repository-scoped RAG index for every affected service. Returns callers, callees, API/event
-operations, statically linked triggers, source evidence, and compact documentation excerpts."""
+from fastmcp import Client, FastMCP
+from fastmcp.client.transports import StreamableHttpTransport
+from fastmcp.server import create_proxy
 
 
-class JsonApi(Protocol):
-    """Minimal interface used by the MCP tools and test doubles."""
+def normalize_mcp_url(value: str, *, variable: str) -> str:
+    """Accept a server root or exact MCP endpoint and return the endpoint URL."""
+    normalized = value.strip().rstrip("/")
+    parsed = urlsplit(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{variable} must be an absolute http:// or https:// URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(f"{variable} must not contain credentials, query, or fragment")
+    path = parsed.path.rstrip("/")
+    if path in {"", "/"}:
+        return f"{normalized}/mcp"
+    if not path.endswith("/mcp"):
+        raise ValueError(f"{variable} must be a server root or end with /mcp")
+    return normalized
 
-    def get_json(self, path: str, params: Mapping[str, object | None]) -> dict[str, Any]: ...
 
-    def post_json(
-        self,
-        path: str,
-        payload: Mapping[str, object | None],
-        headers: Mapping[str, str] | None = None,
-    ) -> dict[str, Any]: ...
+@dataclass(frozen=True, slots=True)
+class RemoteMcpConfig:
+    """Connection settings for the shared remote MCP server."""
 
+    url: str
+    token: str = ""
+    timeout_seconds: float = 120.0
+    ca_file: str | None = None
 
-class RemoteKnowledgeApi:
-    """Synchronous standard-library client for the read-only remote RAG API."""
+    def __post_init__(self) -> None:
+        if self.timeout_seconds <= 0:
+            raise ValueError("CORPORATE_KB_MCP_TIMEOUT must be greater than zero")
 
-    def __init__(
-        self,
-        base_url: str,
-        token: str = "",
-        *,
-        timeout_seconds: float = 30.0,
-        ca_file: str | None = None,
-    ) -> None:
-        normalized = base_url.rstrip("/")
-        parsed = urlsplit(normalized)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("CORPORATE_KB_API_URL must be an http:// or https:// server URL")
-        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
-            raise ValueError("CORPORATE_KB_API_URL must not include /mcp, a query, or a fragment")
-        if timeout_seconds <= 0:
-            raise ValueError("CORPORATE_KB_API_TIMEOUT must be greater than zero")
-
-        self._base_url = normalized
-        self._token = token
-        self._timeout_seconds = timeout_seconds
-        self._ssl_context = ssl.create_default_context(cafile=ca_file) if ca_file else None
-
-    def get_json(self, path: str, params: Mapping[str, object | None]) -> dict[str, Any]:
-        query = urlencode(
-            {key: str(value) for key, value in params.items() if value is not None},
-            doseq=False,
+    def client(self) -> Client[StreamableHttpTransport]:
+        transport = StreamableHttpTransport(
+            self.url,
+            auth=self.token or None,
+            verify=self.ca_file,
         )
-        url = f"{self._base_url}{path}"
-        if query:
-            url = f"{url}?{query}"
-        return self._request_json(url, method="GET")
-
-    def post_json(
-        self,
-        path: str,
-        payload: Mapping[str, object | None],
-        headers: Mapping[str, str] | None = None,
-    ) -> dict[str, Any]:
-        body = json.dumps(
-            {key: value for key, value in payload.items() if value is not None},
-            ensure_ascii=False,
-        ).encode("utf-8")
-        return self._request_json(
-            f"{self._base_url}{path}",
-            method="POST",
-            body=body,
-            extra_headers=headers,
+        return Client(
+            transport,
+            name="corporate-kb-stdio-upstream",
+            timeout=self.timeout_seconds,
         )
 
-    def _request_json(
-        self,
-        url: str,
-        *,
-        method: str,
-        body: bytes | None = None,
-        extra_headers: Mapping[str, str] | None = None,
-    ) -> dict[str, Any]:
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": "corporate-kb-stdio-proxy/1.0",
-        }
-        if self._token:
-            headers["Authorization"] = f"Bearer {self._token}"
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-        if extra_headers:
-            headers.update(extra_headers)
-        request = Request(
-            url,
-            data=body,
-            method=method,
-            headers=headers,
-        )
-        try:
-            with urlopen(
-                request,
-                timeout=self._timeout_seconds,
-                context=self._ssl_context,
-            ) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:1000]
-            raise ToolError(f"Remote RAG returned HTTP {exc.code}: {detail}") from None
-        except URLError as exc:
-            raise ToolError(f"Remote RAG connection failed: {exc.reason}") from None
-        except (TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise ToolError(f"Remote RAG returned an invalid response: {exc}") from None
 
-        if not isinstance(payload, dict):
-            raise ToolError("Remote RAG returned JSON that is not an object")
-        return payload
-
-
-class RemoteManagedTool(Tool):
-    """Dynamic MCP tool whose schema is provided by the remote RAG server."""
-
-    _api: JsonApi = PrivateAttr()
-
-    def __init__(self, definition: Mapping[str, Any], api: JsonApi) -> None:
-        name = definition.get("name")
-        description = definition.get("description")
-        parameters = definition.get("input_schema")
-        if not isinstance(name, str) or not isinstance(description, str):
-            raise ValueError("Remote managed tool is missing name or description")
-        if not isinstance(parameters, dict):
-            raise ValueError("Remote managed tool is missing input_schema")
-        super().__init__(
-            name=name,
-            description=description,
-            parameters=parameters,
-            annotations=ToolAnnotations(
-                readOnlyHint=True,
-                destructiveHint=False,
-                idempotentHint=True,
-                openWorldHint=False,
-            ),
-        )
-        self._api = api
-
-    async def run(self, arguments: dict[str, Any]) -> ToolResult:
-        payload = await asyncio.to_thread(
-            self._api.post_json,
-            "/api/v1/tools/call",
-            {"name": self.name, "arguments": arguments},
-        )
-        return self.convert_result(payload)
-
-
-def create_stdio_server(api: JsonApi) -> FastMCP:
-    """Expose the remote JSON API as a local read-only stdio MCP server."""
-    server = FastMCP(
-        "corporate-knowledge-stdio-proxy",
+def create_stdio_server(target: Any) -> FastMCP:
+    """Mirror the complete upstream MCP surface through local stdio."""
+    return create_proxy(
+        target,
+        name="corporate-knowledge-stdio-proxy",
         instructions=(
-            "Search corporate knowledge before cross-service or architectural work and cite "
-            "source_path or source_url from the results."
+            "This is a transparent proxy to the shared corporate knowledge MCP server. "
+            "Tool names, schemas, annotations, and calls come from the upstream server."
         ),
+        provider_error_strategy="raise",
     )
 
-    @server.tool(
-        name="ssot_context",
-        description=SSOT_DESCRIPTION,
-        annotations={"readOnlyHint": True, "openWorldHint": False},
-    )
-    def ssot_context(
-        question: str,
-        mode: str = "implementation",
-    ) -> dict[str, Any]:
-        return api.get_json(
-            "/api/v1/ssot/context",
-            {"question": question, "mode": mode},
+
+def config_from_environment() -> RemoteMcpConfig:
+    """Load preferred MCP variables while preserving the old API variable names."""
+    direct_url = os.environ.get("CORPORATE_KB_MCP_URL", "").strip()
+    legacy_url = os.environ.get("CORPORATE_KB_API_URL", "").strip()
+    raw_url = direct_url or legacy_url
+    variable = "CORPORATE_KB_MCP_URL" if direct_url else "CORPORATE_KB_API_URL"
+    if not raw_url:
+        raise ValueError(
+            "set CORPORATE_KB_MCP_URL to the shared server endpoint, for example "
+            "http://10.20.30.40:8000/mcp"
         )
-
-    @server.tool(
-        name="kb_feature_context",
-        description=FEATURE_CONTEXT_DESCRIPTION,
-        annotations={"readOnlyHint": True, "openWorldHint": False},
-    )
-    def kb_feature_context(
-        feature: str,
-        start_service: str | None = None,
-        max_hops: int = 2,
-        top_k_per_service: int = 2,
-    ) -> dict[str, Any]:
-        return api.post_json(
-            "/api/v1/feature-context",
-            {
-                "feature": feature,
-                "start_service": start_service,
-                "max_hops": max_hops,
-                "top_k_per_service": top_k_per_service,
-            },
-        )
-
-    @server.tool(
-        name="kb_search",
-        description=SEARCH_DESCRIPTION,
-        annotations={"readOnlyHint": True, "openWorldHint": False},
-    )
-    def kb_search(
-        query: str,
-        top_k: int = 3,
-        min_score: float | None = None,
-        service: str | None = None,
-        domain: str | None = None,
-        document_type: str | None = None,
-        status: str | None = "current",
-        authority: str | None = None,
-        source_type: str | None = None,
-    ) -> dict[str, Any]:
-        return api.get_json(
-            "/api/v1/search",
-            {
-                "query": query,
-                "top_k": top_k,
-                "min_score": min_score,
-                "service": service,
-                "domain": domain,
-                "document_type": document_type,
-                "status": status,
-                "authority": authority,
-                "source_type": source_type,
-            },
-        )
-
-    @server.tool(
-        name="kb_get_document",
-        description="Return a bounded document extract selected by document_id from kb_search.",
-        annotations={"readOnlyHint": True, "openWorldHint": False},
-    )
-    def kb_get_document(
-        document_id: str,
-        max_tokens: int | None = None,
-    ) -> dict[str, Any]:
-        return api.get_json(
-            "/api/v1/document",
-            {"document_id": document_id, "max_tokens": max_tokens},
-        )
-
-    @server.tool(
-        name="kb_get_chunk",
-        description="Return a bounded source chunk selected by chunk_id from kb_search.",
-        annotations={"readOnlyHint": True, "openWorldHint": False},
-    )
-    def kb_get_chunk(
-        chunk_id: str,
-        max_tokens: int | None = None,
-    ) -> dict[str, Any]:
-        return api.get_json(
-            "/api/v1/chunk",
-            {"chunk_id": chunk_id, "max_tokens": max_tokens},
-        )
-
-    @server.tool(
-        name="kb_run_context_benchmark",
-        description=(
-            "Run the protected context benchmark. Ask the user for the separate benchmark "
-            "password immediately before calling; never use the normal API token."
-        ),
-        annotations={"readOnlyHint": True, "openWorldHint": False},
-    )
-    def kb_run_context_benchmark(password: str) -> dict[str, Any]:
-        return api.post_json(
-            "/api/v1/admin/context-benchmark",
-            {},
-            {"X-KB-Benchmark-Password": password},
-        )
-
-    @server.tool(
-        name="kb_list_documents",
-        description="List filtered remote document metadata without document bodies.",
-        annotations={"readOnlyHint": True, "openWorldHint": False},
-    )
-    def kb_list_documents(
-        service: str | None = None,
-        domain: str | None = None,
-        document_type: str | None = None,
-        status: str | None = None,
-        limit: int = 50,
-    ) -> dict[str, Any]:
-        return api.get_json(
-            "/api/v1/documents",
-            {
-                "service": service,
-                "domain": domain,
-                "document_type": document_type,
-                "status": status,
-                "limit": limit,
-            },
-        )
-
-    @server.tool(
-        name="kb_stats",
-        description="Return remote knowledge-index counts and identity.",
-        annotations={"readOnlyHint": True, "openWorldHint": False},
-    )
-    def kb_stats() -> dict[str, Any]:
-        return api.get_json("/api/v1/stats", {})
-
+    token = os.environ.get("CORPORATE_KB_MCP_TOKEN")
+    if token is None:
+        token = os.environ.get("CORPORATE_KB_API_TOKEN", "")
+    ca_file = os.environ.get("CORPORATE_KB_MCP_CA_FILE")
+    if ca_file is None:
+        ca_file = os.environ.get("CORPORATE_KB_API_CA_FILE") or None
+    raw_timeout = os.environ.get("CORPORATE_KB_MCP_TIMEOUT")
+    if raw_timeout is None:
+        raw_timeout = os.environ.get("CORPORATE_KB_API_TIMEOUT", "120")
     try:
-        catalog = api.get_json("/api/v1/tools", {})
-        definitions = catalog.get("tools", [])
-        if isinstance(definitions, list):
-            for definition in definitions:
-                if isinstance(definition, dict):
-                    server.add_tool(RemoteManagedTool(definition, api))
-    except Exception as exc:
-        print(f"Managed MCP tool discovery failed: {exc}", file=sys.stderr)
-
-    return server
+        timeout_seconds = float(raw_timeout)
+    except ValueError:
+        raise ValueError("CORPORATE_KB_MCP_TIMEOUT must be a number") from None
+    return RemoteMcpConfig(
+        url=normalize_mcp_url(raw_url, variable=variable),
+        token=token,
+        timeout_seconds=timeout_seconds,
+        ca_file=ca_file,
+    )
 
 
 def main() -> None:
-    """Load environment settings and reserve stdout for MCP protocol frames."""
-    base_url = os.environ.get("CORPORATE_KB_API_URL", "")
-    token = os.environ.get("CORPORATE_KB_API_TOKEN", "")
-    ca_file = os.environ.get("CORPORATE_KB_API_CA_FILE") or None
+    """Start the local stdio endpoint; stdout stays reserved for MCP frames."""
     try:
-        timeout_seconds = float(os.environ.get("CORPORATE_KB_API_TIMEOUT", "30"))
-        api = RemoteKnowledgeApi(
-            base_url,
-            token,
-            timeout_seconds=timeout_seconds,
-            ca_file=ca_file,
-        )
+        config = config_from_environment()
+        server = create_stdio_server(config.client())
     except ValueError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
     try:
-        create_stdio_server(api).run(transport="stdio", show_banner=False)
+        server.run(transport="stdio", show_banner=False)
     except KeyboardInterrupt:
         return
 

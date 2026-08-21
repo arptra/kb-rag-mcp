@@ -1,4 +1,4 @@
-"""Read-only corporate knowledge server built with standalone FastMCP."""
+"""Corporate knowledge server built with standalone FastMCP."""
 
 from __future__ import annotations
 
@@ -37,9 +37,16 @@ owned by each affected repository. Use this before cross-service implementation 
 callers, callees, API/event operations, statically linked invocation triggers, exact source
 evidence, and compact RAG excerpts grouped by service. Supply start_service when known; otherwise
 the tool discovers likely roots. LOW/UNRESOLVED facts and runtime order must be verified."""
+GENERATE_SSOT_DESCRIPTION = """Generate minimal source-backed SSOT documents for all discovered
+services and load them into a selected RAG index. Call without index_id first to list available
+indexes and LLM readiness. With index_id, the server queues a fresh source analysis, bounded
+OpenAI-compatible LLM generation, local ssot/generated/<service-id>.md publication, and index
+rebuild. Poll the same tool with job_id. This tool writes local files and updates the selected
+index."""
 BUILTIN_TOOL_DESCRIPTIONS = {
     "ssot_context": SSOT_DESCRIPTION,
     "kb_feature_context": FEATURE_CONTEXT_DESCRIPTION,
+    "kb_generate_system_ssot": GENERATE_SSOT_DESCRIPTION,
     "kb_search": SEARCH_DESCRIPTION,
     "kb_get_document": (
         "Return a bounded extract from one normalized document after kb_search identifies its "
@@ -66,6 +73,7 @@ def create_mcp_server(
     knowledge_tools: KnowledgeTools | None = None,
     managed_tools: ManagedToolRegistry | None = None,
     feature_context: FeatureContextPlanner | None = None,
+    catalog: RagCatalog | None = None,
     builtin_tool_overrides: BuiltinToolOverrideRegistry | None = None,
 ) -> FastMCP:
     """Create a FastMCP server without eagerly loading a model or index."""
@@ -148,6 +156,31 @@ def create_mcp_server(
                 start_service=start_service,
                 max_hops=max_hops,
                 top_k_per_service=top_k_per_service,
+            )
+
+    if catalog is not None:
+
+        @server.tool(
+            name="kb_generate_system_ssot",
+            description=description("kb_generate_system_ssot"),
+            annotations={
+                "readOnlyHint": False,
+                "destructiveHint": False,
+                "idempotentHint": False,
+                "openWorldHint": True,
+            },
+        )
+        def kb_generate_system_ssot(
+            index_id: str | None = None,
+            service_ids: list[str] | None = None,
+            refresh_analysis: bool = True,
+            job_id: str | None = None,
+        ) -> dict[str, Any]:
+            return catalog.ssot_generation_request(
+                index_id=index_id,
+                service_ids=service_ids,
+                refresh_analysis=refresh_analysis,
+                job_id=job_id,
             )
 
     @server.tool(
@@ -253,6 +286,7 @@ def main() -> None:
             knowledge_tools=tools,
             managed_tools=managed_tools,
             feature_context=FeatureContextPlanner(catalog),
+            catalog=catalog,
             builtin_tool_overrides=builtin_tool_overrides,
         ).run(
             transport="stdio",
