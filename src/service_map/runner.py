@@ -136,13 +136,16 @@ class ServiceMapProcessRunner:
             process.start()
             if progress is not None:
                 progress(
-                    f"Analysis supervisor started worker pid={process.pid}; "
+                    f"Analysis supervisor started worker "
+                    f"pid={getattr(process, 'pid', 'unknown')}; "
                     f"timeout={self._timeout_seconds}s"
                 )
             progress_offset = 0
             last_progress: str | None = None
             published_checkpoint: int | None = None
-            deadline = time.monotonic() + self._timeout_seconds
+            supervisor_started_at = time.monotonic()
+            last_heartbeat_at = supervisor_started_at
+            deadline = supervisor_started_at + self._timeout_seconds
             while process.is_alive():
                 progress_offset, latest = self._drain_progress(
                     progress_path,
@@ -161,7 +164,15 @@ class ServiceMapProcessRunner:
                     self._stop(process)
                     self._drain_progress(progress_path, progress_offset, progress)
                     raise ServiceMapBuildCancelled("Repository analysis was cancelled")
-                remaining = deadline - time.monotonic()
+                now = time.monotonic()
+                if progress is not None and now - last_heartbeat_at >= 5:
+                    progress(
+                        f"Analysis heartbeat: worker_pid={getattr(process, 'pid', 'unknown')}; "
+                        f"elapsed={now - supervisor_started_at:.1f}s; "
+                        f"last_operation={last_progress or 'worker startup'}"
+                    )
+                    last_heartbeat_at = now
+                remaining = deadline - now
                 if remaining <= 0:
                     self._stop(process)
                     _offset, latest = self._drain_progress(

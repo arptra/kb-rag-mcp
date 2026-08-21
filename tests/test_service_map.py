@@ -393,8 +393,16 @@ public class StatusController {
     assert checkpoints
     assert checkpoints[0].partial is True
     assert checkpoints[0].service_map.services[0].id == "observable-service"
+    assert any("Layout inventory start:" in event for event in events)
+    assert any("Layout module [1/1] inspect:" in event for event in events)
     assert any("Layout ready: Observable service" in event for event in events)
     assert any("Java files found:" in event and "files=1" in event for event in events)
+    assert any("Source parsing ready:" in event for event in events)
+    assert any("Database model start:" in event for event in events)
+    assert any("Framework interfaces start:" in event for event in events)
+    assert any("Database migrations start:" in event for event in events)
+    assert any("Call tracing start:" in event for event in events)
+    assert any("Global snapshot merge start:" in event for event in events)
     assert any("Snapshot ready:" in event for event in events)
     assert events[-1] == "Worker completed successfully"
 
@@ -444,14 +452,18 @@ def test_service_map_process_has_a_hard_timeout(
         lambda: next(monotonic_values),
     )
     settings = GraphSettings(store_path=tmp_path / "system-graph.json").resolved(tmp_path)
+    events: list[str] = []
 
     with pytest.raises(ServiceMapBuildTimedOut, match="10 seconds"):
         ServiceMapProcessRunner(settings, timeout_seconds=10).build(
-            [RepositoryInput(path=tmp_path, name="slow-service")]
+            [RepositoryInput(path=tmp_path, name="slow-service")],
+            progress=events.append,
         )
 
     assert process.started is True
     assert process.terminated is True
+    assert any("Analysis heartbeat:" in event for event in events)
+    assert any("elapsed=11.0s" in event for event in events)
 
 
 def test_service_map_process_returns_latest_checkpoint_on_timeout(

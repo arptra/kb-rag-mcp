@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import time
+from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -712,8 +713,13 @@ class RepositoryScanner:
             )
             progress(f"Java files found: {scan.service_id}; files={java_count}")
             progress(f"Kotlin files found: {scan.service_id}; files={kotlin_count}")
+        parse_started_at = time.monotonic()
+        last_parse_report_at = parse_started_at
         for position, path in enumerate(source_files, start=1):
-            if progress is not None and (position == 1 or position % 250 == 0):
+            now = time.monotonic()
+            if progress is not None and (
+                position == 1 or position % 100 == 0 or now - last_parse_report_at >= 2
+            ):
                 try:
                     current_file = path.relative_to(scan.repository_path).as_posix()
                 except ValueError:
@@ -721,8 +727,9 @@ class RepositoryScanner:
                 progress(
                     f"Parsing {path.suffix.lstrip('.').upper()}: {scan.service_id}; "
                     f"file={position}/{len(source_files)}; "
-                    f"path={current_file}"
+                    f"path={current_file}; elapsed={now - parse_started_at:.1f}s"
                 )
+                last_parse_report_at = now
             try:
                 if path.stat().st_size > self.settings.max_java_file_bytes:
                     self._builder.issues.append(
@@ -760,18 +767,70 @@ class RepositoryScanner:
                         message=f"Cannot parse source: {exc}",
                     )
                 )
-        self._index_database_model(scan)
-        self._index_java_architecture(scan)
-        self._index_migrations(scan)
-        self._trace_operations(scan)
+        if progress is not None:
+            progress(
+                f"Source parsing ready: {scan.service_id}; files={len(source_files)}; "
+                f"classes={len(scan.classes)}; "
+                f"elapsed={time.monotonic() - parse_started_at:.3f}s"
+            )
+        phase_started_at = time.monotonic()
+        if progress is not None:
+            progress(f"Database model start: {scan.service_id}; classes={len(scan.classes)}")
+        self._index_database_model(scan, progress=progress)
+        if progress is not None:
+            progress(
+                f"Database model ready: {scan.service_id}; "
+                f"elapsed={time.monotonic() - phase_started_at:.3f}s"
+            )
+        phase_started_at = time.monotonic()
+        if progress is not None:
+            progress(f"Framework interfaces start: {scan.service_id}; classes={len(scan.classes)}")
+        self._index_java_architecture(scan, progress=progress)
+        if progress is not None:
+            progress(
+                f"Framework interfaces ready: {scan.service_id}; "
+                f"operations={len(scan.operation_methods)}; "
+                f"elapsed={time.monotonic() - phase_started_at:.3f}s"
+            )
+        phase_started_at = time.monotonic()
+        if progress is not None:
+            progress(
+                f"Database migrations start: {scan.service_id}; "
+                f"resources={len(scan.resource_files)}"
+            )
+        self._index_migrations(scan, progress=progress)
+        if progress is not None:
+            progress(
+                f"Database migrations ready: {scan.service_id}; "
+                f"elapsed={time.monotonic() - phase_started_at:.3f}s"
+            )
+        self._trace_operations(scan, progress=progress)
         if progress is not None:
             progress(
                 f"Module extraction complete: {scan.service_id}; "
                 f"elapsed={time.monotonic() - started_at:.3f}s"
             )
 
-    def _index_java_architecture(self, scan: ServiceScan) -> None:
-        for java_class in scan.classes.values():
+    def _index_java_architecture(
+        self,
+        scan: ServiceScan,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> None:
+        classes = list(scan.classes.values())
+        started_at = time.monotonic()
+        last_report_at = started_at
+        for position, java_class in enumerate(classes, start=1):
+            now = time.monotonic()
+            if progress is not None and (
+                position == 1 or position % 250 == 0 or now - last_report_at >= 2
+            ):
+                progress(
+                    f"Framework interfaces running: {scan.service_id}; "
+                    f"classes={position}/{len(classes)}; current={java_class.name}; "
+                    f"elapsed={now - started_at:.1f}s"
+                )
+                last_report_at = now
             class_annotations = java_class.annotations
             class_base = ""
             request_args = _annotation_arguments(class_annotations, "RequestMapping")
@@ -1033,7 +1092,18 @@ class RepositoryScanner:
                 )
             )
 
-    def _trace_operations(self, scan: ServiceScan) -> None:
+    def _trace_operations(
+        self,
+        scan: ServiceScan,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> None:
+        started_at = time.monotonic()
+        if progress is not None:
+            progress(
+                f"Call tracing start: {scan.service_id}; "
+                f"operations={len(scan.operation_methods)}; depth={self.settings.call_depth}"
+            )
         method_lookup: dict[tuple[str, str], JavaMethod] = {}
         for java_class in scan.classes.values():
             for method in java_class.methods:
@@ -1046,14 +1116,33 @@ class RepositoryScanner:
         for outbound_fact in self._outbound:
             if outbound_fact.source_service == scan.service_id and outbound_fact.symbol_id:
                 outbound_by_symbol.setdefault(outbound_fact.symbol_id, []).append(outbound_fact)
-        for operation_id, root_method in scan.operation_methods.items():
-            queue: list[tuple[JavaMethod, int]] = [(root_method, 0)]
+
+        operation_count = len(scan.operation_methods)
+        for operation_position, (operation_id, root_method) in enumerate(
+            scan.operation_methods.items(), start=1
+        ):
+            operation_started_at = time.monotonic()
+            last_report_at = operation_started_at
+            if progress is not None:
+                progress(
+                    f"Call tracing operation [{operation_position}/{operation_count}] start: "
+                    f"{scan.service_id}; root={root_method.symbol}"
+                )
+            queue = deque([(root_method, 0)])
             visited: set[str] = set()
             while queue:
-                method, depth = queue.pop(0)
+                method, depth = queue.popleft()
                 if method.symbol in visited or depth > self.settings.call_depth:
                     continue
                 visited.add(method.symbol)
+                now = time.monotonic()
+                if progress is not None and (len(visited) % 100 == 0 or now - last_report_at >= 2):
+                    progress(
+                        f"Call tracing operation running: {scan.service_id}; "
+                        f"root={root_method.symbol}; visited={len(visited)}; "
+                        f"queued={len(queue)}; elapsed={now - operation_started_at:.1f}s"
+                    )
+                    last_report_at = now
                 symbol_id = f"symbol:{scan.service_id}:{method.symbol}"
                 self._builder.add_node(
                     GraphNode(
@@ -1151,6 +1240,17 @@ class RepositoryScanner:
                             label=topic.topic,
                             evidence_ids=[topic.evidence_id],
                         )
+            if progress is not None:
+                progress(
+                    f"Call tracing operation [{operation_position}/{operation_count}] ready: "
+                    f"{scan.service_id}; visited={len(visited)}; "
+                    f"elapsed={time.monotonic() - operation_started_at:.3f}s"
+                )
+        if progress is not None:
+            progress(
+                f"Call tracing ready: {scan.service_id}; "
+                f"elapsed={time.monotonic() - started_at:.3f}s"
+            )
 
     def _extract_rules(self, scan: ServiceScan, operation_id: str, method: JavaMethod) -> None:
         for match in re.finditer(r"\bif\s*\(([^\n{}]{1,400})\)", method.body):
@@ -1192,8 +1292,26 @@ class RepositoryScanner:
                 evidence_ids=[evidence_id],
             )
 
-    def _index_database_model(self, scan: ServiceScan) -> None:
-        for java_class in scan.classes.values():
+    def _index_database_model(
+        self,
+        scan: ServiceScan,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> None:
+        classes = list(scan.classes.values())
+        started_at = time.monotonic()
+        last_report_at = started_at
+        for position, java_class in enumerate(classes, start=1):
+            now = time.monotonic()
+            if progress is not None and (
+                position == 1 or position % 250 == 0 or now - last_report_at >= 2
+            ):
+                progress(
+                    f"Database entities running: {scan.service_id}; "
+                    f"classes={position}/{len(classes)}; current={java_class.name}; "
+                    f"elapsed={now - started_at:.1f}s"
+                )
+                last_report_at = now
             if _annotation_present(java_class.annotations, "Entity"):
                 table_args = _annotation_arguments(java_class.annotations, "Table") or ""
                 table_name = self._named_string(table_args, "name") or java_class.name
@@ -1242,7 +1360,17 @@ class RepositoryScanner:
                     evidence_ids=[evidence_id],
                 )
                 self._index_entity_columns(scan, java_class, table_id)
-        for java_class in scan.classes.values():
+        for position, java_class in enumerate(classes, start=1):
+            now = time.monotonic()
+            if progress is not None and (
+                position == 1 or position % 250 == 0 or now - last_report_at >= 2
+            ):
+                progress(
+                    f"Database repositories running: {scan.service_id}; "
+                    f"classes={position}/{len(classes)}; current={java_class.name}; "
+                    f"elapsed={now - started_at:.1f}s"
+                )
+                last_report_at = now
             repository_match = re.search(
                 r"(?:JpaRepository|CrudRepository|PagingAndSortingRepository)\s*<\s*"
                 r"([\w.]+)",
@@ -1290,7 +1418,12 @@ class RepositoryScanner:
                 evidence_ids=[evidence_id],
             )
 
-    def _index_migrations(self, scan: ServiceScan) -> None:
+    def _index_migrations(
+        self,
+        scan: ServiceScan,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> None:
         paths = sorted(
             set(scan.resource_files)
             if scan.resource_files
@@ -1300,7 +1433,19 @@ class RepositoryScanner:
                 for path in self._files(root, {".sql", ".yaml", ".yml", ".xml"})
             }
         )
-        for path in paths:
+        started_at = time.monotonic()
+        last_report_at = started_at
+        for position, path in enumerate(paths, start=1):
+            now = time.monotonic()
+            if progress is not None and (
+                position == 1 or position % 100 == 0 or now - last_report_at >= 2
+            ):
+                progress(
+                    f"Database migrations running: {scan.service_id}; "
+                    f"files={position}/{len(paths)}; current={path.name}; "
+                    f"elapsed={now - started_at:.1f}s"
+                )
+                last_report_at = now
             relative = path.relative_to(scan.repository_path).as_posix().lower()
             if not any(marker in relative for marker in ("migration", "liquibase", "changelog")):
                 continue

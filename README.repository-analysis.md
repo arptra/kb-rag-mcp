@@ -265,9 +265,14 @@ Python process через `spawn`.
 
 - cancel проверяется каждые 100 ms;
 - timeout задаёт `KB_REPOSITORY_ANALYSIS_TIMEOUT_SECONDS`, по умолчанию 600 секунд;
+- supervisor раз в 5 секунд пишет heartbeat с PID worker-процесса, прошедшим временем и
+  последней операцией;
+- job-log показывает inventory файлов, определение модулей, cache lookup/key, разбор
+  Java/Kotlin, JPA/репозитории, HTTP/Kafka-интерфейсы, миграции, tracing вызовов и merge графа;
 - при cancel/timeout worker сначала получает terminate, затем kill;
 - worker пишет результаты во временный каталог;
-- новые graph/map публикуются только после успешного завершения worker.
+- первый layout checkpoint публикует карточки сервисов до глубокого анализа, затем обновления
+  публикуются по ходу работы; при timeout сохраняется последний частичный результат.
 
 RAG build также выполняется отдельным процессом и ограничен
 `KB_INDEX_BUILD_TIMEOUT_SECONDS=600` по умолчанию.

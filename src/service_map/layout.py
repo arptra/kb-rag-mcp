@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -89,7 +91,12 @@ class _RepositoryInventory:
 class RepositoryLayoutAnalyzer:
     """Discover independently scannable modules without invoking Maven or Gradle."""
 
-    def discover(self, repository: Path) -> RepositoryLayout:
+    def discover(
+        self,
+        repository: Path,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> RepositoryLayout:
         root = repository.resolve()
         if not root.is_dir():
             raise ValueError(f"Repository directory does not exist: {root}")
@@ -101,7 +108,7 @@ class RepositoryLayoutAnalyzer:
             path: _Candidate(path, declared=True) for path in manifest_modules
         }
 
-        inventory = self._inventory(root)
+        inventory = self._inventory(root, progress=progress)
         descriptors = inventory.descriptors
         maven_modules: set[Path] = set()
         gradle_modules: set[Path] = set()
@@ -123,14 +130,27 @@ class RepositoryLayoutAnalyzer:
         if not candidates:
             candidates[root] = _Candidate(root)
 
+        if progress is not None:
+            progress(
+                f"Layout descriptors resolved: repository={root.name}; "
+                f"descriptors={len(descriptors)}; candidates={len(candidates)}"
+            )
+
         candidate_roots = set(candidates)
         owned_sources = self._owned_files(inventory.source_files, candidate_roots, root)
         owned_resources = self._owned_files(inventory.resource_files, candidate_roots, root)
         owned_openspec = self._owned_files(inventory.openspec_roots, candidate_roots, root)
         modules: list[ModuleLayout] = []
-        for candidate in sorted(
+        ordered_candidates = sorted(
             candidates.values(), key=lambda item: self._relative(root, item.root)
-        ):
+        )
+        for position, candidate in enumerate(ordered_candidates, start=1):
+            relative_path = self._relative(root, candidate.root)
+            if progress is not None:
+                progress(
+                    f"Layout module [{position}/{len(ordered_candidates)}] inspect: "
+                    f"{relative_path}; build={candidate.build_system}"
+                )
             explicit = self._module_manifest(root, candidate.root, manifest, manifest_modules)
             source_roots = self._source_roots(candidate.root, candidate.build_system)
             resource_roots = self._resource_roots(candidate.root, candidate.build_system)
@@ -149,7 +169,11 @@ class RepositoryLayoutAnalyzer:
             explicit_service = isinstance(explicit, dict) and isinstance(
                 explicit.get("service"), dict
             )
-            service_marker = bool(spring_name) or self._has_service_marker(source_files)
+            service_marker = bool(spring_name) or self._has_service_marker(
+                source_files,
+                module_path=relative_path,
+                progress=progress,
+            )
             role: ModuleRole = (
                 "service"
                 if explicit_service or service_marker or (candidate.declared and not has_sources)
@@ -158,7 +182,6 @@ class RepositoryLayoutAnalyzer:
                 else "container"
             )
 
-            relative_path = self._relative(root, candidate.root)
             service = explicit.get("service", {}) if isinstance(explicit, dict) else {}
             service = service if isinstance(service, dict) else {}
             artifact = self._maven_artifact(candidate.root / "pom.xml", issues, root)
@@ -200,6 +223,12 @@ class RepositoryLayoutAnalyzer:
                     resource_files=resource_files,
                 )
             )
+            if progress is not None:
+                progress(
+                    f"Layout module [{position}/{len(ordered_candidates)}] ready: "
+                    f"{relative_path}; role={role}; state={state}; "
+                    f"sources={len(source_files)}; resources={len(resource_files)}"
+                )
 
         if not modules:
             modules.append(self._fallback_module(root, manifest, issues))
@@ -398,7 +427,12 @@ class RepositoryLayoutAnalyzer:
             ),
         )
 
-    def _inventory(self, root: Path) -> _RepositoryInventory:
+    def _inventory(
+        self,
+        root: Path,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> _RepositoryInventory:
         descriptor_names = {
             "pom.xml",
             "build.gradle",
@@ -411,8 +445,16 @@ class RepositoryLayoutAnalyzer:
         resource_files: list[Path] = []
         openspec_roots: list[Path] = []
         resource_suffixes = {".properties", ".yaml", ".yml", ".xml", ".sql"}
+        visited_directories = 0
+        visited_files = 0
+        started_at = time.monotonic()
+        last_report_at = started_at
+        if progress is not None:
+            progress(f"Layout inventory start: repository={root.name}; path={root}")
         for current, directories, files in os.walk(root, followlinks=False):
             directory = Path(current)
+            visited_directories += 1
+            visited_files += len(files)
             directories[:] = [
                 name
                 for name in directories
@@ -434,6 +476,24 @@ class RepositoryLayoutAnalyzer:
                     source_files.append(path)
                 elif suffix in resource_suffixes:
                     resource_files.append(path)
+            now = time.monotonic()
+            if progress is not None and (
+                visited_files % 1000 < len(files) or now - last_report_at >= 2
+            ):
+                progress(
+                    f"Layout inventory running: repository={root.name}; "
+                    f"directories={visited_directories}; files={visited_files}; "
+                    f"java_kotlin={len(source_files)}; current={directory}; "
+                    f"elapsed={now - started_at:.1f}s"
+                )
+                last_report_at = now
+        if progress is not None:
+            progress(
+                f"Layout inventory ready: repository={root.name}; "
+                f"directories={visited_directories}; files={visited_files}; "
+                f"java_kotlin={len(source_files)}; resources={len(resource_files)}; "
+                f"openspec={len(openspec_roots)}; elapsed={time.monotonic() - started_at:.3f}s"
+            )
         return _RepositoryInventory(
             descriptors=tuple(sorted(set(descriptors))),
             source_files=tuple(sorted(set(source_files))),
@@ -460,7 +520,12 @@ class RepositoryLayoutAnalyzer:
         return {key: tuple(value) for key, value in owned.items()}
 
     @staticmethod
-    def _has_service_marker(files: tuple[Path, ...]) -> bool:
+    def _has_service_marker(
+        files: tuple[Path, ...],
+        *,
+        module_path: str,
+        progress: Callable[[str], None] | None = None,
+    ) -> bool:
         markers = (
             "@SpringBootApplication",
             "@SpringBootConfiguration",
@@ -470,17 +535,49 @@ class RepositoryLayoutAnalyzer:
             "@GrpcService",
             "@Scheduled",
         )
-        for path in files:
+        started_at = time.monotonic()
+        last_report_at = started_at
+        if progress is not None and files:
+            progress(f"Layout service markers start: module={module_path}; files={len(files)}")
+        for position, path in enumerate(files, start=1):
             try:
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
             if any(marker in text for marker in markers):
+                if progress is not None:
+                    progress(
+                        f"Layout service marker found: module={module_path}; "
+                        f"file={path.name}; checked={position}/{len(files)}"
+                    )
                 return True
             if path.suffix.lower() == ".kt" and re.search(r"(?m)^\s*fun\s+main\s*\(", text):
+                if progress is not None:
+                    progress(
+                        f"Layout Kotlin main found: module={module_path}; "
+                        f"file={path.name}; checked={position}/{len(files)}"
+                    )
                 return True
             if path.suffix.lower() == ".java" and re.search(r"\bstatic\s+void\s+main\s*\(", text):
+                if progress is not None:
+                    progress(
+                        f"Layout Java main found: module={module_path}; "
+                        f"file={path.name}; checked={position}/{len(files)}"
+                    )
                 return True
+            now = time.monotonic()
+            if progress is not None and (position % 500 == 0 or now - last_report_at >= 2):
+                progress(
+                    f"Layout service markers running: module={module_path}; "
+                    f"checked={position}/{len(files)}; current={path.name}; "
+                    f"elapsed={now - started_at:.1f}s"
+                )
+                last_report_at = now
+        if progress is not None and files:
+            progress(
+                f"Layout service markers ready: module={module_path}; found=false; "
+                f"checked={len(files)}; elapsed={time.monotonic() - started_at:.3f}s"
+            )
         return False
 
     @staticmethod

@@ -92,11 +92,26 @@ class ServiceMapBuilder:
                     f"Layout [{position}/{len(ordered)}]: {item.name}; path={item.path.resolve()}"
                 )
             layout_cache_path = self._layout_cache_path(item)
+            if progress is not None:
+                progress(
+                    f"Layout cache lookup: {item.name}; "
+                    f"path={layout_cache_path.name if layout_cache_path else 'disabled-no-commit'}"
+                )
             layout = self._load_layout(layout_cache_path) if layout_cache_path else None
             if layout is None:
-                layout = RepositoryLayoutAnalyzer().discover(item.path)
+                if progress is not None:
+                    progress(f"Layout cache miss: {item.name}; scanning repository filesystem")
+                layout = RepositoryLayoutAnalyzer().discover(item.path, progress=progress)
                 if layout_cache_path is not None:
+                    if progress is not None:
+                        progress(
+                            f"Layout cache write start: {item.name}; modules={len(layout.modules)}"
+                        )
                     self._save_layout(layout_cache_path, layout)
+                    if progress is not None:
+                        progress(
+                            f"Layout cache write ready: {item.name}; path={layout_cache_path.name}"
+                        )
             elif progress is not None:
                 assert layout_cache_path is not None
                 progress(f"Layout cache hit: {item.name}; path={layout_cache_path.name}")
@@ -139,14 +154,27 @@ class ServiceMapBuilder:
         last_checkpoint_at = time.monotonic()
         forced = force_service_ids or set()
         for position, target in enumerate(targets, start=1):
-            cache_path = self._cache_path(target)
+            if progress is not None:
+                progress(
+                    f"Module cache key [{position}/{len(targets)}] start: "
+                    f"{target.service_id}; files="
+                    f"{len(target.source_files or ()) + len(target.resource_files or ())}"
+                )
+            cache_path = self._cache_path(target, progress=progress)
             use_cache = not force_all and target.service_id not in forced
+            cache_lookup_started_at = time.monotonic()
+            if progress is not None:
+                progress(
+                    f"Module cache lookup [{position}/{len(targets)}]: "
+                    f"{target.service_id}; mode={'reuse' if use_cache else 'force-refresh'}"
+                )
             snapshot = self._load_cached(cache_path) if use_cache else None
             if snapshot is not None:
                 if progress is not None:
                     progress(
                         f"Module cache hit [{position}/{len(targets)}]: "
-                        f"{target.service_id}; path={cache_path.name}"
+                        f"{target.service_id}; path={cache_path.name}; "
+                        f"elapsed={time.monotonic() - cache_lookup_started_at:.3f}s"
                     )
             else:
                 scan_started_at = time.monotonic()
@@ -169,7 +197,15 @@ class ServiceMapBuilder:
             if checkpoint is not None and time.monotonic() - last_checkpoint_at >= 5:
                 publish_scan_checkpoint(merge_and_relink_snapshots(module_snapshots))
                 last_checkpoint_at = time.monotonic()
+        merge_started_at = time.monotonic()
+        if progress is not None:
+            progress(f"Global snapshot merge start: modules={len(module_snapshots)}")
         graph = merge_and_relink_snapshots(module_snapshots) if targets else GraphSnapshot()
+        if progress is not None:
+            progress(
+                f"Global snapshot merge ready: nodes={len(graph.nodes)}; "
+                f"edges={len(graph.edges)}; elapsed={time.monotonic() - merge_started_at:.3f}s"
+            )
         if issues:
             graph = graph.model_copy(update={"issues": [*graph.issues, *issues]})
         result = self.from_graph(graph, repositories)
@@ -182,7 +218,12 @@ class ServiceMapBuilder:
             )
         return result
 
-    def _cache_path(self, target: ScanTarget) -> Path:
+    def _cache_path(
+        self,
+        target: ScanTarget,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> Path:
         digest = hashlib.sha256()
         digest.update(_ANALYZER_VERSION.encode())
         digest.update(str(self._settings.call_depth).encode())
@@ -202,7 +243,9 @@ class ServiceMapBuilder:
             digest.update(b"\x00")
         repository = target.repository_path or target.path
         paths = sorted({*(target.source_files or ()), *(target.resource_files or ())})
-        for path in paths:
+        started_at = time.monotonic()
+        last_report_at = started_at
+        for position, path in enumerate(paths, start=1):
             try:
                 relative = path.relative_to(repository).as_posix()
                 stat = path.stat()
@@ -210,6 +253,19 @@ class ServiceMapBuilder:
                 continue
             digest.update(relative.encode())
             digest.update(f"\x00{stat.st_size}\x00{stat.st_mtime_ns}\x00".encode())
+            now = time.monotonic()
+            if progress is not None and (position % 1000 == 0 or now - last_report_at >= 2):
+                progress(
+                    f"Module cache key running: {target.service_id}; "
+                    f"files={position}/{len(paths)}; current={relative}; "
+                    f"elapsed={now - started_at:.1f}s"
+                )
+                last_report_at = now
+        if progress is not None:
+            progress(
+                f"Module cache key ready: {target.service_id}; files={len(paths)}; "
+                f"elapsed={time.monotonic() - started_at:.3f}s"
+            )
         return self._settings.module_cache_path / f"{digest.hexdigest()}.json"
 
     def _layout_cache_path(self, repository: RepositoryInput) -> Path | None:
