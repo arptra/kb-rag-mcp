@@ -27,7 +27,9 @@ BUILTIN_TOOLS: tuple[dict[str, str], ...] = (
     },
     {
         "name": "kb_generate_system_ssot",
-        "description": "Generate service SSOT files and rebuild a selected RAG index.",
+        "description": (
+            "Coordinate client-side SSOT generation from server analysis and source files."
+        ),
     },
     {"name": "kb_search", "description": "Search indexed corporate knowledge."},
     {"name": "kb_get_document", "description": "Read a bounded document extract."},

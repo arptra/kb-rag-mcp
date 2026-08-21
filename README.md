@@ -109,12 +109,13 @@ Repository и производные сервисы можно удалять и
 успешный source analysis архивируется в `.cache/kb/analysis/runs/`; с карточки сервиса можно
 скачать пакет с analysis JSON и [`build-service-ssot`](skills/build-service-ssot/SKILL.md), затем
 загрузить проверенный Markdown SSOT в выбранный RAG-индекс.
-Для автоматического режима кнопка **«Сгенерировать SSOT»** или MCP-tool
-`kb_generate_system_ssot` запускает свежий source analysis, параллельно создаёт минимальное
-описание API и функциональности каждого сервиса через OpenAI-compatible LLM, сохраняет файлы в
-`ssot/generated/<service-id>.md` выбранного индекса и только после этого перестраивает RAG.
-Настройка модели, polling job и fallback при ошибке отдельного сервиса описаны в
-[документации анализа](README.repository-analysis.md#автоматический-системный-ssot-через-llm).
+Для агентского режима кнопка **«Подготовить SSOT-контекст»** или MCP-tool
+`kb_generate_system_ssot` запускает свежий source analysis и открывает сессию чтения исходников.
+Сервер не содержит LLM и не требует URL модели: SSOT пишет нейронка, которая вызвала MCP с
+клиентского компьютера. Локальный proxy сначала сохраняет Markdown во временный каталог клиента,
+затем загружает его в `ssot/generated/<service-id>.md` выбранного индекса и запускает обновление
+RAG. Полный action-flow описан в
+[документации анализа](README.repository-analysis.md#агентский-системный-ssot-без-llm-на-сервере).
 Во вкладке dashboard **«Операции и логи»** открытый журнал активной job обновляется раз в секунду:
 он показывает layout каждого repository, найденные modules, число Java/Kotlin-файлов, cache
 hit/miss, размер и отдельные фазы чтения layout-cache (`stat`, `read`, `JSON parse`, `hydrate`),
@@ -133,8 +134,9 @@ signal при аварии worker. Supervisor пишет heartbeat каждые 
 - `embeddings.npy` — матрица без pickle.
 
 Это не Vector DB: нет отдельного сервиса хранения, индекса ANN или SQL. Почти все MCP-tools
-read-only; отдельно помеченный `kb_generate_system_ssot` создаёт локальные документы и перестраивает
-выбранный индекс. Поиск выполняется полным cosine scan по NumPy-матрице в памяти, а диск
+read-only; `kb_generate_system_ssot` управляет source-сессией, а локальный
+`kb_save_and_upload_ssot` сохраняет созданный клиентской моделью документ и инициирует перестроение
+выбранного индекса. Поиск выполняется полным cosine scan по NumPy-матрице в памяти, а диск
 используется для ускорения старта.
 
 ## Первый запуск
@@ -355,8 +357,10 @@ qwen
 - `kb_run_context_benchmark` — защищённый паролем read-only замер качества и сжатия;
 - `kb_get_document` — ограниченный извлекаемый фрагмент документа по `document_id`;
 - `kb_list_documents` — metadata документов без embeddings;
-- `kb_generate_system_ssot` — показывает доступные индексы или запускает/опрашивает фоновую
-  генерацию локального SSOT всех сервисов через настроенную OpenAI-compatible модель;
+- `kb_generate_system_ssot` — выбирает индекс и repositories, клонирует недостающий Git source,
+  запускает/опрашивает analysis и порционно отдаёт исходники клиентской нейронке для SSOT;
+- `kb_save_and_upload_ssot` — локальный tool распределённого stdio-proxy: пишет готовый Markdown во
+  временный каталог клиентского компьютера и загружает его в выбранный server index;
 - `kb_stats` — состояние индекса и абсолютные пути.
 
 Во вкладке dashboard **«MCP tools»** отображается живой каталог FastMCP: все встроенные tools и

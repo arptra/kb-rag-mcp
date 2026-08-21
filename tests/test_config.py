@@ -1,6 +1,3 @@
-import pytest
-from pydantic import ValidationError
-
 from corporate_kb.config import Settings
 
 
@@ -39,31 +36,8 @@ def test_context_defaults_keep_mcp_search_output_small() -> None:
     assert Settings.model_fields["admin_max_upload_bytes"].default == 10_000_000
 
 
-def test_ssot_generation_defaults_are_explicitly_unconfigured() -> None:
+def test_ssot_source_context_defaults_are_bounded() -> None:
     settings = Settings(_env_file=None)
 
-    assert settings.ssot_llm_base_url is None
-    assert settings.ssot_llm_model is None
-    assert settings.ssot_generation_workers == 2
     assert settings.ssot_generation_max_source_files == 12
     assert settings.ssot_generation_source_chars == 48_000
-
-
-@pytest.mark.parametrize(
-    "base_url",
-    ["localhost:11434/v1", "ftp://model.local/v1", "https://user:secret@model.local/v1"],
-)
-def test_ssot_llm_base_url_rejects_unsafe_or_ambiguous_values(base_url: str) -> None:
-    with pytest.raises(ValidationError, match="KB_SSOT_LLM_BASE_URL"):
-        Settings(_env_file=None, ssot_llm_base_url=base_url)
-
-
-def test_ssot_llm_configuration_normalizes_whitespace_and_trailing_slash() -> None:
-    settings = Settings(
-        _env_file=None,
-        ssot_llm_base_url=" https://model.local/v1/ ",
-        ssot_llm_model=" qwen2.5-coder ",
-    )
-
-    assert settings.ssot_llm_base_url == "https://model.local/v1"
-    assert settings.ssot_llm_model == "qwen2.5-coder"

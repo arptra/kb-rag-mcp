@@ -8,7 +8,8 @@
       "env": {
         "CORPORATE_KB_MCP_URL": "http://REPLACE_WITH_SERVER_IP_OR_DOMAIN:8000/mcp",
         "CORPORATE_KB_MCP_TOKEN": "",
-        "CORPORATE_KB_MCP_TIMEOUT": "120"
+        "CORPORATE_KB_MCP_TIMEOUT": "120",
+        "CORPORATE_KB_SSOT_TEMP_DIR": "/ABSOLUTE/PATH/corporate-kb-ssot"
       },
       "timeout": 120000,
       "trust": false

@@ -89,11 +89,12 @@ export interface Catalog {
   };
   ssot_generation: {
     configured: boolean;
+    mode: "client-agent";
+    server_llm_required: boolean;
     provider: string;
-    model: string | null;
-    workers: number;
     output_pattern: string;
-    required_settings: string[];
+    local_output_pattern: string;
+    actions: string[];
   };
 }
 

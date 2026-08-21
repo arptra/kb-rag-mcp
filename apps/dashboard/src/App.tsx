@@ -300,7 +300,7 @@ export default function App() {
             <button className="button quiet" onClick={() => void load()} disabled={loading}>↻ Обновить</button>
           {page === "indexes" && selectedIndexId && <button className="button quiet" onClick={() => setSelectedIndexId(null)}>← Все индексы</button>}
           {page === "indexes" && !selectedIndexId && <button className="button primary" onClick={() => setRepositoryModal(true)}>＋ Подключить репозиторий</button>}
-            {page === "services" && <button className="button primary" onClick={() => setSystemSsotModal(true)}>✦ Сгенерировать SSOT</button>}
+            {page === "services" && <button className="button primary" onClick={() => setSystemSsotModal(true)}>✦ Подготовить SSOT-контекст</button>}
             {page === "servers" && <button className="button primary" onClick={() => setServerModal(true)}>＋ Добавить MCP server</button>}
             {page === "tools" && <button className="button primary" onClick={() => setToolModal("new")}>＋ Новый MCP tool</button>}
           </div>
@@ -434,7 +434,7 @@ export default function App() {
           onClose={() => setSystemSsotModal(false)}
           onStarted={() => {
             setSystemSsotModal(false);
-            setToast("Генерация системного SSOT поставлена в очередь");
+            setToast("Подготовка исходников для клиентской модели поставлена в очередь");
             void load();
           }}
         />
@@ -1379,29 +1379,26 @@ function SystemSsotModal({ password, indexes, generator, serviceCount, onClose, 
     setError("");
     try {
       await post("/admin/api/analysis/ssot-generate", password, {
+        action: "prepare",
         index_id: indexId,
+        all_services: true,
         refresh_analysis: refreshAnalysis,
       });
       onStarted();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Не удалось запустить генерацию SSOT");
+      setError(caught instanceof Error ? caught.message : "Не удалось подготовить контекст SSOT");
       setBusy(false);
     }
   };
   return (
-    <Modal title="Сгенерировать SSOT всей системы" onClose={onClose}>
+    <Modal title="Подготовить контекст SSOT всей системы" onClose={onClose}>
       <form className="modal-form" onSubmit={submit}>
-        <div className="callout">Источник → свежий analysis worker → {generator.model || "LLM"} → локальные `ssot/generated/&lt;service-id&gt;.md` → выбранный RAG-индекс. Ручные SSOT не перезаписываются. Будет обработано до {serviceCount} сервисов; отдельный сбой модели создаст помеченный source-derived draft. Фрагменты исходного кода отправляются на настроенный LLM endpoint — для закрытого кода используйте локальную модель.</div>
-        {!generator.configured && (
-          <div className="form-error">
-            LLM не настроена. Добавьте {generator.required_settings.map((item) => <code key={item}>{item} </code>)} в `.env` и перезапустите backend.
-          </div>
-        )}
+        <div className="callout">Сервер не вызывает нейросеть и не требует LLM URL. Он обновит статический анализ и подготовит MCP-сессию с картой сервисов, полным списком файлов и безопасным чтением исходников. Модель в GigaCode запросит нужные файлы, локально создаст SSOT и загрузит его в выбранный индекс.</div>
         <label>Индекс для сгенерированного SSOT<select value={indexId} onChange={(event) => setIndexId(event.target.value)}>{indexes.map((index) => <option key={index.id} value={index.id}>{index.name} · {index.document_count} документов</option>)}</select></label>
         <label className="check"><input type="checkbox" checked={refreshAnalysis} onChange={(event) => setRefreshAnalysis(event.target.checked)} /><span>⌘</span><div><b>Сначала заново проанализировать исходники</b><small>Рекомендуется: SSOT строится из актуальной карты API и функций.</small></div></label>
-        <div className="flow-preview"><span>{serviceCount} сервисов</span><i>→</i><span>{generator.workers} LLM workers</span><i>→</i><span>{indexes.find((index) => index.id === indexId)?.name || indexId}</span></div>
+        <div className="flow-preview"><span>{serviceCount} сервисов</span><i>→</i><span>{generator.provider}</span><i>→</i><span>{indexes.find((index) => index.id === indexId)?.name || indexId}</span></div>
         {error && <div className="form-error">{error}</div>}
-        <div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary" disabled={busy || !generator.configured || !indexes.length}>{busy ? "Ставим в очередь…" : "Запустить генерацию"}</button></div>
+        <div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary" disabled={busy || !indexes.length}>{busy ? "Ставим в очередь…" : "Подготовить контекст"}</button></div>
       </form>
     </Modal>
   );

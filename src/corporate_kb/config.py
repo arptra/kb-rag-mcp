@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -53,13 +52,6 @@ class Settings(BaseSettings):
     ssot_facts_per_service: int = Field(default=3, ge=1, le=6)
     ssot_fact_tokens: int = Field(default=100, ge=40, le=300)
     ssot_context_tokens: int = Field(default=1000, ge=300, le=4000)
-    ssot_llm_base_url: str | None = None
-    ssot_llm_api_key: SecretStr | None = None
-    ssot_llm_model: str | None = None
-    ssot_llm_timeout_seconds: int = Field(default=120, ge=10, le=1800)
-    ssot_llm_max_tokens: int = Field(default=1800, ge=256, le=8000)
-    ssot_llm_temperature: float = Field(default=0.1, ge=0, le=2)
-    ssot_generation_workers: int = Field(default=2, ge=1, le=8)
     ssot_generation_max_source_files: int = Field(default=12, ge=1, le=100)
     ssot_generation_source_chars: int = Field(default=48_000, ge=2_000, le=500_000)
     benchmark_questions_path: Path = Path("evaluation/questions.json")
@@ -98,28 +90,6 @@ class Settings(BaseSettings):
         if "?" in value or "#" in value or "//" in value:
             raise ValueError("KB_MCP_HTTP_PATH must be a plain absolute URL path")
         return value
-
-    @field_validator("ssot_llm_base_url")
-    @classmethod
-    def validate_ssot_llm_base_url(cls, value: str | None) -> str | None:
-        if value is None or not value.strip():
-            return None
-        normalized = value.strip().rstrip("/")
-        parsed = urlsplit(normalized)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("KB_SSOT_LLM_BASE_URL must be an absolute http:// or https:// URL")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError(
-                "KB_SSOT_LLM_BASE_URL must not contain credentials, query, or fragment"
-            )
-        return normalized
-
-    @field_validator("ssot_llm_model")
-    @classmethod
-    def normalize_ssot_llm_model(cls, value: str | None) -> str | None:
-        if value is None or not value.strip():
-            return None
-        return value.strip()
 
     @model_validator(mode="after")
     def validate_chunking(self) -> Settings:

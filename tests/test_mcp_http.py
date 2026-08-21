@@ -113,7 +113,9 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
         ssot_choices = await client.post("/admin/api/analysis/ssot-generate", json={})
         assert ssot_choices.status_code == 200
         assert ssot_choices.json()["status"] == "selection_required"
-        assert ssot_choices.json()["generator"]["configured"] is False
+        assert ssot_choices.json()["workflow"]["server_llm_required"] is False
+        assert ssot_choices.json()["selection"]["cloned_repository_count"] == 0
+        assert ssot_choices.json()["selection"]["clone_if_missing"]["action"] == "clone"
 
         async with streamable_http_client(
             "http://testserver/mcp",
@@ -126,6 +128,24 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
             assert {"kb_search", "kb_feature_context", "kb_generate_system_ssot"} <= {
                 tool.name for tool in listed.tools
             }
+            ssot_tool = next(
+                tool for tool in listed.tools if tool.name == "kb_generate_system_ssot"
+            )
+            assert ssot_tool.inputSchema["properties"]["action"]["enum"] == [
+                "options",
+                "clone",
+                "prepare",
+                "status",
+                "context",
+                "read_file",
+                "submit",
+            ]
+            ssot_options = await session.call_tool(
+                "kb_generate_system_ssot",
+                {"action": "options"},
+            )
+            assert ssot_options.isError is False
+            assert ssot_options.structuredContent["workflow"]["server_llm_required"] is False
             feature = await session.call_tool(
                 "kb_feature_context",
                 {"feature": "daily limits"},

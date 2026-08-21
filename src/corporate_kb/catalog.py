@@ -4,17 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
 import shutil
 import tempfile
 import threading
-import time
 import traceback
 import uuid
 from collections.abc import Iterator
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,7 +26,6 @@ from corporate_kb.index_runner import IndexBuildCancelled, IndexBuildProcessRunn
 from corporate_kb.loaders.filesystem import SUPPORTED_DOCUMENT_SUFFIXES
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeIndexMissingError, KnowledgeService
-from corporate_kb.ssot import GeneratedSsot, ServiceSsotGenerator
 from corporate_kb.usage import UsageTracker
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.models import GraphSnapshot
@@ -51,6 +49,47 @@ from service_map import (
 from service_map.models import ServiceRecord
 
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_SSOT_IGNORED_DIRECTORIES = {
+    ".git",
+    ".gradle",
+    ".idea",
+    ".mvn",
+    ".settings",
+    "build",
+    "dist",
+    "generated",
+    "node_modules",
+    "out",
+    "target",
+    "vendor",
+}
+_SSOT_READABLE_SUFFIXES = {
+    ".conf",
+    ".gradle",
+    ".graphql",
+    ".gql",
+    ".java",
+    ".json",
+    ".kt",
+    ".kts",
+    ".md",
+    ".properties",
+    ".proto",
+    ".sql",
+    ".toml",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+_SSOT_READABLE_NAMES = {
+    "dockerfile",
+    "jenkinsfile",
+    "makefile",
+    "pom.xml",
+    "settings.gradle",
+    "settings.gradle.kts",
+}
 logger = logging.getLogger(__name__)
 
 
@@ -153,8 +192,6 @@ class RagCatalog:
         default_service: KnowledgeService,
         default_tools: KnowledgeTools,
         usage: UsageTracker,
-        *,
-        ssot_generator: ServiceSsotGenerator | None = None,
     ) -> None:
         self.settings = settings
         self._default_service = default_service
@@ -173,7 +210,6 @@ class RagCatalog:
             settings.analysis_archive_dir,
             settings.ssot_skill_path,
         )
-        self._ssot_generator = ssot_generator or ServiceSsotGenerator(settings)
         if not settings.graph_store_path.is_file():
             self._graph_store.save(GraphSnapshot())
         self._graph_service = GraphService(self._graph_store)
@@ -207,7 +243,7 @@ class RagCatalog:
             "repositories": [item.model_dump(mode="json") for item in repositories],
             "jobs": [item.model_dump(mode="json") for item in jobs[:30]],
             "analysis": self._analysis_archive.overview(),
-            "ssot_generation": self._ssot_generator.status(),
+            "ssot_generation": self._ssot_workflow_status(),
         }
 
     def create_index(self, *, name: str, description: str = "") -> RagIndex:
@@ -346,9 +382,25 @@ class RagCatalog:
     def ssot_generation_options(self) -> dict[str, Any]:
         with self._lock:
             indexes = [item.model_copy(deep=True) for item in self._state.indexes]
+            repositories = [item.model_copy(deep=True) for item in self._state.repositories]
+        service_map = self._service_map_store.load()
+        services_by_repository: dict[str, list[dict[str, str]]] = {}
+        for service in service_map.services:
+            try:
+                _mapped, repository = self._service_context(service.id)
+            except KeyError:
+                continue
+            services_by_repository.setdefault(repository.id, []).append(
+                {
+                    "id": service.id,
+                    "name": service.name,
+                    "module_path": service.module_path,
+                    "module_state": service.module_state,
+                }
+            )
         return {
             "status": "selection_required",
-            "generator": self._ssot_generator.status(),
+            "workflow": self._ssot_workflow_status(),
             "indexes": [
                 {
                     "id": item.id,
@@ -360,38 +412,160 @@ class RagCatalog:
                 }
                 for item in indexes
             ],
+            "repositories": [
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "git_url": item.git_url,
+                    "ref": item.ref,
+                    "index_id": item.index_id,
+                    "commit": item.commit,
+                    "checkout_ready": Path(item.checkout_path).is_dir(),
+                    "services": sorted(
+                        services_by_repository.get(item.id, []),
+                        key=lambda service: service["id"],
+                    ),
+                }
+                for item in repositories
+            ],
+            "selection": {
+                "index_required": True,
+                "repository_required": True,
+                "cloned_repository_count": len(repositories),
+                "clone_if_missing": {
+                    "action": "clone",
+                    "required_arguments": ["index_id", "repository_name", "git_url"],
+                    "optional_arguments": ["ref"],
+                },
+                "all_services_arguments": {
+                    "action": "prepare",
+                    "all_services": True,
+                },
+            },
             "next": (
-                "Call kb_generate_system_ssot again with index_id from indexes[].id. "
-                "The server will refresh source analysis, generate local SSOT files, and "
-                "rebuild that RAG index."
+                "Choose an index and one or more repositories, then call this tool with "
+                "action='prepare'. Use all_services=true to process every cloned repository. "
+                "If repositories is empty, call action='clone' with index_id, repository_name "
+                "and git_url first."
             ),
+        }
+
+    @staticmethod
+    def _ssot_workflow_status() -> dict[str, Any]:
+        return {
+            "configured": True,
+            "mode": "client-agent",
+            "server_llm_required": False,
+            "provider": "calling-client",
+            "output_pattern": "<index.knowledge_dir>/ssot/generated/<service-id>.md",
+            "local_output_pattern": "<client-temp>/corporate-kb-ssot/<session-id>/<service-id>.md",
+            "actions": ["options", "clone", "prepare", "status", "context", "read_file", "submit"],
         }
 
     def ssot_generation_request(
         self,
         *,
+        action: str = "options",
         index_id: str | None = None,
+        repository_ids: list[str] | None = None,
         service_ids: list[str] | None = None,
+        all_services: bool = False,
         refresh_analysis: bool = True,
         job_id: str | None = None,
+        repository_name: str | None = None,
+        git_url: str | None = None,
+        ref: str | None = None,
+        service_id: str | None = None,
+        repository_id: str | None = None,
+        file_path: str | None = None,
+        offset: int = 0,
+        max_chars: int = 20_000,
+        content: str | None = None,
+        finalize: bool = True,
     ) -> dict[str, Any]:
-        if job_id:
-            if index_id is not None or service_ids:
-                raise ValueError("job_id cannot be combined with index_id or service_ids")
-            return self._ssot_job_status(job_id)
-        if index_id is None:
+        normalized_action = action.strip().lower() or "options"
+        if normalized_action == "options" and job_id:
+            normalized_action = "status"
+        if normalized_action == "options" and index_id is not None:
+            normalized_action = "prepare"
+            if not repository_ids and not service_ids:
+                all_services = True
+        if normalized_action == "options":
             return self.ssot_generation_options()
-        job = self.start_system_ssot_generation(
-            index_id=index_id,
-            service_ids=service_ids,
-            refresh_analysis=refresh_analysis,
+        if normalized_action == "clone":
+            if index_id is None:
+                raise ValueError("action='clone' requires index_id")
+            if not repository_name or not git_url:
+                raise ValueError("action='clone' requires repository_name and git_url")
+            job = self.start_repository_ingestion(
+                name=repository_name,
+                git_url=git_url,
+                index_id=index_id,
+                ref=ref,
+            )
+            return self._queued_ssot_response(job, next_action="status")
+        if normalized_action == "prepare":
+            if index_id is None:
+                raise ValueError("action='prepare' requires index_id")
+            selected_repositories = self._normalize_selection(repository_ids)
+            selected_services = self._normalize_selection(service_ids)
+            if not all_services and not selected_repositories and not selected_services:
+                raise ValueError(
+                    "Select repository_ids or service_ids, or set all_services=true"
+                )
+            job = self.start_system_ssot_generation(
+                index_id=index_id,
+                repository_ids=list(selected_repositories),
+                service_ids=list(selected_services),
+                all_services=all_services,
+                refresh_analysis=refresh_analysis,
+            )
+            return self._queued_ssot_response(job, next_action="status")
+        if normalized_action == "status":
+            if not job_id:
+                raise ValueError("action='status' requires job_id")
+            return self._workflow_job_status(job_id)
+        if normalized_action == "context":
+            if not job_id or not service_id:
+                raise ValueError("action='context' requires job_id and service_id")
+            return self._ssot_target_context(job_id, service_id)
+        if normalized_action == "read_file":
+            if not job_id or not repository_id or not file_path:
+                raise ValueError(
+                    "action='read_file' requires job_id, repository_id and file_path"
+                )
+            return self._ssot_read_file(
+                job_id,
+                repository_id,
+                file_path,
+                offset=offset,
+                max_chars=max_chars,
+            )
+        if normalized_action == "submit":
+            if not job_id or not service_id or content is None:
+                raise ValueError("action='submit' requires job_id, service_id and content")
+            return self._submit_client_ssot(
+                job_id,
+                service_id,
+                content,
+                finalize=finalize,
+            )
+        raise ValueError(
+            "action must be options, clone, prepare, status, context, read_file, or submit"
         )
+
+    @staticmethod
+    def _normalize_selection(values: list[str] | None) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(item.strip() for item in values or [] if item.strip()))
+
+    @staticmethod
+    def _queued_ssot_response(job: CatalogJob, *, next_action: str) -> dict[str, Any]:
         return {
             "status": "queued",
             "job": job.model_dump(mode="json"),
             "poll": {
                 "tool": "kb_generate_system_ssot",
-                "arguments": {"job_id": job.id},
+                "arguments": {"action": next_action, "job_id": job.id},
             },
         }
 
@@ -399,26 +573,37 @@ class RagCatalog:
         self,
         *,
         index_id: str,
+        repository_ids: list[str] | None = None,
         service_ids: list[str] | None = None,
+        all_services: bool = False,
         refresh_analysis: bool = True,
     ) -> CatalogJob:
         index = self._record(index_id)
-        generator_status = self._ssot_generator.status()
-        if not generator_status["configured"]:
-            required = ", ".join(str(item) for item in generator_status["required_settings"])
-            raise RuntimeError(f"SSOT LLM is not configured; set {required} and restart the server")
-        selected = tuple(dict.fromkeys(item.strip() for item in service_ids or [] if item.strip()))
-        if len(selected) > 500:
+        selected_repositories = self._normalize_selection(repository_ids)
+        selected_services = self._normalize_selection(service_ids)
+        if len(selected_services) > 500:
             raise ValueError("No more than 500 service_ids can be generated in one job")
+        with self._lock:
+            available_repository_ids = {item.id for item in self._state.repositories}
+        missing_repositories = set(selected_repositories) - available_repository_ids
+        if missing_repositories:
+            raise KeyError(f"Unknown repositories: {', '.join(sorted(missing_repositories))}")
         job = self._new_job(
             "ssot",
             index_id=index.id,
             target_id=index.id,
-            message=f"System SSOT generation queued for index: {index.name}",
+            message=f"Client SSOT source preparation queued for index: {index.name}",
         )
         threading.Thread(
             target=self._run_system_ssot_generation_job,
-            args=(job.id, index.id, selected, refresh_analysis),
+            args=(
+                job.id,
+                index.id,
+                selected_repositories,
+                selected_services,
+                all_services,
+                refresh_analysis,
+            ),
             daemon=True,
         ).start()
         return job
@@ -465,17 +650,354 @@ class RagCatalog:
             "log": path.read_text(encoding="utf-8") if path.is_file() else "",
         }
 
-    def _ssot_job_status(self, job_id: str) -> dict[str, Any]:
+    def _workflow_job_status(self, job_id: str) -> dict[str, Any]:
         with self._lock:
             job = self._jobs.get(job_id)
-        if job is None or job.type != "ssot":
-            raise KeyError(f"Unknown SSOT generation job: {job_id}")
+        if job is None or job.type not in {"ssot", "repository", "index"}:
+            raise KeyError(f"Unknown SSOT workflow job: {job_id}")
         log = self.job_log(job_id)["log"]
-        return {
+        payload = {
             "status": job.status,
             "job": job.model_dump(mode="json"),
             "log_tail": "\n".join(log.splitlines()[-80:]),
         }
+        if job.status == "completed" and job.type == "repository":
+            payload["next"] = {
+                "tool": "kb_generate_system_ssot",
+                "arguments": {"action": "options"},
+                "instruction": "Select the cloned repository and start action='prepare'.",
+            }
+        return payload
+
+    def _ssot_session_job(self, job_id: str) -> CatalogJob:
+        with self._lock:
+            job = self._jobs.get(job_id)
+        if job is None or job.type != "ssot" or job.status != "completed" or job.result is None:
+            raise KeyError(f"Unknown or incomplete SSOT session: {job_id}")
+        if job.result.get("phase") != "awaiting_client_generation":
+            raise RuntimeError(f"SSOT session is not accepting client generation: {job_id}")
+        return job.model_copy(deep=True)
+
+    def _ssot_target_context(self, job_id: str, service_id: str) -> dict[str, Any]:
+        job = self._ssot_session_job(job_id)
+        result = job.result or {}
+        target = next(
+            (item for item in result.get("targets", []) if item.get("id") == service_id),
+            None,
+        )
+        if not isinstance(target, dict):
+            raise KeyError(f"SSOT target is not part of session {job_id}: {service_id}")
+        repository_id = str(target["repository_id"])
+        repository = self._repository(repository_id)
+        checkout = Path(repository.checkout_path).resolve()
+        manifest = self._ssot_source_manifest(checkout, module_path=str(target["module_path"]))
+        if target.get("kind") == "service":
+            analysis = AnalysisArchive._service_payload(
+                self._service_map_store.load(),
+                self._graph_store.load(),
+                service_id,
+            )
+        else:
+            analysis = {
+                "schema_version": 1,
+                "service": {
+                    "id": service_id,
+                    "name": target["name"],
+                    "repository": repository.name,
+                    "module_path": ".",
+                    "module_state": target["module_state"],
+                    "commit": repository.commit,
+                    "entrypoints": [],
+                    "outbound_interfaces": [],
+                },
+                "dependencies": [],
+                "evidence": [],
+                "issues": [
+                    {
+                        "message": (
+                            "Static analysis did not discover a complete service module. "
+                            "Treat missing functionality as unknown and inspect source files."
+                        )
+                    }
+                ],
+                "graph_nodes": [],
+                "graph_edges": [],
+            }
+        initial_files: list[dict[str, Any]] = []
+        remaining = self.settings.ssot_generation_source_chars
+        readable = [item for item in manifest["files"] if item["readable"]]
+        readable.sort(
+            key=lambda item: (
+                not bool(item["in_service_module"]),
+                self._ssot_source_priority(str(item["path"])),
+                item["path"],
+            )
+        )
+        for item in readable[: self.settings.ssot_generation_max_source_files]:
+            if remaining <= 0:
+                break
+            excerpt_limit = min(6_000, remaining)
+            excerpt = self._read_checkout_file(checkout, str(item["path"]), 0, excerpt_limit)
+            remaining -= len(str(excerpt["content"]))
+            initial_files.append(excerpt)
+        existing_path = (
+            Path(str(self._record(str(result["index_id"])).knowledge_dir)).resolve()
+            / "ssot"
+            / "generated"
+            / f"{_slug(service_id)}.md"
+        )
+        existing_ssot = None
+        if existing_path.is_file():
+            existing_ssot = existing_path.read_text(encoding="utf-8")[:20_000]
+        return {
+            "status": "context_ready",
+            "session_id": job_id,
+            "target": target,
+            "analysis": analysis,
+            "source_manifest": manifest,
+            "initial_source_files": initial_files,
+            "existing_ssot": existing_ssot,
+            "generation_instructions": self._ssot_skill_instructions(),
+            "read_more": {
+                "tool": "kb_generate_system_ssot",
+                "arguments": {
+                    "action": "read_file",
+                    "job_id": job_id,
+                    "repository_id": repository_id,
+                    "file_path": "<path from source_manifest.files>",
+                },
+            },
+            "finish": (
+                "Generate one evidence-backed SSOT Markdown document. Then call the client-local "
+                "kb_save_and_upload_ssot tool with session_id, service_id, content and finalize."
+            ),
+        }
+
+    def _ssot_read_file(
+        self,
+        job_id: str,
+        repository_id: str,
+        file_path: str,
+        *,
+        offset: int,
+        max_chars: int,
+    ) -> dict[str, Any]:
+        job = self._ssot_session_job(job_id)
+        selected = set((job.result or {}).get("repository_ids", []))
+        if repository_id not in selected:
+            raise PermissionError("Repository is not part of this SSOT session")
+        if offset < 0:
+            raise ValueError("offset must be zero or greater")
+        if not 1_000 <= max_chars <= 100_000:
+            raise ValueError("max_chars must be between 1000 and 100000")
+        repository = self._repository(repository_id)
+        payload = self._read_checkout_file(
+            Path(repository.checkout_path).resolve(),
+            file_path,
+            offset,
+            max_chars,
+        )
+        return {
+            "status": "file_ready",
+            "session_id": job_id,
+            "repository_id": repository_id,
+            **payload,
+        }
+
+    def _submit_client_ssot(
+        self,
+        job_id: str,
+        service_id: str,
+        content: str,
+        *,
+        finalize: bool,
+    ) -> dict[str, Any]:
+        job = self._ssot_session_job(job_id)
+        result = job.result or {}
+        target = next(
+            (item for item in result.get("targets", []) if item.get("id") == service_id),
+            None,
+        )
+        if not isinstance(target, dict):
+            raise KeyError(f"SSOT target is not part of session {job_id}: {service_id}")
+        clean_content = content.strip()
+        if len(clean_content) < 100:
+            raise ValueError("SSOT document must contain at least 100 characters")
+        if len(clean_content.encode("utf-8")) > self.settings.admin_max_upload_bytes:
+            raise ValueError("SSOT document exceeds the configured upload limit")
+        index_id = str(result["index_id"])
+        repository = self._repository(str(target["repository_id"]))
+        document = self._client_ssot_document(clean_content, target, repository)
+        knowledge_root = Path(self._record(index_id).knowledge_dir).resolve()
+        destination = (knowledge_root / "ssot" / "generated" / f"{_slug(service_id)}.md").resolve()
+        if not destination.is_relative_to(knowledge_root):
+            raise ValueError("Invalid generated SSOT destination")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(".md.tmp")
+        temporary.write_text(document, encoding="utf-8")
+        os.replace(temporary, destination)
+
+        submitted = set(str(item) for item in result.get("submitted_service_ids", []))
+        submitted.add(service_id)
+        files = set(str(item) for item in result.get("files", []))
+        files.add(destination.relative_to(knowledge_root).as_posix())
+        updated_result = {
+            **result,
+            "submitted_service_ids": sorted(submitted),
+            "files": sorted(files),
+        }
+        self._update_job(job_id, result=updated_result)
+        index_job = self.start_index_build(index_id) if finalize else None
+        return {
+            "status": "indexing" if index_job is not None else "saved",
+            "session_id": job_id,
+            "service_id": service_id,
+            "index_id": index_id,
+            "server_path": str(destination),
+            "submitted_count": len(submitted),
+            "target_count": int(result["target_count"]),
+            "remaining_service_ids": sorted(
+                str(item["id"])
+                for item in result.get("targets", [])
+                if str(item["id"]) not in submitted
+            ),
+            "index_job": index_job.model_dump(mode="json") if index_job is not None else None,
+            "next": (
+                "Poll the returned index_job with the dashboard jobs API."
+                if index_job is not None
+                else "Generate and submit the next target; use finalize=true on the last one."
+            ),
+        }
+
+    def _ssot_source_manifest(self, checkout: Path, *, module_path: str) -> dict[str, Any]:
+        files: list[dict[str, Any]] = []
+        truncated = False
+        module = (checkout / module_path).resolve()
+        if not module.is_relative_to(checkout) or not module.is_dir():
+            module = checkout
+        for current, directories, names in os.walk(checkout, followlinks=False):
+            root = Path(current)
+            directories[:] = [
+                name
+                for name in directories
+                if name not in _SSOT_IGNORED_DIRECTORIES
+                and not name.startswith(".")
+                and not (root / name).is_symlink()
+            ]
+            for name in sorted(names):
+                path = root / name
+                if name.startswith(".") or path.is_symlink() or not path.is_file():
+                    continue
+                relative = path.relative_to(checkout).as_posix()
+                files.append(
+                    {
+                        "path": relative,
+                        "size_bytes": path.stat().st_size,
+                        "readable": (
+                            path.suffix.lower() in _SSOT_READABLE_SUFFIXES
+                            or name.lower() in _SSOT_READABLE_NAMES
+                        ),
+                        "in_service_module": path.resolve().is_relative_to(module),
+                    }
+                )
+                if len(files) >= self.settings.repository_max_files:
+                    truncated = True
+                    break
+            if truncated:
+                break
+        return {
+            "repository_root": checkout.name,
+            "module_path": module.relative_to(checkout).as_posix() or ".",
+            "file_count": len(files),
+            "truncated": truncated,
+            "files": files,
+        }
+
+    @staticmethod
+    def _read_checkout_file(
+        checkout: Path,
+        file_path: str,
+        offset: int,
+        max_chars: int,
+    ) -> dict[str, Any]:
+        normalized = file_path.strip().replace("\\", "/")
+        relative = Path(normalized)
+        if not normalized or relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("file_path must be a safe repository-relative path")
+        path = (checkout / relative).resolve()
+        if not path.is_relative_to(checkout) or path.is_symlink() or not path.is_file():
+            raise KeyError(f"Unknown repository file: {file_path}")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(f"Repository file is not UTF-8 text: {file_path}") from None
+        content = text[offset : offset + max_chars]
+        return {
+            "path": relative.as_posix(),
+            "offset": offset,
+            "next_offset": offset + len(content),
+            "total_chars": len(text),
+            "has_more": offset + len(content) < len(text),
+            "content": content,
+        }
+
+    def _ssot_skill_instructions(self) -> str:
+        parts = [
+            "Generate concise SSOT Markdown from static analysis and requested source files. "
+            "Describe observed APIs, events, jobs, outbound calls and functionality. Never invent "
+            "missing facts; label inference and unknowns and preserve file/evidence references."
+        ]
+        for relative in (
+            Path("SKILL.md"),
+            Path("references/analysis-contract.md"),
+            Path("assets/ssot-template.md"),
+        ):
+            path = self.settings.ssot_skill_path / relative
+            if path.is_file():
+                parts.append(path.read_text(encoding="utf-8")[:20_000])
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _ssot_source_priority(path: str) -> int:
+        name = Path(path).name.lower()
+        markers = (
+            "controller",
+            "endpoint",
+            "api",
+            "service",
+            "handler",
+            "listener",
+            "client",
+            "application",
+        )
+        return next((position for position, marker in enumerate(markers) if marker in name), 20)
+
+    @staticmethod
+    def _client_ssot_document(
+        content: str,
+        target: dict[str, Any],
+        repository: RepositorySource,
+    ) -> str:
+        if content.startswith("---"):
+            return content.rstrip() + "\n"
+        frontmatter = {
+            "document_type": "ssot",
+            "service": target["id"],
+            "repository": repository.name,
+            "module": target["module_path"],
+            "status": "current",
+            "review_status": "draft",
+            "authority": "client-agent-source-analysis",
+            "source_type": "generated",
+            "generated_by": "kb_generate_system_ssot/client-agent",
+            "commit": repository.commit or "unknown",
+            "generated_at": _now().isoformat(),
+        }
+        yaml = "\n".join(
+            f"{key}: {json.dumps(value, ensure_ascii=False)}"
+            for key, value in frontmatter.items()
+        )
+        return f"---\n{yaml}\n---\n\n{content.rstrip()}\n"
 
     def create_ssot_bundle(self, service_id: str) -> dict[str, str]:
         self._service_context(service_id)
@@ -998,7 +1520,9 @@ class RagCatalog:
         self,
         job_id: str,
         index_id: str,
+        repository_ids: tuple[str, ...],
         service_ids: tuple[str, ...],
+        all_services: bool,
         refresh_analysis: bool,
     ) -> None:
         cancel_event = self._cancel_event(job_id)
@@ -1008,7 +1532,9 @@ class RagCatalog:
                 self._execute_system_ssot_generation_job(
                     job_id,
                     index_id,
+                    repository_ids,
                     service_ids,
+                    all_services,
                     refresh_analysis,
                     cancel_event,
                 )
@@ -1018,9 +1544,9 @@ class RagCatalog:
             RepositoryOperationCancelled,
             ServiceMapBuildCancelled,
         ):
-            self._finish_cancelled_job(job_id, index_id)
+            self._finish_cancelled_job(job_id, None)
         except Exception as exc:
-            self._fail_background_job(job_id, index_id, "System SSOT generation failed", exc)
+            self._fail_background_job(job_id, None, "SSOT source preparation failed", exc)
         finally:
             self._release_cancel_event(job_id)
 
@@ -1028,7 +1554,9 @@ class RagCatalog:
         self,
         job_id: str,
         index_id: str,
+        repository_ids: tuple[str, ...],
         service_ids: tuple[str, ...],
+        all_services: bool,
         refresh_analysis: bool,
         cancel_event: threading.Event,
     ) -> None:
@@ -1036,183 +1564,136 @@ class RagCatalog:
             job_id,
             status="running",
             message=(
-                "Refreshing source analysis before SSOT generation"
+                "Refreshing source analysis for the calling client"
                 if refresh_analysis
-                else "Loading the latest source analysis"
+                else "Loading the latest source analysis for the calling client"
             ),
             started_at=_now(),
         )
         if refresh_analysis:
-            graph = self._build_graph(
+            forced_service_ids = set(service_ids)
+            if not all_services and repository_ids:
+                current_map = self._service_map_store.load()
+                selected_repository_ids = set(repository_ids)
+                for service in current_map.services:
+                    try:
+                        _mapped, repository = self._service_context(service.id)
+                    except KeyError:
+                        continue
+                    if repository.id in selected_repository_ids:
+                        forced_service_ids.add(service.id)
+            self._build_graph(
                 cancel_event=cancel_event,
                 job_id=job_id,
-                force_all=True,
+                force_service_ids=forced_service_ids or None,
+                force_all=all_services,
             )
-        else:
-            graph = self._graph_store.load()
         self._raise_if_cancelled(cancel_event)
         service_map = self._service_map_store.load()
-        selected_ids = set(service_ids)
-        services = [
-            service
-            for service in service_map.services
-            if not selected_ids or service.id in selected_ids
-        ]
-        if selected_ids:
-            missing = selected_ids - {service.id for service in services}
-            if missing:
-                raise KeyError(f"Unknown services after analysis: {', '.join(sorted(missing))}")
-        if not services:
-            raise RuntimeError("Source analysis did not discover any services to document")
-
         index = self._record(index_id)
-        knowledge_root = Path(index.knowledge_dir).resolve()
-        knowledge_root.mkdir(parents=True, exist_ok=True)
-        destination_root = (knowledge_root / "ssot" / "generated").resolve()
-        if not destination_root.is_relative_to(knowledge_root):
-            raise RuntimeError("Invalid SSOT output directory")
-        self._update_job(
-            job_id,
-            message=(
-                f"Generating SSOT with {self._ssot_generator.model_name}: "
-                f"services={len(services)}; workers={self.settings.ssot_generation_workers}"
-            ),
-        )
+        with self._lock:
+            repositories = [item.model_copy(deep=True) for item in self._state.repositories]
+        repository_by_id = {item.id: item for item in repositories}
+        selected_repository_ids = set(repository_ids)
+        selected_service_ids = set(service_ids)
+        if all_services:
+            selected_repository_ids = set(repository_by_id)
 
-        def generate_one(service: ServiceRecord) -> GeneratedSsot:
+        targets: list[dict[str, Any]] = []
+        seen_repository_ids: set[str] = set()
+        found_service_ids: set[str] = set()
+        services_by_repository: dict[str, int] = {}
+        for service in service_map.services:
             self._raise_if_cancelled(cancel_event)
-            _mapped, repository = self._service_context(service.id)
-            payload = AnalysisArchive._service_payload(service_map, graph, service.id)
-            target = destination_root / f"{_slug(service.id)}.md"
-            self._append_job_log(
-                job_id,
-                f"SSOT started: service={service.id}; module={service.module_path}; "
-                f"checkout={repository.checkout_path}",
-            )
-            existing = None
-            if target.is_file():
-                try:
-                    existing = target.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError):
-                    existing = None
             try:
-                return self._ssot_generator.generate(
-                    payload,
-                    checkout=Path(repository.checkout_path),
-                    existing_ssot=existing,
-                    cancel=cancel_event,
-                )
-            except Exception as exc:
-                self._raise_if_cancelled(cancel_event)
-                return self._ssot_generator.fallback(
-                    payload,
-                    checkout=Path(repository.checkout_path),
-                    error=str(exc) or type(exc).__name__,
-                    cancel=cancel_event,
-                )
+                _mapped, repository = self._service_context(service.id)
+            except KeyError:
+                continue
+            selected = (
+                all_services
+                or service.id in selected_service_ids
+                or repository.id in selected_repository_ids
+            )
+            if not selected:
+                continue
+            found_service_ids.add(service.id)
+            seen_repository_ids.add(repository.id)
+            services_by_repository[repository.id] = services_by_repository.get(repository.id, 0) + 1
+            targets.append(
+                {
+                    "id": service.id,
+                    "kind": "service",
+                    "name": service.name,
+                    "service_id": service.id,
+                    "repository_id": repository.id,
+                    "repository_name": repository.name,
+                    "module_path": service.module_path,
+                    "module_state": service.module_state,
+                    "context_call": {
+                        "action": "context",
+                        "job_id": job_id,
+                        "service_id": service.id,
+                    },
+                }
+            )
+        missing_services = selected_service_ids - found_service_ids
+        if missing_services:
+            raise KeyError(
+                f"Unknown services after analysis: {', '.join(sorted(missing_services))}"
+            )
 
-        results: list[GeneratedSsot] = []
-        futures: dict[Future[GeneratedSsot], ServiceRecord] = {}
-        executor = ThreadPoolExecutor(
-            max_workers=self.settings.ssot_generation_workers,
-            thread_name_prefix="ssot-generation",
-        )
-        try:
-            for service in services:
-                futures[executor.submit(generate_one, service)] = service
-            pending = set(futures)
-            position = 0
-            wait_started = time.monotonic()
-            next_heartbeat = wait_started + 5
-            while pending:
-                self._raise_if_cancelled(cancel_event)
-                done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
-                for future in done:
-                    position += 1
-                    service = futures[future]
-                    result = future.result()
-                    results.append(result)
-                    mode = "llm" if result.used_llm else "source-fallback"
-                    self._append_job_log(
-                        job_id,
-                        f"SSOT [{position}/{len(services)}] ready: service={service.id}; "
-                        f"mode={mode}; source_files={len(result.source_files)}"
-                        + (f"; llm_error={result.error}" if result.error else ""),
-                    )
-                now = time.monotonic()
-                if pending and now >= next_heartbeat:
-                    elapsed = int(now - wait_started)
-                    heartbeat = (
-                        f"Waiting for SSOT workers: ready={position}/{len(services)}; "
-                        f"pending={len(pending)}; elapsed={elapsed}s"
-                    )
-                    self._update_job(job_id, message=heartbeat)
-                    next_heartbeat = now + 5
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+        for repository_id in sorted(selected_repository_ids):
+            repository = repository_by_id[repository_id]
+            seen_repository_ids.add(repository.id)
+            if services_by_repository.get(repository.id, 0):
+                continue
+            target_id = f"repository-{repository.id}"
+            targets.append(
+                {
+                    "id": target_id,
+                    "kind": "repository",
+                    "name": repository.name,
+                    "service_id": target_id,
+                    "repository_id": repository.id,
+                    "repository_name": repository.name,
+                    "module_path": ".",
+                    "module_state": "unfinished-or-undetected",
+                    "context_call": {
+                        "action": "context",
+                        "job_id": job_id,
+                        "service_id": target_id,
+                    },
+                }
+            )
+        if not targets:
+            raise RuntimeError(
+                "No SSOT targets were selected; choose cloned repositories or discovered services"
+            )
 
-        self._raise_if_cancelled(cancel_event)
-        temporary = Path(tempfile.mkdtemp(prefix=".ssot-generation-", dir=knowledge_root))
-        published: list[str] = []
-        try:
-            for result in sorted(results, key=lambda item: item.service_id):
-                filename = f"{_slug(result.service_id)}.md"
-                (temporary / filename).write_text(result.content, encoding="utf-8")
-            destination_root.mkdir(parents=True, exist_ok=True)
-            for path in sorted(temporary.glob("*.md")):
-                self._raise_if_cancelled(cancel_event)
-                target = destination_root / path.name
-                os.replace(path, target)
-                published.append(target.relative_to(knowledge_root).as_posix())
-            if not selected_ids:
-                expected = {Path(path).name for path in published}
-                for stale in destination_root.glob("*.md"):
-                    if stale.name not in expected:
-                        stale.unlink()
-                        self._append_job_log(
-                            job_id,
-                            f"Removed stale generated SSOT: {stale.name}",
-                        )
-        finally:
-            shutil.rmtree(temporary, ignore_errors=True)
-
-        self._update_job(
-            job_id,
-            message=f"Building selected RAG index from {len(published)} generated SSOT files",
-        )
-        self._update_index(index_id, status="indexing", error=None)
-        IndexBuildProcessRunner(
-            self.service_for(index_id).settings,
-            timeout_seconds=self.settings.index_build_timeout_seconds,
-        ).build(cancel=cancel_event)
-        stats = self.service_for(index_id).reload_cached_index()
-        self._update_index(
-            index_id,
-            status="ready",
-            document_count=stats.document_count,
-            chunk_count=stats.chunk_count,
-            updated_at=_now(),
-            error=None,
-        )
-        llm_count = sum(result.used_llm for result in results)
-        fallback_count = len(results) - llm_count
-        result_payload = {
+        targets.sort(key=lambda item: str(item["id"]))
+        result_payload: dict[str, Any] = {
+            "phase": "awaiting_client_generation",
+            "session_id": job_id,
             "index_id": index_id,
             "index_name": index.name,
-            "service_count": len(results),
-            "llm_generated_count": llm_count,
-            "fallback_count": fallback_count,
-            "model": self._ssot_generator.model_name,
-            "files": published,
-            "document_count": stats.document_count,
-            "chunk_count": stats.chunk_count,
+            "repository_ids": sorted(seen_repository_ids),
+            "target_count": len(targets),
+            "targets": targets,
+            "submitted_service_ids": [],
+            "server_llm_used": False,
+            "next": (
+                "For each targets[] item call action='context'. Review analysis and file manifest, "
+                "then call action='read_file' for any source needed. Generate Markdown with the "
+                "calling client's model. Use the local kb_save_and_upload_ssot tool so the file "
+                "is written under the client temp directory before action='submit' uploads it."
+            ),
         }
         self._update_job(
             job_id,
             status="completed",
             message=(
-                f"Generated {len(results)} service SSOTs and rebuilt index {index.name} "
-                f"(llm={llm_count}, fallback={fallback_count})"
+                f"Prepared source context for {len(targets)} SSOT targets; waiting for the "
+                "calling client's model"
             ),
             completed_at=_now(),
             result=result_payload,

@@ -12,7 +12,6 @@ from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
 from corporate_kb.index_runner import IndexBuildCancelled, IndexBuildProcessRunner
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeService
-from corporate_kb.ssot import ServiceSsotGenerator
 from corporate_kb.usage import UsageTracker
 from service_map import ServiceMapBuildCancelled, ServiceMapProcessRunner
 
@@ -290,28 +289,10 @@ def test_failed_repository_import_remains_visible_and_retryable(
     assert refreshed["document_count"] == 0
 
 
-def test_system_ssot_job_generates_local_files_and_rebuilds_selected_index(
+def test_system_ssot_session_serves_sources_and_accepts_client_generated_documents(
     settings_factory,
     tmp_path,
 ) -> None:
-    class FakeSsotClient:
-        model_name = "test-neural-model"
-
-        def __init__(self) -> None:
-            self.prompts: list[str] = []
-
-        def generate(self, *, system_prompt, user_prompt, cancel=None):
-            assert "Never invent unsupported facts" in system_prompt
-            assert cancel is not None
-            self.prompts.append(user_prompt)
-            if "fallback-lifecycle-service" in user_prompt:
-                raise RuntimeError("test model rejected fallback service")
-            return (
-                "# Generated lifecycle service\n\n"
-                "## Functionality\n\n"
-                "Neural SSOT says this service exposes the observed lifecycle status API.\n"
-            )
-
     settings = settings_factory()
     settings.knowledge_dir.mkdir(parents=True)
     default_service = KnowledgeService(
@@ -320,14 +301,11 @@ def test_system_ssot_job_generates_local_files_and_rebuilds_selected_index(
     )
     default_service.build_index(force=True)
     usage = UsageTracker()
-    fake_client = FakeSsotClient()
-    generator = ServiceSsotGenerator(settings, client=fake_client)
     catalog = RagCatalog(
         settings,
         default_service,
         KnowledgeTools(default_service, usage=usage),
         usage,
-        ssot_generator=generator,
     )
     index = catalog.create_index(name="Generated system SSOT")
     manual_ssot = Path(index.knowledge_dir) / "ssot" / "primary-lifecycle-service.md"
@@ -391,42 +369,149 @@ public class FallbackController {
 
     options = catalog.ssot_generation_request()
     assert options["status"] == "selection_required"
-    assert options["generator"]["configured"] is True
+    assert options["workflow"]["server_llm_required"] is False
     assert index.id in {item["id"] for item in options["indexes"]}
+    assert imported.target_id in {item["id"] for item in options["repositories"]}
 
-    queued = catalog.ssot_generation_request(index_id=index.id)
+    queued = catalog.ssot_generation_request(
+        action="prepare",
+        index_id=index.id,
+        repository_ids=[str(imported.target_id)],
+    )
     job_id = queued["job"]["id"]
     completed = _wait_for_job(catalog, job_id)
 
     assert completed["status"] == "completed"
-    assert completed["result"]["llm_generated_count"] == 1
-    assert completed["result"]["fallback_count"] == 1
+    assert completed["result"]["phase"] == "awaiting_client_generation"
+    assert completed["result"]["server_llm_used"] is False
+    assert completed["result"]["target_count"] == 2
+
+    context = catalog.ssot_generation_request(
+        action="context",
+        job_id=job_id,
+        service_id="primary-lifecycle-service",
+    )
+    assert context["status"] == "context_ready"
+    controller = next(
+        item
+        for item in context["source_manifest"]["files"]
+        if item["path"].endswith("LifecycleController.java")
+    )
+    source = catalog.ssot_generation_request(
+        action="read_file",
+        job_id=job_id,
+        repository_id=str(imported.target_id),
+        file_path=controller["path"],
+    )
+    assert '@GetMapping("/lifecycle/status")' in source["content"]
+
+    primary_body = (
+        "# Generated lifecycle service\n\n"
+        "## Functionality\n\n"
+        "The client-side model observed the lifecycle status API in "
+        "LifecycleController.java and records its behavior with source evidence.\n"
+    )
+    first = catalog.ssot_generation_request(
+        action="submit",
+        job_id=job_id,
+        service_id="primary-lifecycle-service",
+        content=primary_body,
+        finalize=False,
+    )
+    assert first["status"] == "saved"
+    second = catalog.ssot_generation_request(
+        action="submit",
+        job_id=job_id,
+        service_id="fallback-lifecycle-service",
+        content=(
+            "# Generated fallback lifecycle service\n\n"
+            "## Functionality\n\n"
+            "The client-side model observed the fallback retry API in "
+            "FallbackController.java and records the remaining behavior as unknown.\n"
+        ),
+        finalize=True,
+    )
+    assert second["status"] == "indexing"
+    assert _wait_for_job(catalog, second["index_job"]["id"])["status"] == "completed"
+
     generated_path = Path(index.knowledge_dir) / "ssot/generated/primary-lifecycle-service.md"
     content = generated_path.read_text(encoding="utf-8")
     assert generated_path.name == "primary-lifecycle-service.md"
     assert 'document_type: "ssot"' in content
     assert 'service: "primary-lifecycle-service"' in content
-    assert 'model: "test-neural-model"' in content
-    assert "Neural SSOT says" in content
+    assert 'generated_by: "kb_generate_system_ssot/client-agent"' in content
+    assert "client-side model observed" in content
     fallback_path = Path(index.knowledge_dir) / "ssot/generated/fallback-lifecycle-service.md"
-    assert 'model: "source-analysis-fallback"' in fallback_path.read_text(encoding="utf-8")
-    assert "test model rejected fallback service" not in fallback_path.read_text(encoding="utf-8")
+    assert "client-side model observed" in fallback_path.read_text(encoding="utf-8")
     assert "Human-reviewed SSOT" in manual_ssot.read_text(encoding="utf-8")
-    assert fake_client.prompts
-    assert any("LifecycleController.java" in prompt for prompt in fake_client.prompts)
 
-    search = catalog.tools_for(index.id).search(query="Neural SSOT lifecycle", top_k=3)
+    search = catalog.tools_for(index.id).search(query="client-side lifecycle API", top_k=3)
     assert any(
         item["source_path"] == "ssot/generated/primary-lifecycle-service.md"
         for item in search["results"]
     )
-    polled = catalog.ssot_generation_request(job_id=job_id)
+    polled = catalog.ssot_generation_request(action="status", job_id=job_id)
     assert polled["status"] == "completed"
     assert polled["job"]["result"]["files"] == [
         "ssot/generated/fallback-lifecycle-service.md",
         "ssot/generated/primary-lifecycle-service.md",
     ]
-    assert "llm_error=test model rejected fallback service" in polled["log_tail"]
+
+
+def test_ssot_workflow_clones_and_handles_an_unfinished_repository(
+    settings_factory,
+    tmp_path,
+) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    index = catalog.create_index(name="Unfinished sources")
+    repository = tmp_path / "unfinished-repository"
+    repository.mkdir()
+    _write(repository / "README.md", "# Started but not implemented\n")
+
+    cloned = catalog.ssot_generation_request(
+        action="clone",
+        index_id=index.id,
+        repository_name="Unfinished repository",
+        git_url=str(repository),
+    )
+    clone_job = _wait_for_job(catalog, cloned["job"]["id"])
+    assert clone_job["status"] == "completed"
+    repository_id = clone_job["target_id"]
+
+    prepared = catalog.ssot_generation_request(
+        action="prepare",
+        index_id=index.id,
+        repository_ids=[repository_id],
+        refresh_analysis=False,
+    )
+    session = _wait_for_job(catalog, prepared["job"]["id"])
+    assert session["status"] == "completed"
+    assert session["result"]["target_count"] == 1
+    target = session["result"]["targets"][0]
+    assert target["kind"] in {"repository", "service"}
+    assert target["module_state"] != "complete"
+
+    context = catalog.ssot_generation_request(
+        action="context",
+        job_id=session["id"],
+        service_id=target["id"],
+    )
+    assert context["source_manifest"]["file_count"] == 1
+    assert context["initial_source_files"][0]["path"] == "README.md"
+    assert "Started but not implemented" in context["initial_source_files"][0]["content"]
 
 
 def test_catalog_indexes_all_module_openspec_roots(settings_factory, tmp_path) -> None:

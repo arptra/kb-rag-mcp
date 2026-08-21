@@ -716,10 +716,23 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 raise ValueError("Request body must be a JSON object")
             payload = await asyncio.to_thread(
                 catalog.ssot_generation_request,
+                action=_optional_body_string(body, "action") or "options",
                 index_id=_optional_body_string(body, "index_id"),
+                repository_ids=_optional_body_string_list(body, "repository_ids"),
                 service_ids=_optional_body_string_list(body, "service_ids"),
+                all_services=_body_boolean(body, "all_services", False),
                 refresh_analysis=_body_boolean(body, "refresh_analysis", True),
                 job_id=_optional_body_string(body, "job_id"),
+                repository_name=_optional_body_string(body, "repository_name"),
+                git_url=_optional_body_string(body, "git_url"),
+                ref=_optional_body_string(body, "ref"),
+                service_id=_optional_body_string(body, "service_id"),
+                repository_id=_optional_body_string(body, "repository_id"),
+                file_path=_optional_body_string(body, "file_path"),
+                offset=_body_integer(body, "offset", 0, minimum=0, maximum=100_000_000),
+                max_chars=_body_integer(body, "max_chars", 20_000, minimum=1_000, maximum=100_000),
+                content=_optional_body_string(body, "content"),
+                finalize=_body_boolean(body, "finalize", True),
             )
             status_code = 202 if payload["status"] == "queued" else 200
             return JSONResponse(payload, status_code=status_code)
@@ -1038,10 +1051,23 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 raise ValueError("Request body must be a JSON object")
             payload = await asyncio.to_thread(
                 catalog.ssot_generation_request,
+                action=_optional_body_string(body, "action") or "options",
                 index_id=_optional_body_string(body, "index_id"),
+                repository_ids=_optional_body_string_list(body, "repository_ids"),
                 service_ids=_optional_body_string_list(body, "service_ids"),
+                all_services=_body_boolean(body, "all_services", False),
                 refresh_analysis=_body_boolean(body, "refresh_analysis", True),
                 job_id=_optional_body_string(body, "job_id"),
+                repository_name=_optional_body_string(body, "repository_name"),
+                git_url=_optional_body_string(body, "git_url"),
+                ref=_optional_body_string(body, "ref"),
+                service_id=_optional_body_string(body, "service_id"),
+                repository_id=_optional_body_string(body, "repository_id"),
+                file_path=_optional_body_string(body, "file_path"),
+                offset=_body_integer(body, "offset", 0, minimum=0, maximum=100_000_000),
+                max_chars=_body_integer(body, "max_chars", 20_000, minimum=1_000, maximum=100_000),
+                content=_optional_body_string(body, "content"),
+                finalize=_body_boolean(body, "finalize", True),
             )
             status_code = 202 if payload["status"] == "queued" else 200
             return JSONResponse(payload, status_code=status_code)

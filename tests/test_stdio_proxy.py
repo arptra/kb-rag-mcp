@@ -93,3 +93,68 @@ async def test_stdio_proxy_mirrors_future_tools_without_hardcoding() -> None:
         result = await client.call_tool("kb_future_tool", {"value": "fresh", "count": 3})
         assert result.is_error is False
         assert result.data == {"value": "fresh", "count": 3, "source": "upstream"}
+
+
+@pytest.mark.asyncio
+async def test_stdio_proxy_saves_client_ssot_to_temp_before_upload(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_proxy_module()
+    upstream = FastMCP("ssot-upstream")
+    calls: list[dict[str, object]] = []
+
+    @upstream.tool(name="kb_generate_system_ssot")
+    def generate_system_ssot(
+        action: str,
+        job_id: str,
+        service_id: str,
+        content: str,
+        finalize: bool,
+    ) -> dict[str, object]:
+        payload = {
+            "action": action,
+            "job_id": job_id,
+            "service_id": service_id,
+            "content": content,
+            "finalize": finalize,
+        }
+        calls.append(payload)
+        return {"status": "indexing", "service_id": service_id}
+
+    monkeypatch.setenv("CORPORATE_KB_SSOT_TEMP_DIR", str(tmp_path))
+    proxy = module.create_stdio_server(
+        upstream,
+        upload_client_factory=lambda: Client(upstream),
+    )
+    content = (
+        "# Local lifecycle SSOT\n\n"
+        "The client model generated this source-backed document and keeps a local temp copy "
+        "before uploading it to the selected remote index.\n"
+    )
+    async with Client(proxy) as client:
+        listed = {tool.name for tool in await client.list_tools()}
+        assert "kb_save_and_upload_ssot" in listed
+        result = await client.call_tool(
+            "kb_save_and_upload_ssot",
+            {
+                "session_id": "session-123",
+                "service_id": "lifecycle-service",
+                "content": content,
+                "finalize": True,
+            },
+        )
+
+    assert result.is_error is False
+    local_path = tmp_path / "session-123" / "lifecycle-service.md"
+    assert local_path.read_text(encoding="utf-8") == content
+    assert calls == [
+        {
+            "action": "submit",
+            "job_id": "session-123",
+            "service_id": "lifecycle-service",
+            "content": content,
+            "finalize": True,
+        }
+    ]
+    assert result.data["local_path"] == str(local_path)

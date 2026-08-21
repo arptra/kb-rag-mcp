@@ -9,6 +9,7 @@
 Qwen Code
     ↓ stdio
 локальный corporate_kb_stdio_proxy.py
+    ├── временные SSOT-файлы на клиенте
     ↓ Streamable HTTP MCP
 общий RAG endpoint /mcp
     ↓
@@ -16,7 +17,9 @@ Qwen Code
 ```
 
 Qwen сам запускает локальный MCP-процесс. Отдельно запускать его перед каждым сеансом не нужно.
-На клиент не копируются документы, индекс, embeddings или исходный код серверной части.
+На клиент не копируются индекс и embeddings. При генерации SSOT сервер отдаёт вызывающей модели
+только выбранный source analysis и запрошенные ею файлы; готовый Markdown остаётся во временном
+каталоге клиента и одновременно загружается в выбранный RAG-индекс.
 
 ## Что должен выдать администратор
 
@@ -155,7 +158,8 @@ qwen mcp remove corporate-kb
       "env": {
         "CORPORATE_KB_MCP_URL": "http://SERVER_IP:8000/mcp",
         "CORPORATE_KB_MCP_TOKEN": "",
-        "CORPORATE_KB_MCP_TIMEOUT": "120"
+        "CORPORATE_KB_MCP_TIMEOUT": "120",
+        "CORPORATE_KB_SSOT_TEMP_DIR": "/ABSOLUTE/PATH/corporate-kb-ssot"
       },
       "timeout": 120000,
       "trust": false
@@ -179,7 +183,8 @@ qwen mcp remove corporate-kb
       "env": {
         "CORPORATE_KB_MCP_URL": "http://SERVER_IP:8000/mcp",
         "CORPORATE_KB_MCP_TOKEN": "",
-        "CORPORATE_KB_MCP_TIMEOUT": "120"
+        "CORPORATE_KB_MCP_TIMEOUT": "120",
+        "CORPORATE_KB_SSOT_TEMP_DIR": "C:/ABSOLUTE/PATH/corporate-kb-ssot"
       },
       "timeout": 120000,
       "trust": false
@@ -192,6 +197,8 @@ qwen mcp remove corporate-kb
 
 `CORPORATE_KB_MCP_URL` должен указывать на общий сервер, а не на компьютер сотрудника. `localhost`
 подходит только если сервер запущен на той же машине или к нему настроен SSH/VPN tunnel.
+`CORPORATE_KB_SSOT_TEMP_DIR` необязателен: без него proxy использует системный temp-каталог
+`corporate-kb-ssot/<session-id>/<service-id>.md`.
 
 ## Проверить доступ к удалённой базе
 
@@ -234,6 +241,7 @@ qwen
 ```text
 kb_feature_context
 kb_generate_system_ssot
+kb_save_and_upload_ssot
 kb_search
 kb_get_document
 kb_get_chunk
@@ -251,6 +259,25 @@ ssot_context
 
 `kb_search` возвращает короткие выдержки, а не полные страницы Confluence. Если Qwen нужен текст
 конкретного результата, он сам вызывает `kb_get_chunk` с `chunk_id` — это сохраняет контекст диалога.
+
+### Создать SSOT клиентской нейронкой
+
+Попросите Qwen/GigaCode: «Создай SSOT для выбранного сервиса через corporate-kb и загрузи его в
+индекс». Модель должна выполнить protocol, который возвращает сам tool:
+
+1. вызвать `kb_generate_system_ssot` с `action=options` и показать доступные индексы и repositories;
+2. если repository отсутствует — запросить Git URL и вызвать `action=clone`, затем опрашивать
+   `action=status`;
+3. после выбора repository/service вызвать `action=prepare` и дождаться статуса `completed`;
+4. для каждого target вызвать `action=context`, изучить analysis и manifest, а недостающие файлы
+   получать через `action=read_file`;
+5. самостоятельно создать evidence-backed Markdown и вызвать локальный
+   `kb_save_and_upload_ssot`; для нескольких targets передавать `finalize=false`, а для последнего
+   `finalize=true`.
+
+Никакой URL нейронки на RAG-сервере не задаётся. `kb_save_and_upload_ssot` сначала атомарно пишет
+файл в `CORPORATE_KB_SSOT_TEMP_DIR` (или системный temp), и лишь затем отправляет тот же Markdown в
+server session. Если upload завершится ошибкой, локальная копия не удаляется.
 
 `kb_run_context_benchmark` — отдельный административный прогон. При его вызове Qwen должен сначала
 спросить отдельный benchmark-пароль. Не сохраняйте этот пароль в Qwen settings и не используйте
@@ -329,6 +356,7 @@ CORPORATE_KB_MCP_URL=http://SERVER_IP:8000/mcp \
 ## Обновление и удаление
 
 При появлении новых server tools обновление файла не требуется — достаточно перезапустить Qwen.
-Сам `corporate_kb_stdio_proxy.py` заменяйте только при выпуске новой версии proxy transport.
+Сам `corporate_kb_stdio_proxy.py` нужно заменить, если обновилась proxy-версия или добавился
+client-local tool (как `kb_save_and_upload_ssot`), затем полностью перезапустить Qwen.
 
 Для удаления удалите объект `corporate-kb` из `mcpServers`, затем каталог клиента вместе с `venv`.

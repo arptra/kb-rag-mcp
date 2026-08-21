@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthProvider
@@ -37,12 +37,13 @@ owned by each affected repository. Use this before cross-service implementation 
 callers, callees, API/event operations, statically linked invocation triggers, exact source
 evidence, and compact RAG excerpts grouped by service. Supply start_service when known; otherwise
 the tool discovers likely roots. LOW/UNRESOLVED facts and runtime order must be verified."""
-GENERATE_SSOT_DESCRIPTION = """Generate minimal source-backed SSOT documents for all discovered
-services and load them into a selected RAG index. Call without index_id first to list available
-indexes and LLM readiness. With index_id, the server queues a fresh source analysis, bounded
-OpenAI-compatible LLM generation, local ssot/generated/<service-id>.md publication, and index
-rebuild. Poll the same tool with job_id. This tool writes local files and updates the selected
-index."""
+GENERATE_SSOT_DESCRIPTION = """Coordinate source-backed SSOT generation with the model calling this
+MCP tool. The server never calls an LLM. Use action='options' to list indexes, cloned repositories
+and services; action='clone' for a missing Git repository; action='prepare' to scan selected
+repository_ids/service_ids or all_services; action='status' to poll; action='context' for analysis
+and the file manifest; action='read_file' for more source; and action='submit' to save Markdown and
+rebuild the index. With the distributed stdio proxy, finish through its client-local
+kb_save_and_upload_ssot tool so a temp copy exists on the user's machine."""
 BUILTIN_TOOL_DESCRIPTIONS = {
     "ssot_context": SSOT_DESCRIPTION,
     "kb_feature_context": FEATURE_CONTEXT_DESCRIPTION,
@@ -171,16 +172,50 @@ def create_mcp_server(
             },
         )
         def kb_generate_system_ssot(
+            action: Literal[
+                "options",
+                "clone",
+                "prepare",
+                "status",
+                "context",
+                "read_file",
+                "submit",
+            ] = "options",
             index_id: str | None = None,
+            repository_ids: list[str] | None = None,
             service_ids: list[str] | None = None,
+            all_services: bool = False,
             refresh_analysis: bool = True,
             job_id: str | None = None,
+            repository_name: str | None = None,
+            git_url: str | None = None,
+            ref: str | None = None,
+            service_id: str | None = None,
+            repository_id: str | None = None,
+            file_path: str | None = None,
+            offset: int = 0,
+            max_chars: int = 20_000,
+            content: str | None = None,
+            finalize: bool = True,
         ) -> dict[str, Any]:
             return catalog.ssot_generation_request(
+                action=action,
                 index_id=index_id,
+                repository_ids=repository_ids,
                 service_ids=service_ids,
+                all_services=all_services,
                 refresh_analysis=refresh_analysis,
                 job_id=job_id,
+                repository_name=repository_name,
+                git_url=git_url,
+                ref=ref,
+                service_id=service_id,
+                repository_id=repository_id,
+                file_path=file_path,
+                offset=offset,
+                max_chars=max_chars,
+                content=content,
+                finalize=finalize,
             )
 
     @server.tool(
