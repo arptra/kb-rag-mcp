@@ -11,12 +11,13 @@ export async function api<T>(
   path: string,
   password: string,
   init: RequestInit = {},
+  timeoutMs = 8000,
 ): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
   if (password) headers.set("X-KB-Admin-Password", password);
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 8000);
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   let response: Response;
   try {
     response = await fetch(path, {
@@ -26,7 +27,7 @@ export async function api<T>(
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
-      throw new ApiError("Сервер не ответил за 8 секунд", 504);
+      throw new ApiError(`Сервер не ответил за ${Math.round(timeoutMs / 1000)} секунд`, 504);
     }
     throw error;
   } finally {
@@ -51,8 +52,8 @@ export async function api<T>(
   return payload as T;
 }
 
-export function post<T>(path: string, password: string, body: unknown): Promise<T> {
-  return api<T>(path, password, { method: "POST", body: JSON.stringify(body) });
+export function post<T>(path: string, password: string, body: unknown, timeoutMs?: number): Promise<T> {
+  return api<T>(path, password, { method: "POST", body: JSON.stringify(body) }, timeoutMs);
 }
 
 export async function download(path: string, password: string, filename: string): Promise<void> {

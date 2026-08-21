@@ -95,9 +95,14 @@ class ServiceMapBuilder:
             if progress is not None:
                 progress(
                     f"Layout cache lookup: {item.name}; "
-                    f"path={layout_cache_path.name if layout_cache_path else 'disabled-no-commit'}"
+                    f"commit={item.commit or 'none'}; "
+                    f"path={layout_cache_path if layout_cache_path else 'disabled-no-commit'}"
                 )
-            layout = self._load_layout(layout_cache_path) if layout_cache_path else None
+            layout = self._load_layout(
+                layout_cache_path,
+                repository_name=item.name,
+                progress=progress,
+            )
             if layout is None:
                 if progress is not None:
                     progress(f"Layout cache miss: {item.name}; scanning repository filesystem")
@@ -309,14 +314,76 @@ class ServiceMapBuilder:
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     @staticmethod
-    def _load_layout(path: Path | None) -> RepositoryLayout | None:
-        if path is None or not path.is_file():
+    def _load_layout(
+        path: Path | None,
+        *,
+        repository_name: str,
+        progress: Callable[[str], None] | None = None,
+    ) -> RepositoryLayout | None:
+        if path is None:
+            if progress is not None:
+                progress(
+                    f"Layout cache disabled: {repository_name}; reason=repository-has-no-commit"
+                )
             return None
+        probe_started_at = time.monotonic()
+        if progress is not None:
+            progress(f"Layout cache probe start: {repository_name}; path={path}")
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if payload.get("schema_version") != 1:
+            if not path.is_file():
+                if progress is not None:
+                    progress(
+                        f"Layout cache probe ready: {repository_name}; exists=false; "
+                        f"elapsed={time.monotonic() - probe_started_at:.3f}s"
+                    )
                 return None
-            return RepositoryLayout(
+            if progress is not None:
+                progress(f"Layout cache stat start: {repository_name}; path={path}")
+            stat = path.stat()
+            if progress is not None:
+                progress(
+                    f"Layout cache stat ready: {repository_name}; bytes={stat.st_size}; "
+                    f"mtime_ns={stat.st_mtime_ns}; "
+                    f"elapsed={time.monotonic() - probe_started_at:.3f}s"
+                )
+                progress(
+                    f"Layout cache read start: {repository_name}; bytes={stat.st_size}; path={path}"
+                )
+            read_started_at = time.monotonic()
+            raw = path.read_text(encoding="utf-8")
+            if progress is not None:
+                progress(
+                    f"Layout cache read ready: {repository_name}; chars={len(raw)}; "
+                    f"elapsed={time.monotonic() - read_started_at:.3f}s"
+                )
+                progress(f"Layout cache JSON parse start: {repository_name}; chars={len(raw)}")
+            parse_started_at = time.monotonic()
+            payload = json.loads(raw)
+            if progress is not None:
+                progress(
+                    f"Layout cache JSON parse ready: {repository_name}; "
+                    f"elapsed={time.monotonic() - parse_started_at:.3f}s"
+                )
+            if not isinstance(payload, dict):
+                if progress is not None:
+                    progress(
+                        f"Layout cache rejected: {repository_name}; reason=root-is-not-an-object"
+                    )
+                return None
+            if payload.get("schema_version") != 1:
+                if progress is not None:
+                    progress(
+                        f"Layout cache rejected: {repository_name}; "
+                        f"schema={payload.get('schema_version')!r}; expected=1"
+                    )
+                return None
+            if progress is not None:
+                progress(
+                    f"Layout cache hydrate start: {repository_name}; "
+                    f"modules={len(payload.get('modules', []))}"
+                )
+            hydrate_started_at = time.monotonic()
+            layout = RepositoryLayout(
                 root=Path(payload["root"]),
                 openspec_roots=tuple(Path(value) for value in payload["openspec_roots"]),
                 issues=tuple(LayoutIssue(**value) for value in payload["issues"]),
@@ -342,7 +409,19 @@ class ServiceMapBuilder:
                     for value in payload["modules"]
                 ),
             )
-        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            if progress is not None:
+                progress(
+                    f"Layout cache hydrate ready: {repository_name}; "
+                    f"modules={len(layout.modules)}; issues={len(layout.issues)}; "
+                    f"elapsed={time.monotonic() - hydrate_started_at:.3f}s"
+                )
+            return layout
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            if progress is not None:
+                progress(
+                    f"Layout cache invalid: {repository_name}; error={type(exc).__name__}: {exc}; "
+                    f"elapsed={time.monotonic() - probe_started_at:.3f}s"
+                )
             return None
 
     @staticmethod

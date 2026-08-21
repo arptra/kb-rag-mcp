@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import faulthandler
 import multiprocessing
+import os
 import signal
 import tempfile
+import threading
 import time
 import traceback
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Protocol
 
@@ -54,6 +58,7 @@ def _build_worker(
     checkpoint_path: Path,
     force_service_ids: set[str],
     force_all: bool,
+    diagnostic_path: Path,
 ) -> None:
     def report(message: str) -> None:
         with progress_path.open("a", encoding="utf-8") as handle:
@@ -68,8 +73,38 @@ def _build_worker(
             f"nodes={len(result.graph.nodes)}; edges={len(result.graph.edges)}"
         )
 
+    diagnostic_handle = None
+    diagnostic_signal = getattr(signal, "SIGUSR1", None)
     try:
-        report(f"Worker started; repositories={len(repositories)}")
+        if diagnostic_signal is not None:
+            try:
+                diagnostic_handle = diagnostic_path.open("a", encoding="utf-8", buffering=1)
+                faulthandler.register(
+                    diagnostic_signal,
+                    file=diagnostic_handle,
+                    all_threads=True,
+                )
+                report(
+                    f"Worker stack diagnostics enabled; signal={diagnostic_signal}; "
+                    f"path={diagnostic_path}"
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                report(
+                    f"Worker stack diagnostics unavailable; "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+        report(
+            f"Worker started; pid={os.getpid()}; parent_pid={os.getppid()}; "
+            f"thread={threading.current_thread().name}/{threading.get_ident()}; "
+            f"repositories={len(repositories)}; force_all={force_all}; "
+            f"forced_services={','.join(sorted(force_service_ids)) or 'none'}"
+        )
+        for position, repository in enumerate(repositories, start=1):
+            report(
+                f"Worker input [{position}/{len(repositories)}]: name={repository.name}; "
+                f"path={repository.path}; commit={repository.commit or 'none'}; "
+                f"excluded_modules={len(repository.excluded_module_paths)}"
+            )
         result = ServiceMapBuilder(settings).build(
             repositories,
             progress=report,
@@ -85,6 +120,12 @@ def _build_worker(
     except BaseException:
         error_path.write_text(traceback.format_exc(), encoding="utf-8")
         raise
+    finally:
+        if diagnostic_handle is not None:
+            if diagnostic_signal is not None:
+                with suppress(RuntimeError, ValueError):
+                    faulthandler.unregister(diagnostic_signal)
+            diagnostic_handle.close()
 
 
 class ServiceMapProcessRunner:
@@ -116,6 +157,7 @@ class ServiceMapProcessRunner:
             error_path = temporary / "error.txt"
             progress_path = temporary / "progress.log"
             checkpoint_path = temporary / "checkpoint.ready"
+            diagnostic_path = temporary / "worker-stack.log"
             context = multiprocessing.get_context("spawn")
             process = context.Process(
                 target=_build_worker,
@@ -129,6 +171,7 @@ class ServiceMapProcessRunner:
                     checkpoint_path,
                     force_service_ids or set(),
                     force_all,
+                    diagnostic_path,
                 ),
                 name="service-map-analysis",
                 daemon=True,
@@ -136,15 +179,24 @@ class ServiceMapProcessRunner:
             process.start()
             if progress is not None:
                 progress(
-                    f"Analysis supervisor started worker "
-                    f"pid={getattr(process, 'pid', 'unknown')}; "
-                    f"timeout={self._timeout_seconds}s"
+                    f"Analysis supervisor started worker: "
+                    f"supervisor_pid={os.getpid()}; "
+                    f"supervisor_thread={threading.current_thread().name}/{threading.get_ident()}; "
+                    f"worker_pid={getattr(process, 'pid', 'unknown')}; "
+                    f"start_method=spawn; timeout={self._timeout_seconds}s; "
+                    f"repositories={len(repositories)}; "
+                    f"force_all={force_all}; "
+                    f"forced_services={','.join(sorted(force_service_ids or set())) or 'none'}"
                 )
             progress_offset = 0
+            diagnostic_offset = 0
             last_progress: str | None = None
             published_checkpoint: int | None = None
             supervisor_started_at = time.monotonic()
+            last_progress_at = supervisor_started_at
             last_heartbeat_at = supervisor_started_at
+            last_stack_dump_at: float | None = None
+            stall_signal = getattr(signal, "SIGUSR1", None)
             deadline = supervisor_started_at + self._timeout_seconds
             while process.is_alive():
                 progress_offset, latest = self._drain_progress(
@@ -152,7 +204,15 @@ class ServiceMapProcessRunner:
                     progress_offset,
                     progress,
                 )
-                last_progress = latest or last_progress
+                now = time.monotonic()
+                if latest is not None:
+                    last_progress = latest
+                    last_progress_at = now
+                diagnostic_offset = self._drain_diagnostics(
+                    diagnostic_path,
+                    diagnostic_offset,
+                    progress,
+                )
                 published_checkpoint = self._publish_checkpoint_if_changed(
                     graph_path,
                     service_map_path,
@@ -164,14 +224,41 @@ class ServiceMapProcessRunner:
                     self._stop(process)
                     self._drain_progress(progress_path, progress_offset, progress)
                     raise ServiceMapBuildCancelled("Repository analysis was cancelled")
-                now = time.monotonic()
                 if progress is not None and now - last_heartbeat_at >= 5:
                     progress(
                         f"Analysis heartbeat: worker_pid={getattr(process, 'pid', 'unknown')}; "
                         f"elapsed={now - supervisor_started_at:.1f}s; "
+                        f"silent_for={now - last_progress_at:.1f}s; "
+                        f"progress_bytes={progress_offset}; "
                         f"last_operation={last_progress or 'worker startup'}"
                     )
                     last_heartbeat_at = now
+                worker_pid = getattr(process, "pid", None)
+                if (
+                    stall_signal is not None
+                    and isinstance(worker_pid, int)
+                    and now - last_progress_at >= 10
+                    and (
+                        last_stack_dump_at is None
+                        or now - last_stack_dump_at >= 30
+                    )
+                ):
+                    try:
+                        os.kill(worker_pid, stall_signal)
+                        if progress is not None:
+                            progress(
+                                f"Analysis stall probe requested: worker_pid={worker_pid}; "
+                                f"silent_for={now - last_progress_at:.1f}s; "
+                                "the following 'Worker stack' lines show the exact blocking frame"
+                            )
+                        last_stack_dump_at = now
+                    except OSError as exc:
+                        if progress is not None:
+                            progress(
+                                f"Analysis stall probe failed: worker_pid={worker_pid}; "
+                                f"error={type(exc).__name__}: {exc}"
+                            )
+                        last_stack_dump_at = now
                 remaining = deadline - now
                 if remaining <= 0:
                     self._stop(process)
@@ -180,6 +267,7 @@ class ServiceMapProcessRunner:
                         progress_offset,
                         progress,
                     )
+                    self._drain_diagnostics(diagnostic_path, diagnostic_offset, progress)
                     last_progress = latest or last_progress
                     suffix = f"; last operation: {last_progress}" if last_progress else ""
                     partial = self._partial_result(
@@ -204,6 +292,7 @@ class ServiceMapProcessRunner:
                 progress,
             )
             last_progress = latest or last_progress
+            self._drain_diagnostics(diagnostic_path, diagnostic_offset, progress)
             published_checkpoint = self._publish_checkpoint_if_changed(
                 graph_path,
                 service_map_path,
@@ -311,6 +400,25 @@ class ServiceMapProcessRunner:
             if callback is not None:
                 callback(message)
         return next_offset, latest
+
+    @staticmethod
+    def _drain_diagnostics(
+        path: Path,
+        offset: int,
+        callback: Callable[[str], None] | None,
+    ) -> int:
+        if not path.is_file():
+            return offset
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read()
+            next_offset = handle.tell()
+        if callback is not None:
+            for raw_line in chunk.splitlines():
+                message = raw_line.decode("utf-8", errors="replace").strip()
+                if message:
+                    callback(f"Worker stack | {message}")
+        return next_offset
 
     @staticmethod
     def _exit_detail(exitcode: int | None) -> str:

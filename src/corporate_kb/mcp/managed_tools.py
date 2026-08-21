@@ -17,6 +17,7 @@ from fastmcp.tools import Tool, ToolResult
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
+from corporate_kb.mcp.tool_overrides import BUILTIN_TOOL_NAMES
 from corporate_kb.mcp.tools import KnowledgeTools
 
 logger = logging.getLogger(__name__)
@@ -32,16 +33,7 @@ _ALLOWED_ARGUMENTS = {
     "authority",
     "source_type",
 }
-_RESERVED_NAMES = {
-    "ssot_context",
-    "kb_feature_context",
-    "kb_search",
-    "kb_get_document",
-    "kb_get_chunk",
-    "kb_run_context_benchmark",
-    "kb_list_documents",
-    "kb_stats",
-}
+_RESERVED_NAMES = BUILTIN_TOOL_NAMES
 _OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {

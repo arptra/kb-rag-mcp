@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import time
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -23,6 +24,10 @@ from corporate_kb.mcp.servers import (
     McpServerDefinition,
     McpServerRegistry,
     mcp_servers_payload,
+)
+from corporate_kb.mcp.tool_overrides import (
+    BuiltinToolOverride,
+    BuiltinToolOverrideRegistry,
 )
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import (
@@ -194,6 +199,9 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         index_tools=catalog.tools_for,
         index_exists=catalog.has_index,
     )
+    builtin_tool_overrides = BuiltinToolOverrideRegistry(
+        settings.builtin_tool_overrides_path
+    )
     mcp_servers = McpServerRegistry(settings.mcp_servers_path)
     admin = AdminController(service, usage)
     server = create_mcp_server(
@@ -202,7 +210,40 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         knowledge_tools=tools,
         managed_tools=managed_tools,
         feature_context=feature_context,
+        builtin_tool_overrides=builtin_tool_overrides,
     )
+
+    async def current_tool_catalog() -> dict[str, object]:
+        managed = {item.name: item for item in managed_tools.list()}
+        overridden = {item.name for item in builtin_tool_overrides.list()}
+        runtime_tools = await server.list_tools(run_middleware=False)
+        items: list[dict[str, object]] = []
+        for tool in sorted(runtime_tools, key=lambda item: item.name):
+            definition = managed.get(tool.name)
+            kind = "managed" if definition is not None else "built-in"
+            item: dict[str, object] = {
+                "name": tool.name,
+                "title": tool.title,
+                "description": tool.description or "",
+                "kind": kind,
+                "input_schema": tool.parameters,
+                "output_schema": tool.output_schema,
+                "description_overridden": tool.name in overridden,
+                "editable": True,
+            }
+            if definition is not None:
+                item["index_ids"] = definition.index_ids
+                item["defaults"] = definition.defaults.model_dump(mode="json")
+            else:
+                item["index_ids"] = []
+                item["defaults"] = {}
+            items.append(item)
+        return {
+            "tool_count": len(items),
+            "built_in_count": sum(item["kind"] == "built-in" for item in items),
+            "managed_count": sum(item["kind"] == "managed" for item in items),
+            "tools": items,
+        }
 
     def current_mcp_servers(request: Request) -> dict[str, object]:
         local_url = f"{str(request.base_url).rstrip('/')}{settings.mcp_http_path}"
@@ -251,6 +292,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         try:
             payload = await asyncio.to_thread(admin.overview)
             payload["managed_tools"] = managed_tools.payload()
+            payload["tool_catalog"] = await current_tool_catalog()
             payload["mcp_servers"] = current_mcp_servers(request)
             payload["catalog"] = catalog.payload()
             payload["graph"] = await asyncio.to_thread(catalog.graph_overview)
@@ -401,6 +443,97 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 raise ValueError("index_id must be a non-empty string")
             job = catalog.start_index_build(index_id)
             return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/indexes/documents",
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    async def admin_index_documents(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            index_id = _optional_query(request, "index_id")
+            if not index_id:
+                raise ValueError("index_id query parameter is required")
+            payload = await asyncio.to_thread(
+                catalog.index_documents,
+                index_id,
+                query=_optional_query(request, "query", "") or "",
+                offset=_integer_query(
+                    request,
+                    "offset",
+                    0,
+                    minimum=0,
+                    maximum=10_000_000,
+                ),
+                limit=_integer_query(request, "limit", 50, minimum=1, maximum=200),
+            )
+            return JSONResponse(payload)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/indexes/document",
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    async def admin_index_document(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            index_id = _optional_query(request, "index_id")
+            document_id = _optional_query(request, "document_id")
+            if not index_id or not document_id:
+                raise ValueError("index_id and document_id query parameters are required")
+            payload = await asyncio.to_thread(
+                catalog.index_document,
+                index_id,
+                document_id,
+            )
+            return JSONResponse(payload)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/indexes/documents",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_upload_index_documents(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Request body must be a JSON object")
+            index_id = payload.get("index_id")
+            raw_documents = payload.get("documents")
+            overwrite = payload.get("overwrite", False)
+            if not isinstance(index_id, str) or not index_id:
+                raise ValueError("index_id must be a non-empty string")
+            if not isinstance(raw_documents, list):
+                raise ValueError("documents must be an array")
+            if not isinstance(overwrite, bool):
+                raise ValueError("overwrite must be a boolean")
+            documents: list[dict[str, str]] = []
+            for raw in raw_documents:
+                if not isinstance(raw, dict):
+                    raise ValueError("Each document must be an object")
+                path = raw.get("path")
+                content = raw.get("content")
+                if not isinstance(path, str) or not isinstance(content, str):
+                    raise ValueError("Each document must contain string path and content fields")
+                documents.append({"path": path, "content": content})
+            result = await asyncio.to_thread(
+                catalog.upload_documents,
+                index_id,
+                documents=documents,
+                overwrite=overwrite,
+            )
+            return JSONResponse(result, status_code=202)
         except Exception as exc:
             return _api_error(exc)
 
@@ -675,9 +808,55 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             existing = {item.name for item in managed_tools.list()}
             managed_tools.upsert(definition)
             if definition.name in existing:
-                server.remove_tool(definition.name)
+                server.local_provider.remove_tool(definition.name)
             server.add_tool(replacement)
             return JSONResponse(definition.model_dump(mode="json"), status_code=201)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/tools/catalog",
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    async def admin_tool_catalog(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            return JSONResponse(await current_tool_catalog())
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/tools/builtin",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_save_builtin_tool(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            definition = BuiltinToolOverride.model_validate(payload)
+            runtime_tool = await server.get_tool(definition.name)
+            if runtime_tool is None or definition.name in {
+                item.name for item in managed_tools.list()
+            }:
+                raise KeyError(f"Unknown built-in MCP tool: {definition.name}")
+            builtin_tool_overrides.upsert(definition)
+            replacement = runtime_tool.model_copy(
+                update={"description": definition.description},
+                deep=False,
+            )
+            server.local_provider.remove_tool(definition.name)
+            server.add_tool(replacement)
+            return JSONResponse(
+                {
+                    "name": definition.name,
+                    "description": definition.description,
+                    "status": "updated",
+                }
+            )
         except Exception as exc:
             return _api_error(exc)
 
@@ -691,7 +870,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             if not isinstance(name, str) or not name:
                 raise ValueError("name must be a non-empty string")
             managed_tools.delete(name)
-            server.remove_tool(name)
+            server.local_provider.remove_tool(name)
             return JSONResponse({"status": "deleted", "name": name})
         except Exception as exc:
             return _api_error(exc)
@@ -705,11 +884,24 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             if not isinstance(payload, dict):
                 raise ValueError("Request body must be a JSON object")
             name = payload.get("name")
-            query = payload.get("query")
-            if not isinstance(name, str) or not isinstance(query, str):
-                raise ValueError("name and query must be strings")
-            result = await asyncio.to_thread(managed_tools.execute, name, {"query": query})
-            return JSONResponse(result)
+            arguments = payload.get("arguments")
+            if arguments is None and isinstance(payload.get("query"), str):
+                arguments = {"query": payload["query"]}
+            if not isinstance(name, str) or not isinstance(arguments, dict):
+                raise ValueError("name must be a string and arguments must be an object")
+            started_at = time.perf_counter()
+            result = await server.call_tool(name, arguments, run_middleware=False)
+            elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            if not hasattr(result, "model_dump"):
+                raise RuntimeError("Background MCP tasks are not supported by the playground")
+            serialized = result.model_dump(mode="json")
+            return JSONResponse(
+                {
+                    "tool": name,
+                    "elapsed_ms": elapsed_ms,
+                    **serialized,
+                }
+            )
         except Exception as exc:
             return _api_error(exc)
 

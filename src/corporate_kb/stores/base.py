@@ -31,6 +31,15 @@ class KnowledgeStore(Protocol):
 
     def list_documents(self, filters: SearchFilters, *, limit: int) -> list[Document]: ...
 
+    def browse_documents(
+        self,
+        filters: SearchFilters,
+        *,
+        query: str,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[Document], int]: ...
+
     @property
     def document_count(self) -> int: ...
 

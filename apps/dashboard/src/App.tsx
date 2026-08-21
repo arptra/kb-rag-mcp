@@ -12,11 +12,15 @@ import type {
   GraphNode,
   GraphOverview,
   GraphPayload,
+  IndexDocument,
+  IndexDocumentDetail,
+  IndexDocumentsPage,
   ManagedTool,
   McpServer,
   Overview,
   Page,
   RagIndex,
+  ToolCatalogItem,
 } from "./types";
 
 const NAV: Array<{ id: Page; label: string; mark: string }> = [
@@ -38,6 +42,9 @@ const TOOL_SCHEMA = {
   required: ["query"],
   additionalProperties: false,
 };
+
+const DOCUMENT_PAGE_SIZE = 50;
+const DOCUMENT_ACCEPT = ".md,.markdown,.txt,.html,.htm,.rst,.adoc,.log,.csv,.tsv,.json,.jsonl,.yaml,.yml,.xml,.properties";
 
 function number(value: number): string {
   return new Intl.NumberFormat("ru-RU").format(value ?? 0);
@@ -87,10 +94,10 @@ function Status({ value }: { value: string }) {
   );
 }
 
-function Modal({ title, children, onClose }: { title: string; children: ReactNode; onClose: () => void }) {
+function Modal({ title, children, onClose, className = "" }: { title: string; children: ReactNode; onClose: () => void; className?: string }) {
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+      <section className={`modal ${className}`.trim()} role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
         <header className="modal-header">
           <div>
             <span className="eyebrow">RAG control plane</span>
@@ -161,8 +168,10 @@ export default function App() {
   const [toast, setToast] = useState("");
   const [loading, setLoading] = useState(false);
   const [indexModal, setIndexModal] = useState(false);
+  const [selectedIndexId, setSelectedIndexId] = useState<string | null>(null);
   const [repositoryModal, setRepositoryModal] = useState(false);
   const [toolModal, setToolModal] = useState<ManagedTool | "new" | null>(null);
+  const [builtinToolModal, setBuiltinToolModal] = useState<ToolCatalogItem | null>(null);
   const [serverModal, setServerModal] = useState(false);
   const [ssotModal, setSsotModal] = useState<{
     service: Overview["service_map"]["services"][number];
@@ -258,7 +267,7 @@ export default function App() {
         <nav>
           <span className="nav-label">Рабочая область</span>
           {NAV.map((item) => (
-            <button key={item.id} className={page === item.id ? "active" : ""} onClick={() => setPage(item.id)}>
+            <button key={item.id} className={page === item.id ? "active" : ""} onClick={() => { setPage(item.id); if (item.id !== "indexes") setSelectedIndexId(null); }}>
               <span className="nav-mark">{item.mark}</span>{item.label}
               {item.id === "services" && <em>{Math.max(overview.service_map.service_count, overview.catalog.repository_count)}</em>}
               {item.id === "servers" && <em>{overview.mcp_servers.server_count}</em>}
@@ -288,7 +297,8 @@ export default function App() {
           <div><span className="breadcrumb">RAG Control Plane /</span><h1>{title}</h1></div>
           <div className="top-actions">
             <button className="button quiet" onClick={() => void load()} disabled={loading}>↻ Обновить</button>
-            {page === "indexes" && <button className="button primary" onClick={() => setRepositoryModal(true)}>＋ Подключить репозиторий</button>}
+          {page === "indexes" && selectedIndexId && <button className="button quiet" onClick={() => setSelectedIndexId(null)}>← Все индексы</button>}
+          {page === "indexes" && !selectedIndexId && <button className="button primary" onClick={() => setRepositoryModal(true)}>＋ Подключить репозиторий</button>}
             {page === "servers" && <button className="button primary" onClick={() => setServerModal(true)}>＋ Добавить MCP server</button>}
             {page === "tools" && <button className="button primary" onClick={() => setToolModal("new")}>＋ Новый MCP tool</button>}
           </div>
@@ -296,12 +306,25 @@ export default function App() {
 
         <section className="content">
           {page === "overview" && <OverviewPage data={overview} password={password} onNavigate={setPage} onAction={action} />}
-          {page === "indexes" && (
+          {page === "indexes" && selectedIndexId && overview.catalog.indexes.some((index) => index.id === selectedIndexId) ? (
+            <IndexDetailPage
+              index={overview.catalog.indexes.find((index) => index.id === selectedIndexId)!}
+              repositories={overview.catalog.repositories.filter((repository) => repository.index_id === selectedIndexId)}
+              password={password}
+              onBack={() => setSelectedIndexId(null)}
+              onChanged={(message) => {
+                setToast(message);
+                void load();
+              }}
+              onAction={action}
+            />
+          ) : page === "indexes" && (
             <IndexesPage
               data={overview}
               password={password}
               onCreate={() => setIndexModal(true)}
               onRepository={() => setRepositoryModal(true)}
+              onOpen={setSelectedIndexId}
               onAction={action}
             />
           )}
@@ -321,7 +344,8 @@ export default function App() {
             <ToolsPage
               data={overview}
               password={password}
-              onEdit={setToolModal}
+              onEditManaged={setToolModal}
+              onEditBuiltin={setBuiltinToolModal}
               onAction={action}
             />
           )}
@@ -364,6 +388,14 @@ export default function App() {
             setToast("MCP tool сохранён");
             void load();
           }}
+        />
+      )}
+      {builtinToolModal && (
+        <BuiltinToolForm
+          password={password}
+          tool={builtinToolModal}
+          onClose={() => setBuiltinToolModal(null)}
+          onSaved={() => { setBuiltinToolModal(null); void load(); }}
         />
       )}
       {serverModal && (
@@ -540,11 +572,12 @@ function OperationsPage({ data, password, onAction }: {
   );
 }
 
-function IndexesPage({ data, password, onCreate, onRepository, onAction }: {
+function IndexesPage({ data, password, onCreate, onRepository, onOpen, onAction }: {
   data: Overview;
   password: string;
   onCreate: () => void;
   onRepository: () => void;
+  onOpen: (indexId: string) => void;
   onAction: (run: () => Promise<unknown>, message: string) => Promise<void>;
 }) {
   const nameById = useMemo(() => Object.fromEntries(data.catalog.indexes.map((item) => [item.id, item.name])), [data]);
@@ -556,12 +589,19 @@ function IndexesPage({ data, password, onCreate, onRepository, onAction }: {
       </div>
       <div className="index-card-grid">
         {data.catalog.indexes.map((index) => (
-          <article className="index-card" key={index.id}>
+          <article
+            className="index-card clickable"
+            key={index.id}
+            role="button"
+            tabIndex={0}
+            onClick={() => onOpen(index.id)}
+            onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") onOpen(index.id); }}
+          >
             <header><div className="index-glyph big">{index.kind === "default" ? "◆" : "◇"}</div><Status value={index.status} /></header>
             <h3>{index.name}</h3><p>{index.description || "Отдельный контур корпоративных знаний"}</p>
             <div className="index-numbers"><span><b>{number(index.document_count)}</b> документов</span><span><b>{number(index.chunk_count)}</b> чанков</span><span><b>{index.source_count}</b> Git</span></div>
             {index.error && <div className="inline-error">{index.error}</div>}
-            <footer><small>Обновлён {relativeDate(index.updated_at)}</small><button onClick={() => void onAction(() => post("/admin/api/indexes/build", password, { index_id: index.id }), "Переиндексация запущена")}>↻ Пересобрать</button></footer>
+            <footer><small>Обновлён {relativeDate(index.updated_at)} · открыть →</small><button onClick={(event) => { event.stopPropagation(); void onAction(() => post("/admin/api/indexes/build", password, { index_id: index.id }), "Переиндексация запущена"); }}>↻ Пересобрать</button></footer>
           </article>
         ))}
       </div>
@@ -575,6 +615,204 @@ function IndexesPage({ data, password, onCreate, onRepository, onAction }: {
       </section>
       {data.catalog.jobs.length > 0 && <section className="panel"><PanelHeader title="Очередь операций" kicker="Фоновые задачи" /><JobList password={password} jobs={data.catalog.jobs} onCancel={(job) => void onAction(() => post("/admin/api/jobs/cancel", password, { job_id: job.id }), "Отмена запрошена")} /></section>}
     </>
+  );
+}
+
+function IndexDetailPage({ index, repositories, password, onBack, onChanged, onAction }: {
+  index: RagIndex;
+  repositories: Overview["catalog"]["repositories"];
+  password: string;
+  onBack: () => void;
+  onChanged: (message: string) => void;
+  onAction: (run: () => Promise<unknown>, message: string) => Promise<void>;
+}) {
+  const [documents, setDocuments] = useState<IndexDocumentsPage | null>(null);
+  const [selectedDocument, setSelectedDocument] = useState<IndexDocument | null>(null);
+  const [queryInput, setQueryInput] = useState("");
+  const [query, setQuery] = useState("");
+  const [offset, setOffset] = useState(0);
+  const [files, setFiles] = useState<File[]>([]);
+  const [overwrite, setOverwrite] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [loadingDocuments, setLoadingDocuments] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+
+  const loadDocuments = useCallback(async () => {
+    setLoadingDocuments(true);
+    try {
+      const params = new URLSearchParams({
+        index_id: index.id,
+        offset: String(offset),
+        limit: String(DOCUMENT_PAGE_SIZE),
+      });
+      if (query) params.set("query", query);
+      const payload = await api<IndexDocumentsPage>(`/admin/api/indexes/documents?${params}`, password);
+      setDocuments(payload);
+      setError("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось загрузить документы индекса");
+    } finally {
+      setLoadingDocuments(false);
+    }
+  }, [index.id, index.updated_at, offset, password, query]);
+
+  useEffect(() => void loadDocuments(), [loadDocuments]);
+
+  const selectFiles = (incoming: FileList | File[]) => {
+    const selected = Array.from(incoming);
+    const allowed = new Set(DOCUMENT_ACCEPT.split(","));
+    const unsupported = selected.find((file) => {
+      const dot = file.name.lastIndexOf(".");
+      return dot < 0 || !allowed.has(file.name.slice(dot).toLowerCase());
+    });
+    if (unsupported) {
+      setError(`Неподдерживаемый текстовый формат: ${unsupported.name}`);
+      return;
+    }
+    if (selected.length > 50) {
+      setError("За один раз можно загрузить не больше 50 файлов");
+      return;
+    }
+    const unique = new Map(selected.map((file) => [file.name, file]));
+    setFiles([...unique.values()]);
+    setError("");
+  };
+
+  const upload = async () => {
+    if (!files.length) return;
+    setUploading(true);
+    setError("");
+    try {
+      const payload = await Promise.all(files.map(async (file) => ({
+        path: file.name,
+        content: await file.text(),
+      })));
+      await post(
+        "/admin/api/indexes/documents",
+        password,
+        { index_id: index.id, documents: payload, overwrite },
+        30_000,
+      );
+      const count = files.length;
+      setFiles([]);
+      setOverwrite(false);
+      onChanged(`${count} файл(а) загружено; пересборка индекса поставлена в очередь`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось загрузить документы");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const origins: Record<string, string> = {
+    repository: "Git / OpenSpec",
+    upload: "Загружен вручную",
+    ssot: "SSOT",
+    local: "Локальный источник",
+  };
+  const totalSelectedBytes = files.reduce((sum, file) => sum + file.size, 0);
+
+  return (
+    <>
+      <div className="index-detail-head">
+        <button className="back-link" onClick={onBack}>← Индексы</button>
+        <div className="index-detail-title">
+          <div className="index-glyph big">{index.kind === "default" ? "◆" : "◇"}</div>
+          <div><span className="eyebrow">Index · {index.id}</span><h2>{index.name}</h2><p>{index.description || "Отдельный контур корпоративных знаний"}</p></div>
+          <Status value={index.status} />
+        </div>
+        <div className="index-detail-metrics">
+          <span><b>{number(index.document_count)}</b> документов</span>
+          <span><b>{number(index.chunk_count)}</b> чанков</span>
+          <span><b>{repositories.length}</b> Git-источников</span>
+          <button className="button secondary" onClick={() => void onAction(() => post("/admin/api/indexes/build", password, { index_id: index.id }), "Переиндексация запущена")}>↻ Пересобрать индекс</button>
+        </div>
+      </div>
+
+      <section className="panel index-upload-panel">
+        <PanelHeader title="Догрузить текстовые файлы" kicker="Файлы сохранятся только в этом индексе" />
+        <div className="upload-layout">
+          <label
+            className={`file-drop ${dragging ? "dragging" : ""}`}
+            onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
+            onDragOver={(event) => event.preventDefault()}
+            onDragLeave={() => setDragging(false)}
+            onDrop={(event) => { event.preventDefault(); setDragging(false); selectFiles(event.dataTransfer.files); }}
+          >
+            <input type="file" multiple accept={DOCUMENT_ACCEPT} onChange={(event) => { if (event.target.files) selectFiles(event.target.files); event.currentTarget.value = ""; }} />
+            <span className="drop-icon">＋</span>
+            <b>Перетащите файлы или выберите на диске</b>
+            <small>Markdown, TXT, HTML, JSON, YAML, CSV, XML и другие текстовые форматы · до 50 файлов</small>
+          </label>
+          <div className="upload-queue">
+            <div className="upload-queue-head"><b>{files.length ? `${files.length} выбрано` : "Файлы не выбраны"}</b><small>{files.length ? `${(totalSelectedBytes / 1024).toFixed(1)} KB` : "После загрузки индекс пересоберётся автоматически"}</small></div>
+            {files.length > 0 && <div className="selected-files">{files.slice(0, 6).map((file) => <span key={file.name}><b>{file.name}</b><small>{(file.size / 1024).toFixed(1)} KB</small></span>)}{files.length > 6 && <em>и ещё {files.length - 6}</em>}</div>}
+            <label className="overwrite-check"><input type="checkbox" checked={overwrite} onChange={(event) => setOverwrite(event.target.checked)} /> Перезаписать файлы с одинаковым именем</label>
+            <button className="button primary" disabled={!files.length || uploading} onClick={() => void upload()}>{uploading ? "Загружаем…" : "Загрузить и индексировать"}</button>
+          </div>
+        </div>
+        {error && <div className="form-error index-detail-error">{error}</div>}
+      </section>
+
+      <section className="panel index-documents-panel">
+        <div className="documents-toolbar">
+          <div><span className="eyebrow">Serving index content</span><h3>Документы индекса</h3><p>{documents ? `${number(documents.total)} найдено` : "Загружаем список…"}</p></div>
+          <form onSubmit={(event) => { event.preventDefault(); setOffset(0); setQuery(queryInput.trim()); }}><input value={queryInput} onChange={(event) => setQueryInput(event.target.value)} placeholder="Название или путь документа" /><button className="button secondary">Найти</button>{query && <button type="button" className="button quiet" onClick={() => { setQueryInput(""); setQuery(""); setOffset(0); }}>Сбросить</button>}</form>
+        </div>
+        {loadingDocuments && !documents ? <div className="empty-state"><div>◌</div><h3>Читаем индекс</h3></div> : documents?.documents.length ? (
+          <div className="table-wrap"><table className="documents-table"><thead><tr><th>Документ</th><th>Источник</th><th>Тип</th><th>Загружен</th></tr></thead><tbody>{documents.documents.map((document) => <tr key={document.document_id}><td><button className="document-open" onClick={() => setSelectedDocument(document)}><b>{document.title}</b><small title={document.source_path}>{document.source_path}</small><em>Открыть →</em></button></td><td><span className={`tag origin-${document.origin}`}>{origins[document.origin] || document.origin}</span></td><td><code>{document.source_type}</code></td><td>{relativeDate(document.loaded_at)}</td></tr>)}</tbody></table></div>
+        ) : <div className="empty-state"><div>◇</div><h3>{query ? "Ничего не найдено" : "Индекс пока пуст"}</h3><p>{query ? "Измените поисковый запрос." : "Загрузите текстовые файлы или подключите Git/OpenSpec."}</p></div>}
+        {documents && documents.total > DOCUMENT_PAGE_SIZE && <div className="documents-pagination"><button className="button quiet" disabled={offset === 0 || loadingDocuments} onClick={() => setOffset(Math.max(0, offset - DOCUMENT_PAGE_SIZE))}>← Назад</button><span>{number(offset + 1)}–{number(Math.min(offset + documents.documents.length, documents.total))} из {number(documents.total)}</span><button className="button quiet" disabled={!documents.has_more || loadingDocuments} onClick={() => setOffset(offset + DOCUMENT_PAGE_SIZE)}>Дальше →</button></div>}
+      </section>
+      {selectedDocument && <DocumentViewer indexId={index.id} document={selectedDocument} password={password} onClose={() => setSelectedDocument(null)} />}
+    </>
+  );
+}
+
+function DocumentViewer({ indexId, document, password, onClose }: {
+  indexId: string;
+  document: IndexDocument;
+  password: string;
+  onClose: () => void;
+}) {
+  const [detail, setDetail] = useState<IndexDocumentDetail | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let disposed = false;
+    const params = new URLSearchParams({ index_id: indexId, document_id: document.document_id });
+    api<IndexDocumentDetail>(`/admin/api/indexes/document?${params}`, password, {}, 30_000)
+      .then((payload) => { if (!disposed) { setDetail(payload); setError(""); } })
+      .catch((caught) => { if (!disposed) setError(caught instanceof Error ? caught.message : "Не удалось открыть документ"); });
+    return () => { disposed = true; };
+  }, [document.document_id, indexId, password]);
+
+  const origins: Record<string, string> = {
+    repository: "Git / OpenSpec",
+    upload: "Загружен вручную",
+    ssot: "SSOT",
+    local: "Локальный источник",
+  };
+
+  return (
+    <Modal title={document.title} onClose={onClose} className="document-modal">
+      {error ? <div className="form-error document-view-error">{error}</div> : !detail ? (
+        <div className="document-loading"><span>◌</span><b>Загружаем документ из индекса…</b></div>
+      ) : (
+        <div className="document-viewer">
+          <div className="document-facts">
+            <span><small>Индекс</small><b>{detail.index.name}</b></span>
+            <span><small>Источник</small><b>{origins[detail.origin] || detail.origin}</b></span>
+            <span><small>Тип</small><b>{detail.source_type}</b></span>
+            <span><small>Размер</small><b>{number(detail.content_chars)} символов · {(detail.content_bytes / 1024).toFixed(1)} KB</b></span>
+          </div>
+          <div className="document-source-line"><code>{detail.source_path}</code>{detail.source_url && <a href={detail.source_url} target="_blank" rel="noreferrer">Открыть источник ↗</a>}</div>
+          <section className="document-content"><div><span className="eyebrow">Normalized serving content</span><b>Содержимое документа</b></div><pre>{detail.content}</pre></section>
+          <details className="document-metadata"><summary>Метаданные и идентификаторы</summary><pre>{JSON.stringify({ document_id: detail.document_id, source_id: detail.source_id, loaded_at: detail.loaded_at, metadata: detail.metadata }, null, 2)}</pre></details>
+        </div>
+      )}
+    </Modal>
   );
 }
 
@@ -630,16 +868,19 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
             const mappedServices = servicesByRepository.get(repository.checkout_path)
               || servicesByRepository.get(repository.name)
               || [];
-            const activeJob = data.catalog.jobs.find(
+            const activeRepositoryJob = data.catalog.jobs.find(
               (job) => ["queued", "running", "cancelling"].includes(job.status)
-                && (job.type === "graph" || job.index_id === repository.index_id),
+                && (
+                  job.type === "graph"
+                  || (job.index_id === repository.index_id && job.type !== "service")
+                ),
             );
             const lastGraphJob = data.catalog.jobs.find((job) => job.type === "graph");
             if (!mappedServices.length) return [(
               <article className="service-card" key={repository.id}>
                 <header>
                   <span className="service-mark">S</span>
-                  <Status value={activeJob ? "running" : lastGraphJob?.status === "failed" ? "failed" : "empty"} />
+                  <Status value={activeRepositoryJob ? "running" : lastGraphJob?.status === "failed" ? "failed" : "empty"} />
                 </header>
                 <span className="eyebrow">Awaiting analysis</span>
                 <h3>{repository.name}</h3>
@@ -653,35 +894,55 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
                 <footer><span>Владелец не определён</span><button onClick={onGraph}>Открыть граф →</button></footer>
               </article>
             )];
-            return mappedServices.map((mappedService) => (
-              <article className="service-card" key={`${repository.id}:${mappedService.id}`}>
-                <header>
-                  <span className="service-mark">S</span>
-                  <Status value={activeJob || data.catalog.jobs.some((job) => job.target_id === mappedService.id && ["queued", "running", "cancelling"].includes(job.status)) ? "running" : mappedService.module_state === "active" ? "ready" : mappedService.module_state === "unsupported" ? "unsupported" : "module-empty"} />
-                </header>
-                <span className="eyebrow">
-                  {mappedService.module_path === "." ? "Repository service" : `Module · ${mappedService.module_path}`}
-                </span>
-                <h3>{mappedService.name}</h3>
-                <code>{mappedService.id}</code>
-                <dl>
-                  <div><dt>Репозиторий</dt><dd>{repository.name}</dd></div>
-                  <div><dt>Build</dt><dd>{mappedService.build_system} · {mappedService.module_state}</dd></div>
-                  <div><dt>Подмодули</dt><dd>{mappedService.component_paths.length ? mappedService.component_paths.join(", ") : "—"}</dd></div>
-                  <div><dt>Интерфейсы</dt><dd>{mappedService.entrypoint_count} входов · {mappedService.outbound_interface_count} выходов</dd></div>
-                  <div><dt>Индекс</dt><dd>{indexNames[repository.index_id] || repository.index_id}</dd></div>
-                </dl>
-                <footer>
-                  <span>{mappedService.owner || "Владелец не определён"}</span>
-                  <div className="card-actions">
-                    <button onClick={() => void onAction(() => post("/admin/api/services/analyze", password, { service_id: mappedService.id }), "Повторный анализ поставлен в очередь")}>↻ Анализ</button>
-                    <button onClick={() => onSsot(mappedService, repository.index_id)}>SSOT</button>
-                    <button onClick={onGraph}>Граф</button>
-                    <button className="danger" onClick={() => { if (!window.confirm(`Удалить сервис «${mappedService.name}» из карты? Модуль останется в repository как постоянное исключение.`)) return; void onAction(() => post("/admin/api/services/delete", password, { service_id: mappedService.id }), "Удаление сервиса поставлено в очередь"); }}>Удалить</button>
-                  </div>
-                </footer>
-              </article>
-            ));
+            return mappedServices.map((mappedService) => {
+              const activeServiceJob = data.catalog.jobs.find(
+                (job) => job.type === "service"
+                  && job.target_id === mappedService.id
+                  && ["queued", "running", "cancelling"].includes(job.status),
+              );
+              return (
+                <article
+                  className="service-card"
+                  key={`${repository.id}:${mappedService.id}`}
+                  aria-busy={Boolean(activeServiceJob)}
+                >
+                  <header>
+                    <span className="service-mark">S</span>
+                    <Status value={activeRepositoryJob || activeServiceJob ? "running" : mappedService.module_state === "active" ? "ready" : mappedService.module_state === "unsupported" ? "unsupported" : "module-empty"} />
+                  </header>
+                  <span className="eyebrow">
+                    {mappedService.module_path === "." ? "Repository service" : `Module · ${mappedService.module_path}`}
+                  </span>
+                  <h3>{mappedService.name}</h3>
+                  <code>{mappedService.id}</code>
+                  <dl>
+                    <div><dt>Репозиторий</dt><dd>{repository.name}</dd></div>
+                    <div><dt>Build</dt><dd>{mappedService.build_system} · {mappedService.module_state}</dd></div>
+                    <div><dt>Подмодули</dt><dd>{mappedService.component_paths.length ? mappedService.component_paths.join(", ") : "—"}</dd></div>
+                    <div><dt>Интерфейсы</dt><dd>{mappedService.entrypoint_count} входов · {mappedService.outbound_interface_count} выходов</dd></div>
+                    <div><dt>Индекс</dt><dd>{indexNames[repository.index_id] || repository.index_id}</dd></div>
+                  </dl>
+                  <footer>
+                    <span>{mappedService.owner || "Владелец не определён"}</span>
+                    <div className="card-actions">
+                      <button
+                        className="service-rebuild"
+                        disabled={Boolean(activeServiceJob)}
+                        onClick={() => void onAction(
+                          () => post("/admin/api/services/analyze", password, { service_id: mappedService.id }),
+                          `Пересборка OpenSpec для «${mappedService.name}» поставлена в очередь`,
+                        )}
+                      >
+                        {activeServiceJob ? "◌ OpenSpec пересобирается…" : "↻ Пересобрать OpenSpec"}
+                      </button>
+                      <button onClick={() => onSsot(mappedService, repository.index_id)}>SSOT</button>
+                      <button onClick={onGraph}>Граф</button>
+                      <button className="danger" onClick={() => { if (!window.confirm(`Удалить сервис «${mappedService.name}» из карты? Модуль останется в repository как постоянное исключение.`)) return; void onAction(() => post("/admin/api/services/delete", password, { service_id: mappedService.id }), "Удаление сервиса поставлено в очередь"); }}>Удалить</button>
+                    </div>
+                  </footer>
+                </article>
+              );
+            });
           })}
           {standaloneMapServices.map((service) => (
             <article className="service-card" key={service.id}>
@@ -805,32 +1066,163 @@ function ServerCard({ server, expanded, onToggle, onCheck, onDelete }: {
   );
 }
 
-function ToolsPage({ data, password, onEdit, onAction }: {
+type PlaygroundValue = string | boolean;
+
+interface ToolTestResponse {
+  tool: string;
+  elapsed_ms: number;
+  content: unknown[];
+  structured_content: Record<string, unknown> | null;
+  meta: Record<string, unknown> | null;
+  is_error: boolean;
+}
+
+function schemaProperties(schema: Record<string, unknown>): Record<string, Record<string, unknown>> {
+  const properties = schema.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) return {};
+  return properties as Record<string, Record<string, unknown>>;
+}
+
+function schemaType(property: Record<string, unknown>): string {
+  if (typeof property.type === "string") return property.type;
+  if (Array.isArray(property.anyOf)) {
+    const concrete = property.anyOf.find(
+      (item) => typeof item === "object" && item !== null && (item as { type?: unknown }).type !== "null",
+    );
+    if (concrete && typeof (concrete as { type?: unknown }).type === "string") {
+      return String((concrete as { type: string }).type);
+    }
+  }
+  return "string";
+}
+
+function initialPlaygroundValues(tool: ToolCatalogItem): Record<string, PlaygroundValue> {
+  const samples: Record<string, string> = {
+    feature: "Добавить резервирование товара при создании заказа",
+    question: "Как устроено текущее состояние системы?",
+    query: "Как устроено текущее состояние системы?",
+  };
+  return Object.fromEntries(
+    Object.entries(schemaProperties(tool.input_schema)).map(([name, property]) => {
+      const value = property.default ?? samples[name] ?? (schemaType(property) === "boolean" ? false : "");
+      return [name, typeof value === "boolean" ? value : String(value ?? "")];
+    }),
+  );
+}
+
+function ToolPlayground({ tool, password }: { tool: ToolCatalogItem; password: string }) {
+  const [values, setValues] = useState<Record<string, PlaygroundValue>>(() => initialPlaygroundValues(tool));
+  const [result, setResult] = useState<ToolTestResponse | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const properties = schemaProperties(tool.input_schema);
+  const required = new Set(Array.isArray(tool.input_schema.required) ? tool.input_schema.required.map(String) : []);
+
+  const run = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    setResult(null);
+    try {
+      const argumentsPayload: Record<string, unknown> = {};
+      for (const [name, property] of Object.entries(properties)) {
+        const raw = values[name];
+        const type = schemaType(property);
+        if ((raw === "" || raw === undefined) && !required.has(name)) continue;
+        if ((raw === "" || raw === undefined) && required.has(name)) {
+          throw new Error(`Заполните обязательный параметр ${name}`);
+        }
+        if (type === "integer") argumentsPayload[name] = Number.parseInt(String(raw), 10);
+        else if (type === "number") argumentsPayload[name] = Number(raw);
+        else if (type === "boolean") argumentsPayload[name] = Boolean(raw);
+        else if (type === "array" || type === "object") argumentsPayload[name] = JSON.parse(String(raw));
+        else argumentsPayload[name] = String(raw);
+      }
+      const payload = await post<ToolTestResponse>(
+        "/admin/api/tools/test",
+        password,
+        { name: tool.name, arguments: argumentsPayload },
+        120_000,
+      );
+      setResult(payload);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Tool завершился с ошибкой");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form className="tool-playground" onSubmit={run}>
+      <div className="playground-head"><span className="eyebrow">Live FastMCP call</span><b>Параметры из JSON Schema</b></div>
+      {Object.entries(properties).map(([name, property]) => {
+        const type = schemaType(property);
+        const description = typeof property.description === "string" ? property.description : "";
+        const isLongText = ["feature", "question", "query"].includes(name);
+        return (
+          <label className="playground-field" key={name}>
+            <span><code>{name}</code>{required.has(name) && <i>обязательно</i>}</span>
+            {type === "boolean" ? (
+              <input type="checkbox" checked={Boolean(values[name])} onChange={(event) => setValues((current) => ({ ...current, [name]: event.target.checked }))} />
+            ) : isLongText ? (
+              <textarea value={String(values[name] ?? "")} onChange={(event) => setValues((current) => ({ ...current, [name]: event.target.value }))} />
+            ) : (
+              <input
+                type={name.toLowerCase().includes("password") ? "password" : ["integer", "number"].includes(type) ? "number" : "text"}
+                min={typeof property.minimum === "number" ? property.minimum : undefined}
+                max={typeof property.maximum === "number" ? property.maximum : undefined}
+                value={String(values[name] ?? "")}
+                onChange={(event) => setValues((current) => ({ ...current, [name]: event.target.value }))}
+              />
+            )}
+            {description && <small>{description}</small>}
+          </label>
+        );
+      })}
+      {!Object.keys(properties).length && <div className="callout">У этого tool нет входных параметров.</div>}
+      <button className="button primary playground-run" disabled={busy}>{busy ? "Выполняется…" : "▶ Вызвать tool"}</button>
+      {error && <div className="form-error">{error}</div>}
+      {result && (
+        <div className="playground-result">
+          <div><span className={result.is_error ? "result-error" : "result-ok"}>{result.is_error ? "ERROR" : "SUCCESS"}</span><b>{result.elapsed_ms} ms</b></div>
+          <pre>{JSON.stringify(result, null, 2)}</pre>
+        </div>
+      )}
+    </form>
+  );
+}
+
+function ToolsPage({ data, password, onEditManaged, onEditBuiltin, onAction }: {
   data: Overview;
   password: string;
-  onEdit: (tool: ManagedTool) => void;
+  onEditManaged: (tool: ManagedTool) => void;
+  onEditBuiltin: (tool: ToolCatalogItem) => void;
   onAction: (run: () => Promise<unknown>, message: string) => Promise<void>;
 }) {
   const [testing, setTesting] = useState<string | null>(null);
-  const [query, setQuery] = useState("Как устроено текущее состояние системы?");
-  const [result, setResult] = useState<Record<string, unknown> | null>(null);
   const indexNames = Object.fromEntries(data.catalog.indexes.map((index) => [index.id, index.name]));
+  const managedByName = Object.fromEntries(data.managed_tools.tools.map((tool) => [tool.name, tool]));
+  const catalog = data.tool_catalog?.tools ?? [];
   return (
     <>
-      <div className="section-intro"><div><span className="eyebrow">Agent interfaces</span><h2>Управляемые MCP tools</h2><p>Каждый tool — безопасный поисковый контракт с собственным описанием, фильтрами и набором индексов.</p></div></div>
+      <div className="section-intro"><div><span className="eyebrow">Live tools/list catalog</span><h2>Все MCP tools</h2><p>Встроенные и управляемые инструменты с реальной JSON Schema. Описание определяет, когда нейросеть выберет tool; playground показывает точный ответ FastMCP.</p></div><div className="server-summary"><span><b>{data.tool_catalog?.built_in_count ?? 0}</b> встроенных</span><span><b>{data.tool_catalog?.managed_count ?? 0}</b> управляемых</span></div></div>
       <div className="tool-grid">
-        {data.managed_tools.tools.map((tool) => (
+        {catalog.map((tool) => {
+          const managed = managedByName[tool.name];
+          const propertyCount = Object.keys(schemaProperties(tool.input_schema)).length;
+          return (
           <article className="tool-card" key={tool.name}>
-            <header><span className="tool-mark">⌁</span><Status value={tool.index_ids.length ? "ready" : "empty"} /><button className="dots" onClick={() => onEdit(tool)}>•••</button></header>
+            <header><span className="tool-mark">{tool.name === "kb_feature_context" ? "⌘" : "⌁"}</span><span className={`tag ${tool.kind === "managed" ? "managed" : ""}`}>{tool.kind}</span><button className="dots" aria-label={`Настроить ${tool.name}`} onClick={() => managed ? onEditManaged(managed) : onEditBuiltin(tool)}>•••</button></header>
             <code>{tool.name}</code><p>{tool.description}</p>
-            <div className="bindings">{tool.index_ids.length ? tool.index_ids.map((id) => <span className="tag" key={id}>◇ {indexNames[id] || id}</span>) : <span className="tag warning">Не привязан</span>}</div>
-            <footer><span>top {tool.defaults.top_k} · {tool.defaults.status || "любой статус"}</span><div className="card-actions"><button onClick={() => { setTesting(testing === tool.name ? null : tool.name); setResult(null); }}>Проверить →</button><button className="danger" onClick={() => { if (!window.confirm(`Удалить MCP tool «${tool.name}»?`)) return; void onAction(() => post("/admin/api/tools/delete", password, { name: tool.name }), "Tool удалён"); }}>Удалить</button></div></footer>
-            {testing === tool.name && <div className="tool-test"><input value={query} onChange={(event) => setQuery(event.target.value)} /><button className="button primary" onClick={() => void onAction(async () => { const payload = await post<Record<string, unknown>>("/admin/api/tools/test", password, { name: tool.name, query }); setResult(payload); }, "Тест завершён")}>Запустить</button>{result && <pre>{JSON.stringify(result, null, 2)}</pre>}</div>}
+            <div className="bindings">{tool.kind === "managed" ? (tool.index_ids.length ? tool.index_ids.map((id) => <span className="tag" key={id}>◇ {indexNames[id] || id}</span>) : <span className="tag warning">Не привязан</span>) : <><span className="tag">code-backed</span>{tool.description_overridden && <span className="tag managed">описание изменено</span>}</>}</div>
+            <footer><span>{propertyCount} параметров · JSON Schema</span><div className="card-actions"><button onClick={() => setTesting(testing === tool.name ? null : tool.name)}>{testing === tool.name ? "Скрыть тест ↑" : "Проверить →"}</button><button onClick={() => managed ? onEditManaged(managed) : onEditBuiltin(tool)}>Изменить</button>{managed && <button className="danger" onClick={() => { if (!window.confirm(`Удалить MCP tool «${tool.name}»?`)) return; void onAction(() => post("/admin/api/tools/delete", password, { name: tool.name }), "Tool удалён"); }}>Удалить</button>}</div></footer>
+            {testing === tool.name && <ToolPlayground key={tool.name} tool={tool} password={password} />}
           </article>
-        ))}
-        {!data.managed_tools.tools.length && <button className="new-tool-card" onClick={() => document.querySelector<HTMLButtonElement>(".top-actions .primary")?.click()}><span>＋</span><b>Создать первый MCP tool</b><small>Выберите индексы и опишите агенту назначение поиска</small></button>}
+          );
+        })}
+        <button className="new-tool-card" onClick={() => document.querySelector<HTMLButtonElement>(".top-actions .primary")?.click()}><span>＋</span><b>Создать поисковый MCP tool</b><small>Выберите индексы и опишите агенту назначение поиска</small></button>
       </div>
-      {data.managed_tools.tools.length > 0 && <div className="danger-note"><span>i</span><p>Кнопка удаления находится на каждой карточке и сразу убирает tool из MCP discovery. Клиентскому stdio-прокси потребуется перезапуск.</p></div>}
+      <div className="danger-note"><span>i</span><p>У встроенных tools редактируется описание для LLM, а исполняемый код и JSON Schema остаются защищёнными. После изменения описания уже подключённому MCP-клиенту может потребоваться переподключение, чтобы повторить tools/list.</p></div>
     </>
   );
 }
@@ -950,6 +1342,36 @@ function SsotModal({ password, service, indexes, defaultIndexId, onClose, onImpo
         <label>Готовый SSOT Markdown<textarea className="ssot-editor" required minLength={100} value={content} onChange={(event) => setContent(event.target.value)} placeholder="---\nservice: ...\ndocument_type: ssot\n---\n\n# Service…" /><small>Документ сохранится в `knowledge/ssot/` выбранного индекса, после чего RAG автоматически пересоберётся.</small></label>
         {error && <div className="form-error">{error}</div>}
         <div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Закрыть</button><button className="button primary" disabled={busy !== null || content.trim().length < 100}>{busy === "import" ? "Индексируем…" : "Сохранить в индекс"}</button></div>
+      </form>
+    </Modal>
+  );
+}
+
+function BuiltinToolForm({ password, tool, onClose, onSaved }: { password: string; tool: ToolCatalogItem; onClose: () => void; onSaved: () => void }) {
+  const [description, setDescription] = useState(tool.description);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await post("/admin/api/tools/builtin", password, { name: tool.name, description });
+      onSaved();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось обновить tool");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal title={`Встроенный tool · ${tool.name}`} onClose={onClose}>
+      <form className="modal-form" onSubmit={submit}>
+        <div className="callout">Описание попадает в MCP tools/list и объясняет нейросети, когда выбирать этот tool. Код и входная схема защищены, чтобы сохранённое изменение не могло сломать сервер.</div>
+        <label>Описание для LLM<textarea required minLength={10} maxLength={4000} value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+        <label>Input JSON Schema — только чтение<pre className="schema-preview">{JSON.stringify(tool.input_schema, null, 2)}</pre></label>
+        {error && <div className="form-error">{error}</div>}
+        <div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary" disabled={busy}>{busy ? "Сохраняем…" : "Сохранить описание"}</button></div>
       </form>
     </Modal>
   );

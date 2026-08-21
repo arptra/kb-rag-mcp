@@ -130,6 +130,81 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
 
 
 @pytest.mark.asyncio
+async def test_admin_browses_and_uploads_documents_to_selected_index(settings_factory) -> None:
+    service, settings = _indexed_service(settings_factory)
+    app = create_http_app(service, settings)
+    transport = httpx.ASGITransport(app=app)
+    headers = {"X-KB-Admin-Password": ADMIN_PASSWORD}
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
+    ):
+        initial = await client.get(
+            "/admin/api/indexes/documents",
+            headers=headers,
+            params={"index_id": "default", "limit": 1},
+        )
+        assert initial.status_code == 200
+        assert initial.json()["total"] == 1
+        assert initial.json()["documents"][0]["source_path"] == "limits.md"
+        document_id = initial.json()["documents"][0]["document_id"]
+        detail = await client.get(
+            "/admin/api/indexes/document",
+            headers=headers,
+            params={"index_id": "default", "document_id": document_id},
+        )
+        assert detail.status_code == 200
+        assert detail.json()["title"] == "Limits"
+        assert detail.json()["content"] == "# Limits\n\nlimits-service owns daily limits."
+        assert detail.json()["index"]["id"] == "default"
+
+        uploaded = await client.post(
+            "/admin/api/indexes/documents",
+            headers=headers,
+            json={
+                "index_id": "default",
+                "documents": [
+                    {
+                        "path": "manual-note.yaml",
+                        "content": "owner: payments-service\nstatus: current\n",
+                    }
+                ],
+                "overwrite": False,
+            },
+        )
+        assert uploaded.status_code == 202
+        job_id = uploaded.json()["job"]["id"]
+        for _ in range(200):
+            catalog = (await client.get("/admin/api/catalog", headers=headers)).json()
+            job = next(item for item in catalog["jobs"] if item["id"] == job_id)
+            if job["status"] not in {"queued", "running"}:
+                break
+            await asyncio.sleep(0.01)
+        assert job["status"] == "completed"
+
+        filtered = await client.get(
+            "/admin/api/indexes/documents",
+            headers=headers,
+            params={"index_id": "default", "query": "manual-note"},
+        )
+        assert filtered.status_code == 200
+        assert filtered.json()["total"] == 1
+        assert filtered.json()["documents"][0]["origin"] == "upload"
+        assert filtered.json()["documents"][0]["source_type"] == "text"
+
+        rejected = await client.post(
+            "/admin/api/indexes/documents",
+            headers=headers,
+            json={
+                "index_id": "default",
+                "documents": [{"path": "archive.zip", "content": "not really a zip"}],
+            },
+        )
+        assert rejected.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_admin_registers_checks_and_deletes_external_mcp_servers(
     settings_factory,
     monkeypatch,
@@ -244,6 +319,48 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
         assert server_metrics["cpu_cores"] >= 1
         assert 0 <= server_metrics["load_percent"] <= 100
         assert server_metrics["peak_rss_mb"] > 0
+
+        runtime_catalog = admin_overview.json()["tool_catalog"]
+        assert runtime_catalog["built_in_count"] == 8
+        assert {
+            "ssot_context",
+            "kb_feature_context",
+            "kb_search",
+            "kb_get_document",
+            "kb_get_chunk",
+            "kb_run_context_benchmark",
+            "kb_list_documents",
+            "kb_stats",
+        } <= {item["name"] for item in runtime_catalog["tools"]}
+
+        stats_test = await anonymous_client.post(
+            "/admin/api/tools/test",
+            headers=admin_headers,
+            json={"name": "kb_stats", "arguments": {}},
+        )
+        assert stats_test.status_code == 200
+        assert stats_test.json()["structured_content"]["document_count"] == 1
+        assert stats_test.json()["elapsed_ms"] >= 0
+
+        updated_description = (
+            "Return compact RAG health, cache identity and resolved storage diagnostics."
+        )
+        updated_builtin = await anonymous_client.post(
+            "/admin/api/tools/builtin",
+            headers=admin_headers,
+            json={"name": "kb_stats", "description": updated_description},
+        )
+        assert updated_builtin.status_code == 200
+        refreshed_catalog = await anonymous_client.get(
+            "/admin/api/tools/catalog",
+            headers=admin_headers,
+        )
+        stats_definition = next(
+            item for item in refreshed_catalog.json()["tools"] if item["name"] == "kb_stats"
+        )
+        assert stats_definition["description"] == updated_description
+        assert stats_definition["description_overridden"] is True
+        assert settings.builtin_tool_overrides_path.is_file()
 
         managed_definition = {
             "name": "kb_search_limits",

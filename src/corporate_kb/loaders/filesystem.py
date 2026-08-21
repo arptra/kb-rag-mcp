@@ -15,6 +15,23 @@ from corporate_kb.models import Document
 logger = logging.getLogger(__name__)
 
 _IGNORED_PARTS = {".git", ".cache", "__pycache__", "node_modules"}
+MARKDOWN_SUFFIXES = {".md", ".markdown"}
+HTML_SUFFIXES = {".html", ".htm"}
+PLAIN_TEXT_SUFFIXES = {
+    ".txt",
+    ".rst",
+    ".adoc",
+    ".log",
+    ".csv",
+    ".tsv",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".properties",
+}
+SUPPORTED_DOCUMENT_SUFFIXES = MARKDOWN_SUFFIXES | HTML_SUFFIXES | PLAIN_TEXT_SUFFIXES
 
 
 class FileSystemDocumentLoader:
@@ -25,11 +42,9 @@ class FileSystemDocumentLoader:
         html = HtmlDocumentLoader()
         text = TextDocumentLoader()
         self._loaders: dict[str, DocumentLoader] = {
-            ".md": markdown,
-            ".markdown": markdown,
-            ".html": html,
-            ".htm": html,
-            ".txt": text,
+            **{suffix: markdown for suffix in MARKDOWN_SUFFIXES},
+            **{suffix: html for suffix in HTML_SUFFIXES},
+            **{suffix: text for suffix in PLAIN_TEXT_SUFFIXES},
         }
 
     def load_directory(self, knowledge_root: Path) -> list[Document]:

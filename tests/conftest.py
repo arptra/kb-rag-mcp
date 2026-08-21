@@ -21,6 +21,9 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
             "chunk_overlap_tokens": 8,
             "benchmark_questions_path": tmp_path / "evaluation" / "questions.json",
             "managed_tools_path": tmp_path / ".cache" / "kb" / "managed_tools.json",
+            "builtin_tool_overrides_path": (
+                tmp_path / ".cache" / "kb" / "builtin_tool_overrides.json"
+            ),
             "mcp_servers_path": tmp_path / ".cache" / "kb" / "mcp_servers.json",
             "index_catalog_path": tmp_path / ".cache" / "kb" / "index_catalog.json",
             "managed_indexes_dir": tmp_path / ".cache" / "kb" / "indexes",

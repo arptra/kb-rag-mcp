@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from corporate_kb.config import Settings
 from corporate_kb.index_runner import IndexBuildCancelled, IndexBuildProcessRunner
+from corporate_kb.loaders.filesystem import SUPPORTED_DOCUMENT_SUFFIXES
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeIndexMissingError, KnowledgeService
 from corporate_kb.usage import UsageTracker
@@ -48,7 +49,6 @@ from service_map.layout import RepositoryLayoutAnalyzer
 from service_map.models import ServiceRecord
 
 _ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-_SUPPORTED_DOCUMENT_SUFFIXES = {".md", ".markdown", ".html", ".htm", ".txt"}
 logger = logging.getLogger(__name__)
 
 
@@ -381,6 +381,155 @@ class RagCatalog:
             "service_id": service.id,
             "index_id": index_id,
             "path": str(destination),
+            "job": job.model_dump(mode="json"),
+        }
+
+    def index_documents(
+        self,
+        index_id: str,
+        *,
+        query: str = "",
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Return one searchable page of documents from the live serving index."""
+        record = self._record(index_id)
+        if offset < 0:
+            raise ValueError("offset must be zero or greater")
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        documents, total = self.service_for(index_id).browse_documents(
+            query=query,
+            offset=offset,
+            limit=limit,
+        )
+        items = []
+        for document in documents:
+            items.append(
+                {
+                    "document_id": document.document_id,
+                    "title": document.title,
+                    "source_path": document.source_path,
+                    "source_type": document.source_type,
+                    "source_url": document.source_url,
+                    "origin": self._document_origin(document.source_path),
+                    "loaded_at": document.loaded_at.isoformat(),
+                    "metadata": document.metadata,
+                }
+            )
+        return {
+            "index": record.model_dump(mode="json"),
+            "query": query.strip(),
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "has_more": offset + len(items) < total,
+            "documents": items,
+        }
+
+    def index_document(self, index_id: str, document_id: str) -> dict[str, Any]:
+        """Return one full normalized document from the selected serving index."""
+        record = self._record(index_id)
+        if not document_id.strip():
+            raise ValueError("document_id must not be empty")
+        document = self.service_for(index_id).get_document(document_id)
+        encoded = document.content.encode("utf-8")
+        return {
+            "index": {
+                "id": record.id,
+                "name": record.name,
+            },
+            "document_id": document.document_id,
+            "title": document.title,
+            "source_path": document.source_path,
+            "source_type": document.source_type,
+            "source_id": document.source_id,
+            "source_url": document.source_url,
+            "origin": self._document_origin(document.source_path),
+            "loaded_at": document.loaded_at.isoformat(),
+            "metadata": document.metadata,
+            "content": document.content,
+            "content_chars": len(document.content),
+            "content_bytes": len(encoded),
+        }
+
+    def upload_documents(
+        self,
+        index_id: str,
+        *,
+        documents: list[dict[str, str]],
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Persist validated text files under one index and queue one rebuild."""
+        record = self._record(index_id)
+        if not documents:
+            raise ValueError("At least one document is required")
+        if len(documents) > 50:
+            raise ValueError("No more than 50 documents can be uploaded at once")
+
+        root = Path(record.knowledge_dir).resolve()
+        prepared: list[tuple[Path, bytes]] = []
+        seen: set[Path] = set()
+        total_bytes = 0
+        for item in documents:
+            raw_path = item.get("path")
+            content = item.get("content")
+            if not isinstance(raw_path, str) or not isinstance(content, str):
+                raise ValueError("Each document must contain string path and content fields")
+            if not content.strip():
+                raise ValueError(f"Document is empty: {raw_path}")
+            encoded = content.encode("utf-8")
+            if b"\x00" in encoded:
+                raise ValueError(f"Binary-looking document is not allowed: {raw_path}")
+            if len(encoded) > self.settings.admin_max_upload_bytes:
+                raise ValueError(
+                    f"Document exceeds KB_ADMIN_MAX_UPLOAD_BYTES="
+                    f"{self.settings.admin_max_upload_bytes}: {raw_path}"
+                )
+            total_bytes += len(encoded)
+            if total_bytes > self.settings.admin_max_upload_bytes:
+                raise ValueError(
+                    "Combined upload exceeds "
+                    f"KB_ADMIN_MAX_UPLOAD_BYTES={self.settings.admin_max_upload_bytes}"
+                )
+            target = self._safe_uploaded_document_path(root, raw_path)
+            if target in seen:
+                raise ValueError(f"Duplicate document path in upload: {raw_path}")
+            if target.exists() and not overwrite:
+                raise ValueError(
+                    f"Document already exists; enable overwrite to replace it: {raw_path}"
+                )
+            seen.add(target)
+            prepared.append((target, encoded))
+
+        uploaded = []
+        for target, encoded in prepared:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
+                    temporary = Path(handle.name)
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, target)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            uploaded.append(
+                {
+                    "source_path": target.relative_to(root).as_posix(),
+                    "bytes": len(encoded),
+                }
+            )
+
+        job = self.start_index_build(index_id)
+        return {
+            "status": "uploaded",
+            "index_id": index_id,
+            "file_count": len(uploaded),
+            "bytes": total_bytes,
+            "documents": uploaded,
             "job": job.model_dump(mode="json"),
         }
 
@@ -966,7 +1115,7 @@ class RagCatalog:
                         not name.startswith(".")
                         and path.is_file()
                         and not path.is_symlink()
-                        and path.suffix.lower() in _SUPPORTED_DOCUMENT_SUFFIXES
+                        and path.suffix.lower() in SUPPORTED_DOCUMENT_SUFFIXES
                         and path.resolve().is_relative_to(source)
                     ):
                         files.append((path, module_prefix / path.relative_to(source)))
@@ -995,6 +1144,33 @@ class RagCatalog:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
         return len(files)
+
+    @staticmethod
+    def _safe_uploaded_document_path(root: Path, raw_path: str) -> Path:
+        normalized = raw_path.strip().replace("\\", "/")
+        relative = Path(normalized)
+        if not normalized or relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("Document path must be a safe relative path")
+        if any(part.startswith(".") for part in relative.parts):
+            raise ValueError("Hidden document paths are not allowed")
+        if relative.suffix.lower() not in SUPPORTED_DOCUMENT_SUFFIXES:
+            supported = ", ".join(sorted(SUPPORTED_DOCUMENT_SUFFIXES))
+            raise ValueError(f"Unsupported document type; allowed: {supported}")
+        target = (root / "uploads" / relative).resolve()
+        uploads_root = (root / "uploads").resolve()
+        if not target.is_relative_to(uploads_root):
+            raise ValueError("Document path escapes the index upload directory")
+        return target
+
+    @staticmethod
+    def _document_origin(source_path: str) -> str:
+        if source_path.startswith("repositories/"):
+            return "repository"
+        if source_path.startswith("uploads/"):
+            return "upload"
+        if source_path.startswith("ssot/"):
+            return "ssot"
+        return "local"
 
     def _ensure_default_index(self) -> None:
         try:

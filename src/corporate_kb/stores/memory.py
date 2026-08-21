@@ -144,14 +144,40 @@ class InMemoryKnowledgeStore:
         return self._chunks[index] if index is not None else None
 
     def list_documents(self, filters: SearchFilters, *, limit: int) -> list[Document]:
+        documents, _total = self.browse_documents(
+            filters,
+            query="",
+            offset=0,
+            limit=limit,
+        )
+        return documents
+
+    def browse_documents(
+        self,
+        filters: SearchFilters,
+        *,
+        query: str,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[Document], int]:
         if not 1 <= limit <= 200:
             raise ValueError("limit must be between 1 and 200")
+        if offset < 0:
+            raise ValueError("offset must be zero or greater")
+        needle = query.strip().casefold()
         documents = [
             document
             for document in self._documents.values()
             if self._matches_document(document, filters)
+            and (
+                not needle
+                or needle in document.title.casefold()
+                or needle in document.source_path.casefold()
+                or needle in document.source_id.casefold()
+            )
         ]
-        return sorted(documents, key=lambda item: (item.source_path, item.document_id))[:limit]
+        ordered = sorted(documents, key=lambda item: (item.source_path, item.document_id))
+        return ordered[offset : offset + limit], len(ordered)
 
     @staticmethod
     def _value_matches(actual: object, expected: str) -> bool:

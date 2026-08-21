@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 import threading
 from pathlib import Path
 
@@ -344,6 +345,13 @@ public class Controller {{
     cached_events: list[str] = []
     ServiceMapBuilder(settings).build(repositories, progress=cached_events.append)
     assert any("Layout cache hit" in event for event in cached_events)
+    assert any("Layout cache stat ready" in event and "bytes=" in event for event in cached_events)
+    assert any("Layout cache read ready" in event and "chars=" in event for event in cached_events)
+    assert any("Layout cache JSON parse ready" in event for event in cached_events)
+    assert any(
+        "Layout cache hydrate ready" in event and "modules=2" in event
+        for event in cached_events
+    )
     assert sum("Module cache hit" in event for event in cached_events) == 2
     assert not any(event.startswith("Parsing ") for event in cached_events)
 
@@ -464,6 +472,82 @@ def test_service_map_process_has_a_hard_timeout(
     assert process.terminated is True
     assert any("Analysis heartbeat:" in event for event in events)
     assert any("elapsed=11.0s" in event for event in events)
+    assert any("silent_for=11.0s" in event for event in events)
+
+
+def test_service_map_process_dumps_worker_stack_when_stalled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    diagnostic_path: Path | None = None
+
+    class HangingProcess:
+        exitcode = None
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.alive = True
+
+        def start(self) -> None:
+            return None
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+
+        def terminate(self) -> None:
+            self.alive = False
+
+        def kill(self) -> None:
+            self.alive = False
+
+    process = HangingProcess()
+
+    class FakeContext:
+        @staticmethod
+        def Process(**kwargs: object) -> HangingProcess:
+            nonlocal diagnostic_path
+            args = kwargs["args"]
+            assert isinstance(args, tuple)
+            diagnostic_path = args[9]
+            assert isinstance(diagnostic_path, Path)
+            return process
+
+    def write_stack_dump(pid: int, requested_signal: int) -> None:
+        assert pid == process.pid
+        assert requested_signal == signal.SIGUSR1
+        assert diagnostic_path is not None
+        diagnostic_path.write_text(
+            "Current thread 0x01\n  File /workspace/layout.py, line 99 in discover\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        "service_map.runner.multiprocessing.get_context",
+        lambda _method: FakeContext(),
+    )
+    monkeypatch.setattr("service_map.runner.os.kill", write_stack_dump)
+    monotonic_values = iter([0.0, 11.0])
+    monkeypatch.setattr(
+        "service_map.runner.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+    settings = GraphSettings(store_path=tmp_path / "system-graph.json").resolved(tmp_path)
+    events: list[str] = []
+
+    with pytest.raises(ServiceMapBuildTimedOut):
+        ServiceMapProcessRunner(settings, timeout_seconds=10).build(
+            [RepositoryInput(path=tmp_path, name="stalled-service")],
+            progress=events.append,
+        )
+
+    assert any("Analysis stall probe requested:" in event for event in events)
+    assert any(
+        event == "Worker stack | File /workspace/layout.py, line 99 in discover"
+        for event in events
+    )
 
 
 def test_service_map_process_returns_latest_checkpoint_on_timeout(

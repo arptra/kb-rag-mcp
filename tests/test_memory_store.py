@@ -77,6 +77,27 @@ def test_metadata_filters_support_strings_and_lists() -> None:
     assert store._value_matches("b", "b")
 
 
+def test_document_browser_supports_query_and_offset() -> None:
+    store = populated_store()
+
+    page, total = store.browse_documents(
+        SearchFilters(),
+        query="second",
+        offset=0,
+        limit=1,
+    )
+    empty_page, same_total = store.browse_documents(
+        SearchFilters(),
+        query="second",
+        offset=1,
+        limit=1,
+    )
+
+    assert [item.document_id for item in page] == ["second"]
+    assert total == same_total == 1
+    assert empty_page == []
+
+
 def test_empty_store_and_wrong_dimension() -> None:
     store = InMemoryKnowledgeStore()
     store.replace_index([], [], np.empty((0, 2), dtype=np.float32))

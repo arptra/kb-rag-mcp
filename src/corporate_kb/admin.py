@@ -12,10 +12,9 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
 
+from corporate_kb.loaders.filesystem import SUPPORTED_DOCUMENT_SUFFIXES
 from corporate_kb.service import KnowledgeService, create_service
 from corporate_kb.usage import UsageTracker
-
-_SUPPORTED_DOCUMENT_SUFFIXES = {".md", ".markdown", ".html", ".htm", ".txt"}
 
 
 class AdminController:
@@ -164,8 +163,8 @@ class AdminController:
             raise ValueError("Document path must be a safe relative path")
         if any(part.startswith(".") for part in relative.parts):
             raise ValueError("Hidden document paths are not allowed")
-        if relative.suffix.lower() not in _SUPPORTED_DOCUMENT_SUFFIXES:
-            supported = ", ".join(sorted(_SUPPORTED_DOCUMENT_SUFFIXES))
+        if relative.suffix.lower() not in SUPPORTED_DOCUMENT_SUFFIXES:
+            supported = ", ".join(sorted(SUPPORTED_DOCUMENT_SUFFIXES))
             raise ValueError(f"Unsupported document type; allowed: {supported}")
         root = self._service.settings.knowledge_dir.resolve()
         target = (root / relative).resolve()

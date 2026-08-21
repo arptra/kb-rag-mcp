@@ -5,6 +5,8 @@ import time
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
 from corporate_kb.index_runner import IndexBuildCancelled, IndexBuildProcessRunner
@@ -22,6 +24,64 @@ def _wait_for_job(catalog: RagCatalog, job_id: str) -> dict[str, object]:
             return current
         time.sleep(0.01)
     raise AssertionError(f"Job did not finish: {job_id} ({current})")
+
+
+def test_catalog_uploads_and_pages_documents_for_one_index(settings_factory) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    index = catalog.create_index(name="Manual knowledge")
+
+    uploaded = catalog.upload_documents(
+        index.id,
+        documents=[
+            {"path": "runbook.md", "content": "# Worker runbook\n\nRestart the worker."},
+            {"path": "limits.json", "content": '{"owner": "limits-service"}'},
+        ],
+    )
+    finished = _wait_for_job(catalog, uploaded["job"]["id"])
+    assert finished["status"] == "completed"
+    assert uploaded["file_count"] == 2
+    assert (Path(index.knowledge_dir) / "uploads" / "runbook.md").is_file()
+
+    first_page = catalog.index_documents(index.id, limit=1)
+    assert first_page["total"] == 2
+    assert first_page["has_more"] is True
+    assert len(first_page["documents"]) == 1
+    second_page = catalog.index_documents(index.id, offset=1, limit=1)
+    assert second_page["has_more"] is False
+    by_query = catalog.index_documents(index.id, query="worker", limit=20)
+    assert [item["title"] for item in by_query["documents"]] == ["Worker runbook"]
+    assert by_query["documents"][0]["origin"] == "upload"
+    detail = catalog.index_document(
+        index.id,
+        by_query["documents"][0]["document_id"],
+    )
+    assert detail["content"] == "# Worker runbook\n\nRestart the worker."
+    assert detail["index"] == {"id": index.id, "name": "Manual knowledge"}
+    assert detail["content_bytes"] == len(detail["content"].encode("utf-8"))
+
+    with pytest.raises(ValueError, match="safe relative path"):
+        catalog.upload_documents(
+            index.id,
+            documents=[{"path": "../escape.md", "content": "unsafe"}],
+        )
+    with pytest.raises(ValueError, match="Binary-looking"):
+        catalog.upload_documents(
+            index.id,
+            documents=[{"path": "binary.txt", "content": "bad\x00data"}],
+        )
 
 
 def test_catalog_creates_index_and_imports_local_openspec(settings_factory, tmp_path) -> None:

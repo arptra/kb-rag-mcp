@@ -15,6 +15,35 @@ export interface RagIndex {
   error: string | null;
 }
 
+export interface IndexDocument {
+  document_id: string;
+  title: string;
+  source_path: string;
+  source_type: string;
+  source_url: string | null;
+  origin: "repository" | "upload" | "ssot" | "local";
+  loaded_at: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface IndexDocumentsPage {
+  index: RagIndex;
+  query: string;
+  offset: number;
+  limit: number;
+  total: number;
+  has_more: boolean;
+  documents: IndexDocument[];
+}
+
+export interface IndexDocumentDetail extends IndexDocument {
+  index: { id: string; name: string };
+  source_id: string;
+  content: string;
+  content_chars: number;
+  content_bytes: number;
+}
+
 export interface RepositorySource {
   id: string;
   name: string;
@@ -76,6 +105,26 @@ export interface ManagedTool {
   index_ids: string[];
 }
 
+export interface ToolCatalogItem {
+  name: string;
+  title: string | null;
+  description: string;
+  kind: "built-in" | "managed";
+  input_schema: Record<string, unknown>;
+  output_schema: Record<string, unknown> | null;
+  description_overridden: boolean;
+  editable: boolean;
+  index_ids: string[];
+  defaults: Record<string, unknown>;
+}
+
+export interface ToolCatalog {
+  tool_count: number;
+  built_in_count: number;
+  managed_count: number;
+  tools: ToolCatalogItem[];
+}
+
 export interface McpServerTool {
   name: string;
   description: string;
@@ -121,6 +170,7 @@ export interface Overview {
     indexed_at: string;
   };
   managed_tools: { tool_count: number; tools: ManagedTool[] };
+  tool_catalog: ToolCatalog;
   mcp_servers: McpServers;
   catalog: Catalog;
   graph: GraphOverview;

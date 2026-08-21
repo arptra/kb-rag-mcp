@@ -13,6 +13,7 @@ from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
 from corporate_kb.feature_context import FeatureContextPlanner
 from corporate_kb.mcp.managed_tools import ManagedToolRegistry
+from corporate_kb.mcp.tool_overrides import BuiltinToolOverrideRegistry
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import (
     KnowledgeService,
@@ -36,6 +37,25 @@ owned by each affected repository. Use this before cross-service implementation 
 callers, callees, API/event operations, statically linked invocation triggers, exact source
 evidence, and compact RAG excerpts grouped by service. Supply start_service when known; otherwise
 the tool discovers likely roots. LOW/UNRESOLVED facts and runtime order must be verified."""
+BUILTIN_TOOL_DESCRIPTIONS = {
+    "ssot_context": SSOT_DESCRIPTION,
+    "kb_feature_context": FEATURE_CONTEXT_DESCRIPTION,
+    "kb_search": SEARCH_DESCRIPTION,
+    "kb_get_document": (
+        "Return a bounded extract from one normalized document after kb_search identifies its "
+        "document_id."
+    ),
+    "kb_get_chunk": (
+        "Return a bounded source chunk selected by chunk_id from kb_search. Prefer this over "
+        "kb_get_document when only one search result needs more context."
+    ),
+    "kb_run_context_benchmark": (
+        "Run the protected read-only context benchmark. Before calling, ask the user to enter "
+        "the separate benchmark password; never guess or reuse the normal API Bearer token."
+    ),
+    "kb_list_documents": "List filtered document metadata without document bodies or embeddings.",
+    "kb_stats": "Return index counts, identity, timestamps, and resolved local directories.",
+}
 logger = logging.getLogger(__name__)
 
 
@@ -46,11 +66,19 @@ def create_mcp_server(
     knowledge_tools: KnowledgeTools | None = None,
     managed_tools: ManagedToolRegistry | None = None,
     feature_context: FeatureContextPlanner | None = None,
+    builtin_tool_overrides: BuiltinToolOverrideRegistry | None = None,
 ) -> FastMCP:
     """Create a FastMCP server without eagerly loading a model or index."""
     kb_service = service or create_service()
     tools = knowledge_tools or KnowledgeTools(kb_service)
     registry = managed_tools or ManagedToolRegistry(kb_service.settings.managed_tools_path, tools)
+
+    def description(name: str) -> str:
+        default = BUILTIN_TOOL_DESCRIPTIONS[name]
+        if builtin_tool_overrides is None:
+            return default
+        return builtin_tool_overrides.description_for(name, default)
+
     server = FastMCP(
         "corporate-knowledge",
         instructions=(
@@ -65,7 +93,7 @@ def create_mcp_server(
 
     @server.tool(
         name="ssot_context",
-        description=SSOT_DESCRIPTION,
+        description=description("ssot_context"),
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
     def ssot_context(
@@ -76,7 +104,7 @@ def create_mcp_server(
 
     @server.tool(
         name="kb_search",
-        description=SEARCH_DESCRIPTION,
+        description=description("kb_search"),
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
     def kb_search(
@@ -106,7 +134,7 @@ def create_mcp_server(
 
         @server.tool(
             name="kb_feature_context",
-            description=FEATURE_CONTEXT_DESCRIPTION,
+            description=description("kb_feature_context"),
             annotations={"readOnlyHint": True, "openWorldHint": False},
         )
         def kb_feature_context(
@@ -124,10 +152,7 @@ def create_mcp_server(
 
     @server.tool(
         name="kb_get_document",
-        description=(
-            "Return a bounded extract from one normalized document after kb_search identifies its "
-            "document_id."
-        ),
+        description=description("kb_get_document"),
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
     def kb_get_document(
@@ -138,10 +163,7 @@ def create_mcp_server(
 
     @server.tool(
         name="kb_get_chunk",
-        description=(
-            "Return a bounded source chunk selected by chunk_id from kb_search. Prefer this over "
-            "kb_get_document when only one search result needs more context."
-        ),
+        description=description("kb_get_chunk"),
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
     def kb_get_chunk(
@@ -152,10 +174,7 @@ def create_mcp_server(
 
     @server.tool(
         name="kb_run_context_benchmark",
-        description=(
-            "Run the protected read-only context benchmark. Before calling, ask the user to enter "
-            "the separate benchmark password; never guess or reuse the normal API Bearer token."
-        ),
+        description=description("kb_run_context_benchmark"),
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
     def kb_run_context_benchmark(password: str) -> dict[str, Any]:
@@ -163,7 +182,7 @@ def create_mcp_server(
 
     @server.tool(
         name="kb_list_documents",
-        description="List filtered document metadata without document bodies or embeddings.",
+        description=description("kb_list_documents"),
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
     def kb_list_documents(
@@ -183,7 +202,7 @@ def create_mcp_server(
 
     @server.tool(
         name="kb_stats",
-        description="Return index counts, identity, timestamps, and resolved local directories.",
+        description=description("kb_stats"),
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
     def kb_stats() -> dict[str, Any]:
@@ -226,11 +245,15 @@ def main() -> None:
             index_tools=catalog.tools_for,
             index_exists=catalog.has_index,
         )
+        builtin_tool_overrides = BuiltinToolOverrideRegistry(
+            settings.builtin_tool_overrides_path
+        )
         create_mcp_server(
             service,
             knowledge_tools=tools,
             managed_tools=managed_tools,
             feature_context=FeatureContextPlanner(catalog),
+            builtin_tool_overrides=builtin_tool_overrides,
         ).run(
             transport="stdio",
             show_banner=False,

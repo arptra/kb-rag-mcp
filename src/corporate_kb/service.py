@@ -235,6 +235,22 @@ class KnowledgeService:
         self.load_read_index()
         return self.store.list_documents(filters or SearchFilters(), limit=limit)
 
+    def browse_documents(
+        self,
+        *,
+        query: str = "",
+        offset: int = 0,
+        limit: int = 50,
+        filters: SearchFilters | None = None,
+    ) -> tuple[list[Document], int]:
+        self.load_read_index()
+        return self.store.browse_documents(
+            filters or SearchFilters(),
+            query=query,
+            offset=offset,
+            limit=limit,
+        )
+
     def stats(self) -> IndexStats:
         return self.load_read_index()
 
