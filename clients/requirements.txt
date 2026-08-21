@@ -1,0 +1,2 @@
+# Runtime for corporate_kb_stdio_proxy.py. Keep this version aligned with the server.
+fastmcp==3.4.4

@@ -1,10 +1,9 @@
 {
   "mcpServers": {
     "corporate-kb": {
-      "command": "REPLACE_WITH_ABSOLUTE_UV_PATH",
+      "command": "REPLACE_WITH_CLIENT_DIR/venv/bin/python",
       "args": [
-        "run",
-        "REPLACE_WITH_ABSOLUTE_PATH/corporate_kb_stdio_proxy.py"
+        "REPLACE_WITH_CLIENT_DIR/corporate_kb_stdio_proxy.py"
       ],
       "env": {
         "CORPORATE_KB_MCP_URL": "http://REPLACE_WITH_SERVER_IP_OR_DOMAIN:8000/mcp",

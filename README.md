@@ -158,29 +158,27 @@ dependencies своей части. Подробности и production-реж�
 ### Подключение сотрудника к удалённой базе
 
 RAG, индекс и документы находятся только на сервере. Для старых версий Qwen сотруднику
-передаётся один файл [`clients/corporate_kb_stdio_proxy.py`](clients/corporate_kb_stdio_proxy.py).
-Qwen запускает его локально через `uv` как stdio MCP, а Python-процесс ходит к удалённому
+передаются [`clients/corporate_kb_stdio_proxy.py`](clients/corporate_kb_stdio_proxy.py) и
+[`clients/requirements.txt`](clients/requirements.txt). В отдельном клиентском `venv` через обычный
+`pip` устанавливается `FastMCP==3.4.4`. Qwen запускает Python из этого `venv` как stdio MCP, а процесс ходит к удалённому
 серверу как прозрачный Streamable HTTP MCP-клиент. На клиенте нет прошитого списка tools: при
 каждом запуске он выполняет удалённый `tools/list` и зеркалирует новые имена, схемы, annotations и
-вызовы. Node.js, `npx`, `mcp-remote`, Nginx, копия проекта,
-`.venv`, документы и индекс на клиенте не нужны.
+вызовы. `uv`, Node.js, `npx`, `mcp-remote`, Nginx, копия серверного проекта, документы и индекс на
+клиенте не нужны.
 
 Готовый settings находится в
-[`examples/qwen-uv-stdio-settings.example.json`](examples/qwen-uv-stdio-settings.example.json), а полная
+[`examples/qwen-venv-stdio-settings.example.json`](examples/qwen-venv-stdio-settings.example.json), а полная
 инструкция для сотрудника — в [`README.client.md`](README.client.md).
 
 Новые версии Qwen также могут подключаться к `/mcp` напряму через Streamable HTTP; скрипт
 `install.sh` оставлен как опциональный способ для таких клиентов.
-Скопируйте из неё `mcpServers` в `~/.qwen/settings.json` и замените три placeholder:
+Скопируйте из неё `mcpServers` в `~/.qwen/settings.json` и замените placeholder:
 
-- `REPLACE_WITH_ABSOLUTE_UV_PATH` — результат `which uv` или `where uv` (в Windows `uv.exe`);
-- `REPLACE_WITH_ABSOLUTE_PATH` — каталог, в котором сотрудник сохранил единственный `.py`-файл;
+- `REPLACE_WITH_CLIENT_DIR` — каталог с клиентским `venv` и `.py`-файлом;
 - `REPLACE_WITH_SERVER_IP_OR_DOMAIN` — адрес удалённого сервера;
 
-Qwen запускает этот файл как локальный MCP по `stdio` командой `uv run`. Скрипт содержит inline
-dependency на FastMCP, поэтому `uv` сам создаёт изолированное кэшированное окружение. Локальный MCP
-обращается к общему RAG-серверу через его Streamable HTTP endpoint `/mcp`.
-`node`, `npx`, `mcp-remote`, локальная копия документов и локальный индекс не нужны.
+Qwen запускает этот файл как локальный MCP по `stdio` через абсолютный путь к `venv/bin/python`.
+Локальный MCP обращается к общему RAG-серверу через Streamable HTTP endpoint `/mcp`.
 
 ### Установка серверной части
 

@@ -20,12 +20,14 @@ Qwen сам запускает локальный MCP-процесс. Отдел
 
 ## Что должен выдать администратор
 
-1. Один файл `corporate_kb_stdio_proxy.py`.
+1. Файлы `corporate_kb_stdio_proxy.py` и `requirements.txt` из каталога `clients/`.
 2. Адрес MCP endpoint, например `http://10.20.30.40:8000/mcp`.
 3. Bearer-токен — только если администратор включил защиту на сервере.
 
-На клиентском компьютере должны быть установлены Qwen Code и `uv`. Node.js, `npx`, `mcp-remote`,
-Nginx и отдельное Python-окружение не нужны.
+На клиентском компьютере должны быть установлены Qwen Code, Python 3.12 и `pip`. `uv`, Node.js,
+`npx`, `mcp-remote` и Nginx не нужны. Используется отдельное клиентское окружение `venv` с
+зафиксированным `FastMCP==3.4.4`. Она не использует Python-окружение RAG-сервера или других
+проектов и устраняет конфликты импортов.
 
 ## 1. Сохранить клиентский файл
 
@@ -39,30 +41,159 @@ Nginx и отдельное Python-окружение не нужны.
 C:/Users/User/corporate_kb_stdio_proxy.py
 ```
 
-## 2. Найти абсолютный путь к uv
+## 2. Создать чистое клиентское Python-окружение
+
+Положите рядом два файла из repository:
+
+```text
+corporate-kb-client/
+├── corporate_kb_stdio_proxy.py
+└── requirements.txt
+```
+
+`requirements.txt` находится в `clients/requirements.txt`. Старое окружение не используйте.
+
+### Linux или macOS
+
+Перейдите в созданный каталог и выполните:
+
+```bash
+cd /ABSOLUTE/PATH/corporate-kb-client
+
+python3.12 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install --requirement requirements.txt
+
+python -c 'import fastmcp; from fastmcp import Client, FastMCP; from fastmcp.server import create_proxy; print(f"FastMCP {fastmcp.__version__}: OK")'
+```
+
+Последняя команда должна вывести `FastMCP 3.4.4: OK`.
+
+Если в этом каталоге уже есть сломанная `venv`, сначала сохраните её под другим именем и повторите
+команды:
+
+```bash
+deactivate 2>/dev/null || true
+mv venv "venv-old-$(date +%Y%m%d-%H%M%S)"
+```
+
+### Windows PowerShell
+
+```powershell
+Set-Location "C:/ABSOLUTE/PATH/corporate-kb-client"
+
+py -3.12 -m venv venv
+& "venv/Scripts/Activate.ps1"
+python -m pip install --upgrade pip
+python -m pip install --requirement requirements.txt
+
+python -c 'import fastmcp; from fastmcp import Client, FastMCP; from fastmcp.server import create_proxy; print(f"FastMCP {fastmcp.__version__}: OK")'
+```
+
+Старое окружение в PowerShell можно сохранить так:
+
+```powershell
+deactivate
+Rename-Item venv ("venv-old-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+```
+
+## 3. Проверить клиент вручную
 
 Linux или macOS:
 
 ```bash
-command -v uv
+cd /ABSOLUTE/PATH/corporate-kb-client
+source venv/bin/activate
+CORPORATE_KB_MCP_URL=http://SERVER_IP:8000/mcp \
+  python corporate_kb_stdio_proxy.py
 ```
 
 Windows PowerShell:
 
 ```powershell
-(Get-Command uv).Source
+Set-Location "C:/ABSOLUTE/PATH/corporate-kb-client"
+& "venv/Scripts/Activate.ps1"
+$env:CORPORATE_KB_MCP_URL = "http://SERVER_IP:8000/mcp"
+python "corporate_kb_stdio_proxy.py"
 ```
 
-Windows CMD:
+При успешном запуске процесс будет молча ожидать MCP-сообщения в stdin. Это нормально; остановите
+его через `Ctrl+C`. `ModuleNotFoundError` или ошибка импорта означает, что окружение не активировано
+либо зависимости установлены не в этот `venv`.
 
-```bat
-where uv
+## 4. Добавить MCP в Qwen
+
+Сначала удалите прежнюю запись с тем же именем, чтобы Qwen не запускал старый Python:
+
+```bash
+qwen mcp remove corporate-kb
 ```
 
-Используйте полученный абсолютный путь в Qwen settings. Это важно: Qwen может запускаться с другим
-`PATH` и не находить просто команду `uv`.
+Пользовательский файл настроек:
 
-## 3. Проверить доступ к удалённой базе
+- Linux/macOS: `~/.qwen/settings.json`;
+- Windows: `%USERPROFILE%\.qwen\settings.json`.
+
+Если файл уже содержит настройки модели или другие MCP-серверы, добавьте объект `corporate-kb` в
+существующий `mcpServers`, не удаляя остальные поля. В `command` должен быть абсолютный путь именно
+к Python из нового клиентского `venv`, а не глобальный `python` или Python другого проекта.
+
+Готовый шаблон находится в
+`examples/qwen-venv-stdio-settings.example.json`.
+
+### Linux или macOS
+
+```json
+{
+  "mcpServers": {
+    "corporate-kb": {
+      "command": "/ABSOLUTE/PATH/corporate-kb-client/venv/bin/python",
+      "args": [
+        "/ABSOLUTE/PATH/corporate-kb-client/corporate_kb_stdio_proxy.py"
+      ],
+      "env": {
+        "CORPORATE_KB_MCP_URL": "http://SERVER_IP:8000/mcp",
+        "CORPORATE_KB_MCP_TOKEN": "",
+        "CORPORATE_KB_MCP_TIMEOUT": "120"
+      },
+      "timeout": 120000,
+      "trust": false
+    }
+  }
+}
+```
+
+### Windows
+
+Используйте прямые `/` в JSON:
+
+```json
+{
+  "mcpServers": {
+    "corporate-kb": {
+      "command": "C:/ABSOLUTE/PATH/corporate-kb-client/venv/Scripts/python.exe",
+      "args": [
+        "C:/ABSOLUTE/PATH/corporate-kb-client/corporate_kb_stdio_proxy.py"
+      ],
+      "env": {
+        "CORPORATE_KB_MCP_URL": "http://SERVER_IP:8000/mcp",
+        "CORPORATE_KB_MCP_TOKEN": "",
+        "CORPORATE_KB_MCP_TIMEOUT": "120"
+      },
+      "timeout": 120000,
+      "trust": false
+    }
+  }
+}
+```
+
+После изменения полностью закройте Qwen, запустите его заново и выполните `/mcp`.
+
+`CORPORATE_KB_MCP_URL` должен указывать на общий сервер, а не на компьютер сотрудника. `localhost`
+подходит только если сервер запущен на той же машине или к нему настроен SSH/VPN tunnel.
+
+## Проверить доступ к удалённой базе
 
 Проверка статистики:
 
@@ -82,67 +213,6 @@ curl -G \
 
 Оба запроса должны вернуть `HTTP 200` и JSON. Если администратор всё же включил Bearer-защиту,
 добавьте к командам `-H 'Authorization: Bearer SERVER_TOKEN'`.
-
-## 4. Добавить MCP в Qwen
-
-Пользовательский файл настроек:
-
-- Linux/macOS: `~/.qwen/settings.json`;
-- Windows: `%USERPROFILE%\.qwen\settings.json`.
-
-Если файл уже содержит настройки модели или другие MCP-серверы, добавьте объект `corporate-kb` в
-существующий `mcpServers`, не удаляя остальные поля.
-
-### Linux или macOS
-
-```json
-{
-  "mcpServers": {
-    "corporate-kb": {
-      "command": "/home/user/.local/bin/uv",
-      "args": [
-        "run",
-        "/home/user/corporate_kb_stdio_proxy.py"
-      ],
-      "env": {
-        "CORPORATE_KB_MCP_URL": "http://SERVER_IP:8000/mcp",
-        "CORPORATE_KB_MCP_TIMEOUT": "120"
-      },
-      "timeout": 120000,
-      "trust": false
-    }
-  }
-}
-```
-
-### Windows
-
-В JSON удобно использовать прямые `/`, чтобы не экранировать обратные слеши:
-
-```json
-{
-  "mcpServers": {
-    "corporate-kb": {
-      "command": "C:/Users/User/.local/bin/uv.exe",
-      "args": [
-        "run",
-        "C:/Users/User/corporate_kb_stdio_proxy.py"
-      ],
-      "env": {
-        "CORPORATE_KB_MCP_URL": "http://SERVER_IP:8000/mcp",
-        "CORPORATE_KB_MCP_TIMEOUT": "120"
-      },
-      "timeout": 120000,
-      "trust": false
-    }
-  }
-}
-```
-
-`CORPORATE_KB_MCP_URL` должен указывать на общий сервер, а не на компьютер сотрудника. `localhost`
-подходит только если сервер запущен на той же машине или к нему настроен SSH/VPN tunnel.
-Старая переменная `CORPORATE_KB_API_URL=http://SERVER_IP:8000` продолжает работать: proxy сам
-добавит `/mcp`.
 
 ## 5. Запустить Qwen
 
@@ -201,20 +271,20 @@ annotations, а `tools/call` прозрачно отправляет обрат�
 Используй corporate-kb. Найди информацию о дневных лимитах и укажи использованные источники.
 ```
 
-## Что происходит при первом запуске
+## Что установлено на клиенте
 
-В начале `uv` читает inline dependency из единственного `.py`-файла и устанавливает
-`FastMCP==3.4.4` в собственный кэш. Последующие запуски используют кэш и происходят быстрее.
-Проектная папка и локальная `.venv` не создаются.
+Все Python-зависимости находятся только в каталоге `venv`. `requirements.txt` фиксирует
+`FastMCP==3.4.4`, а обычный `pip` устанавливает совместимые зависимости. После установки Qwen
+запускает готовый `venv/bin/python` и ничего не скачивает при старте.
 
 Если корпоративный компьютер использует внутренний Python package index, он должен содержать
-FastMCP и его зависимости либо быть настроен в `uv` администратором.
+FastMCP и его зависимости либо `pip` должен быть настроен администратором на этот index.
 
 ## Диагностика
 
 ### Qwen не видит MCP
 
-- Проверьте абсолютные пути к `uv` и `.py`-файлу.
+- Проверьте абсолютные пути к `venv/bin/python` или `venv/Scripts/python.exe` и к `.py`-файлу.
 - Проверьте JSON на лишние запятые.
 - Полностью перезапустите Qwen после изменения settings.
 
@@ -237,18 +307,20 @@ CORPORATE_KB_API_URL=http://SERVER_IP:8000
 На сервере включена опциональная Bearer-защита. Запросите токен у администратора и добавьте
 `CORPORATE_KB_MCP_TOKEN` в `env` MCP-настройки.
 
-### uv не может скачать FastMCP
+### pip не может установить FastMCP
 
-Проверьте настройки корпоративного Python package index. Это единственная загрузка зависимости на
-клиенте; документы и индекс при этом не скачиваются.
+Проверьте настройки корпоративного Python package index. При необходимости администратор должен
+выдать URL и сертификат внутреннего PyPI mirror. Документы и индекс при этом не скачиваются.
 
 ### Поиск работает через curl, но не через Qwen
 
 Запустите файл вручную той же командой из settings:
 
 ```bash
+cd /ABSOLUTE/PATH/corporate-kb-client
+source venv/bin/activate
 CORPORATE_KB_MCP_URL=http://SERVER_IP:8000/mcp \
-  /absolute/path/to/uv run /absolute/path/to/corporate_kb_stdio_proxy.py
+  python corporate_kb_stdio_proxy.py
 ```
 
 Процесс должен ожидать MCP-сообщения в stdin. Ошибки конфигурации выводятся в stderr. Остановить
@@ -259,4 +331,4 @@ CORPORATE_KB_MCP_URL=http://SERVER_IP:8000/mcp \
 При появлении новых server tools обновление файла не требуется — достаточно перезапустить Qwen.
 Сам `corporate_kb_stdio_proxy.py` заменяйте только при выпуске новой версии proxy transport.
 
-Для удаления удалите объект `corporate-kb` из `mcpServers`, затем удалите единственный `.py`-файл.
+Для удаления удалите объект `corporate-kb` из `mcpServers`, затем каталог клиента вместе с `venv`.

@@ -1,10 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.10"
-# dependencies = [
-#   "fastmcp==3.4.4",
-# ]
-# ///
+#!/usr/bin/env python3
 """One-file stdio proxy that mirrors every tool from a remote MCP server."""
 
 from __future__ import annotations
