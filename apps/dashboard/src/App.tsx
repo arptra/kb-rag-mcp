@@ -846,6 +846,7 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
   const indexNames = Object.fromEntries(
     data.catalog.indexes.map((index) => [index.id, index.name]),
   );
+  const gigacode = data.catalog.ssot_generation.gigacode;
   const servicesByRepository = new Map<string, typeof data.service_map.services>();
   data.service_map.services.forEach((service) => {
     const key = service.repository_root || service.repository;
@@ -880,6 +881,13 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
         <p>{data.catalog.analysis.available
           ? <>Последний полный analysis run сохранён: <code>{data.catalog.analysis.path}</code></>
           : <>Архив анализа пока пуст. Запустите анализ любого сервиса или полную пересборку графа.</>}</p>
+      </div>
+
+      <div className={`server-note analysis-note ${gigacode.available ? "" : "warning"}`}>
+        <span>{gigacode.available ? "✦" : "!"}</span>
+        <p>{gigacode.available
+          ? <>GigaCode готов: <code>{gigacode.executable}</code> · {gigacode.version}. Кнопка на карточке сначала обновит статическую карту, затем запустит GigaCode, создаст SSOT и обновит индекс.</>
+          : <>GigaCode недоступен: <code>{gigacode.error || "executable не найден"}</code>. Укажите реальный абсолютный путь в <code>KB_GIGACODE_COMMAND</code> и перезапустите backend.</>}</p>
       </div>
 
       {data.catalog.repositories.length || standaloneMapServices.length ? (
@@ -1006,13 +1014,21 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
                             : "↻ OpenSpec + RAG"}
                       </button>
                       <button
-                        disabled={Boolean(activeServiceJob || activeGraphJob)}
+                        disabled={Boolean(activeServiceJob || activeGraphJob) || !gigacode.available}
+                        title={gigacode.available ? "Статика → GigaCode → SSOT → RAG" : gigacode.error || "GigaCode недоступен"}
                         onClick={() => void onAction(
-                          () => post("/admin/api/services/analyze", password, { service_id: mappedService.id }),
-                          `Анализ кода «${mappedService.name}» поставлен в очередь`,
+                          () => post("/admin/api/services/analyze", password, {
+                            service_id: mappedService.id,
+                            generation_mode: "gigacode",
+                          }),
+                          `GigaCode-анализ «${mappedService.name}» поставлен в очередь`,
                         )}
                       >
-                        {activeServiceJob ? "◌ Анализируется…" : "Анализ кода"}
+                        {activeServiceJob
+                          ? "◌ GigaCode анализирует…"
+                          : gigacode.available
+                            ? "✦ Анализ через GigaCode"
+                            : "GigaCode недоступен"}
                       </button>
                       <button onClick={() => onSsot(mappedService, repository.index_id)}>SSOT</button>
                       <button onClick={onGraph}>Граф</button>

@@ -631,6 +631,21 @@ public class GigaCodeController {
     assert "https://auth.example/gigacode/device" in log
     assert "GigaCode result" in log
 
+    service_id = options["repositories"][0]["services"][0]["id"]
+    card_job = catalog.start_service_analysis(
+        service_id,
+        generation_mode="gigacode",
+    )
+    card_completed = _wait_for_job(catalog, card_job.id)
+
+    assert card_completed["status"] == "completed"
+    assert card_completed["type"] == "service"
+    assert card_completed["result"]["phase"] == "indexed"
+    assert card_completed["result"]["target_count"] == 1
+    card_log = catalog.job_log(card_job.id)["log"]
+    assert "Static scan completed; starting GigaCode" in card_log
+    assert "GigaCode starting" in card_log
+
 
 def test_catalog_indexes_all_module_openspec_roots(settings_factory, tmp_path) -> None:
     settings = settings_factory()

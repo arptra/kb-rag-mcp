@@ -109,6 +109,11 @@ Repository и производные сервисы можно удалять и
 успешный source analysis архивируется в `.cache/kb/analysis/runs/`; с карточки сервиса можно
 скачать пакет с analysis JSON и [`build-service-ssot`](skills/build-service-ssot/SKILL.md), затем
 загрузить проверенный Markdown SSOT в выбранный RAG-индекс.
+Кнопка **«Анализ через GigaCode»** на карточке выполняет полный service-flow: сначала обновляет
+детерминированную карту исходников, затем запускает GigaCode для этого сервиса, сохраняет
+сгенерированный SSOT и перестраивает индекс repository. Над списком сервисов dashboard показывает
+результат `gigacode --version` и точную ошибку executable/PATH; при browser-login ссылка появляется
+в соответствующей job.
 Для агентского режима кнопка **«Подготовить SSOT-контекст»** или MCP-tool
 `kb_generate_system_ssot` запускает свежий source analysis и открывает сессию чтения исходников.
 Отдельный LLM URL серверу не нужен. В `generation_mode=client` SSOT пишет нейронка, вызвавшая MCP с

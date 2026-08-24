@@ -103,6 +103,11 @@ Job останется в `running`, dashboard покажет кнопку **«�
 показывает URL, session, tool progress, stderr, duration и полную ошибку. Таймаут и отмена продолжают
 действовать во время ожидания авторизации.
 
+На вкладке **«Сервисы»** кнопка **«Анализ через GigaCode»** запускает тот же workflow только для
+выбранной карточки: static scan → GigaCode → generated SSOT → rebuild связанного RAG-индекса.
+Строка `/абсолютный/путь/до/gigacode` в примерах является placeholder; подставьте результат
+`command -v gigacode`, иначе dashboard явно покажет, что executable не найден.
+
 ## 3. Построить индекс
 
 Для первого запуска без внешней модели используйте hash provider:

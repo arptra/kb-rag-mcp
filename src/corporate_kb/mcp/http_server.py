@@ -659,7 +659,19 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             service_id = payload.get("service_id") if isinstance(payload, dict) else None
             if not isinstance(service_id, str) or not service_id:
                 raise ValueError("service_id must be a non-empty string")
-            job = catalog.start_service_analysis(service_id)
+            generation_mode = (
+                payload.get("generation_mode", "static")
+                if isinstance(payload, dict)
+                else "static"
+            )
+            if generation_mode not in {"static", "gigacode"}:
+                raise ValueError("generation_mode must be static or gigacode")
+            job = catalog.start_service_analysis(
+                service_id,
+                generation_mode=(
+                    "gigacode" if generation_mode == "gigacode" else "static"
+                ),
+            )
             return JSONResponse(job.model_dump(mode="json"), status_code=202)
         except Exception as exc:
             return _api_error(exc)

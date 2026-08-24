@@ -366,17 +366,36 @@ class RagCatalog:
         threading.Thread(target=self._run_graph_job, args=(job.id,), daemon=True).start()
         return job
 
-    def start_service_analysis(self, service_id: str) -> CatalogJob:
+    def start_service_analysis(
+        self,
+        service_id: str,
+        *,
+        generation_mode: Literal["static", "gigacode"] = "static",
+    ) -> CatalogJob:
         service, repository = self._service_context(service_id)
+        if generation_mode == "gigacode":
+            gigacode_status = self._gigacode.status(refresh=True)
+            if not gigacode_status["available"]:
+                raise RuntimeError(str(gigacode_status["error"]))
         job = self._new_job(
             "service",
             index_id=repository.index_id,
             target_id=service.id,
-            message=f"Service analysis queued: {service.name}",
+            message=(
+                f"GigaCode service analysis queued: {service.name}"
+                if generation_mode == "gigacode"
+                else f"Static service analysis queued: {service.name}"
+            ),
         )
         threading.Thread(
             target=self._run_service_analysis_job,
-            args=(job.id, service.id, service.name, repository.index_id),
+            args=(
+                job.id,
+                service.id,
+                service.name,
+                repository.index_id,
+                generation_mode,
+            ),
             daemon=True,
         ).start()
         return job
@@ -1508,33 +1527,60 @@ class RagCatalog:
         service_id: str,
         service_name: str,
         index_id: str,
+        generation_mode: Literal["static", "gigacode"],
     ) -> None:
         cancel_event = self._cancel_event(job_id)
         try:
-            self._raise_if_cancelled(cancel_event)
-            self._update_job(
-                job_id,
-                status="running",
-                message=f"Reanalyzing service: {service_name}",
-                started_at=_now(),
-            )
-            snapshot = self._build_graph(
-                cancel_event=cancel_event,
-                job_id=job_id,
-                force_service_ids={service_id},
-            )
-            self._raise_if_cancelled(cancel_event)
-            self._update_job(
-                job_id,
-                status="completed",
-                message=f"Service analysis completed: {service_name}",
-                completed_at=_now(),
-            )
-            self._append_job_log(
-                job_id,
-                (f"Snapshot contains {len(snapshot.nodes)} nodes and {len(snapshot.edges)} edges"),
-            )
-        except (CatalogJobCancelled, RepositoryOperationCancelled, ServiceMapBuildCancelled):
+            with self._cancellable_lock(self._index_work_lock(index_id), cancel_event):
+                self._raise_if_cancelled(cancel_event)
+                self._update_job(
+                    job_id,
+                    status="running",
+                    message=f"Static source scan: {service_name}",
+                    started_at=_now(),
+                )
+                snapshot = self._build_graph(
+                    cancel_event=cancel_event,
+                    job_id=job_id,
+                    force_service_ids={service_id},
+                )
+                self._raise_if_cancelled(cancel_event)
+                self._append_job_log(
+                    job_id,
+                    (
+                        f"Snapshot contains {len(snapshot.nodes)} nodes and "
+                        f"{len(snapshot.edges)} edges"
+                    ),
+                )
+                if generation_mode == "gigacode":
+                    self._append_job_log(
+                        job_id,
+                        f"Static scan completed; starting GigaCode for service={service_id}",
+                    )
+                    self._execute_system_ssot_generation_job(
+                        job_id,
+                        index_id,
+                        (),
+                        (service_id,),
+                        False,
+                        False,
+                        "gigacode",
+                        cancel_event,
+                    )
+                    return
+                self._update_job(
+                    job_id,
+                    status="completed",
+                    message=f"Static service analysis completed: {service_name}",
+                    completed_at=_now(),
+                )
+        except (
+            CatalogJobCancelled,
+            GigaCodeCancelled,
+            IndexBuildCancelled,
+            RepositoryOperationCancelled,
+            ServiceMapBuildCancelled,
+        ):
             self._finish_cancelled_job(job_id, index_id)
         except Exception as exc:
             self._fail_background_job(job_id, None, f"Service analysis failed: {service_id}", exc)
