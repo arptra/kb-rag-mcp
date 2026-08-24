@@ -31,6 +31,51 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def _write_fake_gigacode(path: Path) -> Path:
+    path.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+if "--version" in sys.argv:
+    print("0.99.0-catalog-test")
+    raise SystemExit(0)
+
+prompt = sys.stdin.read()
+if "STATIC ANALYSIS" not in prompt or "read-only repository analyst" not in prompt:
+    raise SystemExit(7)
+print("Open authentication URL: https://auth.example/gigacode/device", file=sys.stderr)
+print(json.dumps({
+    "type": "system",
+    "subtype": "session_start",
+    "session_id": "catalog-gigacode-session",
+    "model": "catalog-fake-gigacode",
+}))
+print(json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "session_id": "catalog-gigacode-session",
+    "model": "catalog-fake-gigacode",
+    "is_error": False,
+    "duration_ms": 23,
+    "usage": {"total_tokens": 88},
+    "structured_result": {
+        "markdown": (
+            "# GigaCode analyzed lifecycle service\\n\\nThe read-only GigaCode repository "
+            "scan observed GET /gigacode/status in GigaCodeController.java and did not invent "
+            "unsupported runtime behavior.\\n"
+        ),
+        "analyzed_files": ["src/main/java/example/GigaCodeController.java"],
+        "blocking_unknowns": ["Production traffic behavior is unknown."],
+    },
+}))
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
 def test_catalog_uploads_and_pages_documents_for_one_index(settings_factory) -> None:
     settings = settings_factory()
     settings.knowledge_dir.mkdir(parents=True)
@@ -512,6 +557,79 @@ def test_ssot_workflow_clones_and_handles_an_unfinished_repository(
     assert context["source_manifest"]["file_count"] == 1
     assert context["initial_source_files"][0]["path"] == "README.md"
     assert "Started but not implemented" in context["initial_source_files"][0]["content"]
+
+
+def test_gigacode_mode_scans_repository_generates_ssot_and_rebuilds_index(
+    settings_factory,
+    tmp_path,
+) -> None:
+    gigacode = _write_fake_gigacode(tmp_path / "gigacode")
+    settings = settings_factory(gigacode_command=str(gigacode))
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    index = catalog.create_index(name="GigaCode generated SSOT")
+    repository = tmp_path / "gigacode-repository"
+    _write(repository / "build.gradle", "plugins { id 'java' }\n")
+    _write(
+        repository / "src/main/resources/application.properties",
+        "spring.application.name=gigacode-lifecycle-service\n",
+    )
+    _write(
+        repository / "src/main/java/example/GigaCodeController.java",
+        """
+package example;
+@RestController
+public class GigaCodeController {
+  @GetMapping("/gigacode/status")
+  public String status() { return "ok"; }
+}
+""",
+    )
+    imported = catalog.start_repository_ingestion(
+        name="GigaCode repository",
+        git_url=str(repository),
+        index_id=index.id,
+    )
+    assert _wait_for_job(catalog, imported.id)["status"] == "completed"
+
+    options = catalog.ssot_generation_request(action="options")
+    assert options["workflow"]["gigacode"]["available"] is True
+    queued = catalog.ssot_generation_request(
+        action="prepare",
+        index_id=index.id,
+        repository_ids=[str(imported.target_id)],
+        refresh_analysis=False,
+        generation_mode="gigacode",
+    )
+    completed = _wait_for_job(catalog, queued["job"]["id"])
+
+    assert completed["status"] == "completed"
+    assert completed["result"]["phase"] == "indexed"
+    assert completed["result"]["generation_mode"] == "gigacode"
+    assert completed["result"]["gigacode_used"] is True
+    assert completed["result"]["gigacode_runs"][0]["session_id"] == "catalog-gigacode-session"
+    generated = Path(index.knowledge_dir) / completed["result"]["files"][0]
+    content = generated.read_text(encoding="utf-8")
+    assert 'generated_by: "kb_generate_system_ssot/gigacode"' in content
+    assert "GET /gigacode/status" in content
+    search = catalog.tools_for(index.id).search(query="GigaCode status endpoint", top_k=3)
+    assert any("GET /gigacode/status" in item["excerpt"] for item in search["results"])
+    log = catalog.job_log(queued["job"]["id"])["log"]
+    assert "GigaCode starting" in log
+    assert "GigaCode authentication URL" in log
+    assert "https://auth.example/gigacode/device" in log
+    assert "GigaCode result" in log
 
 
 def test_catalog_indexes_all_module_openspec_roots(settings_factory, tmp_path) -> None:

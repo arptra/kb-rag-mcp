@@ -89,9 +89,23 @@ export interface Catalog {
   };
   ssot_generation: {
     configured: boolean;
-    mode: "client-agent";
+    mode: "client-agent-or-server-gigacode";
     server_llm_required: boolean;
     provider: string;
+    generation_modes: Array<"client" | "gigacode">;
+    gigacode: {
+      enabled: boolean;
+      available: boolean;
+      command: string;
+      executable: string | null;
+      version: string | null;
+      error: string | null;
+      mode: string;
+      output_format: string;
+      server_llm_url_required: boolean;
+      read_only: boolean;
+      authentication: "browser-on-first-run";
+    };
     output_pattern: string;
     local_output_pattern: string;
     actions: string[];

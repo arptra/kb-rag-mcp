@@ -97,7 +97,7 @@ if [[ ! -x "${install_dir}/.venv/bin/python" ]]; then
   exit 0
 fi
 
-printf '\nInstallation complete. Add this entry to Qwen settings.json:\n\n'
+printf '\nInstallation complete. Add this entry to GigaCode settings.json:\n\n'
 "${install_dir}/.venv/bin/python" -c '
 import json
 import sys

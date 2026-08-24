@@ -22,6 +22,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from corporate_kb.config import Settings
+from corporate_kb.gigacode_runner import GigaCodeCancelled, GigaCodeRunner
 from corporate_kb.index_runner import IndexBuildCancelled, IndexBuildProcessRunner
 from corporate_kb.loaders.filesystem import SUPPORTED_DOCUMENT_SUFFIXES
 from corporate_kb.mcp.tools import KnowledgeTools
@@ -210,6 +211,7 @@ class RagCatalog:
             settings.analysis_archive_dir,
             settings.ssot_skill_path,
         )
+        self._gigacode = GigaCodeRunner(settings)
         if not settings.graph_store_path.is_file():
             self._graph_store.save(GraphSnapshot())
         self._graph_service = GraphService(self._graph_store)
@@ -450,13 +452,14 @@ class RagCatalog:
             ),
         }
 
-    @staticmethod
-    def _ssot_workflow_status() -> dict[str, Any]:
+    def _ssot_workflow_status(self) -> dict[str, Any]:
         return {
             "configured": True,
-            "mode": "client-agent",
+            "mode": "client-agent-or-server-gigacode",
             "server_llm_required": False,
-            "provider": "calling-client",
+            "provider": "calling-client-or-gigacode",
+            "generation_modes": ["client", "gigacode"],
+            "gigacode": self._gigacode.status(),
             "output_pattern": "<index.knowledge_dir>/ssot/generated/<service-id>.md",
             "local_output_pattern": "<client-temp>/corporate-kb-ssot/<session-id>/<service-id>.md",
             "actions": ["options", "clone", "prepare", "status", "context", "read_file", "submit"],
@@ -471,6 +474,7 @@ class RagCatalog:
         service_ids: list[str] | None = None,
         all_services: bool = False,
         refresh_analysis: bool = True,
+        generation_mode: Literal["client", "gigacode"] = "client",
         job_id: str | None = None,
         repository_name: str | None = None,
         git_url: str | None = None,
@@ -519,6 +523,7 @@ class RagCatalog:
                 service_ids=list(selected_services),
                 all_services=all_services,
                 refresh_analysis=refresh_analysis,
+                generation_mode=generation_mode,
             )
             return self._queued_ssot_response(job, next_action="status")
         if normalized_action == "status":
@@ -577,6 +582,7 @@ class RagCatalog:
         service_ids: list[str] | None = None,
         all_services: bool = False,
         refresh_analysis: bool = True,
+        generation_mode: Literal["client", "gigacode"] = "client",
     ) -> CatalogJob:
         index = self._record(index_id)
         selected_repositories = self._normalize_selection(repository_ids)
@@ -588,11 +594,19 @@ class RagCatalog:
         missing_repositories = set(selected_repositories) - available_repository_ids
         if missing_repositories:
             raise KeyError(f"Unknown repositories: {', '.join(sorted(missing_repositories))}")
+        if generation_mode == "gigacode":
+            gigacode_status = self._gigacode.status(refresh=True)
+            if not gigacode_status["available"]:
+                raise RuntimeError(str(gigacode_status["error"]))
         job = self._new_job(
             "ssot",
             index_id=index.id,
             target_id=index.id,
-            message=f"Client SSOT source preparation queued for index: {index.name}",
+            message=(
+                f"GigaCode repository analysis queued for index: {index.name}"
+                if generation_mode == "gigacode"
+                else f"Client SSOT source preparation queued for index: {index.name}"
+            ),
         )
         threading.Thread(
             target=self._run_system_ssot_generation_job,
@@ -603,6 +617,7 @@ class RagCatalog:
                 selected_services,
                 all_services,
                 refresh_analysis,
+                generation_mode,
             ),
             daemon=True,
         ).start()
@@ -691,38 +706,7 @@ class RagCatalog:
         repository = self._repository(repository_id)
         checkout = Path(repository.checkout_path).resolve()
         manifest = self._ssot_source_manifest(checkout, module_path=str(target["module_path"]))
-        if target.get("kind") == "service":
-            analysis = AnalysisArchive._service_payload(
-                self._service_map_store.load(),
-                self._graph_store.load(),
-                service_id,
-            )
-        else:
-            analysis = {
-                "schema_version": 1,
-                "service": {
-                    "id": service_id,
-                    "name": target["name"],
-                    "repository": repository.name,
-                    "module_path": ".",
-                    "module_state": target["module_state"],
-                    "commit": repository.commit,
-                    "entrypoints": [],
-                    "outbound_interfaces": [],
-                },
-                "dependencies": [],
-                "evidence": [],
-                "issues": [
-                    {
-                        "message": (
-                            "Static analysis did not discover a complete service module. "
-                            "Treat missing functionality as unknown and inspect source files."
-                        )
-                    }
-                ],
-                "graph_nodes": [],
-                "graph_edges": [],
-            }
+        analysis = self._ssot_analysis_for_target(target, repository)
         initial_files: list[dict[str, Any]] = []
         remaining = self.settings.ssot_generation_source_chars
         readable = [item for item in manifest["files"] if item["readable"]]
@@ -913,6 +897,44 @@ class RagCatalog:
             "files": files,
         }
 
+    def _ssot_analysis_for_target(
+        self,
+        target: dict[str, Any],
+        repository: RepositorySource,
+    ) -> dict[str, Any]:
+        service_id = str(target["id"])
+        if target.get("kind") == "service":
+            return AnalysisArchive._service_payload(
+                self._service_map_store.load(),
+                self._graph_store.load(),
+                service_id,
+            )
+        return {
+            "schema_version": 1,
+            "service": {
+                "id": service_id,
+                "name": target["name"],
+                "repository": repository.name,
+                "module_path": ".",
+                "module_state": target["module_state"],
+                "commit": repository.commit,
+                "entrypoints": [],
+                "outbound_interfaces": [],
+            },
+            "dependencies": [],
+            "evidence": [],
+            "issues": [
+                {
+                    "message": (
+                        "Static analysis did not discover a complete service module. "
+                        "Treat missing functionality as unknown and inspect source files."
+                    )
+                }
+            ],
+            "graph_nodes": [],
+            "graph_edges": [],
+        }
+
     @staticmethod
     def _read_checkout_file(
         checkout: Path,
@@ -977,6 +999,9 @@ class RagCatalog:
         content: str,
         target: dict[str, Any],
         repository: RepositorySource,
+        *,
+        generated_by: str = "kb_generate_system_ssot/client-agent",
+        authority: str = "client-agent-source-analysis",
     ) -> str:
         if content.startswith("---"):
             return content.rstrip() + "\n"
@@ -987,9 +1012,9 @@ class RagCatalog:
             "module": target["module_path"],
             "status": "current",
             "review_status": "draft",
-            "authority": "client-agent-source-analysis",
+            "authority": authority,
             "source_type": "generated",
-            "generated_by": "kb_generate_system_ssot/client-agent",
+            "generated_by": generated_by,
             "commit": repository.commit or "unknown",
             "generated_at": _now().isoformat(),
         }
@@ -1524,6 +1549,7 @@ class RagCatalog:
         service_ids: tuple[str, ...],
         all_services: bool,
         refresh_analysis: bool,
+        generation_mode: Literal["client", "gigacode"],
     ) -> None:
         cancel_event = self._cancel_event(job_id)
         try:
@@ -1536,11 +1562,13 @@ class RagCatalog:
                     service_ids,
                     all_services,
                     refresh_analysis,
+                    generation_mode,
                     cancel_event,
                 )
         except (
             CatalogJobCancelled,
             IndexBuildCancelled,
+            GigaCodeCancelled,
             RepositoryOperationCancelled,
             ServiceMapBuildCancelled,
         ):
@@ -1558,13 +1586,18 @@ class RagCatalog:
         service_ids: tuple[str, ...],
         all_services: bool,
         refresh_analysis: bool,
+        generation_mode: Literal["client", "gigacode"],
         cancel_event: threading.Event,
     ) -> None:
         self._update_job(
             job_id,
             status="running",
             message=(
-                "Refreshing source analysis for the calling client"
+                "Refreshing source analysis before GigaCode repository scan"
+                if refresh_analysis and generation_mode == "gigacode"
+                else "Loading source analysis before GigaCode repository scan"
+                if generation_mode == "gigacode"
+                else "Refreshing source analysis for the calling client"
                 if refresh_analysis
                 else "Loading the latest source analysis for the calling client"
             ),
@@ -1671,6 +1704,15 @@ class RagCatalog:
             )
 
         targets.sort(key=lambda item: str(item["id"]))
+        if generation_mode == "gigacode":
+            self._generate_ssot_with_gigacode(
+                job_id=job_id,
+                index=index,
+                targets=targets,
+                repository_ids=sorted(seen_repository_ids),
+                cancel_event=cancel_event,
+            )
+            return
         result_payload: dict[str, Any] = {
             "phase": "awaiting_client_generation",
             "session_id": job_id,
@@ -1697,6 +1739,213 @@ class RagCatalog:
             ),
             completed_at=_now(),
             result=result_payload,
+        )
+
+    def _generate_ssot_with_gigacode(
+        self,
+        *,
+        job_id: str,
+        index: RagIndex,
+        targets: list[dict[str, Any]],
+        repository_ids: list[str],
+        cancel_event: threading.Event,
+    ) -> None:
+        knowledge_root = Path(index.knowledge_dir).resolve()
+        knowledge_root.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".gigacode-ssot-", dir=knowledge_root))
+        gigacode_runs: list[dict[str, Any]] = []
+        published: list[str] = []
+        try:
+            for position, target in enumerate(targets, start=1):
+                self._raise_if_cancelled(cancel_event)
+                service_id = str(target["id"])
+                repository = self._repository(str(target["repository_id"]))
+                analysis = self._ssot_analysis_for_target(target, repository)
+                existing_path = (
+                    knowledge_root / "ssot" / "generated" / f"{_slug(service_id)}.md"
+                )
+                existing_ssot = (
+                    existing_path.read_text(encoding="utf-8")[:20_000]
+                    if existing_path.is_file()
+                    else None
+                )
+                self._update_job(
+                    job_id,
+                    message=(
+                        f"GigaCode [{position}/{len(targets)}] is analyzing "
+                        f"{service_id} in {repository.name}"
+                    ),
+                )
+                self._append_job_log(
+                    job_id,
+                    f"GigaCode target [{position}/{len(targets)}]: service={service_id}; "
+                    f"repository={repository.id}; module={target['module_path']}; "
+                    f"checkout={repository.checkout_path}",
+                )
+
+                def authentication_required(
+                    url: str,
+                    target_service_id: str = service_id,
+                ) -> None:
+                    self._gigacode_authentication_required(
+                        job_id,
+                        target_service_id,
+                        url,
+                    )
+
+                result = self._gigacode.run(
+                    checkout=Path(repository.checkout_path),
+                    prompt=self._gigacode_ssot_prompt(
+                        target=target,
+                        repository=repository,
+                        analysis=analysis,
+                        existing_ssot=existing_ssot,
+                    ),
+                    cancel=cancel_event,
+                    progress=lambda message: self._append_job_log(job_id, message),
+                    authentication_url=authentication_required,
+                )
+                document = self._client_ssot_document(
+                    result.markdown,
+                    target,
+                    repository,
+                    generated_by="kb_generate_system_ssot/gigacode",
+                    authority="gigacode-source-analysis",
+                )
+                filename = f"{_slug(service_id)}.md"
+                (staging / filename).write_text(document, encoding="utf-8")
+                gigacode_runs.append(
+                    {
+                        "service_id": service_id,
+                        "repository_id": repository.id,
+                        "session_id": result.session_id,
+                        "model": result.model,
+                        "duration_ms": result.duration_ms,
+                        "analyzed_files": list(result.analyzed_files),
+                        "blocking_unknowns": list(result.blocking_unknowns),
+                        "usage": result.usage,
+                    }
+                )
+                self._append_job_log(
+                    job_id,
+                    f"GigaCode target ready: service={service_id}; "
+                    f"files={len(result.analyzed_files)}; "
+                    f"unknowns={len(result.blocking_unknowns)}",
+                )
+
+            self._raise_if_cancelled(cancel_event)
+            destination_root = knowledge_root / "ssot" / "generated"
+            destination_root.mkdir(parents=True, exist_ok=True)
+            for staged in sorted(staging.glob("*.md")):
+                destination = destination_root / staged.name
+                os.replace(staged, destination)
+                published.append(destination.relative_to(knowledge_root).as_posix())
+
+            self._update_job(
+                job_id,
+                message=f"GigaCode generated {len(published)} SSOT files; rebuilding RAG index",
+            )
+            self._update_index(index.id, status="indexing", error=None)
+            IndexBuildProcessRunner(
+                self.service_for(index.id).settings,
+                timeout_seconds=self.settings.index_build_timeout_seconds,
+            ).build(cancel=cancel_event)
+            stats = self.service_for(index.id).reload_cached_index()
+            self._update_index(
+                index.id,
+                status="ready",
+                document_count=stats.document_count,
+                chunk_count=stats.chunk_count,
+                updated_at=_now(),
+                error=None,
+            )
+            self._update_job(
+                job_id,
+                status="completed",
+                message=(
+                    f"GigaCode analyzed {len(targets)} targets and rebuilt index {index.name}"
+                ),
+                completed_at=_now(),
+                result={
+                    "phase": "indexed",
+                    "generation_mode": "gigacode",
+                    "index_id": index.id,
+                    "index_name": index.name,
+                    "repository_ids": repository_ids,
+                    "target_count": len(targets),
+                    "targets": targets,
+                    "files": published,
+                    "gigacode_runs": gigacode_runs,
+                    "document_count": stats.document_count,
+                    "chunk_count": stats.chunk_count,
+                    "server_llm_used": False,
+                    "gigacode_used": True,
+                },
+            )
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _gigacode_authentication_required(
+        self,
+        job_id: str,
+        service_id: str,
+        url: str,
+    ) -> None:
+        self._update_job(
+            job_id,
+            message="GigaCode ожидает вход через браузер",
+            result={
+                "phase": "awaiting_authentication",
+                "generation_mode": "gigacode",
+                "service_id": service_id,
+                "authentication_url": url,
+            },
+        )
+        self._append_job_log(
+            job_id,
+            f"GigaCode authentication URL for service={service_id}: {url}",
+        )
+
+    def _gigacode_ssot_prompt(
+        self,
+        *,
+        target: dict[str, Any],
+        repository: RepositorySource,
+        analysis: dict[str, Any],
+        existing_ssot: str | None,
+    ) -> str:
+        return "\n\n".join(
+            (
+                "You are running as a read-only repository analyst. Inspect the checkout with "
+                "GigaCode read/list/glob/grep tools. Do not modify files and do not execute "
+                "project code. Build one concise evidence-backed service SSOT Markdown document. "
+                "Cover observed purpose, APIs, events, jobs, outbound calls, dependencies, runtime "
+                "and build facts. Label conservative inference and unknowns explicitly. Never "
+                "invent business rules, owners, SLAs, security guarantees or runtime behavior. "
+                "Use repository-relative file references and static evidence IDs where available. "
+                "Return the required structured object with markdown, analyzed_files and "
+                "blocking_unknowns.",
+                "TARGET:\n" + json.dumps(target, ensure_ascii=False, indent=2),
+                "REPOSITORY:\n"
+                + json.dumps(
+                    {
+                        "id": repository.id,
+                        "name": repository.name,
+                        "git_url": repository.git_url,
+                        "commit": repository.commit,
+                        "module_path": target["module_path"],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                "STATIC ANALYSIS:\n" + json.dumps(analysis, ensure_ascii=False, indent=2),
+                "GENERATION CONTRACT:\n" + self._ssot_skill_instructions(),
+                (
+                    "EXISTING GENERATED SSOT TO REVISE:\n" + existing_ssot
+                    if existing_ssot
+                    else "There is no existing generated SSOT."
+                ),
+            )
         )
 
     def _run_repository_delete_job(

@@ -13,9 +13,9 @@ server_name="corporate-kb"
 mcp_url="${CORPORATE_KB_MCP_URL:-${default_mcp_url}}"
 mcp_token="${CORPORATE_KB_MCP_TOKEN:-${default_mcp_token}}"
 
-if ! command -v qwen >/dev/null 2>&1; then
-  printf '%s\n' 'Ошибка: Qwen Code CLI не найден в PATH.' >&2
-  printf '%s\n' 'Сначала установите Qwen Code, затем снова запустите этот файл.' >&2
+if ! command -v gigacode >/dev/null 2>&1; then
+  printf '%s\n' 'Ошибка: GigaCode CLI не найден в PATH.' >&2
+  printf '%s\n' 'Сначала установите GigaCode, затем снова запустите этот файл.' >&2
   exit 1
 fi
 
@@ -35,25 +35,25 @@ if [[ -n "${mcp_token}" && ${#mcp_token} -lt 32 ]]; then
   exit 2
 fi
 
-printf 'Подключаю Qwen Code к %s...\n' "${mcp_url}"
+printf 'Подключаю GigaCode к %s...\n' "${mcp_url}"
 
 # Повторный запуск обновляет только нашу запись и не затрагивает другие MCP-серверы.
-qwen mcp remove "${server_name}" >/dev/null 2>&1 || true
+gigacode mcp remove "${server_name}" >/dev/null 2>&1 || true
 
-qwen_args=(
+gigacode_args=(
   --scope user
   --transport http
   --timeout 120000
 )
 if [[ -n "${mcp_token}" ]]; then
-  qwen_args+=(--header "Authorization: Bearer ${mcp_token}")
+  gigacode_args+=(--header "Authorization: Bearer ${mcp_token}")
 fi
 
-qwen mcp add \
-  "${qwen_args[@]}" \
+gigacode mcp add \
+  "${gigacode_args[@]}" \
   --description "Удалённая корпоративная база знаний" \
   "${server_name}" \
   "${mcp_url}"
 
 printf '\nГотово. Локальные файлы, Python, FastMCP и uv не устанавливались.\n'
-printf 'Перезапустите Qwen Code и выполните /mcp. Сервер: %s\n' "${server_name}"
+printf 'Перезапустите GigaCode и выполните /mcp. Сервер: %s\n' "${server_name}"

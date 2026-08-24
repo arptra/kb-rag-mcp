@@ -38,12 +38,17 @@ callers, callees, API/event operations, statically linked invocation triggers, e
 evidence, and compact RAG excerpts grouped by service. Supply start_service when known; otherwise
 the tool discovers likely roots. LOW/UNRESOLVED facts and runtime order must be verified."""
 GENERATE_SSOT_DESCRIPTION = """Coordinate source-backed SSOT generation with the model calling this
-MCP tool. The server never calls an LLM. Use action='options' to list indexes, cloned repositories
-and services; action='clone' for a missing Git repository; action='prepare' to scan selected
+MCP tool. The RAG service never calls an LLM HTTP endpoint directly. Use action='options' to list
+indexes, cloned repositories and services; action='clone' for a missing Git repository;
+action='prepare' to scan selected
 repository_ids/service_ids or all_services; action='status' to poll; action='context' for analysis
 and the file manifest; action='read_file' for more source; and action='submit' to save Markdown and
-rebuild the index. With the distributed stdio proxy, finish through its client-local
-kb_save_and_upload_ssot tool so a temp copy exists on the user's machine."""
+rebuild the index. For action='prepare', generation_mode='client' keeps generation in the calling
+client, while generation_mode='gigacode' launches an installed GigaCode CLI headlessly on the
+server, scans the checkout read-only, writes structured SSOT, and rebuilds the index automatically.
+Check
+workflow.gigacode.available in action='options' first. With client mode and the distributed stdio
+proxy, finish through kb_save_and_upload_ssot so a temp copy exists on the user's machine."""
 BUILTIN_TOOL_DESCRIPTIONS = {
     "ssot_context": SSOT_DESCRIPTION,
     "kb_feature_context": FEATURE_CONTEXT_DESCRIPTION,
@@ -186,6 +191,7 @@ def create_mcp_server(
             service_ids: list[str] | None = None,
             all_services: bool = False,
             refresh_analysis: bool = True,
+            generation_mode: Literal["client", "gigacode"] = "client",
             job_id: str | None = None,
             repository_name: str | None = None,
             git_url: str | None = None,
@@ -205,6 +211,7 @@ def create_mcp_server(
                 service_ids=service_ids,
                 all_services=all_services,
                 refresh_analysis=refresh_analysis,
+                generation_mode=generation_mode,
                 job_id=job_id,
                 repository_name=repository_name,
                 git_url=git_url,

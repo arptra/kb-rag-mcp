@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     ssot_context_tokens: int = Field(default=1000, ge=300, le=4000)
     ssot_generation_max_source_files: int = Field(default=12, ge=1, le=100)
     ssot_generation_source_chars: int = Field(default=48_000, ge=2_000, le=500_000)
+    gigacode_enabled: bool = True
+    gigacode_command: str = "gigacode"
+    gigacode_auth_timeout_seconds: int = Field(default=600, ge=60, le=7200)
+    gigacode_timeout_seconds: int = Field(default=600, ge=30, le=7200)
+    gigacode_max_session_turns: int = Field(default=30, ge=2, le=500)
+    gigacode_max_tool_calls: int = Field(default=50, ge=1, le=5000)
     benchmark_questions_path: Path = Path("evaluation/questions.json")
     benchmark_password: SecretStr | None = None
     benchmark_max_questions: int = Field(default=100, ge=1, le=1000)

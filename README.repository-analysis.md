@@ -371,12 +371,12 @@ Skill требует отделять observed facts от inference, не выд
 сохранять ссылки `[evidence:<id>]`. В ручном ZIP workflow сервер не вызывает внешнюю модель: выбор
 модели, передача закрытого source analysis и human review остаются под контролем пользователя.
 
-### Агентский системный SSOT без LLM на сервере
+### Агентский системный SSOT без отдельного LLM endpoint
 
 Встроенный MCP tool `kb_generate_system_ssot` — это stateful protocol между RAG-сервером и
-нейронкой, которая уже работает в GigaCode/Qwen на клиентском компьютере. Сервер не вызывает LLM,
-не хранит model URL/API key и не требует Ollama, OpenAI или vLLM. Его обязанности ограничены Git,
-статическим анализом, безопасной выдачей source-файлов и приёмом готового Markdown.
+нейронкой в GigaCode на клиентском компьютере либо с GigaCode CLI, установленным на самом
+сервере. Приложение не хранит model URL/API key и не требует отдельного Ollama/OpenAI/vLLM endpoint:
+server-side режим использует browser-авторизацию самого GigaCode.
 
 Protocol состоит из действий одного tool:
 
@@ -384,7 +384,8 @@ Protocol состоит из действий одного tool:
 2. Если нужного source нет, `action=clone` принимает `index_id`, `repository_name`, `git_url` и
    необязательный `ref`. Возвращённый `job_id` опрашивается через `action=status`.
 3. `action=prepare` принимает выбранный `index_id`, `repository_ids`/`service_ids` либо
-   `all_services=true`. Cancellable worker обновляет статический analysis и возвращает targets.
+   `all_services=true`. `generation_mode=client` готовит интерактивную сессию, а
+   `generation_mode=gigacode` после статического analysis сразу запускает GigaCode для каждого target.
 4. `action=context` для каждого target отдаёт analysis slice, полный file manifest, начальные
    приоритетные source-фрагменты, шаблон/skill и указание следующего вызова.
 5. Клиентская модель вызывает `action=read_file` столько раз, сколько нужно. Файл задаётся только
@@ -419,6 +420,36 @@ synthetic target `repository-<repository-id>`. Модель всё равно п
 remote proxy используют тот же payload: `POST /admin/api/analysis/ssot-generate` и
 `POST /api/v1/ssot/generate`. Клиентский temp root задаётся необязательной переменной
 `CORPORATE_KB_SSOT_TEMP_DIR`; по умолчанию используется системный temp.
+
+### Автоматический анализ через GigaCode headless
+
+`action=options` возвращает `workflow.gigacode`. Если `available=true`, можно выполнить:
+
+```json
+{
+  "action":"prepare",
+  "generation_mode":"gigacode",
+  "index_id":"architecture-1234abcd",
+  "repository_ids":["payments-a1b2c3d4"],
+  "refresh_analysis":true
+}
+```
+
+Worker запускает GigaCode из корня checkout с `--output-format stream-json` и доверенной
+`--json-schema`. Prompt передаётся через stdin. GigaCode получает только read-only
+инструменты навигации; `shell`, `write`, `edit`, subagents и web tools исключены. Дополнительно
+действуют hard limits по wall time, session turns и tool calls. Cancel job посылает процессу
+прерывание, затем terminate/kill, если он не остановился.
+
+Если при первом запуске GigaCode выводит URL для browser-login, runner распознаёт его в stdout или
+stderr. Job сохраняет статус `running` с phase `awaiting_authentication`, а dashboard показывает
+кликабельную кнопку. Пользователь открывает ссылку на своей машине; CLI остаётся запущенным на
+сервере и после подтверждения продолжает ту же JSON-сессию.
+
+Каждый JSONL event и stderr попадает в полный job log без записи полного Markdown в журнал. После
+успеха всех targets документы атомарно публикуются в `ssot/generated/`, затем RAG перестраивается
+один раз. Если GigaCode отсутствует или авторизация завершилась ошибкой, job не стартует/падает с полной диагностикой;
+client mode продолжает работать независимо.
 
 Диагностика:
 

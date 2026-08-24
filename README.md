@@ -1,7 +1,7 @@
-# Локальная корпоративная база знаний для Qwen Code
+# Локальная корпоративная база знаний для GigaCode
 
 Это локальный MVP корпоративного RAG: документы индексируются Python-процессом, embeddings
-сохраняются в проверяемый файловый кэш, а при поиске целиком находятся в RAM. Qwen Code остаётся
+сохраняются в проверяемый файловый кэш, а при поиске целиком находятся в RAM. GigaCode остаётся
 единственной генеративной моделью и получает найденные фрагменты через read-only MCP tools по
 локальному `stdio` или удалённому Streamable HTTP. MCP-сервер не формулирует финальные ответы,
 не исполняет shell-команды и не изменяет документы.
@@ -15,7 +15,7 @@
 
 - [текущее устройство module-aware анализа repository, lifecycle jobs и SSOT workflow](README.repository-analysis.md);
 - [evidence-backed граф Java/Spring-репозиториев для GigaCode](README.gigacode-graph.md);
-- [подключение Qwen на клиентском компьютере](README.client.md);
+- [подключение GigaCode на клиентском компьютере](README.client.md);
 - [развёртывание базы и API на удалённом сервере](README.server.md);
 - [быстрый запуск RAG с уменьшенным контекстом](README.low-context.md);
 - [отдельный общий SSOT-индекс всех сервисов](README.ssot.md).
@@ -35,16 +35,16 @@ NumPy matrix in RAM
        ↓
 MCP stdio / Streamable HTTP
        ↓
-Qwen Code CLI
+GigaCode CLI
 ```
 
 В удалённом режиме тот же индекс один раз загружается в память серверного процесса, после чего к
-нему одновременно подключаются Qwen Code CLI с разных машин:
+нему одновременно подключаются GigaCode CLI с разных машин:
 
 ```text
-Qwen CLI ─┐
-Qwen CLI ─┼─ HTTP(S), Bearer optional ─ MCP Streamable HTTP ─ in-memory index
-Qwen CLI ─┘
+GigaCode CLI ─┐
+GigaCode CLI ─┼─ HTTP(S), Bearer optional ─ MCP Streamable HTTP ─ in-memory index
+GigaCode CLI ─┘
 ```
 
 `DocumentLoader` безопасно обходит только `KB_KNOWLEDGE_DIR`, нормализует Markdown/TXT и переводит
@@ -55,7 +55,7 @@ Qwen CLI ─┘
 В RAM находятся документы, чанки, отображение `chunk_id -> index` и нормализованная NumPy-матрица
 `[chunk_count, embedding_dimension]`. Cosine similarity считается как `matrix @ query_vector`.
 
-### Экономия контекста Qwen
+### Экономия контекста GigaCode
 
 Поиск не передаёт модели все найденные тексты. Сервер сначала находит до 12 кандидатов внутри
 индекса, затем отдаёт максимум 3 наиболее релевантные выдержки из разных документов: до 260
@@ -63,13 +63,13 @@ Qwen CLI ─┘
 вопроса и сохраняет ссылку на источник. Это ограничивает расход контекста, даже если в базе десятки
 тысяч страниц.
 
-Если выбранный результат требует деталей, Qwen вызывает `kb_get_chunk` с `chunk_id`; полный текст
+Если выбранный результат требует деталей, GigaCode вызывает `kb_get_chunk` с `chunk_id`; полный текст
 не загружается автоматически. `kb_get_document` также возвращает ограниченный извлекаемый фрагмент.
 Лимиты настраиваются через `KB_SEARCH_*` и `KB_DOCUMENT_CONTEXT_TOKENS` в `.env.example`.
 
 Защищённый `kb_run_context_benchmark` сравнивает прежние `top-5` полных чанков с текущими `top-3`
 выдержками: Hit@K, оценку токенов, точные JSON bytes, процент сжатия и latency. Инструмент требует
-отдельный `KB_BENCHMARK_PASSWORD`, который Qwen запрашивает перед каждым вызовом.
+отдельный `KB_BENCHMARK_PASSWORD`, который GigaCode запрашивает перед каждым вызовом.
 
 В HTTP-режиме по `/admin` доступна React/TypeScript-панель управления. Через неё создаются
 отдельные RAG-индексы и MCP search-tools, tools привязываются к одному или нескольким индексам,
@@ -111,11 +111,13 @@ Repository и производные сервисы можно удалять и
 загрузить проверенный Markdown SSOT в выбранный RAG-индекс.
 Для агентского режима кнопка **«Подготовить SSOT-контекст»** или MCP-tool
 `kb_generate_system_ssot` запускает свежий source analysis и открывает сессию чтения исходников.
-Сервер не содержит LLM и не требует URL модели: SSOT пишет нейронка, которая вызвала MCP с
-клиентского компьютера. Локальный proxy сначала сохраняет Markdown во временный каталог клиента,
-затем загружает его в `ssot/generated/<service-id>.md` выбранного индекса и запускает обновление
-RAG. Полный action-flow описан в
-[документации анализа](README.repository-analysis.md#агентский-системный-ssot-без-llm-на-сервере).
+Отдельный LLM URL серверу не нужен. В `generation_mode=client` SSOT пишет нейронка, вызвавшая MCP с
+клиентского компьютера; локальный proxy сохраняет Markdown во временный каталог и загружает его в
+индекс. В `generation_mode=gigacode` сервер запускает установленный GigaCode headlessly в checkout
+репозитория, получает структурированный JSON-результат, сохраняет SSOT и сразу перестраивает RAG.
+Если CLI требует первый вход, задача показывает browser URL и продолжает работу после авторизации.
+Полный action-flow описан в
+[документации анализа](README.repository-analysis.md#агентский-системный-ssot-без-отдельного-llm-endpoint).
 Во вкладке dashboard **«Операции и логи»** открытый журнал активной job обновляется раз в секунду:
 он показывает layout каждого repository, найденные modules, число Java/Kotlin-файлов, cache
 hit/miss, размер и отдельные фазы чтения layout-cache (`stat`, `read`, `JSON parse`, `hydrate`),
@@ -159,27 +161,27 @@ dependencies своей части. Подробности и production-реж�
 
 ### Подключение сотрудника к удалённой базе
 
-RAG, индекс и документы находятся только на сервере. Для старых версий Qwen сотруднику
+RAG, индекс и документы находятся только на сервере. Для старых версий GigaCode сотруднику
 передаются [`clients/corporate_kb_stdio_proxy.py`](clients/corporate_kb_stdio_proxy.py) и
 [`clients/requirements.txt`](clients/requirements.txt). В отдельном клиентском `venv` через обычный
-`pip` устанавливается `FastMCP==3.4.4`. Qwen запускает Python из этого `venv` как stdio MCP, а процесс ходит к удалённому
+`pip` устанавливается `FastMCP==3.4.4`. GigaCode запускает Python из этого `venv` как stdio MCP, а процесс ходит к удалённому
 серверу как прозрачный Streamable HTTP MCP-клиент. На клиенте нет прошитого списка tools: при
 каждом запуске он выполняет удалённый `tools/list` и зеркалирует новые имена, схемы, annotations и
 вызовы. `uv`, Node.js, `npx`, `mcp-remote`, Nginx, копия серверного проекта, документы и индекс на
 клиенте не нужны.
 
 Готовый settings находится в
-[`examples/qwen-venv-stdio-settings.example.json`](examples/qwen-venv-stdio-settings.example.json), а полная
+[`examples/gigacode-venv-stdio-settings.example.json`](examples/gigacode-venv-stdio-settings.example.json), а полная
 инструкция для сотрудника — в [`README.client.md`](README.client.md).
 
-Новые версии Qwen также могут подключаться к `/mcp` напряму через Streamable HTTP; скрипт
+Новые версии GigaCode также могут подключаться к `/mcp` напряму через Streamable HTTP; скрипт
 `install.sh` оставлен как опциональный способ для таких клиентов.
-Скопируйте из неё `mcpServers` в `~/.qwen/settings.json` и замените placeholder:
+Скопируйте из неё `mcpServers` в `~/.gigacode/settings.json` и замените placeholder:
 
 - `REPLACE_WITH_CLIENT_DIR` — каталог с клиентским `venv` и `.py`-файлом;
 - `REPLACE_WITH_SERVER_IP_OR_DOMAIN` — адрес удалённого сервера;
 
-Qwen запускает этот файл как локальный MCP по `stdio` через абсолютный путь к `venv/bin/python`.
+GigaCode запускает этот файл как локальный MCP по `stdio` через абсолютный путь к `venv/bin/python`.
 Локальный MCP обращается к общему RAG-серверу через Streamable HTTP endpoint `/mcp`.
 
 ### Установка серверной части
@@ -238,8 +240,8 @@ Hugging Face. Если model files отсутствуют, индексиров�
 скачивания. По умолчанию выбирается CUDA, затем MPS, затем CPU.
 
 `scripts/start-mcp.sh` по умолчанию запускает MCP с `KB_EMBEDDING_PROVIDER=hash`, поэтому обычное
-подключение Qwen полностью offline. Для локальной semantic-модели явно передайте provider и путь в
-environment Qwen-конфигурации. Все runtime wrappers вызывают Python из готовой `.venv` напрямую:
+подключение GigaCode полностью offline. Для локальной semantic-модели явно передайте provider и путь в
+environment GigaCode-конфигурации. Все runtime wrappers вызывают Python из готовой `.venv` напрямую:
 после установки они не обращаются к package registry и не меняют окружение.
 
 ## CLI
@@ -261,12 +263,12 @@ environment Qwen-конфигурации. Все runtime wrappers вызыва�
 сообщением `Run: ./scripts/dev.sh index`. Это предотвращает неожиданную сетевую активность во время
 MCP discovery.
 
-## Подключение к Qwen Code
+## Подключение к GigaCode
 
 Если MCP-серверы хранятся в отдельном каталоге, установите туда автономную runtime-копию. Скрипт
 создаёт подкаталог `corporate-kb`, копирует только необходимые файлы, создаёт собственный `.venv`,
 ставит locked runtime dependencies без dev-пакетов, строит hash-индекс и печатает готовый server
-entry для Qwen:
+entry для GigaCode:
 
 ```bash
 ./scripts/install-mcp-server.sh /absolute/path/to/mcp-servers
@@ -286,10 +288,10 @@ package registry и завершить установку командами, к
 ./scripts/install-mcp-server.sh /absolute/path/to/mcp-servers --copy-only
 ```
 
-Скопируйте `examples/qwen-settings.example.json` в `.qwen/settings.json` проекта и замените все
+Скопируйте `examples/gigacode-settings.example.json` в `.gigacode/settings.json` проекта и замените все
 `/ABSOLUTE/PATH/...` реальными абсолютными путями. Не рассчитывайте на раскрытие `${PROJECT_ROOT}`
 в JSON. В `command` указан абсолютный путь к `.venv/bin/python`, а в `args` — запуск модуля
-`corporate_kb.mcp.server`. Поэтому Qwen не зависит от глобальных `python`, `uv`, `PATH`, shell
+`corporate_kb.mcp.server`. Поэтому GigaCode не зависит от глобальных `python`, `uv`, `PATH`, shell
 activation или wrapper-скрипта.
 
 Минимальная форма server entry:
@@ -308,7 +310,7 @@ activation или wrapper-скрипта.
 Альтернатива через CLI (выполняйте из корня этого репозитория, подставив абсолютные пути):
 
 ```bash
-qwen mcp add \
+gigacode mcp add \
   --scope project \
   --timeout 120000 \
   -e KB_KNOWLEDGE_DIR=/absolute/path/to/repository/knowledge \
@@ -326,15 +328,15 @@ qwen mcp add \
   -m corporate_kb.mcp.server
 ```
 
-`stdio` — транспорт по умолчанию, поэтому `--transport http` здесь не нужен. Синтаксис команды
-сверен с [официальной документацией Qwen Code](https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/),
-но в среде разработки этого репозитория `qwen` не был установлен, и команда локально не выполнялась.
-JSON-конфигурация также задаёт `cwd` и `trust: false`; статического фильтра tools в ней нет.
+`stdio` — транспорт по умолчанию, поэтому `--transport http` здесь не нужен. Команды рассчитаны на
+корпоративную сборку GigaCode с совместимым `mcp add/remove` интерфейсом; перед распространением
+проверьте их через `gigacode mcp --help` на целевой машине. JSON-конфигурация также задаёт `cwd` и
+`trust: false`; статического фильтра tools в ней нет.
 
 Проверка подключения:
 
 ```text
-qwen
+gigacode
 /mcp
 ```
 
@@ -358,7 +360,8 @@ qwen
 - `kb_get_document` — ограниченный извлекаемый фрагмент документа по `document_id`;
 - `kb_list_documents` — metadata документов без embeddings;
 - `kb_generate_system_ssot` — выбирает индекс и repositories, клонирует недостающий Git source,
-  запускает/опрашивает analysis и порционно отдаёт исходники клиентской нейронке для SSOT;
+  запускает/опрашивает analysis и либо отдаёт исходники клиентской нейронке, либо запускает
+  read-only GigaCode headless scan на сервере;
 - `kb_save_and_upload_ssot` — локальный tool распределённого stdio-proxy: пишет готовый Markdown во
   временный каталог клиентского компьютера и загружает его в выбранный server index;
 - `kb_stats` — состояние индекса и абсолютные пути.
@@ -383,9 +386,9 @@ curl -sS http://127.0.0.1:8000/api/v1/feature-context \
 RAG. В неоднозначном случае ответ имеет `status: needs_service` и содержит допустимые
 `candidate_services` вместо придуманного маршрута.
 
-Не задавайте статический `includeTools` в Qwen settings, если используете управляемые tools из UI:
+Не задавайте статический `includeTools` в GigaCode settings, если используете управляемые tools из UI:
 клиентский allowlist скроет новые схемы от LLM. Прямой HTTP-клиент обновляет `/mcp` discovery, а
-однофайловый stdio proxy выполняет тот же удалённый `tools/list` после перезапуска Qwen. Обновлять
+однофайловый stdio proxy выполняет тот же удалённый `tools/list` после перезапуска GigaCode. Обновлять
 сам proxy-файл при добавлении server tools больше не требуется.
 
 ### Разработка React-панели
@@ -458,7 +461,7 @@ stdout зарезервирован для MCP-протокола; все applic
 ## Удалённый MCP по HTTP
 
 Удалённый режим заранее загружает готовый индекс и только после этого открывает порт. Поэтому все
-подключённые Qwen CLI используют один прогретый процесс и не строят embeddings при каждом запросе.
+подключённые GigaCode CLI используют один прогретый процесс и не строят embeddings при каждом запросе.
 Endpoint реализует рекомендованный для удалённых MCP-серверов Streamable HTTP, а не устаревший SSE.
 
 ### 1. Подготовить сервер
@@ -533,10 +536,10 @@ curl -i --max-time 15 \
 
 Ожидается `HTTP/1.1 200`. При включённой защите `401` означает неверный токен, `404` — неверный путь, а `421` — что
 запущена старая сборка с Host allowlist. Прямой FastMCP listener, запущенный через Python или `uv`,
-использует обычный HTTP. `https://` указывайте только при наличии TLS reverse proxy; иначе Qwen
+использует обычный HTTP. `https://` указывайте только при наличии TLS reverse proxy; иначе GigaCode
 обычно сообщает `TypeError: fetch failed`.
 
-### 2. Подключить Qwen CLI
+### 2. Подключить GigaCode CLI
 
 Перед раздачей впишите в корневой `install.sh` адрес сервера. Токен оставьте пустым, если защита
 на сервере не включена:
@@ -554,7 +557,7 @@ bash install.sh
 
 Скрипт не скачивает репозиторий, документы или Python-зависимости и не создаёт каталог RAG. Он
 только добавляет подключение `corporate-kb` в пользовательскую конфигурацию уже установленного
-Qwen Code. После запуска сотрудник перезапускает `qwen` и проверяет соединение через `/mcp`.
+GigaCode. После запуска сотрудник перезапускает `gigacode` и проверяет соединение через `/mcp`.
 
 Если опциональный Bearer-токен всё же задан, раздавайте файл через защищённый корпоративный канал.
 
@@ -678,7 +681,7 @@ custom_field: "неизвестные поля тоже сохраняются"
 ./scripts/dev.sh serve-http
 ```
 
-Тесты всегда инжектируют hash provider и не требуют интернета, Hugging Face, GPU, Qwen Code, Docker
+Тесты всегда инжектируют hash provider и не требуют интернета, Hugging Face, GPU, GigaCode, Docker
 или внешней БД. Интеграционные тесты проверяют как in-memory MCP transport, так и HTTP handshake
 через ASGI без открытия сетевого порта.
 

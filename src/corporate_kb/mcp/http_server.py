@@ -7,6 +7,7 @@ import logging
 import secrets
 import time
 from pathlib import Path
+from typing import Literal
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, TokenVerifier
@@ -134,6 +135,15 @@ def _body_boolean(body: dict[str, object], name: str, default: bool) -> bool:
     return raw
 
 
+def _body_generation_mode(
+    body: dict[str, object],
+) -> Literal["client", "gigacode"]:
+    value = _optional_body_string(body, "generation_mode") or "client"
+    if value not in {"client", "gigacode"}:
+        raise ValueError("generation_mode must be client or gigacode")
+    return "gigacode" if value == "gigacode" else "client"
+
+
 def _float_query(request: Request, name: str) -> float | None:
     raw = request.query_params.get(name)
     if raw is None or raw == "":
@@ -197,7 +207,7 @@ class ConstantTimeTokenVerifier(TokenVerifier):
             return None
         return AccessToken(
             token=token,
-            client_id="qwen-cli",
+            client_id="gigacode-cli",
             subject="corporate-kb-reader",
             scopes=[_READ_SCOPE],
         )
@@ -722,6 +732,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 service_ids=_optional_body_string_list(body, "service_ids"),
                 all_services=_body_boolean(body, "all_services", False),
                 refresh_analysis=_body_boolean(body, "refresh_analysis", True),
+                generation_mode=_body_generation_mode(body),
                 job_id=_optional_body_string(body, "job_id"),
                 repository_name=_optional_body_string(body, "repository_name"),
                 git_url=_optional_body_string(body, "git_url"),
@@ -1057,6 +1068,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 service_ids=_optional_body_string_list(body, "service_ids"),
                 all_services=_body_boolean(body, "all_services", False),
                 refresh_analysis=_body_boolean(body, "refresh_analysis", True),
+                generation_mode=_body_generation_mode(body),
                 job_id=_optional_body_string(body, "job_id"),
                 repository_name=_optional_body_string(body, "repository_name"),
                 git_url=_optional_body_string(body, "git_url"),

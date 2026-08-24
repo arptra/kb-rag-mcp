@@ -538,8 +538,11 @@ function JobList({ jobs, password, onCancel }: { jobs: CatalogJob[]; password: s
     setLogError("");
   };
   if (!jobs.length) return <div className="empty-state compact">Операций пока не было</div>;
-  return <div className="job-list">{jobs.map((job) => (
-    <div className="job-item" key={job.id}>
+  return <div className="job-list">{jobs.map((job) => {
+    const authenticationUrl = typeof job.result?.authentication_url === "string"
+      ? job.result.authentication_url
+      : null;
+    return <div className="job-item" key={job.id}>
       <div className="job-row">
         <span className={`job-icon ${job.type}`}>{job.type === "repository" ? "↗" : job.type === "graph" || job.type === "service" ? "⌘" : job.type === "ssot" ? "✦" : job.type === "cleanup" ? "×" : "◇"}</span>
         <div className="grow"><b>{job.message}</b><small>{job.error || `${job.type} · ${relativeDate(job.completed_at || job.started_at)}`}</small></div>
@@ -547,11 +550,12 @@ function JobList({ jobs, password, onCancel }: { jobs: CatalogJob[]; password: s
         {job.log_path
           ? <button className="job-log-button" onClick={() => toggleLog(job)}>{expanded === job.id ? "Скрыть лог" : "Полный лог"}</button>
           : <span className="job-log-missing" title="Эта задача была создана до появления постоянных job-логов">Лог не сохранён</span>}
+        {authenticationUrl && job.status === "running" && <a className="job-log-button" href={authenticationUrl} target="_blank" rel="noreferrer">Войти в GigaCode ↗</a>}
         {onCancel && ["queued", "running", "cancelling"].includes(job.status) && <button className="job-cancel" disabled={job.status === "cancelling"} onClick={() => onCancel(job)}>{job.status === "cancelling" ? "Отменяем…" : "Отменить"}</button>}
       </div>
       {expanded === job.id && <div className="job-log"><div className="job-log-meta"><code>{job.id}</code><span>{job.log_path}</span></div><pre>{logError || logs[job.id] || "Загружаем журнал…"}</pre></div>}
-    </div>
-  ))}</div>;
+    </div>;
+  })}</div>;
 }
 
 function OperationsPage({ data, password, onAction }: {
@@ -1371,6 +1375,9 @@ function SystemSsotModal({ password, indexes, generator, serviceCount, onClose, 
 }) {
   const [indexId, setIndexId] = useState(indexes[0]?.id || "default");
   const [refreshAnalysis, setRefreshAnalysis] = useState(true);
+  const [generationMode, setGenerationMode] = useState<"client" | "gigacode">(
+    generator.gigacode.available ? "gigacode" : "client",
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const submit = async (event: FormEvent) => {
@@ -1383,6 +1390,7 @@ function SystemSsotModal({ password, indexes, generator, serviceCount, onClose, 
         index_id: indexId,
         all_services: true,
         refresh_analysis: refreshAnalysis,
+        generation_mode: generationMode,
       });
       onStarted();
     } catch (caught) {
@@ -1393,12 +1401,14 @@ function SystemSsotModal({ password, indexes, generator, serviceCount, onClose, 
   return (
     <Modal title="Подготовить контекст SSOT всей системы" onClose={onClose}>
       <form className="modal-form" onSubmit={submit}>
-        <div className="callout">Сервер не вызывает нейросеть и не требует LLM URL. Он обновит статический анализ и подготовит MCP-сессию с картой сервисов, полным списком файлов и безопасным чтением исходников. Модель в GigaCode запросит нужные файлы, локально создаст SSOT и загрузит его в выбранный индекс.</div>
+        <div className="callout">Отдельный LLM URL серверу не нужен. Backend запускает установленный GigaCode в JSON-режиме. Если требуется вход, операция покажет кнопку со ссылкой: открой её в своём браузере, заверши авторизацию — и тот же worker продолжит read-only анализ, создаст SSOT и обновит индекс.</div>
+        <label>Режим генерации<select value={generationMode} onChange={(event) => setGenerationMode(event.target.value as "client" | "gigacode")}><option value="gigacode" disabled={!generator.gigacode.available}>GigaCode на сервере{generator.gigacode.available ? ` · ${generator.gigacode.version || "готов"}` : " · недоступен"}</option><option value="client">Нейронка в GigaCode-клиенте</option></select><small>{generationMode === "gigacode" ? "GigaCode сам читает выбранные repositories, создаёт SSOT и перестраивает RAG." : "Сервер подготовит context/read_file сессию для клиентской модели."}</small></label>
+        {!generator.gigacode.available && <div className="form-error">GigaCode на сервере не готов: {generator.gigacode.error}</div>}
         <label>Индекс для сгенерированного SSOT<select value={indexId} onChange={(event) => setIndexId(event.target.value)}>{indexes.map((index) => <option key={index.id} value={index.id}>{index.name} · {index.document_count} документов</option>)}</select></label>
         <label className="check"><input type="checkbox" checked={refreshAnalysis} onChange={(event) => setRefreshAnalysis(event.target.checked)} /><span>⌘</span><div><b>Сначала заново проанализировать исходники</b><small>Рекомендуется: SSOT строится из актуальной карты API и функций.</small></div></label>
-        <div className="flow-preview"><span>{serviceCount} сервисов</span><i>→</i><span>{generator.provider}</span><i>→</i><span>{indexes.find((index) => index.id === indexId)?.name || indexId}</span></div>
+        <div className="flow-preview"><span>{serviceCount} сервисов</span><i>→</i><span>{generationMode === "gigacode" ? "GigaCode JSON" : generator.provider}</span><i>→</i><span>{indexes.find((index) => index.id === indexId)?.name || indexId}</span></div>
         {error && <div className="form-error">{error}</div>}
-        <div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary" disabled={busy || !indexes.length}>{busy ? "Ставим в очередь…" : "Подготовить контекст"}</button></div>
+        <div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary" disabled={busy || !indexes.length}>{busy ? "Ставим в очередь…" : generationMode === "gigacode" ? "Анализировать через GigaCode" : "Подготовить контекст"}</button></div>
       </form>
     </Modal>
   );

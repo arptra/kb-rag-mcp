@@ -114,6 +114,7 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
         assert ssot_choices.status_code == 200
         assert ssot_choices.json()["status"] == "selection_required"
         assert ssot_choices.json()["workflow"]["server_llm_required"] is False
+        assert ssot_choices.json()["workflow"]["gigacode"]["server_llm_url_required"] is False
         assert ssot_choices.json()["selection"]["cloned_repository_count"] == 0
         assert ssot_choices.json()["selection"]["clone_if_missing"]["action"] == "clone"
 
@@ -139,6 +140,10 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
                 "context",
                 "read_file",
                 "submit",
+            ]
+            assert ssot_tool.inputSchema["properties"]["generation_mode"]["enum"] == [
+                "client",
+                "gigacode",
             ]
             ssot_options = await session.call_tool(
                 "kb_generate_system_ssot",

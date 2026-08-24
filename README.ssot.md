@@ -1,6 +1,6 @@
 # Общий SSOT-индекс сервисов
 
-Этот режим решает одну задачу: Qwen делает один вызов `ssot_context`, а RAG сам находит все
+Этот режим решает одну задачу: GigaCode делает один вызов `ssot_context`, а RAG сам находит все
 относящиеся к вопросу сервисы и возвращает один компактный межсервисный контекст.
 
 ```text
@@ -10,7 +10,7 @@ SSOT всех сервисов в ssot/
         ↓
 один MCP tool ssot_context
         ↓
-один сгруппированный ответ для Qwen
+один сгруппированный ответ для GigaCode
 ```
 
 Обычные документы и Confluence продолжают использовать `knowledge/` и `.cache/kb`. Они не
@@ -75,7 +75,7 @@ export KB_SSOT_CACHE_DIR=/opt/corporate-kb/.cache/ssot
 
 При старте в логе должна появиться строка `Preloaded global SSOT index`.
 
-## 4. Проверить до подключения Qwen
+## 4. Проверить до подключения GigaCode
 
 ```bash
 KB_SSOT_ENABLED=true ./scripts/dev.sh ssot \
@@ -100,7 +100,7 @@ curl -G 'http://SERVER_IP:8000/api/v1/ssot/context' \
   --data-urlencode 'mode=implementation'
 ```
 
-## Что получает Qwen
+## Что получает GigaCode
 
 Один ответ содержит:
 
@@ -111,7 +111,7 @@ curl -G 'http://SERVER_IP:8000/api/v1/ssot/context' \
 - `missing_information`, если актуальные SSOT не дают ответа.
 
 Размер всего ответа ограничивает `KB_SSOT_CONTEXT_TOKENS`, по умолчанию 1000 условных токенов.
-Qwen не должен повторять обычный `kb_search`: описание `ssot_context` прямо сообщает, что расширение
+GigaCode не должен повторять обычный `kb_search`: описание `ssot_context` прямо сообщает, что расширение
 по связанным сервисам уже выполнено внутри RAG.
 
 ## Автоматическое обновление из Git

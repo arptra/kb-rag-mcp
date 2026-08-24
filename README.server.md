@@ -74,6 +74,35 @@ cd /opt/corporate-kb
 Скрипт создаёт `/opt/corporate-kb/.venv` на Python 3.12 и устанавливает FastMCP и runtime
 зависимости. Глобальные Python-пакеты не изменяются.
 
+### Опционально: GigaCode для автоматического анализа repositories
+
+Без GigaCode остаётся доступен обычный client-agent SSOT workflow. Чтобы сервер сам прочитал
+checkout, создал SSOT и сразу обновил индекс, установите корпоративный GigaCode CLI на сервер и
+проверьте его от имени той же системной учётной записи, под которой работает backend:
+
+```bash
+sudo -u corporate-kb -H gigacode --version
+```
+
+Приложению не передаются URL, token или ключ модели. Оно запускает GigaCode в JSON-режиме. Если
+`gigacode` не входит в PATH systemd, укажите абсолютный executable:
+
+```dotenv
+KB_GIGACODE_ENABLED=true
+KB_GIGACODE_COMMAND=/usr/local/bin/gigacode
+KB_GIGACODE_AUTH_TIMEOUT_SECONDS=600
+KB_GIGACODE_TIMEOUT_SECONDS=600
+KB_GIGACODE_MAX_SESSION_TURNS=30
+KB_GIGACODE_MAX_TOOL_CALLS=50
+```
+
+В Admin UI откройте подготовку SSOT. При успешном `gigacode --version` режим **GigaCode на сервере**
+будет выбран по умолчанию. При первом запуске CLI может напечатать URL авторизации и ждать входа.
+Job останется в `running`, dashboard покажет кнопку **«Войти в GigaCode»**. Откройте ссылку на своём
+компьютере и завершите вход: тот же worker продолжит анализ без повторного запуска. Полный job log
+показывает URL, session, tool progress, stderr, duration и полную ошибку. Таймаут и отмена продолжают
+действовать во время ожидания авторизации.
+
 ## 3. Построить индекс
 
 Для первого запуска без внешней модели используйте hash provider:
@@ -142,7 +171,7 @@ openssl rand -hex 32
 ```
 
 Запишите его в `KB_BENCHMARK_PASSWORD`. Этот пароль не заменяет Bearer-токен и не должен храниться
-в клиентском settings: Qwen запрашивает его у администратора непосредственно перед запуском
+в клиентском settings: GigaCode запрашивает его у администратора непосредственно перед запуском
 `kb_run_context_benchmark`.
 
 ## 5. Запустить сервер вручную
@@ -261,7 +290,7 @@ checkout и заменяет его OpenSpec-снимок в индексе. П�
 
 Декларативные schemas сохраняются в `KB_MANAGED_TOOLS_PATH`, каталог индексов — в
 `KB_INDEX_CATALOG_PATH`. Подключённому прямому MCP-клиенту после изменения tools нужно обновить
-discovery; однофайловому proxy — перезапустить Qwen.
+discovery; однофайловому proxy — перезапустить GigaCode.
 
 ## 7. Запустить как systemd service
 
@@ -289,6 +318,12 @@ KB_MANAGED_INDEXES_DIR=/opt/corporate-kb/.cache/kb/indexes
 KB_REPOSITORY_CACHE_DIR=/opt/corporate-kb/.cache/kb/repositories
 KB_GRAPH_STORE_PATH=/opt/corporate-kb/.cache/kb/system_graph.json
 KB_REPOSITORY_MAX_FILES=10000
+KB_GIGACODE_ENABLED=true
+KB_GIGACODE_COMMAND=/usr/local/bin/gigacode
+KB_GIGACODE_AUTH_TIMEOUT_SECONDS=600
+KB_GIGACODE_TIMEOUT_SECONDS=600
+KB_GIGACODE_MAX_SESSION_TURNS=30
+KB_GIGACODE_MAX_TOOL_CALLS=50
 KB_LOG_LEVEL=INFO
 ```
 

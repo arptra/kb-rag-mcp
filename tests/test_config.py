@@ -41,3 +41,9 @@ def test_ssot_source_context_defaults_are_bounded() -> None:
 
     assert settings.ssot_generation_max_source_files == 12
     assert settings.ssot_generation_source_chars == 48_000
+    assert settings.gigacode_enabled is True
+    assert settings.gigacode_command == "gigacode"
+    assert settings.gigacode_auth_timeout_seconds == 600
+    assert settings.gigacode_timeout_seconds == 600
+    assert settings.gigacode_max_session_turns == 30
+    assert settings.gigacode_max_tool_calls == 50
