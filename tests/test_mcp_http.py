@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from pathlib import Path
 
 import httpx
 import pytest
@@ -351,10 +352,11 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
         assert server_metrics["peak_rss_mb"] > 0
 
         runtime_catalog = admin_overview.json()["tool_catalog"]
-        assert runtime_catalog["built_in_count"] == 9
+        assert runtime_catalog["built_in_count"] == 10
         assert {
             "ssot_context",
             "kb_feature_context",
+            "kb_search_index",
             "kb_generate_system_ssot",
             "kb_search",
             "kb_get_document",
@@ -494,6 +496,7 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
             assert {tool.name for tool in listed.tools} == {
                 "ssot_context",
                 "kb_feature_context",
+                "kb_search_index",
                 "kb_generate_system_ssot",
                 "kb_search",
                 "kb_get_document",
@@ -632,6 +635,37 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
             "payments-service"
         }
         service_id = service_map.json()["services"][0]["id"]
+
+        filtered_graph = await client.get(
+            "/admin/api/graph",
+            headers=admin_headers,
+            params={"view": "full", "node_types": "Service"},
+        )
+        assert filtered_graph.status_code == 200
+        assert {item["type"] for item in filtered_graph.json()["nodes"]} == {"Service"}
+        assert filtered_graph.json()["snapshot_id"]
+
+        graph_rebuild = await client.post(
+            "/admin/api/graph/rebuild",
+            headers=admin_headers,
+            json={"generation_mode": "static", "verify_all": False},
+        )
+        assert graph_rebuild.status_code == 202
+        graph_job_id = graph_rebuild.json()["id"]
+        for _ in range(300):
+            catalog = (
+                await client.get("/admin/api/catalog", headers=admin_headers)
+            ).json()
+            graph_job = next(item for item in catalog["jobs"] if item["id"] == graph_job_id)
+            if graph_job["status"] not in {"queued", "running", "cancelling"}:
+                break
+            await asyncio.sleep(0.01)
+        assert graph_job["status"] == "completed"
+        graph_documents = list(
+            (Path(imported_index["knowledge_dir"]) / "system-graph").glob("*.md")
+        )
+        assert graph_documents
+        assert "snapshot_id:" in graph_documents[0].read_text(encoding="utf-8")
 
         job_log = await client.get(
             "/admin/api/jobs/log",

@@ -240,14 +240,23 @@ export interface GraphNode {
 
 export interface GraphEdge {
   id: string;
-  source: string;
-  target: string;
+  source: string | GraphNode;
+  target: string | GraphNode;
   type: string;
   label: string;
   confidence: string;
+  status: "confirmed" | "inferred" | "unresolved" | "rejected";
+  origin: "declared" | "static" | "gigacode" | "static+gigacode";
+  verified_at: string | null;
+  metadata: Record<string, unknown>;
+  evidence_ids: string[];
 }
 
 export interface GraphPayload {
+  schema_version: number;
+  snapshot_id: string | null;
+  analysis_mode: "static" | "static+gigacode" | "partial";
+  verification: Record<string, unknown>;
   generated_at: string;
   view: string;
   truncated: boolean;
@@ -256,12 +265,18 @@ export interface GraphPayload {
 }
 
 export interface GraphOverview {
+  schema_version: number;
+  snapshot_id: string | null;
+  analysis_mode: "static" | "static+gigacode" | "partial";
+  verification: Record<string, unknown>;
   generated_at: string;
   node_count: number;
   edge_count: number;
   evidence_count: number;
   issue_count: number;
   nodes_by_type: Record<string, number>;
+  edges_by_type: Record<string, number>;
+  edges_by_confidence: Record<string, number>;
   services: Array<{
     id: string;
     label: string;

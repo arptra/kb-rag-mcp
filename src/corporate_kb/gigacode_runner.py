@@ -66,6 +66,25 @@ class GigaCodeResult:
     usage: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class GigaCodeJsonResult:
+    """Validated arbitrary JSON result returned by a headless GigaCode run."""
+
+    payload: dict[str, Any]
+    analyzed_files: tuple[str, ...]
+    session_id: str | None
+    model: str | None
+    duration_ms: int | None
+    usage: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _InvocationResult:
+    payload: dict[str, Any]
+    result_event: dict[str, Any]
+    parse_mode: str
+
+
 class GigaCodeRunner:
     """Supervise GigaCode without granting shell or source-write tools."""
 
@@ -99,6 +118,76 @@ class GigaCodeRunner:
         authentication_complete: Callable[[], None] | None = None,
     ) -> GigaCodeResult:
         """Execute one single-shot structured repository analysis."""
+        invocation = self._run_payload(
+            checkout=checkout,
+            prompt=prompt,
+            schema=_SSOT_RESULT_SCHEMA,
+            normalizer=self._normalize_result_mapping,
+            allow_text_fallback=True,
+            cancel=cancel,
+            progress=progress,
+            authentication_url=authentication_url,
+            authentication_complete=authentication_complete,
+        )
+        return self._validated_result(invocation.payload, invocation.result_event)
+
+    def run_json(
+        self,
+        *,
+        checkout: Path,
+        prompt: str,
+        schema: dict[str, Any],
+        cancel: CancellationSignal | None = None,
+        progress: Callable[[str], None] | None = None,
+        authentication_url: Callable[[str], None] | None = None,
+        authentication_complete: Callable[[], None] | None = None,
+    ) -> GigaCodeJsonResult:
+        """Execute one strict JSON-contract analysis without accepting prose fallback."""
+        invocation = self._run_payload(
+            checkout=checkout,
+            prompt=prompt,
+            schema=schema,
+            normalizer=lambda payload: payload,
+            allow_text_fallback=False,
+            cancel=cancel,
+            progress=progress,
+            authentication_url=authentication_url,
+            authentication_complete=authentication_complete,
+        )
+        event = invocation.result_event
+        analyzed_files = invocation.payload.get("analyzed_files", [])
+        if not isinstance(analyzed_files, list) or not all(
+            isinstance(item, str) for item in analyzed_files
+        ):
+            analyzed_files = []
+        usage = event.get("usage")
+        return GigaCodeJsonResult(
+            payload=invocation.payload,
+            analyzed_files=tuple(analyzed_files),
+            session_id=str(event["session_id"]) if event.get("session_id") is not None else None,
+            model=str(event["model"]) if event.get("model") is not None else None,
+            duration_ms=(
+                int(event["duration_ms"])
+                if isinstance(event.get("duration_ms"), int)
+                else None
+            ),
+            usage=usage if isinstance(usage, dict) else {},
+        )
+
+    def _run_payload(
+        self,
+        *,
+        checkout: Path,
+        prompt: str,
+        schema: dict[str, Any],
+        normalizer: Callable[[dict[str, Any] | None], dict[str, Any] | None],
+        allow_text_fallback: bool,
+        cancel: CancellationSignal | None = None,
+        progress: Callable[[str], None] | None = None,
+        authentication_url: Callable[[str], None] | None = None,
+        authentication_complete: Callable[[], None] | None = None,
+    ) -> _InvocationResult:
+        """Run the shared supervised process and return its structured payload."""
         status = self.status(refresh=True)
         if not status["available"]:
             raise RuntimeError(str(status["error"]))
@@ -165,7 +254,7 @@ class GigaCodeRunner:
             reader.start()
         assert process.stdin is not None
         try:
-            bounded_prompt = self._prompt_with_output_contract(prompt)
+            bounded_prompt = self._prompt_with_output_contract(prompt, schema=schema)
             process.stdin.write(bounded_prompt)
             if not bounded_prompt.endswith("\n"):
                 process.stdin.write("\n")
@@ -271,6 +360,8 @@ class GigaCodeRunner:
             result_event,
             assistant_messages,
             stream_text_parts,
+            normalizer=normalizer,
+            allow_text_fallback=allow_text_fallback,
         )
         if progress is not None:
             progress(f"GigaCode output contract: mode={parse_mode}")
@@ -279,10 +370,10 @@ class GigaCodeRunner:
             if progress is not None:
                 progress(f"GigaCode output contract failed: {diagnostic}")
             raise RuntimeError(
-                "GigaCode result did not contain usable JSON or SSOT Markdown; "
+                "GigaCode result did not contain usable output for the requested contract; "
                 + diagnostic
             )
-        return self._validated_result(structured, result_event)
+        return _InvocationResult(structured, result_event, parse_mode)
 
     def _probe(self) -> dict[str, Any]:
         command = self._settings.gigacode_command.strip()
@@ -339,14 +430,19 @@ class GigaCodeRunner:
             "version": version[-1][:300] if version else "unknown",
         }
 
-    def _prompt_with_output_contract(self, prompt: str) -> str:
-        schema = json.dumps(_SSOT_RESULT_SCHEMA, ensure_ascii=False, indent=2)
+    def _prompt_with_output_contract(
+        self,
+        prompt: str,
+        *,
+        schema: dict[str, Any] | None = None,
+    ) -> str:
+        rendered_schema = json.dumps(schema or _SSOT_RESULT_SCHEMA, ensure_ascii=False, indent=2)
         return (
             prompt.rstrip()
             + "\n\nGIGACODE OUTPUT CONTRACT:\n"
             + "Your final response must contain only one valid JSON object: no Markdown fence, "
             + "no prose before or after it. The object must satisfy this JSON Schema:\n"
-            + schema
+            + rendered_schema
             + "\nUse no more than "
             + str(self._settings.gigacode_max_tool_calls)
             + " read-only tool calls."
@@ -358,7 +454,11 @@ class GigaCodeRunner:
         result_event: dict[str, Any],
         assistant_messages: list[str],
         stream_text_parts: list[str],
+        *,
+        normalizer: Callable[[dict[str, Any] | None], dict[str, Any] | None] | None = None,
+        allow_text_fallback: bool = True,
     ) -> tuple[dict[str, Any] | None, str]:
+        normalize = normalizer or cls._normalize_result_mapping
         candidates: list[tuple[str, object]] = [
             ("structured_result", result_event.get("structured_result")),
             ("structured_output", result_event.get("structured_output")),
@@ -373,24 +473,25 @@ class GigaCodeRunner:
 
         for source, raw_candidate in candidates:
             decoded = cls._decode_structured_result(raw_candidate)
-            normalized = cls._normalize_result_mapping(decoded)
+            normalized = normalize(decoded)
             if normalized is not None:
                 return normalized, f"{source}:json"
 
-        for source, raw_candidate in candidates:
-            text = cls._extract_text(raw_candidate).strip()
-            if len(text) < 100:
-                continue
-            return (
-                {
-                    "markdown": text,
-                    "analyzed_files": [],
-                    "blocking_unknowns": [
-                        "GigaCode returned plain Markdown without structured file metadata."
-                    ],
-                },
-                f"{source}:markdown-fallback",
-            )
+        if allow_text_fallback:
+            for source, raw_candidate in candidates:
+                text = cls._extract_text(raw_candidate).strip()
+                if len(text) < 100:
+                    continue
+                return (
+                    {
+                        "markdown": text,
+                        "analyzed_files": [],
+                        "blocking_unknowns": [
+                            "GigaCode returned plain Markdown without structured file metadata."
+                        ],
+                    },
+                    f"{source}:markdown-fallback",
+                )
         return None, "unusable"
 
     @classmethod

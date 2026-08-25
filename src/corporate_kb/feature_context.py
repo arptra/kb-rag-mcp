@@ -13,6 +13,13 @@ from service_map.models import ServiceDependency, ServiceMapSnapshot, ServiceRec
 _MAX_SELECTED_SERVICES = 12
 _MAX_EVIDENCE = 100
 _TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_\u0400-\u04ff-]+")
+_CONFIDENCE_RANK = {
+    "UNRESOLVED": 0,
+    "LOW": 1,
+    "MEDIUM": 2,
+    "HIGH": 3,
+    "DECLARED": 4,
+}
 
 
 class FeatureContextCatalog(Protocol):
@@ -42,6 +49,9 @@ class FeatureContextPlanner:
         start_service: str | None = None,
         max_hops: int = 2,
         top_k_per_service: int = 2,
+        direction: str = "both",
+        min_confidence: str = "LOW",
+        include_unresolved: bool = True,
     ) -> dict[str, Any]:
         feature = feature.strip()
         if not feature:
@@ -50,6 +60,13 @@ class FeatureContextPlanner:
             raise ValueError("max_hops must be between 0 and 4")
         if not 1 <= top_k_per_service <= 5:
             raise ValueError("top_k_per_service must be between 1 and 5")
+        if direction not in {"incoming", "outgoing", "both"}:
+            raise ValueError("direction must be incoming, outgoing, or both")
+        normalized_confidence = min_confidence.upper()
+        if normalized_confidence not in _CONFIDENCE_RANK:
+            raise ValueError(
+                "min_confidence must be DECLARED, HIGH, MEDIUM, LOW, or UNRESOLVED"
+            )
 
         snapshot = ServiceMapSnapshot.model_validate(self._catalog.service_map())
         services = {item.id: item for item in snapshot.services}
@@ -79,13 +96,26 @@ class FeatureContextPlanner:
                 ],
             }
 
-        selected_ids, distances = self._neighbourhood(snapshot, roots, max_hops)
+        selected_ids, distances = self._neighbourhood(
+            snapshot,
+            roots,
+            max_hops,
+            direction=direction,
+            min_confidence=normalized_confidence,
+            include_unresolved=include_unresolved,
+        )
         selected_ids = set(
             sorted(selected_ids, key=lambda item: (distances[item], item))[
                 :_MAX_SELECTED_SERVICES
             ]
         )
-        calls = self._calls(snapshot, selected_ids, warnings)
+        calls = self._calls(
+            snapshot,
+            selected_ids,
+            warnings,
+            min_confidence=normalized_confidence,
+            include_unresolved=include_unresolved,
+        )
         evidence_ids = {
             evidence_id
             for call in calls
@@ -121,7 +151,16 @@ class FeatureContextPlanner:
         return {
             "status": "ready",
             "feature": feature,
+            "graph_revision": snapshot.snapshot_id,
+            "analysis_mode": snapshot.analysis_mode,
+            "verification": snapshot.verification,
             "analysis_generated_at": snapshot.generated_at.isoformat(),
+            "routing": {
+                "direction": direction,
+                "max_hops": max_hops,
+                "min_confidence": normalized_confidence,
+                "include_unresolved": include_unresolved,
+            },
             "discovery": discovery,
             "root_services": [item.id for item in roots],
             "service_count": len(service_contexts),
@@ -131,6 +170,19 @@ class FeatureContextPlanner:
             "unresolved_targets": unresolved,
             "evidence": evidence,
             "warnings": list(dict.fromkeys(warnings)),
+            "next_calls": [
+                {
+                    "tool": "kb_search_index",
+                    "arguments": {
+                        "index_id": context["rag"]["index_id"],
+                        "query": context["rag"]["query"],
+                        "top_k": top_k_per_service,
+                        "service": context["id"],
+                    },
+                }
+                for context in service_contexts
+                if context["rag"]["index_id"]
+            ],
             "agent_guidance": [
                 "Use each service.rag.index_id and the returned citations as the documentation "
                 "boundary for that service.",
@@ -146,6 +198,9 @@ class FeatureContextPlanner:
         return {
             "status": "empty_graph",
             "feature": feature,
+            "graph_revision": snapshot.snapshot_id,
+            "analysis_mode": snapshot.analysis_mode,
+            "verification": snapshot.verification,
             "analysis_generated_at": snapshot.generated_at.isoformat(),
             "discovery": {"method": "none", "matches": []},
             "root_services": [],
@@ -307,6 +362,10 @@ class FeatureContextPlanner:
         snapshot: ServiceMapSnapshot,
         roots: list[ServiceRecord],
         max_hops: int,
+        *,
+        direction: str,
+        min_confidence: str,
+        include_unresolved: bool,
     ) -> tuple[set[str], dict[str, int]]:
         known = {item.id for item in snapshot.services}
         distances = {item.id: 0 for item in roots}
@@ -317,9 +376,22 @@ class FeatureContextPlanner:
                 continue
             adjacent = []
             for dependency in snapshot.dependencies:
-                if dependency.source_service_id == current and dependency.target_service_id:
+                if not FeatureContextPlanner._dependency_allowed(
+                    dependency,
+                    min_confidence=min_confidence,
+                    include_unresolved=include_unresolved,
+                ):
+                    continue
+                if (
+                    direction in {"outgoing", "both"}
+                    and dependency.source_service_id == current
+                    and dependency.target_service_id
+                ):
                     adjacent.append(dependency.target_service_id)
-                if dependency.target_service_id == current:
+                if (
+                    direction in {"incoming", "both"}
+                    and dependency.target_service_id == current
+                ):
                     adjacent.append(dependency.source_service_id)
             for neighbour in adjacent:
                 if neighbour not in known or neighbour in distances:
@@ -333,10 +405,19 @@ class FeatureContextPlanner:
         snapshot: ServiceMapSnapshot,
         selected_ids: set[str],
         warnings: list[str],
+        *,
+        min_confidence: str,
+        include_unresolved: bool,
     ) -> list[dict[str, Any]]:
         calls = []
         business_cache: dict[str, dict[str, Any]] = {}
         for dependency in snapshot.dependencies:
+            if not self._dependency_allowed(
+                dependency,
+                min_confidence=min_confidence,
+                include_unresolved=include_unresolved,
+            ):
+                continue
             if dependency.source_service_id not in selected_ids:
                 continue
             if dependency.target_service_id and dependency.target_service_id not in selected_ids:
@@ -371,12 +452,27 @@ class FeatureContextPlanner:
                     },
                     "invocation_contexts": contexts,
                     "confidence": dependency.confidence,
+                    "status": dependency.status,
+                    "origin": dependency.origin,
                     "evidence_ids": list(
                         dict.fromkeys([*dependency.evidence_ids, *context_evidence])
                     ),
                 }
             )
         return calls
+
+    @staticmethod
+    def _dependency_allowed(
+        dependency: ServiceDependency,
+        *,
+        min_confidence: str,
+        include_unresolved: bool,
+    ) -> bool:
+        if dependency.status == "rejected":
+            return False
+        if dependency.confidence == "UNRESOLVED":
+            return include_unresolved
+        return _CONFIDENCE_RANK[dependency.confidence] >= _CONFIDENCE_RANK[min_confidence]
 
     @staticmethod
     def _invocation_contexts(

@@ -68,6 +68,26 @@ def _optional_query(request: Request, name: str, default: str | None = None) -> 
     return value if value not in (None, "") else default
 
 
+def _csv_query(request: Request, name: str) -> list[str] | None:
+    raw = request.query_params.get(name)
+    if raw is None or not raw.strip():
+        return None
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    return values or None
+
+
+def _boolean_query(request: Request, name: str, default: bool) -> bool:
+    raw = request.query_params.get(name)
+    if raw is None or raw == "":
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 def _integer_query(
     request: Request,
     name: str,
@@ -841,8 +861,23 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
     async def admin_build_graph(request: Request) -> JSONResponse:
         if not _admin_authorized(request, settings):
             return _admin_denied(settings)
-        job = catalog.start_graph_build()
-        return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("JSON body must be an object")
+            generation_mode = payload.get("generation_mode", "static")
+            if generation_mode not in {"static", "gigacode"}:
+                raise ValueError("generation_mode must be static or gigacode")
+            verify_all = payload.get("verify_all", False)
+            if not isinstance(verify_all, bool):
+                raise ValueError("verify_all must be boolean")
+            job = catalog.start_graph_build(
+                generation_mode=generation_mode,
+                verify_all=verify_all,
+            )
+            return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
 
     @server.custom_route("/admin/api/graph/overview", methods=["GET"], include_in_schema=False)
     async def admin_graph_overview(request: Request) -> JSONResponse:
@@ -864,6 +899,11 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 service=_optional_query(request, "service"),
                 depth=_integer_query(request, "depth", 1, minimum=0, maximum=10),
                 limit=_integer_query(request, "limit", 3000, minimum=1, maximum=20_000),
+                node_types=_csv_query(request, "node_types"),
+                edge_types=_csv_query(request, "edge_types"),
+                confidences=_csv_query(request, "confidences"),
+                connected_only=_boolean_query(request, "connected_only", False),
+                include_rejected=_boolean_query(request, "include_rejected", False),
             )
             return JSONResponse(payload)
         except Exception as exc:

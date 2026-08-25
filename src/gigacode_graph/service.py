@@ -8,7 +8,15 @@ from collections import deque
 from collections.abc import Iterable
 from typing import Any
 
-from gigacode_graph.models import Evidence, GraphEdge, GraphNode, GraphSnapshot, NodeType
+from gigacode_graph.models import (
+    Confidence,
+    EdgeType,
+    Evidence,
+    GraphEdge,
+    GraphNode,
+    GraphSnapshot,
+    NodeType,
+)
 from gigacode_graph.store import GraphStore
 
 _SERVICE_VIEW_TYPES = {"Service", "ExternalSystem"}
@@ -89,6 +97,11 @@ class GraphService:
         service: str | None = None,
         depth: int = 1,
         limit: int = 3_000,
+        node_types: list[NodeType] | None = None,
+        edge_types: list[EdgeType] | None = None,
+        confidences: list[Confidence] | None = None,
+        connected_only: bool = False,
+        include_rejected: bool = False,
     ) -> dict[str, Any]:
         self._maybe_reload()
         if view not in {"services", "full"}:
@@ -151,12 +164,36 @@ class GraphService:
                     edge for edge in edges if edge.source in node_ids and edge.target in node_ids
                 ]
 
+        if not include_rejected:
+            edges = [edge for edge in edges if edge.status != "rejected"]
+        if edge_types:
+            allowed_edge_types = set(edge_types)
+            edges = [edge for edge in edges if edge.type in allowed_edge_types]
+        if confidences:
+            allowed_confidences = set(confidences)
+            edges = [edge for edge in edges if edge.confidence in allowed_confidences]
+        if node_types:
+            allowed_node_types = set(node_types)
+            nodes = [node for node in nodes if node.type in allowed_node_types]
+        node_ids = {node.id for node in nodes}
+        edges = [edge for edge in edges if edge.source in node_ids and edge.target in node_ids]
+        if connected_only:
+            connected_ids = {
+                endpoint
+                for edge in edges
+                for endpoint in (edge.source, edge.target)
+            }
+            nodes = [node for node in nodes if node.id in connected_ids]
+
         truncated = len(nodes) > limit
         nodes = nodes[:limit]
         node_ids = {node.id for node in nodes}
         edges = [edge for edge in edges if edge.source in node_ids and edge.target in node_ids]
         return {
             "schema_version": self._snapshot.schema_version,
+            "snapshot_id": self._snapshot.snapshot_id,
+            "analysis_mode": self._snapshot.analysis_mode,
+            "verification": self._snapshot.verification,
             "generated_at": self._snapshot.generated_at.isoformat(),
             "view": view,
             "focus": focus_id,

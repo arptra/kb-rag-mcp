@@ -40,6 +40,8 @@ EdgeType = Literal[
     "CONSUMES",
 ]
 Confidence = Literal["DECLARED", "HIGH", "MEDIUM", "LOW", "UNRESOLVED"]
+EdgeStatus = Literal["confirmed", "inferred", "unresolved", "rejected"]
+EdgeOrigin = Literal["declared", "static", "gigacode", "static+gigacode"]
 
 
 class GraphModel(BaseModel):
@@ -73,6 +75,9 @@ class GraphEdge(GraphModel):
     type: EdgeType
     label: str = ""
     confidence: Confidence = "HIGH"
+    status: EdgeStatus = "inferred"
+    origin: EdgeOrigin = "static"
+    verified_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     evidence_ids: list[str] = Field(default_factory=list)
 
@@ -102,7 +107,10 @@ class IngestionManifest(GraphModel):
 
 
 class GraphSnapshot(GraphModel):
-    schema_version: int = 1
+    schema_version: int = 2
+    snapshot_id: str | None = None
+    analysis_mode: Literal["static", "static+gigacode", "partial"] = "static"
+    verification: dict[str, Any] = Field(default_factory=dict)
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     nodes: list[GraphNode] = Field(default_factory=list)
     edges: list[GraphEdge] = Field(default_factory=list)
@@ -118,6 +126,9 @@ class GraphSnapshot(GraphModel):
             edge_types[edge.type] = edge_types.get(edge.type, 0) + 1
         return {
             "schema_version": self.schema_version,
+            "snapshot_id": self.snapshot_id,
+            "analysis_mode": self.analysis_mode,
+            "verification": self.verification,
             "generated_at": self.generated_at.isoformat(),
             "node_count": len(self.nodes),
             "edge_count": len(self.edges),
@@ -125,4 +136,8 @@ class GraphSnapshot(GraphModel):
             "issue_count": len(self.issues),
             "nodes_by_type": by_type,
             "edges_by_type": edge_types,
+            "edges_by_confidence": {
+                confidence: sum(edge.confidence == confidence for edge in self.edges)
+                for confidence in ("DECLARED", "HIGH", "MEDIUM", "LOW", "UNRESOLVED")
+            },
         }

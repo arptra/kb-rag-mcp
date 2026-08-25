@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -47,6 +47,8 @@ class ServiceDependency(ServiceMapModel):
     operation: str
     confidence: Confidence
     resolved: bool
+    status: Literal["confirmed", "inferred", "unresolved", "rejected"] = "inferred"
+    origin: Literal["declared", "static", "gigacode", "static+gigacode"] = "static"
     evidence_ids: list[str] = Field(default_factory=list)
 
 
@@ -76,7 +78,10 @@ class ServiceMapIssue(ServiceMapModel):
 
 
 class ServiceMapSnapshot(ServiceMapModel):
-    schema_version: int = 1
+    schema_version: int = 2
+    snapshot_id: str | None = None
+    analysis_mode: Literal["static", "static+gigacode", "partial"] = "static"
+    verification: dict[str, Any] = Field(default_factory=dict)
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     services: list[ServiceRecord] = Field(default_factory=list)
     dependencies: list[ServiceDependency] = Field(default_factory=list)
@@ -89,6 +94,9 @@ class ServiceMapSnapshot(ServiceMapModel):
         unresolved_count = sum(not item.resolved for item in self.dependencies)
         return {
             "schema_version": self.schema_version,
+            "snapshot_id": self.snapshot_id,
+            "analysis_mode": self.analysis_mode,
+            "verification": self.verification,
             "generated_at": self.generated_at.isoformat(),
             "service_count": len(self.services),
             "entrypoint_count": entrypoint_count,

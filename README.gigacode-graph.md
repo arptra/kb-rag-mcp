@@ -47,6 +47,52 @@ flowchart LR
 У каждого извлечённого факта есть `evidence_id`, ведущий к repository, commit, file, line, snippet и
 extractor. Выводы имеют `DECLARED`, `HIGH`, `MEDIUM`, `LOW` или `UNRESOLVED` confidence.
 
+## Два режима перестройки в RAG Control Plane
+
+На странице **«Граф системы»** основной сервер предлагает два независимых режима:
+
+- **«Быстро»** — только deterministic Java/Kotlin/tree-sitter анализ, без запуска build и LLM;
+- **«Точный rebuild»** — тот же статический scan, затем read-only GigaCode проверяет bounded-пакеты
+  уже найденных межсервисных dependency-кандидатов.
+
+Во втором режиме GigaCode не генерирует topology с нуля. Сервер передаёт ему candidate id,
+исходный/предполагаемый целевой сервис, интерфейс и имеющееся evidence. Модель возвращает только
+`confirm`, `reject`, `retarget` или `unresolved`. Сервер принимает новое evidence лишь когда файл
+находится внутри нужного checkout и указанная строка реально существует; неизвестные сервисы и
+candidate id отбрасываются. Таким образом LLM повышает precision сложных Kotlin/Java-связей, но не
+становится владельцем graph state.
+
+Каждый опубликованный результат имеет общие для `graph.json` и `service_map.json` поля
+`schema_version`, `snapshot_id`, `analysis_mode` и `verification`. Цвета UI соответствуют confidence:
+
+- зелёный — `DECLARED`, связь задана конфигурацией или декларацией;
+- синий — `HIGH`, связь подтверждена сильным source evidence;
+- жёлтый — `MEDIUM`, вероятная связь;
+- оранжевый — `LOW`, слабая гипотеза;
+- красный — `UNRESOLVED`, цель определить не удалось.
+
+Отклонённые связи остаются в versioned graph для аудита, но по умолчанию не показываются в UI,
+service map и feature-routing. Raw GigaCode result записывается в
+`.cache/kb/analysis/gigacode-verification/`. После явной перестройки создаются RAG-документы
+`system-graph/<service>.md`; изменившиеся индексы перестраиваются автоматически.
+
+Административный API принимает:
+
+```bash
+# быстрый режим
+curl -X POST http://127.0.0.1:8000/admin/api/graph/rebuild \
+  -H 'Content-Type: application/json' \
+  -d '{"generation_mode":"static","verify_all":false}'
+
+# полный проход GigaCode по всем dependency-кандидатам
+curl -X POST http://127.0.0.1:8000/admin/api/graph/rebuild \
+  -H 'Content-Type: application/json' \
+  -d '{"generation_mode":"gigacode","verify_all":true}'
+```
+
+Для просмотра можно передавать CSV-фильтры `node_types`, `edge_types`, `confidences`, а также
+`connected_only=true` и `include_rejected=true` в `GET /admin/api/graph`.
+
 ## Быстрый запуск
 
 Требуется уже созданная `.venv` проекта с Python 3.12.

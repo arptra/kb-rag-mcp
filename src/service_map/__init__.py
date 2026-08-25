@@ -8,6 +8,7 @@ from service_map.runner import (
     ServiceMapBuildTimedOut,
     ServiceMapProcessRunner,
 )
+from service_map.snapshot import finalize_snapshot
 from service_map.store import JsonServiceMapStore
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "ServiceMapBuilder",
     "ServiceMapProcessRunner",
     "ServiceMapSnapshot",
+    "finalize_snapshot",
 ]

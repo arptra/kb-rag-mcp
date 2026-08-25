@@ -121,6 +121,64 @@ def test_gigacode_runner_reports_missing_executable(settings_factory) -> None:
     assert "was not found" in status["error"]
 
 
+def test_gigacode_runner_accepts_a_strict_non_ssot_json_contract(
+    settings_factory,
+    tmp_path,
+) -> None:
+    executable = tmp_path / "gigacode-json"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+if "--version" in sys.argv:
+    print("0.99.0-json-test")
+    raise SystemExit(0)
+
+prompt = sys.stdin.read()
+if '"edge_updates"' not in prompt:
+    raise SystemExit(8)
+payload = {
+    "edge_updates": [{"candidate_id": "dep:one", "decision": "confirm"}],
+    "analyzed_files": ["Client.kt"],
+    "warnings": [],
+}
+print(json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "session_id": "json-session",
+    "result": json.dumps(payload),
+}))
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    checkout = tmp_path / "repository"
+    checkout.mkdir()
+    schema = {
+        "type": "object",
+        "properties": {
+            "edge_updates": {"type": "array"},
+            "analyzed_files": {"type": "array"},
+            "warnings": {"type": "array"},
+        },
+        "required": ["edge_updates", "analyzed_files", "warnings"],
+    }
+
+    result = GigaCodeRunner(
+        settings_factory(gigacode_command=str(executable))
+    ).run_json(
+        checkout=checkout,
+        prompt="Verify dependency evidence.",
+        schema=schema,
+    )
+
+    assert result.session_id == "json-session"
+    assert result.analyzed_files == ("Client.kt",)
+    assert result.payload["edge_updates"][0]["candidate_id"] == "dep:one"
+
+
 def test_gigacode_runner_accepts_plain_markdown_result(
     settings_factory,
     tmp_path,

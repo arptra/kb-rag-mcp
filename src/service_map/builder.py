@@ -705,10 +705,15 @@ class ServiceMapBuilder:
                     operation=operation,
                     confidence=edge.confidence,
                     resolved=target_service_id is not None,
+                    status=edge.status,
+                    origin=edge.origin,
                     evidence_ids=edge.evidence_ids,
                 )
             )
-        return sorted(dependencies, key=lambda item: item.id)
+        return sorted(
+            (item for item in dependencies if item.status != "rejected"),
+            key=lambda item: item.id,
+        )
 
     @staticmethod
     def _optional_string(value: Any) -> str | None:

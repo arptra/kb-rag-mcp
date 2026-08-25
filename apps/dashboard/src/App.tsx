@@ -1,6 +1,8 @@
 import {
   FormEvent,
+  lazy,
   ReactNode,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -44,6 +46,7 @@ const TOOL_SCHEMA = {
 };
 
 const DOCUMENT_PAGE_SIZE = 50;
+const GraphCanvas3D = lazy(() => import("./GraphCanvas3D"));
 const DOCUMENT_ACCEPT = ".md,.markdown,.txt,.html,.htm,.rst,.adoc,.log,.csv,.tsv,.json,.jsonl,.yaml,.yml,.xml,.properties";
 
 function number(value: number): string {
@@ -374,7 +377,15 @@ export default function App() {
               onAction={action}
             />
           )}
-          {page === "graph" && <GraphPage data={overview.graph} password={password} onAction={action} />}
+          {page === "graph" && (
+            <GraphPage
+              data={overview.graph}
+              password={password}
+              gigacodeAvailable={overview.catalog.ssot_generation.gigacode.available}
+              gigacodeError={overview.catalog.ssot_generation.gigacode.error}
+              onAction={action}
+            />
+          )}
           {page === "operations" && <OperationsPage data={overview} password={password} onAction={action} />}
         </section>
       </main>
@@ -1565,21 +1576,116 @@ function ToolForm({ password, indexes, tool, onClose, onSaved }: { password: str
   return <Modal title={tool ? "Настроить MCP tool" : "Новый MCP tool"} onClose={onClose}><form className="modal-form" onSubmit={submit}><label>Имя tool<input required value={name} readOnly={Boolean(tool)} onChange={(event) => setName(event.target.value)} placeholder="kb_search_payments" /><small>Только A–Z, 0–9, _, . и -. Имя начинается с kb_.</small></label><label>Описание для агента<textarea required minLength={10} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Когда и для каких вопросов агент должен использовать этот поиск" /></label><fieldset><legend>Привязанные индексы</legend><div className="check-grid">{indexes.map((index) => <label className="check" key={index.id}><input type="checkbox" checked={selected.includes(index.id)} onChange={() => setSelected((current) => current.includes(index.id) ? current.filter((id) => id !== index.id) : [...current, index.id])} /><span>◇</span><div><b>{index.name}</b><small>{index.document_count} документов</small></div></label>)}</div><small>Можно сохранить tool без индекса — он останется видимым, но не будет выполнять поиск.</small></fieldset><div className="field-row three"><label>Top K<input type="number" min={1} max={20} value={topK} onChange={(event) => setTopK(Number(event.target.value))} /></label><label>Статус<input value={status} onChange={(event) => setStatus(event.target.value)} /></label><label>Тип документа<input value={documentType} onChange={(event) => setDocumentType(event.target.value)} placeholder="service / adr" /></label></div><div className="field-row"><label>Service filter<input value={service} onChange={(event) => setService(event.target.value)} placeholder="не задан" /></label><label>Domain filter<input value={domain} onChange={(event) => setDomain(event.target.value)} placeholder="не задан" /></label></div>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary">Сохранить tool</button></div></form></Modal>;
 }
 
-function GraphPage({ data, password, onAction }: { data: GraphOverview; password: string; onAction: (run: () => Promise<unknown>, message: string) => Promise<void> }) {
+type ConnectivityFilter = "all" | "connected" | "incoming" | "outgoing" | "bidirectional" | "isolated";
+type FocusDirection = "all" | "incoming" | "outgoing" | "both";
+
+const CONFIDENCE_ORDER = ["DECLARED", "HIGH", "MEDIUM", "LOW", "UNRESOLVED"] as const;
+const CONFIDENCE_LABELS: Record<string, string> = {
+  DECLARED: "Декларативно",
+  HIGH: "Подтверждено",
+  MEDIUM: "Вероятно",
+  LOW: "Сомнительно",
+  UNRESOLVED: "Не определено",
+};
+
+function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction }: {
+  data: GraphOverview;
+  password: string;
+  gigacodeAvailable: boolean;
+  gigacodeError: string | null;
+  onAction: (run: () => Promise<unknown>, message: string) => Promise<void>;
+}) {
   const [view, setView] = useState<"services" | "full">("services");
   const [graph, setGraph] = useState<GraphPayload | null>(null);
   const [selected, setSelected] = useState<GraphNode | null>(null);
   const [error, setError] = useState("");
+  const [selectedTypes, setSelectedTypes] = useState<Set<string>>(
+    () => new Set(Object.keys(data.nodes_by_type)),
+  );
+  const [selectedConfidence, setSelectedConfidence] = useState<Set<string>>(
+    () => new Set(CONFIDENCE_ORDER),
+  );
+  const [connectivity, setConnectivity] = useState<ConnectivityFilter>("all");
+  const [focusDirection, setFocusDirection] = useState<FocusDirection>("all");
+  const [query, setQuery] = useState("");
   useEffect(() => {
-    api<GraphPayload>(`/admin/api/graph?view=${view}&limit=${view === "services" ? 300 : 700}`, password).then((payload) => { setGraph(payload); setSelected(null); setError(""); }).catch((caught) => setError(caught instanceof Error ? caught.message : "Граф недоступен"));
+    api<GraphPayload>(`/admin/api/graph?view=${view}&limit=${view === "services" ? 5000 : 10000}`, password)
+      .then((payload) => { setGraph(payload); setSelected(null); setFocusDirection("all"); setError(""); })
+      .catch((caught) => setError(caught instanceof Error ? caught.message : "Граф недоступен"));
   }, [password, view, data.generated_at]);
+  useEffect(() => {
+    setSelectedTypes((current) => {
+      const next = new Set(current);
+      Object.keys(data.nodes_by_type).forEach((type) => next.add(type));
+      return next;
+    });
+  }, [data.nodes_by_type]);
+
+  const filtered = useMemo(() => filterGraph(
+    graph,
+    selectedTypes,
+    selectedConfidence,
+    connectivity,
+    selected?.id || null,
+    focusDirection,
+    query,
+  ), [graph, selectedTypes, selectedConfidence, connectivity, selected?.id, focusDirection, query]);
+  const visibleTypeCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    filtered?.nodes.forEach((node) => { counts[node.type] = (counts[node.type] || 0) + 1; });
+    return counts;
+  }, [filtered]);
+  const selectedLinks = useMemo(() => {
+    if (!filtered || !selected) return [];
+    return filtered.edges.filter((edge) => edgeSource(edge) === selected.id || edgeTarget(edge) === selected.id);
+  }, [filtered, selected]);
+
+  const toggleType = (type: string) => setSelectedTypes((current) => {
+    const next = new Set(current);
+    if (next.has(type)) next.delete(type); else next.add(type);
+    return next;
+  });
+  const toggleConfidence = (confidence: string) => setSelectedConfidence((current) => {
+    const next = new Set(current);
+    if (next.has(confidence)) next.delete(confidence); else next.add(confidence);
+    return next;
+  });
+  const resetFilters = () => {
+    setSelectedTypes(new Set(Object.keys(data.nodes_by_type)));
+    setSelectedConfidence(new Set(CONFIDENCE_ORDER));
+    setConnectivity("all");
+    setFocusDirection("all");
+    setQuery("");
+  };
+
   return (
     <div className="graph-page">
-      <div className="section-intro graph-intro"><div><span className="eyebrow">Source-derived topology</span><h2>Граф связей системы</h2><p>Первая версия извлекает сервисы, HTTP-вызовы, события, таблицы и business rules из подключённых репозиториев.</p></div><div className="segmented"><button className={view === "services" ? "active" : ""} onClick={() => setView("services")}>Сервисы</button><button className={view === "full" ? "active" : ""} onClick={() => setView("full")}>Полный граф</button></div><button className="button secondary" onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, {}), "Анализ графа запущен")}>⌘ Перестроить</button></div>
+      <div className="section-intro graph-intro">
+        <div><span className="eyebrow">Source-derived topology</span><h2>Граф связей системы</h2><p>Статика быстро находит кандидатов, GigaCode проверяет направление и цель по исходникам. Цвет связи показывает уровень уверенности.</p></div>
+        <div className="graph-head-actions">
+          <div className="segmented"><button className={view === "services" ? "active" : ""} onClick={() => setView("services")}>Сервисы</button><button className={view === "full" ? "active" : ""} onClick={() => setView("full")}>Полный граф</button></div>
+          <button className="button secondary" onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "static", verify_all: false }), "Быстрое перестроение запущено")}>⌘ Быстро</button>
+          <button className="button precise" disabled={!gigacodeAvailable} title={!gigacodeAvailable ? gigacodeError || "GigaCode недоступен" : "Проверить все связи через GigaCode"} onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "gigacode", verify_all: true }), "Точное перестроение с GigaCode запущено")}>✦ Точный rebuild</button>
+        </div>
+      </div>
+      <div className="graph-toolbar">
+        <label className="graph-search"><span>Поиск</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Сервис, API, событие…" /></label>
+        <label><span>Связность</span><select value={connectivity} onChange={(event) => setConnectivity(event.target.value as ConnectivityFilter)}><option value="all">Все узлы</option><option value="connected">Есть любые связи</option><option value="incoming">Есть входящие</option><option value="outgoing">Есть исходящие</option><option value="bidirectional">Входящие и исходящие</option><option value="isolated">Изолированные</option></select></label>
+        {selected && <label><span>Окружение выбранного</span><select value={focusDirection} onChange={(event) => setFocusDirection(event.target.value as FocusDirection)}><option value="all">Весь граф</option><option value="incoming">Только входящие</option><option value="outgoing">Только исходящие</option><option value="both">Оба направления</option></select></label>}
+        <button className="button quiet" onClick={resetFilters}>Сбросить фильтры</button>
+      </div>
       <div className="graph-layout">
-        <aside className="graph-stats"><span className="eyebrow">Snapshot</span><h3>{number(data.node_count)} узлов</h3><div className="graph-metrics"><span><b>{number(data.edge_count)}</b> связей</span><span><b>{number(data.evidence_count)}</b> evidence</span><span><b>{number(data.services.length)}</b> сервисов</span><span><b>{number(data.issue_count)}</b> замечаний</span></div><h4>Типы узлов</h4>{Object.entries(data.nodes_by_type).slice(0, 12).map(([type, count]) => <div className="legend-row" key={type}><i style={{ background: nodeColor(type) }} /><span>{type}</span><b>{count}</b></div>)}</aside>
-        <section className="graph-canvas">{error ? <div className="empty-state"><h3>{error}</h3></div> : graph && graph.nodes.length ? <GraphCanvas graph={graph} selected={selected?.id || null} onSelect={setSelected} /> : <div className="empty-state"><div>⌘</div><h3>Граф пока пуст</h3><p>Подключите Git-репозитории или запустите перестроение.</p></div>}</section>
-        <aside className="graph-details">{selected ? <><span className="eyebrow">{selected.type}</span><h3>{selected.label}</h3><code>{selected.id}</code><h4>Метаданные</h4><pre>{JSON.stringify(selected.metadata, null, 2)}</pre><h4>Evidence</h4><p>{selected.evidence_ids.length ? `${selected.evidence_ids.length} подтверждений в исходном коде` : "Для агрегированного узла evidence не записан."}</p></> : <><div className="detail-placeholder">⌖</div><h3>Выберите узел</h3><p>Здесь появятся тип, метаданные и ссылки на подтверждения в исходниках.</p></>}</aside>
+        <aside className="graph-stats">
+          <span className="eyebrow">Snapshot</span><h3>{number(filtered?.nodes.length || 0)} / {number(data.node_count)} узлов</h3>
+          <div className="graph-metrics"><span><b>{number(filtered?.edges.length || 0)}</b> связей</span><span><b>{number(data.evidence_count)}</b> evidence</span><span><b>{number(data.services.length)}</b> сервисов</span><span><b>{number(data.issue_count)}</b> замечаний</span></div>
+          <div className="snapshot-meta"><b>{data.analysis_mode === "static+gigacode" ? "✦ Static + GigaCode" : data.analysis_mode || "Static"}</b><code>{short(data.snapshot_id || "legacy snapshot", 28)}</code></div>
+          <h4>Типы узлов · multi-select</h4>
+          <div className="filter-chip-list">{Object.entries(data.nodes_by_type).map(([type, count]) => <button aria-pressed={selectedTypes.has(type)} className={selectedTypes.has(type) ? "active" : ""} key={type} onClick={() => toggleType(type)}><i style={{ background: nodeColor(type) }} /><span>{type}</span><b>{visibleTypeCounts[type] || 0}/{count}</b></button>)}</div>
+          <h4>Уверенность связей</h4>
+          <div className="confidence-list">{CONFIDENCE_ORDER.map((confidence) => <button aria-pressed={selectedConfidence.has(confidence)} className={selectedConfidence.has(confidence) ? "active" : ""} key={confidence} onClick={() => toggleConfidence(confidence)}><i style={{ background: confidenceColor(confidence) }} /><span>{CONFIDENCE_LABELS[confidence]}</span></button>)}</div>
+        </aside>
+        <section className="graph-canvas">{error ? <div className="empty-state"><h3>{error}</h3></div> : filtered && filtered.nodes.length ? <GraphCanvas graph={filtered} selected={selected?.id || null} onSelect={setSelected} /> : <div className="empty-state"><div>⌘</div><h3>По фильтрам ничего нет</h3><p>Сбросьте фильтры или запустите перестроение.</p></div>}</section>
+        <aside className="graph-details">{selected ? <><span className="eyebrow">{selected.type}</span><h3>{selected.label}</h3><code>{selected.id}</code><div className="selected-edge-summary"><span><b>{selectedLinks.filter((edge) => edgeTarget(edge) === selected.id).length}</b> входящих</span><span><b>{selectedLinks.filter((edge) => edgeSource(edge) === selected.id).length}</b> исходящих</span></div><h4>Метаданные</h4><pre>{JSON.stringify(selected.metadata, null, 2)}</pre><h4>Evidence</h4><p>{selected.evidence_ids.length ? `${selected.evidence_ids.length} подтверждений в исходном коде` : "Для агрегированного узла evidence не записан."}</p><h4>Связи</h4><div className="edge-detail-list">{selectedLinks.slice(0, 40).map((edge) => <span key={edge.id}><i style={{ background: confidenceColor(edge.confidence) }} /><b>{edgeSource(edge) === selected.id ? "→" : "←"} {edge.type}</b><small>{CONFIDENCE_LABELS[edge.confidence] || edge.confidence}</small></span>)}</div></> : <><div className="detail-placeholder">⌖</div><h3>Выберите узел</h3><p>Кликните узел: камера приблизится, здесь появятся направления связей, confidence и evidence.</p></>}</aside>
       </div>
     </div>
   );
@@ -1589,16 +1695,79 @@ function nodeColor(type: string): string {
   return ({ Service: "#b6f36b", ExternalSystem: "#ffb45d", BusinessOperation: "#78a7ff", BusinessRule: "#df83ff", EntryPoint: "#6ee7d8", ExitPoint: "#ff7e67", Event: "#ff7690", Table: "#f4d269", DomainEntity: "#a78bfa", Repository: "#8795aa" } as Record<string, string>)[type] || "#728096";
 }
 
+function confidenceColor(confidence: string): string {
+  return ({ DECLARED: "#55e89a", HIGH: "#74a7ff", MEDIUM: "#f3c76b", LOW: "#ff9b55", UNRESOLVED: "#ff5f7d" } as Record<string, string>)[confidence] || "#8795aa";
+}
+
+function edgeSource(edge: GraphPayload["edges"][number]): string {
+  return typeof edge.source === "object" ? edge.source.id : edge.source;
+}
+
+function edgeTarget(edge: GraphPayload["edges"][number]): string {
+  return typeof edge.target === "object" ? edge.target.id : edge.target;
+}
+
+function filterGraph(
+  graph: GraphPayload | null,
+  selectedTypes: Set<string>,
+  selectedConfidence: Set<string>,
+  connectivity: ConnectivityFilter,
+  selectedId: string | null,
+  focusDirection: FocusDirection,
+  query: string,
+): GraphPayload | null {
+  if (!graph) return null;
+  const normalizedQuery = query.trim().toLowerCase();
+  const baseNodes = graph.nodes.filter((node) => selectedTypes.has(node.type));
+  const baseIds = new Set(baseNodes.map((node) => node.id));
+  let edges = graph.edges.filter((edge) => selectedConfidence.has(edge.confidence) && baseIds.has(edgeSource(edge)) && baseIds.has(edgeTarget(edge)));
+  const incoming = new Map<string, number>();
+  const outgoing = new Map<string, number>();
+  edges.forEach((edge) => {
+    const source = edgeSource(edge), target = edgeTarget(edge);
+    outgoing.set(source, (outgoing.get(source) || 0) + 1);
+    incoming.set(target, (incoming.get(target) || 0) + 1);
+  });
+  let nodes = baseNodes.filter((node) => {
+    const ins = incoming.get(node.id) || 0, outs = outgoing.get(node.id) || 0;
+    if (connectivity === "connected") return ins + outs > 0;
+    if (connectivity === "incoming") return ins > 0;
+    if (connectivity === "outgoing") return outs > 0;
+    if (connectivity === "bidirectional") return ins > 0 && outs > 0;
+    if (connectivity === "isolated") return ins + outs === 0;
+    return true;
+  });
+  if (normalizedQuery) {
+    const matches = new Set(nodes.filter((node) => `${node.label} ${node.id} ${node.type} ${JSON.stringify(node.metadata)}`.toLowerCase().includes(normalizedQuery)).map((node) => node.id));
+    edges.forEach((edge) => {
+      if (matches.has(edgeSource(edge)) || matches.has(edgeTarget(edge))) {
+        matches.add(edgeSource(edge)); matches.add(edgeTarget(edge));
+      }
+    });
+    nodes = nodes.filter((node) => matches.has(node.id));
+  }
+  if (selectedId && focusDirection !== "all") {
+    const neighbourhood = new Set([selectedId]);
+    edges.forEach((edge) => {
+      const source = edgeSource(edge), target = edgeTarget(edge);
+      if (focusDirection === "outgoing" || focusDirection === "both") {
+        if (source === selectedId) neighbourhood.add(target);
+      }
+      if (focusDirection === "incoming" || focusDirection === "both") {
+        if (target === selectedId) neighbourhood.add(source);
+      }
+    });
+    nodes = nodes.filter((node) => neighbourhood.has(node.id));
+  }
+  const visibleIds = new Set(nodes.map((node) => node.id));
+  edges = edges.filter((edge) => visibleIds.has(edgeSource(edge)) && visibleIds.has(edgeTarget(edge)));
+  return { ...graph, nodes, edges };
+}
+
 function GraphCanvas({ graph, selected, onSelect }: { graph: GraphPayload; selected: string | null; onSelect: (node: GraphNode) => void }) {
-  const positions = useMemo(() => {
-    const width = 1100, height = 650, result: Record<string, { x: number; y: number }> = {};
-    if (graph.view === "services") {
-      graph.nodes.forEach((node, index) => { const angle = (index / Math.max(1, graph.nodes.length)) * Math.PI * 2 - Math.PI / 2; const radius = Math.min(250, 105 + graph.nodes.length * 14); result[node.id] = { x: width / 2 + Math.cos(angle) * radius, y: height / 2 + Math.sin(angle) * radius }; });
-    } else {
-      const columns = Math.max(4, Math.ceil(Math.sqrt(graph.nodes.length * 1.6)));
-      graph.nodes.forEach((node, index) => { result[node.id] = { x: 55 + (index % columns) * (990 / Math.max(1, columns - 1)), y: 55 + Math.floor(index / columns) * 84 }; });
-    }
-    return result;
-  }, [graph]);
-  return <svg viewBox="0 0 1100 650" role="img" aria-label="Граф связей системы"><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" /></marker></defs>{graph.edges.map((edge) => { const from = positions[edge.source], to = positions[edge.target]; if (!from || !to) return null; return <line key={edge.id} className={edge.confidence === "LOW" || edge.confidence === "UNRESOLVED" ? "uncertain" : ""} x1={from.x} y1={from.y} x2={to.x} y2={to.y} markerEnd="url(#arrow)" />; })}{graph.nodes.map((node) => { const position = positions[node.id]; const radius = node.type === "Service" ? 24 : 15; return <g key={node.id} className={`graph-node ${selected === node.id ? "selected" : ""}`} transform={`translate(${position.x} ${position.y})`} onClick={() => onSelect(node)}><circle r={radius} fill={nodeColor(node.type)} /><text y={radius + 18}>{short(node.label, 22)}</text><title>{node.type}: {node.label}</title></g>; })}</svg>;
+  return (
+    <Suspense fallback={<div className="graph-loading"><span>✦</span><b>Загружаем 3D-движок…</b></div>}>
+      <GraphCanvas3D graph={graph} selected={selected} onSelect={onSelect} />
+    </Suspense>
+  );
 }

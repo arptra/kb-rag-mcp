@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from corporate_kb.config import Settings
 from corporate_kb.gigacode_runner import GigaCodeCancelled, GigaCodeRunner
+from corporate_kb.graph_verifier import GraphGigaCodeVerifier
 from corporate_kb.index_runner import IndexBuildCancelled, IndexBuildProcessRunner
 from corporate_kb.loaders.filesystem import SUPPORTED_DOCUMENT_SUFFIXES
 from corporate_kb.mcp.tools import KnowledgeTools
@@ -46,6 +47,7 @@ from service_map import (
     ServiceMapBuildResult,
     ServiceMapProcessRunner,
     ServiceMapSnapshot,
+    finalize_snapshot,
 )
 from service_map.models import ServiceRecord
 
@@ -212,6 +214,11 @@ class RagCatalog:
             settings.ssot_skill_path,
         )
         self._gigacode = GigaCodeRunner(settings)
+        self._graph_verifier = GraphGigaCodeVerifier(
+            self._gigacode,
+            self._graph_settings(),
+            settings.analysis_archive_dir,
+        )
         if not settings.graph_store_path.is_file():
             self._graph_store.save(GraphSnapshot())
         self._graph_service = GraphService(self._graph_store)
@@ -361,9 +368,29 @@ class RagCatalog:
         ).start()
         return job
 
-    def start_graph_build(self) -> CatalogJob:
-        job = self._new_job("graph", message="Graph rebuild queued")
-        threading.Thread(target=self._run_graph_job, args=(job.id,), daemon=True).start()
+    def start_graph_build(
+        self,
+        *,
+        generation_mode: Literal["static", "gigacode"] = "static",
+        verify_all: bool = False,
+    ) -> CatalogJob:
+        if generation_mode == "gigacode":
+            gigacode_status = self._gigacode.status(refresh=True)
+            if not gigacode_status["available"]:
+                raise RuntimeError(str(gigacode_status["error"]))
+        job = self._new_job(
+            "graph",
+            message=(
+                "Precise graph rebuild queued: static + GigaCode"
+                if generation_mode == "gigacode"
+                else "Static graph rebuild queued"
+            ),
+        )
+        threading.Thread(
+            target=self._run_graph_job,
+            args=(job.id, generation_mode, verify_all),
+            daemon=True,
+        ).start()
         return job
 
     def start_service_analysis(
@@ -1253,12 +1280,29 @@ class RagCatalog:
     def graph_overview(self) -> dict[str, Any]:
         return self._graph_service.overview()
 
-    def graph(self, *, view: str, service: str | None, depth: int, limit: int) -> dict[str, Any]:
+    def graph(
+        self,
+        *,
+        view: str,
+        service: str | None,
+        depth: int,
+        limit: int,
+        node_types: list[str] | None = None,
+        edge_types: list[str] | None = None,
+        confidences: list[str] | None = None,
+        connected_only: bool = False,
+        include_rejected: bool = False,
+    ) -> dict[str, Any]:
         return self._graph_service.graph(
             view=view,
             service=service,
             depth=depth,
             limit=limit,
+            node_types=node_types,  # type: ignore[arg-type]
+            edge_types=edge_types,  # type: ignore[arg-type]
+            confidences=confidences,  # type: ignore[arg-type]
+            connected_only=connected_only,
+            include_rejected=include_rejected,
         )
 
     def graph_evidence(self, evidence_ids: list[str]) -> dict[str, Any]:
@@ -1484,29 +1528,52 @@ class RagCatalog:
             )
             raise
 
-    def _run_graph_job(self, job_id: str) -> None:
+    def _run_graph_job(
+        self,
+        job_id: str,
+        generation_mode: Literal["static", "gigacode"],
+        verify_all: bool,
+    ) -> None:
         cancel_event = self._cancel_event(job_id)
         try:
             self._raise_if_cancelled(cancel_event)
-            self._execute_graph_job(job_id, cancel_event)
-        except (CatalogJobCancelled, RepositoryOperationCancelled, ServiceMapBuildCancelled):
+            self._execute_graph_job(job_id, cancel_event, generation_mode, verify_all)
+        except (
+            CatalogJobCancelled,
+            GigaCodeCancelled,
+            RepositoryOperationCancelled,
+            ServiceMapBuildCancelled,
+        ):
             self._finish_cancelled_job(job_id, None)
         except Exception as exc:
             self._fail_background_job(job_id, None, "Graph build failed", exc)
         finally:
             self._release_cancel_event(job_id)
 
-    def _execute_graph_job(self, job_id: str, cancel_event: threading.Event) -> None:
+    def _execute_graph_job(
+        self,
+        job_id: str,
+        cancel_event: threading.Event,
+        generation_mode: Literal["static", "gigacode"],
+        verify_all: bool,
+    ) -> None:
         self._update_job(
             job_id,
             status="running",
-            message="Analyzing repositories",
+            message=(
+                "Static scan before GigaCode verification"
+                if generation_mode == "gigacode"
+                else "Analyzing repositories"
+            ),
             started_at=_now(),
         )
         snapshot = self._build_graph(
             cancel_event=cancel_event,
             job_id=job_id,
             force_all=True,
+            analysis_mode=generation_mode,
+            verify_all=verify_all,
+            publish_rag_routes=True,
         )
         self._raise_if_cancelled(cancel_event)
         partial = self._is_partial_analysis(snapshot)
@@ -1516,9 +1583,18 @@ class RagCatalog:
             message=(
                 f"Published partial map with {len(snapshot.nodes)} nodes"
                 if partial
-                else f"Built {len(snapshot.nodes)} nodes and {len(snapshot.edges)} edges"
+                else (
+                    f"Built {len(snapshot.nodes)} nodes and {len(snapshot.edges)} edges "
+                    f"with {snapshot.analysis_mode}"
+                )
             ),
             completed_at=_now(),
+            result={
+                "phase": "published",
+                "generation_mode": generation_mode,
+                "snapshot_id": snapshot.snapshot_id,
+                "verification": snapshot.verification,
+            },
         )
 
     def _run_service_analysis_job(
@@ -2137,6 +2213,9 @@ class RagCatalog:
         job_id: str | None = None,
         force_service_ids: set[str] | None = None,
         force_all: bool = False,
+        analysis_mode: Literal["static", "gigacode"] = "static",
+        verify_all: bool = False,
+        publish_rag_routes: bool = False,
     ) -> GraphSnapshot:
         if job_id is not None and self._analysis_lock.locked():
             self._append_job_log(job_id, "Waiting for another graph analysis to finish")
@@ -2146,6 +2225,9 @@ class RagCatalog:
                 job_id=job_id,
                 force_service_ids=force_service_ids,
                 force_all=force_all,
+                analysis_mode=analysis_mode,
+                verify_all=verify_all,
+                publish_rag_routes=publish_rag_routes,
             )
 
     def _build_graph_unlocked(
@@ -2155,6 +2237,9 @@ class RagCatalog:
         job_id: str | None,
         force_service_ids: set[str] | None,
         force_all: bool,
+        analysis_mode: Literal["static", "gigacode"],
+        verify_all: bool,
+        publish_rag_routes: bool,
     ) -> GraphSnapshot:
         with self._lock:
             repositories = [item.model_copy(deep=True) for item in self._state.repositories]
@@ -2182,8 +2267,70 @@ class RagCatalog:
             checkpoint=self._publish_analysis_checkpoint,
             **build_options,
         )
+        verification: dict[str, Any] = {}
+        if analysis_mode == "gigacode" and not result.partial:
+            if job_id is not None:
+                self._update_job(
+                    job_id,
+                    message="Static graph ready; GigaCode is verifying dependency evidence",
+                    result={
+                        "phase": "gigacode_verification",
+                        "generation_mode": "gigacode",
+                    },
+                )
+            result, verification = self._graph_verifier.verify(
+                result,
+                inputs,
+                verify_all=verify_all,
+                cancel=cancel_event,
+                progress=(
+                    (lambda message: self._append_job_log(job_id, message))
+                    if job_id is not None
+                    else None
+                ),
+                authentication_url=(
+                    (
+                        lambda target, url: self._gigacode_authentication_required(
+                            job_id, target, url
+                        )
+                    )
+                    if job_id is not None
+                    else None
+                ),
+                authentication_complete=(
+                    (
+                        lambda target: self._gigacode_authentication_completed(
+                            job_id, target
+                        )
+                    )
+                    if job_id is not None
+                    else None
+                ),
+            )
+        elif analysis_mode == "gigacode":
+            verification = {
+                "skipped": True,
+                "reason": "Static analysis published only a partial checkpoint",
+            }
+        result = finalize_snapshot(
+            result,
+            mode=(
+                "partial"
+                if result.partial
+                else "static+gigacode"
+                if analysis_mode == "gigacode"
+                else "static"
+            ),
+            verification=verification,
+        )
         self._service_map_store.save(result.service_map)
         self._graph_store.save(result.graph)
+        if publish_rag_routes:
+            self._publish_graph_rag_routes(
+                result.service_map,
+                cancel_event=cancel_event,
+                job_id=job_id,
+            )
         manifest = self._analysis_archive.record(
             result.service_map,
             result.graph,
@@ -2198,6 +2345,229 @@ class RagCatalog:
                 )
             self._append_job_log(job_id, f"Analysis archived at {manifest['path']}")
         return result.graph
+
+    def _publish_graph_rag_routes(
+        self,
+        service_map: ServiceMapSnapshot,
+        *,
+        cancel_event: threading.Event | None,
+        job_id: str | None,
+    ) -> None:
+        """Write graph-derived service dossiers and incrementally refresh affected indexes."""
+        with self._lock:
+            repositories = [item.model_copy(deep=True) for item in self._state.repositories]
+            indexes = {item.id: item.model_copy(deep=True) for item in self._state.indexes}
+        repository_by_root = {
+            str(Path(item.checkout_path).resolve()): item for item in repositories
+        }
+        repository_by_name = {item.name: item for item in repositories}
+        evidence = {item.id: item for item in service_map.evidence}
+        changed_indexes: set[str] = set()
+        desired_paths_by_index: dict[str, set[Path]] = {
+            item.index_id: set()
+            for item in repositories
+            if item.index_id in indexes
+        }
+        for service in service_map.services:
+            self._raise_if_cancelled(cancel_event)
+            repository = None
+            if service.repository_root:
+                repository = repository_by_root.get(
+                    str(Path(service.repository_root).resolve())
+                )
+            if repository is None:
+                repository = repository_by_name.get(service.repository)
+            if repository is None or repository.index_id not in indexes:
+                continue
+            index = indexes[repository.index_id]
+            outbound = [
+                item
+                for item in service_map.dependencies
+                if item.source_service_id == service.id and item.status != "rejected"
+            ]
+            inbound = [
+                item
+                for item in service_map.dependencies
+                if item.target_service_id == service.id and item.status != "rejected"
+            ]
+            lines = [
+                "---",
+                f"service: {json.dumps(service.id, ensure_ascii=False)}",
+                "document_type: system_graph",
+                "status: current",
+                "authority: source-derived-graph",
+                f"snapshot_id: {json.dumps(service_map.snapshot_id, ensure_ascii=False)}",
+                f"analysis_mode: {service_map.analysis_mode}",
+                "---",
+                "",
+                f"# System graph · {service.name}",
+                "",
+                f"Repository: `{service.repository}`  ",
+                f"Module: `{service.module_path}`  ",
+                f"Snapshot: `{service_map.snapshot_id or 'legacy'}`",
+                "",
+                "## Incoming interfaces",
+            ]
+            lines.extend(
+                f"- `{item.kind}` `{item.operation}`" for item in service.entrypoints
+            )
+            if not service.entrypoints:
+                lines.append("- No source-derived incoming interface found.")
+            lines.extend(["", "## Outgoing dependencies"])
+            lines.extend(self._graph_dependency_lines(outbound, evidence, outbound=True))
+            if not outbound:
+                lines.append("- No source-derived outgoing dependency found.")
+            lines.extend(["", "## Incoming dependencies"])
+            lines.extend(self._graph_dependency_lines(inbound, evidence, outbound=False))
+            if not inbound:
+                lines.append("- No source-derived incoming dependency found.")
+            if service_map.verification:
+                lines.extend(
+                    [
+                        "",
+                        "## Verification summary",
+                        "",
+                        "```json",
+                        json.dumps(service_map.verification, ensure_ascii=False, indent=2),
+                        "```",
+                    ]
+                )
+            content = "\n".join(lines).rstrip() + "\n"
+            destination = (
+                Path(index.knowledge_dir).resolve()
+                / "system-graph"
+                / f"{_slug(service.id)}.md"
+            )
+            desired_paths_by_index.setdefault(index.id, set()).add(destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            current = (
+                destination.read_text(encoding="utf-8")
+                if destination.is_file()
+                else None
+            )
+            if current != content:
+                temporary = destination.with_suffix(".md.tmp")
+                temporary.write_text(content, encoding="utf-8")
+                os.replace(temporary, destination)
+                changed_indexes.add(index.id)
+                if job_id is not None:
+                    self._append_job_log(
+                        job_id,
+                        f"Graph RAG document updated: index={index.id}; service={service.id}; "
+                        f"path={destination}",
+                    )
+
+        snapshot_marker = (service_map.snapshot_id or "legacy") + "\n"
+        for index_id, desired_paths in desired_paths_by_index.items():
+            index = indexes[index_id]
+            route_root = Path(index.knowledge_dir).resolve() / "system-graph"
+            if route_root.is_dir():
+                for existing in route_root.glob("*.md"):
+                    if existing in desired_paths or not existing.is_file():
+                        continue
+                    header = existing.read_text(encoding="utf-8", errors="replace")[:1000]
+                    if "authority: source-derived-graph" not in header:
+                        continue
+                    existing.unlink()
+                    changed_indexes.add(index_id)
+                    if job_id is not None:
+                        self._append_job_log(
+                            job_id,
+                            f"Stale graph RAG document removed: index={index_id}; "
+                            f"path={existing}",
+                        )
+            marker = route_root / ".snapshot-id"
+            current_marker = (
+                marker.read_text(encoding="utf-8")
+                if marker.is_file()
+                else None
+            )
+            if current_marker != snapshot_marker:
+                changed_indexes.add(index_id)
+
+        for position, index_id in enumerate(sorted(changed_indexes), start=1):
+            self._raise_if_cancelled(cancel_event)
+            index = indexes[index_id]
+            previous_status = index.status
+            if job_id is not None:
+                self._update_job(
+                    job_id,
+                    message=(
+                        f"Updating graph documents in RAG index "
+                        f"[{position}/{len(changed_indexes)}]: {index.name}"
+                    ),
+                    result={
+                        "phase": "rag_route_indexing",
+                        "index_id": index_id,
+                        "position": position,
+                        "total": len(changed_indexes),
+                    },
+                )
+            with self._cancellable_lock(self._index_work_lock(index_id), cancel_event):
+                self._update_index(index_id, status="indexing", error=None)
+                try:
+                    IndexBuildProcessRunner(
+                        self.service_for(index_id).settings,
+                        timeout_seconds=self.settings.index_build_timeout_seconds,
+                    ).build(cancel=cancel_event)
+                    stats = self.service_for(index_id).reload_cached_index()
+                    marker = Path(index.knowledge_dir).resolve() / "system-graph" / ".snapshot-id"
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker_temporary = marker.with_suffix(".tmp")
+                    marker_temporary.write_text(snapshot_marker, encoding="utf-8")
+                    os.replace(marker_temporary, marker)
+                    self._update_index(
+                        index_id,
+                        status="ready",
+                        document_count=stats.document_count,
+                        chunk_count=stats.chunk_count,
+                        updated_at=_now(),
+                        error=None,
+                    )
+                except (CatalogJobCancelled, IndexBuildCancelled):
+                    self._update_index(index_id, status=previous_status, error=None)
+                    raise
+                except Exception:
+                    self._update_index(
+                        index_id,
+                        status="error",
+                        error="Graph route indexing failed; open the job log for traceback",
+                        updated_at=_now(),
+                    )
+                    raise
+                if job_id is not None:
+                    self._append_job_log(
+                        job_id,
+                        f"Graph routes indexed: index={index_id}; "
+                        f"documents={stats.document_count}; chunks={stats.chunk_count}",
+                    )
+
+    @staticmethod
+    def _graph_dependency_lines(
+        dependencies: list[Any],
+        evidence: dict[str, Any],
+        *,
+        outbound: bool,
+    ) -> list[str]:
+        lines: list[str] = []
+        for dependency in dependencies:
+            peer = (
+                dependency.target_service_id or dependency.target_hint
+                if outbound
+                else dependency.source_service_id
+            )
+            lines.append(
+                f"- `{dependency.protocol}` `{dependency.operation}` "
+                f"{'→' if outbound else '←'} `{peer}` · "
+                f"confidence `{dependency.confidence}` · {dependency.origin}"
+            )
+            for evidence_id in dependency.evidence_ids[:3]:
+                item = evidence.get(evidence_id)
+                if item is not None:
+                    lines.append(
+                        f"  - evidence `{item.file}:{item.line}` — {item.snippet[:240]}"
+                    )
+        return lines
 
     def _index_work_lock(self, index_id: str) -> threading.Lock:
         with self._lock:

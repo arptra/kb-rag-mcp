@@ -36,7 +36,12 @@ FEATURE_CONTEXT_DESCRIPTION = """Plan a feature with the static service call gra
 owned by each affected repository. Use this before cross-service implementation work. It returns
 callers, callees, API/event operations, statically linked invocation triggers, exact source
 evidence, and compact RAG excerpts grouped by service. Supply start_service when known; otherwise
-the tool discovers likely roots. LOW/UNRESOLVED facts and runtime order must be verified."""
+the tool discovers likely roots. The stable graph_revision changes after rebuild and next_calls
+contains exact kb_search_index calls for affected indexes. LOW/UNRESOLVED facts and runtime order
+must be verified."""
+INDEX_SEARCH_DESCRIPTION = """Search one exact RAG index selected by kb_feature_context. Pass the
+returned index_id instead of guessing a managed MCP tool name. Use this for follow-up questions
+after graph routing and cite source_path/source_url from the results."""
 GENERATE_SSOT_DESCRIPTION = """Coordinate source-backed SSOT generation with the model calling this
 MCP tool. The RAG service never calls an LLM HTTP endpoint directly. Use action='options' to list
 indexes, cloned repositories and services; action='clone' for a missing Git repository;
@@ -52,6 +57,7 @@ proxy, finish through kb_save_and_upload_ssot so a temp copy exists on the user'
 BUILTIN_TOOL_DESCRIPTIONS = {
     "ssot_context": SSOT_DESCRIPTION,
     "kb_feature_context": FEATURE_CONTEXT_DESCRIPTION,
+    "kb_search_index": INDEX_SEARCH_DESCRIPTION,
     "kb_generate_system_ssot": GENERATE_SSOT_DESCRIPTION,
     "kb_search": SEARCH_DESCRIPTION,
     "kb_get_document": (
@@ -156,15 +162,54 @@ def create_mcp_server(
             start_service: str | None = None,
             max_hops: int = 2,
             top_k_per_service: int = 2,
+            direction: Literal["incoming", "outgoing", "both"] = "both",
+            min_confidence: Literal[
+                "DECLARED", "HIGH", "MEDIUM", "LOW", "UNRESOLVED"
+            ] = "LOW",
+            include_unresolved: bool = True,
         ) -> dict[str, Any]:
             return feature_context.build(
                 feature=feature,
                 start_service=start_service,
                 max_hops=max_hops,
                 top_k_per_service=top_k_per_service,
+                direction=direction,
+                min_confidence=min_confidence,
+                include_unresolved=include_unresolved,
             )
 
     if catalog is not None:
+
+        @server.tool(
+            name="kb_search_index",
+            description=description("kb_search_index"),
+            annotations={"readOnlyHint": True, "openWorldHint": False},
+        )
+        def kb_search_index(
+            index_id: str,
+            query: str,
+            top_k: int = 3,
+            min_score: float | None = None,
+            service: str | None = None,
+            domain: str | None = None,
+            document_type: str | None = None,
+            status: str | None = "current",
+            authority: str | None = None,
+            source_type: str | None = None,
+        ) -> dict[str, Any]:
+            result = catalog.tools_for(index_id).search(
+                query=query,
+                top_k=top_k,
+                min_score=min_score,
+                service=service,
+                domain=domain,
+                document_type=document_type,
+                status=status,
+                authority=authority,
+                source_type=source_type,
+            )
+            result["index_id"] = index_id
+            return result
 
         @server.tool(
             name="kb_generate_system_ssot",
