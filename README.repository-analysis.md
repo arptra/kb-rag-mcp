@@ -454,6 +454,19 @@ gigacode \
 Runner намеренно не передаёт неподдерживаемые параметры `--json-schema`, `--safe-mode`,
 `--max-tool-calls` и `--max-wall-time`.
 
+`stream-json` описывает JSONL envelope, но terminal `result.result` в разных сборках GigaCode может
+оставаться обычным текстом ассистента. Поэтому runner последовательно принимает:
+
+1. JSON contract из `structured_result`, `structured_output`, `result`, `output` или `response`;
+2. JSON object внутри Markdown fence или окружающего пояснения;
+3. camelCase-поля `analyzedFiles` и `blockingUnknowns`;
+4. готовый Markdown SSOT из terminal result, последнего assistant event или stream text.
+
+При Markdown fallback документ не теряется: `analyzed_files` остаётся пустым, а в
+`blocking_unknowns` записывается, что CLI не вернул структурированные file metadata. Если ни JSON,
+ни достаточно полный Markdown найти нельзя, job log содержит список полей, тип `result`, длину и
+ограниченный preview фактического ответа.
+
 Если при первом запуске GigaCode выводит URL для browser-login, runner распознаёт его в stdout или
 stderr. Job сохраняет статус `running` с phase `awaiting_authentication`, а dashboard показывает
 глобальный баннер и кликабельную кнопку также прямо на карточке сервиса. Пользователь открывает

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -118,6 +119,103 @@ def test_gigacode_runner_reports_missing_executable(settings_factory) -> None:
 
     assert status["available"] is False
     assert "was not found" in status["error"]
+
+
+def test_gigacode_runner_accepts_plain_markdown_result(
+    settings_factory,
+    tmp_path,
+) -> None:
+    executable = tmp_path / "gigacode-markdown"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+if "--version" in sys.argv:
+    print("0.99.0-markdown-test")
+    raise SystemExit(0)
+
+sys.stdin.read()
+markdown = (
+    "# Plain Markdown service SSOT\\n\\n"
+    "This repository exposes an observed HTTP status endpoint and delegates persistence "
+    "through a repository interface. Runtime deployment details are not present in source.\\n"
+)
+print(json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "result": markdown,
+    "session_id": "plain-markdown-session",
+}))
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    checkout = tmp_path / "repository"
+    checkout.mkdir()
+    progress: list[str] = []
+
+    result = GigaCodeRunner(
+        settings_factory(gigacode_command=str(executable))
+    ).run(
+        checkout=checkout,
+        prompt="Create an evidence-backed service SSOT.",
+        progress=progress.append,
+    )
+
+    assert result.session_id == "plain-markdown-session"
+    assert result.analyzed_files == ()
+    assert "# Plain Markdown service SSOT" in result.markdown
+    assert result.blocking_unknowns == (
+        "GigaCode returned plain Markdown without structured file metadata.",
+    )
+    assert any("mode=result:markdown-fallback" in line for line in progress)
+
+
+def test_gigacode_runner_extracts_embedded_json_and_camel_case_fields() -> None:
+    markdown = (
+        "# Embedded JSON SSOT\\n\\n"
+        "This evidence-backed service description is deliberately long enough to pass "
+        "the SSOT validation contract without inventing any unsupported runtime facts."
+    )
+    raw_result = (
+        "Here is the requested object:\n```json\n"
+        + '{"markdown": '
+        + json.dumps(markdown)
+        + ', "analyzedFiles": ["README.md"], "blockingUnknowns": []}'
+        + "\n```\nDone."
+    )
+
+    structured, mode = GigaCodeRunner._result_contract(
+        {"type": "result", "result": raw_result},
+        [],
+        [],
+    )
+
+    assert mode == "result:json"
+    assert structured is not None
+    assert structured["analyzed_files"] == ["README.md"]
+    assert structured["blocking_unknowns"] == []
+    assert structured["markdown"] == markdown
+
+
+def test_gigacode_runner_uses_final_assistant_text_when_result_is_empty() -> None:
+    assistant_markdown = (
+        "# Assistant event SSOT\\n\\n"
+        "The terminal result omitted its text, but the final assistant event retained this "
+        "complete evidence-backed service description for safe recovery by the runner."
+    )
+
+    structured, mode = GigaCodeRunner._result_contract(
+        {"type": "result", "subtype": "success", "is_error": False},
+        [assistant_markdown],
+        [],
+    )
+
+    assert mode == "assistant_message:markdown-fallback"
+    assert structured is not None
+    assert structured["markdown"] == assistant_markdown
 
 
 def test_gigacode_runner_preserves_structured_failure_reason(

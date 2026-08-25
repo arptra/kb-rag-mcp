@@ -178,6 +178,8 @@ class GigaCodeRunner:
         result_event: dict[str, Any] | None = None
         stderr_tail: list[str] = []
         stdout_tail: list[str] = []
+        assistant_messages: list[str] = []
+        stream_text_parts: list[str] = []
         reported_auth_urls: set[str] = set()
         waiting_for_authentication = False
         try:
@@ -227,6 +229,14 @@ class GigaCodeRunner:
                     continue
                 if event.get("type") == "result":
                     result_event = event
+                elif event.get("type") == "assistant":
+                    assistant_text = self._assistant_message_text(event)
+                    if assistant_text:
+                        assistant_messages.append(assistant_text)
+                elif event.get("type") == "stream_event":
+                    stream_text = self._stream_text_delta(event)
+                    if stream_text:
+                        stream_text_parts.append(stream_text)
                 if (
                     waiting_for_authentication
                     and not authentication_started
@@ -257,9 +267,21 @@ class GigaCodeRunner:
             raise RuntimeError(
                 f"GigaCode result failed: {self._result_error(result_event)}"
             )
-        structured = result_event.get("structured_result")
-        if not isinstance(structured, dict):
-            structured = self._decode_structured_result(result_event.get("result"))
+        structured, parse_mode = self._result_contract(
+            result_event,
+            assistant_messages,
+            stream_text_parts,
+        )
+        if progress is not None:
+            progress(f"GigaCode output contract: mode={parse_mode}")
+        if structured is None:
+            diagnostic = self._result_diagnostic(result_event, assistant_messages)
+            if progress is not None:
+                progress(f"GigaCode output contract failed: {diagnostic}")
+            raise RuntimeError(
+                "GigaCode result did not contain usable JSON or SSOT Markdown; "
+                + diagnostic
+            )
         return self._validated_result(structured, result_event)
 
     def _probe(self) -> dict[str, Any]:
@@ -271,7 +293,7 @@ class GigaCodeRunner:
             "executable": None,
             "version": None,
             "error": None,
-            "mode": "headless-structured-output",
+            "mode": "headless-json-or-markdown",
             "output_format": "stream-json",
             "schema_delivery": "prompt",
             "wall_time_enforcement": "supervisor",
@@ -330,22 +352,181 @@ class GigaCodeRunner:
             + " read-only tool calls."
         )
 
-    @staticmethod
-    def _decode_structured_result(raw_result: object) -> dict[str, Any] | None:
+    @classmethod
+    def _result_contract(
+        cls,
+        result_event: dict[str, Any],
+        assistant_messages: list[str],
+        stream_text_parts: list[str],
+    ) -> tuple[dict[str, Any] | None, str]:
+        candidates: list[tuple[str, object]] = [
+            ("structured_result", result_event.get("structured_result")),
+            ("structured_output", result_event.get("structured_output")),
+            ("result", result_event.get("result")),
+            ("output", result_event.get("output")),
+            ("response", result_event.get("response")),
+        ]
+        if assistant_messages:
+            candidates.append(("assistant_message", assistant_messages[-1]))
+        if stream_text_parts:
+            candidates.append(("stream_text", "".join(stream_text_parts)))
+
+        for source, raw_candidate in candidates:
+            decoded = cls._decode_structured_result(raw_candidate)
+            normalized = cls._normalize_result_mapping(decoded)
+            if normalized is not None:
+                return normalized, f"{source}:json"
+
+        for source, raw_candidate in candidates:
+            text = cls._extract_text(raw_candidate).strip()
+            if len(text) < 100:
+                continue
+            return (
+                {
+                    "markdown": text,
+                    "analyzed_files": [],
+                    "blocking_unknowns": [
+                        "GigaCode returned plain Markdown without structured file metadata."
+                    ],
+                },
+                f"{source}:markdown-fallback",
+            )
+        return None, "unusable"
+
+    @classmethod
+    def _decode_structured_result(cls, raw_result: object) -> dict[str, Any] | None:
         if isinstance(raw_result, dict):
             return raw_result
-        if not isinstance(raw_result, str):
+        text = cls._extract_text(raw_result).strip()
+        if not text:
             return None
-        candidate = raw_result.strip()
-        if candidate.startswith("```") and candidate.endswith("```"):
-            first_newline = candidate.find("\n")
-            if first_newline >= 0:
-                candidate = candidate[first_newline + 1 : -3].strip()
-        try:
-            decoded = json.loads(candidate)
-        except json.JSONDecodeError:
+        candidates = [text]
+        fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+        candidates.extend(item.strip() for item in fenced if item.strip())
+        for candidate in candidates:
+            try:
+                decoded = json.loads(candidate)
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, dict):
+                return decoded
+
+        decoder = json.JSONDecoder()
+        for position, character in enumerate(text):
+            if character != "{":
+                continue
+            try:
+                decoded, _ = decoder.raw_decode(text[position:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(decoded, dict):
+                return decoded
+        return None
+
+    @classmethod
+    def _normalize_result_mapping(
+        cls,
+        payload: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if payload is None:
             return None
-        return decoded if isinstance(decoded, dict) else None
+        for key in (
+            "structured_result",
+            "structuredResult",
+            "structured_output",
+            "structuredOutput",
+            "data",
+            "output",
+            "response",
+        ):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                normalized = cls._normalize_result_mapping(nested)
+                if normalized is not None:
+                    return normalized
+
+        markdown = payload.get("markdown")
+        if not isinstance(markdown, str):
+            for key in ("content", "ssot", "text"):
+                candidate = payload.get(key)
+                if isinstance(candidate, str):
+                    markdown = candidate
+                    break
+        if not isinstance(markdown, str):
+            return None
+
+        analyzed_files = payload.get("analyzed_files", payload.get("analyzedFiles"))
+        blocking_unknowns = payload.get(
+            "blocking_unknowns",
+            payload.get("blockingUnknowns"),
+        )
+        warnings: list[str] = []
+        if not isinstance(analyzed_files, list) or not all(
+            isinstance(item, str) for item in analyzed_files
+        ):
+            analyzed_files = []
+            warnings.append("GigaCode omitted structured analyzed_files metadata.")
+        if not isinstance(blocking_unknowns, list) or not all(
+            isinstance(item, str) for item in blocking_unknowns
+        ):
+            blocking_unknowns = []
+            warnings.append("GigaCode omitted structured blocking_unknowns metadata.")
+        return {
+            "markdown": markdown,
+            "analyzed_files": analyzed_files,
+            "blocking_unknowns": [*blocking_unknowns, *warnings],
+        }
+
+    @classmethod
+    def _extract_text(cls, value: object, *, depth: int = 0) -> str:
+        if depth > 5:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "\n".join(
+                text
+                for item in value
+                if (text := cls._extract_text(item, depth=depth + 1))
+            )
+        if not isinstance(value, dict):
+            return ""
+        for key in ("text", "content", "message", "result", "output", "response"):
+            if key not in value:
+                continue
+            text = cls._extract_text(value[key], depth=depth + 1)
+            if text:
+                return text
+        return ""
+
+    @classmethod
+    def _assistant_message_text(cls, event: dict[str, Any]) -> str:
+        return cls._extract_text(event.get("message")).strip()
+
+    @classmethod
+    def _stream_text_delta(cls, event: dict[str, Any]) -> str:
+        nested = event.get("event")
+        if not isinstance(nested, dict):
+            return ""
+        delta = nested.get("delta")
+        return cls._extract_text(delta)
+
+    @classmethod
+    def _result_diagnostic(
+        cls,
+        result_event: dict[str, Any],
+        assistant_messages: list[str],
+    ) -> str:
+        raw_result = result_event.get("result")
+        preview = cls._extract_text(raw_result).strip()
+        if not preview and assistant_messages:
+            preview = assistant_messages[-1].strip()
+        compact_preview = " ".join(preview.split())[:2000]
+        return (
+            f"fields={','.join(sorted(str(key) for key in result_event))}; "
+            f"result_type={type(raw_result).__name__}; result_chars={len(preview)}; "
+            f"preview={compact_preview or '<empty>'}"
+        )
 
     @staticmethod
     def _resolve_executable(command: str) -> str | None:
@@ -421,11 +602,16 @@ class GigaCodeRunner:
                 f"model={event.get('model', 'unknown')}; subtype={subtype or 'start'}"
             )
         if kind == "result":
+            raw_result = event.get("result")
             summary = (
                 "GigaCode result: "
                 f"subtype={subtype or 'unknown'}; is_error={bool(event.get('is_error'))}; "
-                f"duration_ms={event.get('duration_ms', 'unknown')}"
+                f"duration_ms={event.get('duration_ms', 'unknown')}; "
+                f"fields={','.join(sorted(str(key) for key in event))}; "
+                f"result_type={type(raw_result).__name__}"
             )
+            if isinstance(raw_result, str):
+                summary += f"; result_chars={len(raw_result)}"
             if bool(event.get("is_error")):
                 error = GigaCodeRunner._result_error(event).replace("\n", " ")
                 summary += f"; error={error[:2000]}"
