@@ -435,16 +435,31 @@ remote proxy используют тот же payload: `POST /admin/api/analysis
 }
 ```
 
-Worker запускает GigaCode из корня checkout с `--output-format stream-json` и доверенной
-`--json-schema`. Prompt передаётся через stdin. GigaCode получает только read-only
-инструменты навигации; `shell`, `write`, `edit`, subagents и web tools исключены. Дополнительно
-действуют hard limits по wall time, session turns и tool calls. Cancel job посылает процессу
-прерывание, затем terminate/kill, если он не остановился.
+Worker запускает GigaCode из корня checkout с `--output-format stream-json`, `--exclude-tools` и
+`--max-session-turns`. Prompt вместе с доверенной JSON Schema передаётся через stdin: корпоративная
+сборка CLI не поддерживает флаг `--json-schema`. GigaCode получает только read-only инструменты
+навигации; `shell`, `write`, `edit`, subagents и web tools исключены. Wall time жёстко контролирует
+Python supervisor, а лимит tool calls передаётся модели как часть prompt. Cancel job посылает
+процессу прерывание, затем terminate/kill, если он не остановился.
+
+Фактическая командная строка (без prompt, который поступает через stdin):
+
+```bash
+gigacode \
+  --output-format stream-json \
+  --exclude-tools shell,write,edit,agent,web_fetch,web_search \
+  --max-session-turns 30
+```
+
+Runner намеренно не передаёт неподдерживаемые параметры `--json-schema`, `--safe-mode`,
+`--max-tool-calls` и `--max-wall-time`.
 
 Если при первом запуске GigaCode выводит URL для browser-login, runner распознаёт его в stdout или
 stderr. Job сохраняет статус `running` с phase `awaiting_authentication`, а dashboard показывает
-кликабельную кнопку. Пользователь открывает ссылку на своей машине; CLI остаётся запущенным на
-сервере и после подтверждения продолжает ту же JSON-сессию.
+глобальный баннер и кликабельную кнопку также прямо на карточке сервиса. Пользователь открывает
+ссылку на своей машине; CLI остаётся запущенным на сервере и после подтверждения продолжает ту же
+JSON-сессию. Первый model/tool event переводит job из `awaiting_authentication` обратно в
+`analyzing`, убирает ссылку и явно записывает успешное продолжение в job log.
 
 Каждый JSONL event и stderr попадает в полный job log без записи полного Markdown в журнал. После
 успеха всех targets документы атомарно публикуются в `ssot/generated/`, затем RAG перестраивается

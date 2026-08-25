@@ -69,6 +69,11 @@ function short(value: string, limit = 48): string {
   return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
 }
 
+function jobAuthenticationUrl(job: CatalogJob | null | undefined): string | null {
+  const value = job?.result?.authentication_url;
+  return typeof value === "string" && value.startsWith("http") ? value : null;
+}
+
 function Status({ value }: { value: string }) {
   const labels: Record<string, string> = {
     ready: "готов",
@@ -261,6 +266,12 @@ export default function App() {
   }
 
   const title = NAV.find((item) => item.id === page)?.label ?? "RAG Control Plane";
+  const authenticationJob = overview.catalog.jobs.find(
+    (job) => job.status === "running"
+      && job.result?.phase === "awaiting_authentication"
+      && jobAuthenticationUrl(job),
+  );
+  const authenticationUrl = jobAuthenticationUrl(authenticationJob);
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -305,6 +316,18 @@ export default function App() {
             {page === "tools" && <button className="button primary" onClick={() => setToolModal("new")}>＋ Новый MCP tool</button>}
           </div>
         </header>
+
+        {authenticationJob && authenticationUrl && (
+          <section className="authentication-banner" role="alert" aria-live="assertive">
+            <span className="authentication-mark">✦</span>
+            <div className="grow">
+              <b>GigaCode ожидает авторизацию</b>
+              <small>Откройте ссылку, завершите вход в браузере — текущая задача продолжится автоматически, перезапускать анализ не нужно.</small>
+            </div>
+            <button className="button quiet" onClick={() => setPage("operations")}>Открыть лог</button>
+            <a className="button primary" href={authenticationUrl} target="_blank" rel="noreferrer">Войти в GigaCode ↗</a>
+          </section>
+        )}
 
         <section className="content">
           {page === "overview" && <OverviewPage data={overview} password={password} onNavigate={setPage} onAction={action} />}
@@ -539,9 +562,7 @@ function JobList({ jobs, password, onCancel }: { jobs: CatalogJob[]; password: s
   };
   if (!jobs.length) return <div className="empty-state compact">Операций пока не было</div>;
   return <div className="job-list">{jobs.map((job) => {
-    const authenticationUrl = typeof job.result?.authentication_url === "string"
-      ? job.result.authentication_url
-      : null;
+    const authenticationUrl = jobAuthenticationUrl(job);
     return <div className="job-item" key={job.id}>
       <div className="job-row">
         <span className={`job-icon ${job.type}`}>{job.type === "repository" ? "↗" : job.type === "graph" || job.type === "service" ? "⌘" : job.type === "ssot" ? "✦" : job.type === "cleanup" ? "×" : "◇"}</span>
@@ -973,6 +994,7 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
                   && job.target_id === mappedService.id
                   && ["queued", "running", "cancelling"].includes(job.status),
               );
+              const serviceAuthenticationUrl = jobAuthenticationUrl(activeServiceJob);
               return (
                 <article
                   className="service-card"
@@ -997,7 +1019,7 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
                     {repositoryError && <div><dt>Ошибка</dt><dd title={repositoryError}>{short(repositoryError, 100)}</dd></div>}
                   </dl>
                   <footer>
-                    <span>{mappedService.owner || "Владелец не определён"}</span>
+                    <span>{activeServiceJob?.message || mappedService.owner || "Владелец не определён"}</span>
                     <div className="card-actions">
                       <button
                         className="service-rebuild"
@@ -1013,23 +1035,25 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
                             ? "↻ Повторить OpenSpec + RAG"
                             : "↻ OpenSpec + RAG"}
                       </button>
-                      <button
-                        disabled={Boolean(activeServiceJob || activeGraphJob) || !gigacode.available}
-                        title={gigacode.available ? "Статика → GigaCode → SSOT → RAG" : gigacode.error || "GigaCode недоступен"}
-                        onClick={() => void onAction(
-                          () => post("/admin/api/services/analyze", password, {
-                            service_id: mappedService.id,
-                            generation_mode: "gigacode",
-                          }),
-                          `GigaCode-анализ «${mappedService.name}» поставлен в очередь`,
-                        )}
-                      >
-                        {activeServiceJob
-                          ? "◌ GigaCode анализирует…"
-                          : gigacode.available
-                            ? "✦ Анализ через GigaCode"
-                            : "GigaCode недоступен"}
-                      </button>
+                      {serviceAuthenticationUrl
+                        ? <a className="service-auth-link" href={serviceAuthenticationUrl} target="_blank" rel="noreferrer">Войти в GigaCode ↗</a>
+                        : <button
+                            disabled={Boolean(activeServiceJob || activeGraphJob) || !gigacode.available}
+                            title={gigacode.available ? "Статика → GigaCode → SSOT → RAG" : gigacode.error || "GigaCode недоступен"}
+                            onClick={() => void onAction(
+                              () => post("/admin/api/services/analyze", password, {
+                                service_id: mappedService.id,
+                                generation_mode: "gigacode",
+                              }),
+                              `GigaCode-анализ «${mappedService.name}» поставлен в очередь`,
+                            )}
+                          >
+                            {activeServiceJob
+                              ? "◌ GigaCode анализирует…"
+                              : gigacode.available
+                                ? "✦ Анализ через GigaCode"
+                                : "GigaCode недоступен"}
+                          </button>}
                       <button onClick={() => onSsot(mappedService, repository.index_id)}>SSOT</button>
                       <button onClick={onGraph}>Граф</button>
                       <button className="danger" onClick={() => { if (!window.confirm(`Удалить сервис «${mappedService.name}» из карты? Модуль останется в repository как постоянное исключение.`)) return; void onAction(() => post("/admin/api/services/delete", password, { service_id: mappedService.id }), "Удаление сервиса поставлено в очередь"); }}>Удалить</button>

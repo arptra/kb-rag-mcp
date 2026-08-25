@@ -37,6 +37,7 @@ _SSOT_RESULT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 _URL_PATTERN: re.Pattern[str] = re.compile(r"https?://[^\s<>\"']+")
+_ANSI_PATTERN: re.Pattern[str] = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _AUTH_HINTS = ("auth", "browser", "device", "login", "sign in", "verify", "open")
 
 
@@ -95,6 +96,7 @@ class GigaCodeRunner:
         cancel: CancellationSignal | None = None,
         progress: Callable[[str], None] | None = None,
         authentication_url: Callable[[str], None] | None = None,
+        authentication_complete: Callable[[], None] | None = None,
     ) -> GigaCodeResult:
         """Execute one single-shot structured repository analysis."""
         status = self.status(refresh=True)
@@ -111,17 +113,10 @@ class GigaCodeRunner:
             executable,
             "--output-format",
             "stream-json",
-            "--json-schema",
-            json.dumps(_SSOT_RESULT_SCHEMA, ensure_ascii=False, separators=(",", ":")),
-            "--safe-mode",
             "--exclude-tools",
             "shell,write,edit,agent,web_fetch,web_search",
             "--max-session-turns",
             str(self._settings.gigacode_max_session_turns),
-            "--max-tool-calls",
-            str(self._settings.gigacode_max_tool_calls),
-            "--max-wall-time",
-            f"{self._total_wall_time_seconds()}s",
         ]
         environment = os.environ.copy()
         environment.setdefault("NO_COLOR", "1")
@@ -137,7 +132,8 @@ class GigaCodeRunner:
                 f"timeout={self._settings.gigacode_timeout_seconds}s; "
                 f"auth_timeout={self._settings.gigacode_auth_timeout_seconds}s; "
                 f"max_turns={self._settings.gigacode_max_session_turns}; "
-                f"max_tools={self._settings.gigacode_max_tool_calls}; read_only=true"
+                f"max_tools_advisory={self._settings.gigacode_max_tool_calls}; "
+                "read_only=true; schema_delivery=prompt"
             )
         process = subprocess.Popen(
             command,
@@ -169,8 +165,9 @@ class GigaCodeRunner:
             reader.start()
         assert process.stdin is not None
         try:
-            process.stdin.write(prompt)
-            if not prompt.endswith("\n"):
+            bounded_prompt = self._prompt_with_output_contract(prompt)
+            process.stdin.write(bounded_prompt)
+            if not bounded_prompt.endswith("\n"):
                 process.stdin.write("\n")
             process.stdin.close()
         except BrokenPipeError:
@@ -202,9 +199,11 @@ class GigaCodeRunner:
                     open_streams.discard(source)
                     continue
                 auth_url = self._authentication_url(line)
+                authentication_started = False
                 if auth_url is not None and auth_url not in reported_auth_urls:
                     reported_auth_urls.add(auth_url)
                     waiting_for_authentication = True
+                    authentication_started = True
                     deadline = (
                         time.monotonic()
                         + self._settings.gigacode_auth_timeout_seconds
@@ -228,15 +227,17 @@ class GigaCodeRunner:
                     continue
                 if event.get("type") == "result":
                     result_event = event
-                if waiting_for_authentication and event.get("type") in {
-                    "assistant",
-                    "user",
-                    "result",
-                }:
+                if (
+                    waiting_for_authentication
+                    and not authentication_started
+                    and self._signals_analysis_activity(event)
+                ):
                     waiting_for_authentication = False
                     deadline = time.monotonic() + self._settings.gigacode_timeout_seconds + 10
                     if progress is not None:
                         progress("GigaCode browser authentication completed; analysis resumed")
+                    if authentication_complete is not None:
+                        authentication_complete()
                 if progress is not None:
                     progress(self._event_summary(event))
         finally:
@@ -258,12 +259,7 @@ class GigaCodeRunner:
             )
         structured = result_event.get("structured_result")
         if not isinstance(structured, dict):
-            raw_result = result_event.get("result")
-            if isinstance(raw_result, str):
-                try:
-                    structured = json.loads(raw_result)
-                except json.JSONDecodeError:
-                    structured = None
+            structured = self._decode_structured_result(result_event.get("result"))
         return self._validated_result(structured, result_event)
 
     def _probe(self) -> dict[str, Any]:
@@ -277,6 +273,9 @@ class GigaCodeRunner:
             "error": None,
             "mode": "headless-structured-output",
             "output_format": "stream-json",
+            "schema_delivery": "prompt",
+            "wall_time_enforcement": "supervisor",
+            "tool_call_limit_enforcement": "prompt",
             "server_llm_url_required": False,
             "read_only": True,
             "authentication": "browser-on-first-run",
@@ -318,11 +317,35 @@ class GigaCodeRunner:
             "version": version[-1][:300] if version else "unknown",
         }
 
-    def _total_wall_time_seconds(self) -> int:
+    def _prompt_with_output_contract(self, prompt: str) -> str:
+        schema = json.dumps(_SSOT_RESULT_SCHEMA, ensure_ascii=False, indent=2)
         return (
-            self._settings.gigacode_auth_timeout_seconds
-            + self._settings.gigacode_timeout_seconds
+            prompt.rstrip()
+            + "\n\nGIGACODE OUTPUT CONTRACT:\n"
+            + "Your final response must contain only one valid JSON object: no Markdown fence, "
+            + "no prose before or after it. The object must satisfy this JSON Schema:\n"
+            + schema
+            + "\nUse no more than "
+            + str(self._settings.gigacode_max_tool_calls)
+            + " read-only tool calls."
         )
+
+    @staticmethod
+    def _decode_structured_result(raw_result: object) -> dict[str, Any] | None:
+        if isinstance(raw_result, dict):
+            return raw_result
+        if not isinstance(raw_result, str):
+            return None
+        candidate = raw_result.strip()
+        if candidate.startswith("```") and candidate.endswith("```"):
+            first_newline = candidate.find("\n")
+            if first_newline >= 0:
+                candidate = candidate[first_newline + 1 : -3].strip()
+        try:
+            decoded = json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+        return decoded if isinstance(decoded, dict) else None
 
     @staticmethod
     def _resolve_executable(command: str) -> str | None:
@@ -359,16 +382,33 @@ class GigaCodeRunner:
 
     @staticmethod
     def _authentication_url(line: str) -> str | None:
-        lowered = line.lower()
-        matches = _URL_PATTERN.findall(line)
+        clean_line = _ANSI_PATTERN.sub("", line)
+        lowered = clean_line.lower()
+        matches = _URL_PATTERN.findall(clean_line)
         if not matches:
             return None
-        stripped = line.strip()
+        stripped = clean_line.strip()
         if not any(hint in lowered for hint in _AUTH_HINTS) and not stripped.startswith(
             ("http://", "https://")
         ):
             return None
         return str(matches[0]).rstrip(".,;:)]}")
+
+    @staticmethod
+    def _signals_analysis_activity(event: dict[str, Any]) -> bool:
+        kind = event.get("type")
+        if kind in {"assistant", "user", "result"}:
+            return True
+        if kind != "stream_event":
+            return False
+        nested = event.get("event")
+        if not isinstance(nested, dict):
+            return False
+        nested_type = str(nested.get("type", "")).lower()
+        return any(
+            marker in nested_type
+            for marker in ("content", "message", "text", "tool", "response")
+        )
 
     @staticmethod
     def _event_summary(event: dict[str, Any]) -> str:
@@ -419,7 +459,9 @@ class GigaCodeRunner:
         result_event: dict[str, Any],
     ) -> GigaCodeResult:
         if not isinstance(structured, dict):
-            raise RuntimeError("GigaCode result did not contain structured_result")
+            raise RuntimeError(
+                "GigaCode result did not contain a JSON object matching the SSOT contract"
+            )
         markdown = structured.get("markdown")
         analyzed_files = structured.get("analyzed_files")
         blocking_unknowns = structured.get("blocking_unknowns")

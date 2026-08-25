@@ -102,6 +102,9 @@ export interface Catalog {
       error: string | null;
       mode: string;
       output_format: string;
+      schema_delivery: "prompt";
+      wall_time_enforcement: "supervisor";
+      tool_call_limit_enforcement: "prompt";
       server_llm_url_required: boolean;
       read_only: boolean;
       authentication: "browser-on-first-run";

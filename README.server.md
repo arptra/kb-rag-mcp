@@ -96,6 +96,12 @@ KB_GIGACODE_MAX_SESSION_TURNS=30
 KB_GIGACODE_MAX_TOOL_CALLS=50
 ```
 
+Backend запускает CLI только с `--output-format stream-json`, `--exclude-tools` и
+`--max-session-turns`. `KB_GIGACODE_MAX_TOOL_CALLS` является инструкцией внутри prompt, а wall-time
+контролирует и принудительно завершает Python worker. Флаги `--json-schema`, `--safe-mode`,
+`--max-tool-calls` и `--max-wall-time` не передаются, поскольку корпоративный GigaCode CLI их не
+поддерживает.
+
 В Admin UI откройте подготовку SSOT. При успешном `gigacode --version` режим **GigaCode на сервере**
 будет выбран по умолчанию. При первом запуске CLI может напечатать URL авторизации и ждать входа.
 Job останется в `running`, dashboard покажет кнопку **«Войти в GigaCode»**. Откройте ссылку на своём

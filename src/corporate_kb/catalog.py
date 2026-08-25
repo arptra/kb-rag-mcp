@@ -1839,6 +1839,14 @@ class RagCatalog:
                         url,
                     )
 
+                def authentication_completed(
+                    target_service_id: str = service_id,
+                ) -> None:
+                    self._gigacode_authentication_completed(
+                        job_id,
+                        target_service_id,
+                    )
+
                 result = self._gigacode.run(
                     checkout=Path(repository.checkout_path),
                     prompt=self._gigacode_ssot_prompt(
@@ -1850,6 +1858,7 @@ class RagCatalog:
                     cancel=cancel_event,
                     progress=lambda message: self._append_job_log(job_id, message),
                     authentication_url=authentication_required,
+                    authentication_complete=authentication_completed,
                 )
                 document = self._client_ssot_document(
                     result.markdown,
@@ -1950,6 +1959,25 @@ class RagCatalog:
         self._append_job_log(
             job_id,
             f"GigaCode authentication URL for service={service_id}: {url}",
+        )
+
+    def _gigacode_authentication_completed(
+        self,
+        job_id: str,
+        service_id: str,
+    ) -> None:
+        self._update_job(
+            job_id,
+            message=f"GigaCode: вход завершён, анализируется {service_id}",
+            result={
+                "phase": "analyzing",
+                "generation_mode": "gigacode",
+                "service_id": service_id,
+            },
+        )
+        self._append_job_log(
+            job_id,
+            f"GigaCode authentication completed for service={service_id}; analysis resumed",
         )
 
     def _gigacode_ssot_prompt(

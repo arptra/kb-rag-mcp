@@ -24,8 +24,13 @@ if "evidence-backed" not in prompt:
     raise SystemExit(4)
 if "--output-format" not in sys.argv or "stream-json" not in sys.argv:
     raise SystemExit(5)
-if "--json-schema" not in sys.argv:
+unsupported = {"--json-schema", "--safe-mode", "--max-tool-calls", "--max-wall-time"}
+if unsupported.intersection(sys.argv):
     raise SystemExit(6)
+if "--exclude-tools" not in sys.argv or "--max-session-turns" not in sys.argv:
+    raise SystemExit(7)
+if "GIGACODE OUTPUT CONTRACT" not in prompt or '"markdown"' not in prompt:
+    raise SystemExit(8)
 
 print("Open browser to authenticate: https://auth.example/device?code=test-code", file=sys.stderr)
 print(json.dumps({
@@ -38,6 +43,14 @@ print(json.dumps({
     "type": "assistant",
     "message": {"content": [{"type": "tool_use", "name": "read_file"}]},
 }))
+result_payload = {
+    "markdown": (
+        "# Fake service SSOT\\n\\nThis evidence-backed document was produced after "
+        "reading README.md and records observed behavior without inventing missing APIs.\\n"
+    ),
+    "analyzed_files": ["README.md"],
+    "blocking_unknowns": ["Runtime behavior is not present in source."],
+}
 print(json.dumps({
     "type": "result",
     "subtype": "success",
@@ -46,14 +59,7 @@ print(json.dumps({
     "is_error": False,
     "duration_ms": 17,
     "usage": {"total_tokens": 42},
-    "structured_result": {
-        "markdown": (
-            "# Fake service SSOT\\n\\nThis evidence-backed document was produced after "
-            "reading README.md and records observed behavior without inventing missing APIs.\\n"
-        ),
-        "analyzed_files": ["README.md"],
-        "blocking_unknowns": ["Runtime behavior is not present in source."],
-    },
+    "result": json.dumps(result_payload),
 }))
 """,
         encoding="utf-8",
@@ -80,11 +86,13 @@ def test_gigacode_runner_probes_and_parses_structured_stream(
 
     progress: list[str] = []
     authentication_urls: list[str] = []
+    authentication_completed: list[bool] = []
     result = runner.run(
         checkout=checkout,
         prompt="Create an evidence-backed service SSOT.",
         progress=progress.append,
         authentication_url=authentication_urls.append,
+        authentication_complete=lambda: authentication_completed.append(True),
     )
 
     assert result.session_id == "fake-session"
@@ -96,7 +104,9 @@ def test_gigacode_runner_probes_and_parses_structured_stream(
     assert any("tools=read_file" in line for line in progress)
     assert any("GigaCode result" in line for line in progress)
     assert authentication_urls == ["https://auth.example/device?code=test-code"]
+    assert authentication_completed == [True]
     assert any("waits for browser authentication" in line for line in progress)
+    assert any("authentication completed" in line for line in progress)
 
 
 def test_gigacode_runner_reports_missing_executable(settings_factory) -> None:

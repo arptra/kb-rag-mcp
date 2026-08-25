@@ -36,6 +36,7 @@ def _write_fake_gigacode(path: Path) -> Path:
         """#!/usr/bin/env python3
 import json
 import sys
+import time
 
 if "--version" in sys.argv:
     print("0.99.0-catalog-test")
@@ -44,12 +45,21 @@ if "--version" in sys.argv:
 prompt = sys.stdin.read()
 if "STATIC ANALYSIS" not in prompt or "read-only repository analyst" not in prompt:
     raise SystemExit(7)
-print("Open authentication URL: https://auth.example/gigacode/device", file=sys.stderr)
+print(
+    "Open authentication URL: https://auth.example/gigacode/device",
+    file=sys.stderr,
+    flush=True,
+)
 print(json.dumps({
     "type": "system",
     "subtype": "session_start",
     "session_id": "catalog-gigacode-session",
     "model": "catalog-fake-gigacode",
+}))
+time.sleep(0.15)
+print(json.dumps({
+    "type": "assistant",
+    "message": {"content": [{"type": "tool_use", "name": "read_file"}]},
 }))
 print(json.dumps({
     "type": "result",
@@ -612,6 +622,23 @@ public class GigaCodeController {
         refresh_analysis=False,
         generation_mode="gigacode",
     )
+    waiting: dict[str, object] | None = None
+    for _ in range(100):
+        current = next(
+            item
+            for item in catalog.payload()["jobs"]
+            if item["id"] == queued["job"]["id"]
+        )
+        result = current.get("result")
+        if isinstance(result, dict) and result.get("phase") == "awaiting_authentication":
+            waiting = current
+            break
+        time.sleep(0.01)
+    assert waiting is not None
+    assert waiting["message"] == "GigaCode ожидает вход через браузер"
+    assert waiting["result"]["authentication_url"] == (
+        "https://auth.example/gigacode/device"
+    )
     completed = _wait_for_job(catalog, queued["job"]["id"])
 
     assert completed["status"] == "completed"
@@ -629,6 +656,7 @@ public class GigaCodeController {
     assert "GigaCode starting" in log
     assert "GigaCode authentication URL" in log
     assert "https://auth.example/gigacode/device" in log
+    assert "GigaCode authentication completed" in log
     assert "GigaCode result" in log
 
     service_id = options["repositories"][0]["services"][0]["id"]
