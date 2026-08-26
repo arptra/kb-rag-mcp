@@ -611,6 +611,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             index_id = payload.get("index_id")
             index_name = payload.get("index_name")
             ref = payload.get("ref")
+            generation_mode = payload.get("generation_mode", "static")
             if not isinstance(name, str) or not isinstance(git_url, str):
                 raise ValueError("name and git_url must be strings")
             if index_id is not None and not isinstance(index_id, str):
@@ -619,12 +620,15 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 raise ValueError("index_name must be a string or null")
             if ref is not None and not isinstance(ref, str):
                 raise ValueError("ref must be a string or null")
+            if generation_mode not in {"static", "gigacode"}:
+                raise ValueError("generation_mode must be static or gigacode")
             job = catalog.start_repository_ingestion(
                 name=name,
                 git_url=git_url,
                 index_id=index_id,
                 index_name=index_name,
                 ref=ref,
+                generation_mode=generation_mode,
             )
             return JSONResponse(job.model_dump(mode="json"), status_code=202)
         except Exception as exc:

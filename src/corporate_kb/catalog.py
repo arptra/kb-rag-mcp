@@ -319,6 +319,7 @@ class RagCatalog:
         index_id: str | None,
         index_name: str | None = None,
         ref: str | None = None,
+        generation_mode: Literal["static", "gigacode"] = "static",
     ) -> CatalogJob:
         clean_name = name.strip()
         if len(clean_name) < 2:
@@ -326,6 +327,10 @@ class RagCatalog:
         clean_url = git_url.strip()
         if not clean_url:
             raise ValueError("Git URL must not be empty")
+        if generation_mode == "gigacode":
+            gigacode_status = self._gigacode.status(refresh=True)
+            if not gigacode_status["available"]:
+                raise RuntimeError(str(gigacode_status["error"]))
         target_id = index_id
         if target_id is None:
             created = self.create_index(name=index_name or clean_name)
@@ -337,11 +342,15 @@ class RagCatalog:
             "repository",
             index_id=target_id,
             target_id=repository_id,
-            message="Repository import queued",
+            message=(
+                "Repository import with GigaCode queued"
+                if generation_mode == "gigacode"
+                else "Repository import queued"
+            ),
         )
         threading.Thread(
             target=self._run_repository_job,
-            args=(job.id, clean_name, clean_url, clean_ref, target_id),
+            args=(job.id, clean_name, clean_url, clean_ref, target_id, generation_mode),
             daemon=True,
         ).start()
         return job
@@ -363,6 +372,7 @@ class RagCatalog:
                 repository.git_url,
                 repository.ref,
                 repository.index_id,
+                "static",
             ),
             daemon=True,
         ).start()
@@ -1380,6 +1390,7 @@ class RagCatalog:
         git_url: str,
         ref: str | None,
         index_id: str,
+        generation_mode: Literal["static", "gigacode"],
     ) -> None:
         cancel_event = self._cancel_event(job_id)
         try:
@@ -1392,9 +1403,11 @@ class RagCatalog:
                     ref,
                     index_id,
                     cancel_event,
+                    generation_mode,
                 )
         except (
             CatalogJobCancelled,
+            GigaCodeCancelled,
             IndexBuildCancelled,
             RepositoryOperationCancelled,
             ServiceMapBuildCancelled,
@@ -1413,6 +1426,7 @@ class RagCatalog:
         ref: str | None,
         index_id: str,
         cancel_event: threading.Event,
+        generation_mode: Literal["static", "gigacode"],
     ) -> None:
         self._update_job(
             job_id,
@@ -1485,25 +1499,51 @@ class RagCatalog:
                 }
             )
             self._upsert_repository(repository)
-            self._update_job(job_id, message=f"Building RAG index from {document_count} documents")
-            self._raise_if_cancelled(cancel_event)
-            service = self.service_for(index_id)
-            IndexBuildProcessRunner(
-                service.settings,
-                timeout_seconds=self.settings.index_build_timeout_seconds,
-            ).build(cancel=cancel_event)
-            stats = service.reload_cached_index()
-            self._update_index(
-                index_id,
-                status="ready",
-                document_count=stats.document_count,
-                chunk_count=stats.chunk_count,
-                updated_at=_now(),
-                error=None,
-            )
+            if generation_mode == "static":
+                self._update_job(
+                    job_id,
+                    message=f"Building RAG index from {document_count} documents",
+                )
+                self._raise_if_cancelled(cancel_event)
+                service = self.service_for(index_id)
+                IndexBuildProcessRunner(
+                    service.settings,
+                    timeout_seconds=self.settings.index_build_timeout_seconds,
+                ).build(cancel=cancel_event)
+                stats = service.reload_cached_index()
+                self._update_index(
+                    index_id,
+                    status="ready",
+                    document_count=stats.document_count,
+                    chunk_count=stats.chunk_count,
+                    updated_at=_now(),
+                    error=None,
+                )
+            else:
+                self._append_job_log(
+                    job_id,
+                    f"OpenSpec staged: documents={document_count}; final index build will run "
+                    "after GigaCode SSOT generation",
+                )
             self._update_job(job_id, message="Building service graph")
             self._build_graph(cancel_event=cancel_event, job_id=job_id)
             self._raise_if_cancelled(cancel_event)
+            if generation_mode == "gigacode":
+                self._append_job_log(
+                    job_id,
+                    f"Static graph ready; starting GigaCode for repository={repository_id}",
+                )
+                self._execute_system_ssot_generation_job(
+                    job_id,
+                    index_id,
+                    (repository_id,),
+                    (),
+                    False,
+                    False,
+                    "gigacode",
+                    cancel_event,
+                )
+                return
             self._update_job(
                 job_id,
                 status="completed",
@@ -1514,6 +1554,7 @@ class RagCatalog:
             )
         except (
             CatalogJobCancelled,
+            GigaCodeCancelled,
             IndexBuildCancelled,
             RepositoryOperationCancelled,
             ServiceMapBuildCancelled,

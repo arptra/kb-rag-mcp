@@ -48,6 +48,41 @@ const TOOL_SCHEMA = {
 const DOCUMENT_PAGE_SIZE = 50;
 const GraphCanvas3D = lazy(() => import("./GraphCanvas3D"));
 const DOCUMENT_ACCEPT = ".md,.markdown,.txt,.html,.htm,.rst,.adoc,.log,.csv,.tsv,.json,.jsonl,.yaml,.yml,.xml,.properties";
+const SERVICE_FACET_KEYS = ["repository", "index", "build", "state", "owner", "interfaces", "submodules"] as const;
+
+type ServiceFacetKey = typeof SERVICE_FACET_KEYS[number];
+type ServiceFacetOption = { value: string; label: string };
+type ServiceFilterRecord = {
+  key: string;
+  searchText: string;
+  facets: Record<ServiceFacetKey, ServiceFacetOption[]>;
+};
+
+const SERVICE_FACET_LABELS: Record<ServiceFacetKey, string> = {
+  repository: "Репозиторий",
+  index: "Индекс",
+  build: "Build",
+  state: "Состояние",
+  owner: "Владелец",
+  interfaces: "Интерфейсы",
+  submodules: "Подмодули",
+};
+
+function emptyServiceFilters(): Record<ServiceFacetKey, string[]> {
+  return {
+    repository: [],
+    index: [],
+    build: [],
+    state: [],
+    owner: [],
+    interfaces: [],
+    submodules: [],
+  };
+}
+
+function facet(value: string, label: string): ServiceFacetOption {
+  return { value, label };
+}
 
 function number(value: number): string {
   return new Intl.NumberFormat("ru-RU").format(value ?? 0);
@@ -70,6 +105,18 @@ function relativeDate(value: string | null | undefined): string {
 
 function short(value: string, limit = 48): string {
   return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+}
+
+function repositoryNameFromGitUrl(value: string): string {
+  const clean = value.trim().replace(/[?#].*$/, "").replace(/\/+$/, "");
+  if (!clean) return "";
+  const segment = clean.split(/[/:]/).filter(Boolean).at(-1) || "";
+  const name = segment.replace(/\.git$/i, "");
+  try {
+    return decodeURIComponent(name);
+  } catch {
+    return name;
+  }
 }
 
 function jobAuthenticationUrl(job: CatalogJob | null | undefined): string | null {
@@ -405,10 +452,12 @@ export default function App() {
         <RepositoryForm
           password={password}
           indexes={overview.catalog.indexes}
+          gigacodeAvailable={overview.catalog.ssot_generation.gigacode.available}
+          gigacodeError={overview.catalog.ssot_generation.gigacode.error}
           onClose={() => setRepositoryModal(false)}
-          onSaved={() => {
+          onSaved={(mode) => {
             setRepositoryModal(false);
-            setToast("Импорт поставлен в очередь");
+            setToast(mode === "gigacode" ? "Импорт и GigaCode-анализ поставлены в очередь" : "Импорт поставлен в очередь");
             void load();
           }}
         />
@@ -875,6 +924,10 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
   onSsot: (service: Overview["service_map"]["services"][number], defaultIndexId: string) => void;
   onAction: (run: () => Promise<unknown>, message: string) => Promise<void>;
 }) {
+  const [serviceQuery, setServiceQuery] = useState("");
+  const [serviceFilters, setServiceFilters] = useState<Record<ServiceFacetKey, string[]>>(
+    emptyServiceFilters,
+  );
   const indexNames = Object.fromEntries(
     data.catalog.indexes.map((index) => [index.id, index.name]),
   );
@@ -891,6 +944,120 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
     (service) => !repositoryNames.has(service.repository)
       && (!service.repository_root || !repositoryRoots.has(service.repository_root)),
   );
+  const serviceFilterRecords: ServiceFilterRecord[] = [];
+  data.catalog.repositories.forEach((repository) => {
+    const mappedServices = servicesByRepository.get(repository.checkout_path)
+      || servicesByRepository.get(repository.name)
+      || [];
+    const repositoryFacet = facet(repository.id, repository.name);
+    const indexFacet = facet(
+      repository.index_id,
+      indexNames[repository.index_id] || repository.index_id,
+    );
+    if (!mappedServices.length) {
+      serviceFilterRecords.push({
+        key: `repository:${repository.id}`,
+        searchText: `${repository.name} ${repository.commit || ""}`.toLocaleLowerCase("ru"),
+        facets: {
+          repository: [repositoryFacet],
+          index: [indexFacet],
+          build: [facet("unknown", "Не определён")],
+          state: [facet("awaiting", "Ожидает анализа")],
+          owner: [facet("unassigned", "Не определён")],
+          interfaces: [facet("none", "Нет интерфейсов")],
+          submodules: [facet("none", "Нет подмодулей")],
+        },
+      });
+      return;
+    }
+    mappedServices.forEach((service) => {
+      const interfaceFacets: ServiceFacetOption[] = [];
+      if (service.entrypoint_count) interfaceFacets.push(facet("entrypoints", "Есть входы"));
+      if (service.outbound_interface_count) interfaceFacets.push(facet("outbound", "Есть выходы"));
+      if (!interfaceFacets.length) interfaceFacets.push(facet("none", "Нет интерфейсов"));
+      const stateLabels = { active: "Активный", empty: "Пустой модуль", unsupported: "Не поддерживается" };
+      serviceFilterRecords.push({
+        key: `${repository.id}:${service.id}`,
+        searchText: `${service.name} ${service.id} ${service.module_path} ${repository.name} ${service.owner || ""}`.toLocaleLowerCase("ru"),
+        facets: {
+          repository: [repositoryFacet],
+          index: [indexFacet],
+          build: [service.module_state === "empty"
+            ? facet("empty", "empty")
+            : facet(service.build_system, service.build_system === "unknown" ? "Не определён" : service.build_system)],
+          state: [facet(service.module_state, stateLabels[service.module_state])],
+          owner: [facet(service.owner || "unassigned", service.owner || "Не определён")],
+          interfaces: interfaceFacets,
+          submodules: [service.component_paths.length ? facet("present", "Есть подмодули") : facet("none", "Нет подмодулей")],
+        },
+      });
+    });
+  });
+  standaloneMapServices.forEach((service) => {
+    const interfaceFacets: ServiceFacetOption[] = [];
+    if (service.entrypoint_count) interfaceFacets.push(facet("entrypoints", "Есть входы"));
+    if (service.outbound_interface_count) interfaceFacets.push(facet("outbound", "Есть выходы"));
+    if (!interfaceFacets.length) interfaceFacets.push(facet("none", "Нет интерфейсов"));
+    const repositoryLabel = service.repository || "Без репозитория";
+    const repositoryValue = `standalone:${service.repository_root || repositoryLabel}`;
+    const stateLabels = { active: "Активный", empty: "Пустой модуль", unsupported: "Не поддерживается" };
+    serviceFilterRecords.push({
+      key: `standalone:${service.id}`,
+      searchText: `${service.name} ${service.id} ${service.module_path} ${repositoryLabel} ${service.owner || ""}`.toLocaleLowerCase("ru"),
+      facets: {
+        repository: [facet(repositoryValue, repositoryLabel)],
+        index: [facet("unassigned", "Без индекса")],
+        build: [service.module_state === "empty"
+          ? facet("empty", "empty")
+          : facet(service.build_system, service.build_system === "unknown" ? "Не определён" : service.build_system)],
+        state: [facet(service.module_state, stateLabels[service.module_state])],
+        owner: [facet(service.owner || "unassigned", service.owner || "Не определён")],
+        interfaces: interfaceFacets,
+        submodules: [service.component_paths.length ? facet("present", "Есть подмодули") : facet("none", "Нет подмодулей")],
+      },
+    });
+  });
+  const facetGroups = SERVICE_FACET_KEYS.map((key) => {
+    const options = new Map<string, { label: string; count: number }>();
+    serviceFilterRecords.forEach((record) => {
+      record.facets[key].forEach((option) => {
+        const current = options.get(option.value);
+        options.set(option.value, { label: option.label, count: (current?.count || 0) + 1 });
+      });
+    });
+    return {
+      key,
+      label: SERVICE_FACET_LABELS[key],
+      options: [...options.entries()]
+        .map(([value, option]) => ({ value, ...option }))
+        .sort((left, right) => left.label.localeCompare(right.label, "ru")),
+    };
+  });
+  const normalizedServiceQuery = serviceQuery.trim().toLocaleLowerCase("ru");
+  const filteredServiceRecords = serviceFilterRecords.filter((record) => {
+    if (normalizedServiceQuery && !record.searchText.includes(normalizedServiceQuery)) return false;
+    return SERVICE_FACET_KEYS.every((key) => {
+      const selected = serviceFilters[key];
+      return !selected.length || record.facets[key].some((option) => selected.includes(option.value));
+    });
+  });
+  const visibleServiceKeys = new Set(filteredServiceRecords.map((record) => record.key));
+  const activeFilterCount = SERVICE_FACET_KEYS.reduce(
+    (total, key) => total + serviceFilters[key].length,
+    0,
+  );
+  const toggleServiceFilter = (key: ServiceFacetKey, value: string) => {
+    setServiceFilters((current) => ({
+      ...current,
+      [key]: current[key].includes(value)
+        ? current[key].filter((item) => item !== value)
+        : [...current[key], value],
+    }));
+  };
+  const resetServiceFilters = () => {
+    setServiceQuery("");
+    setServiceFilters(emptyServiceFilters());
+  };
 
   return (
     <>
@@ -922,7 +1089,52 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
           : <>GigaCode недоступен: <code>{gigacode.error || "executable не найден"}</code>. Укажите реальный абсолютный путь в <code>KB_GIGACODE_COMMAND</code> и перезапустите backend.</>}</p>
       </div>
 
-      {data.catalog.repositories.length || standaloneMapServices.length ? (
+      {serviceFilterRecords.length > 0 && (
+        <section className="service-filter-panel" aria-label="Фильтры сервисов">
+          <div className="service-filter-head">
+            <div><span className="eyebrow">Фильтры карточек</span><b>{number(filteredServiceRecords.length)} из {number(serviceFilterRecords.length)}</b></div>
+            <label className="service-filter-search"><span>Поиск</span><input value={serviceQuery} onChange={(event) => setServiceQuery(event.target.value)} placeholder="Сервис, ID, модуль…" /></label>
+            {(activeFilterCount > 0 || serviceQuery) && <button type="button" className="button quiet" onClick={resetServiceFilters}>Сбросить всё</button>}
+          </div>
+          <div className="service-filter-groups">
+            {facetGroups.map((group) => (
+              <details
+                className="service-filter-group"
+                key={group.key}
+                onToggle={(event) => {
+                  if (!event.currentTarget.open) return;
+                  event.currentTarget.parentElement?.querySelectorAll("details[open]").forEach((details) => {
+                    if (details !== event.currentTarget) details.removeAttribute("open");
+                  });
+                }}
+              >
+                <summary><span>{group.label}</span>{serviceFilters[group.key].length > 0 && <b>{serviceFilters[group.key].length}</b>}<i>⌄</i></summary>
+                <div className="service-filter-menu">
+                  {group.options.map((option) => {
+                    const checked = serviceFilters[group.key].includes(option.value);
+                    return (
+                      <label className={checked ? "selected" : ""} key={option.value}>
+                        <input type="checkbox" checked={checked} aria-label={`${group.label}: ${option.label}`} onChange={() => toggleServiceFilter(group.key, option.value)} />
+                        <span>{option.label}</span><em>{number(option.count)}</em>
+                      </label>
+                    );
+                  })}
+                </div>
+              </details>
+            ))}
+          </div>
+          {activeFilterCount > 0 && (
+            <div className="service-active-filters">
+              {facetGroups.flatMap((group) => serviceFilters[group.key].map((value) => {
+                const option = group.options.find((item) => item.value === value);
+                return <button type="button" key={`${group.key}:${value}`} onClick={() => toggleServiceFilter(group.key, value)}><small>{group.label}</small>{option?.label || value}<span>×</span></button>;
+              }))}
+            </div>
+          )}
+        </section>
+      )}
+
+      {serviceFilterRecords.length ? filteredServiceRecords.length ? (
         <div className="service-grid">
           {data.catalog.repositories.flatMap((repository) => {
             const mappedServices = servicesByRepository.get(repository.checkout_path)
@@ -961,7 +1173,9 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
               : repositoryIndex?.status === "error"
                 ? repositoryIndex.error || "Ошибка индексации"
                 : graphError;
-            if (!mappedServices.length) return [(
+            if (!mappedServices.length) {
+              if (!visibleServiceKeys.has(`repository:${repository.id}`)) return [];
+              return [(
               <article className="service-card" key={repository.id} aria-busy={Boolean(activeRepositoryJob || activeGraphJob)}>
                 <header>
                   <span className="service-mark">S</span>
@@ -998,8 +1212,11 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
                   </div>
                 </footer>
               </article>
-            )];
-            return mappedServices.map((mappedService) => {
+              )];
+            }
+            return mappedServices.filter(
+              (mappedService) => visibleServiceKeys.has(`${repository.id}:${mappedService.id}`),
+            ).map((mappedService) => {
               const activeServiceJob = data.catalog.jobs.find(
                 (job) => job.type === "service"
                   && job.target_id === mappedService.id
@@ -1074,7 +1291,9 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
               );
             });
           })}
-          {standaloneMapServices.map((service) => (
+          {standaloneMapServices.filter(
+            (service) => visibleServiceKeys.has(`standalone:${service.id}`),
+          ).map((service) => (
             <article className="service-card" key={service.id}>
               <header><span className="service-mark">S</span><Status value="ready" /></header>
               <span className="eyebrow">Source map discovered</span>
@@ -1085,6 +1304,8 @@ function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
             </article>
           ))}
         </div>
+      ) : (
+        <div className="empty-state services-empty"><div>⌁</div><h3>По фильтрам ничего не найдено</h3><p>Выберите другие значения или сбросьте активные фильтры.</p><button className="button secondary" onClick={resetServiceFilters}>Сбросить фильтры</button></div>
       ) : (
         <div className="empty-state services-empty"><div>▦</div><h3>Сервисов пока нет</h3><p>Подключите Git-репозиторий. Сервис появится после быстрого анализа исходников, даже без SSOT.</p></div>
       )}
@@ -1399,21 +1620,73 @@ function ServerForm({ password, onClose, onSaved }: { password: string; onClose:
   );
 }
 
-function RepositoryForm({ password, indexes, onClose, onSaved }: { password: string; indexes: RagIndex[]; onClose: () => void; onSaved: () => void }) {
+function RepositoryForm({ password, indexes, gigacodeAvailable, gigacodeError, onClose, onSaved }: {
+  password: string;
+  indexes: RagIndex[];
+  gigacodeAvailable: boolean;
+  gigacodeError: string | null;
+  onClose: () => void;
+  onSaved: (mode: "static" | "gigacode") => void;
+}) {
   const [name, setName] = useState("");
+  const [nameEdited, setNameEdited] = useState(false);
   const [gitUrl, setGitUrl] = useState("");
-  const [ref, setRef] = useState("");
+  const [ref, setRef] = useState("master");
   const [target, setTarget] = useState(indexes[0]?.id || "__new__");
   const [indexName, setIndexName] = useState("");
   const [error, setError] = useState("");
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
+  const [busyMode, setBusyMode] = useState<"static" | "gigacode" | null>(null);
+  const connect = async (generationMode: "static" | "gigacode") => {
+    setBusyMode(generationMode);
+    setError("");
     try {
-      await post("/admin/api/repositories", password, { name, git_url: gitUrl, ref: ref || null, index_id: target === "__new__" ? null : target, index_name: target === "__new__" ? indexName || name : null });
-      onSaved();
-    } catch (caught) { setError(caught instanceof Error ? caught.message : "Не удалось подключить репозиторий"); }
+      await post("/admin/api/repositories", password, {
+        name,
+        git_url: gitUrl,
+        ref: ref || null,
+        index_id: target === "__new__" ? null : target,
+        index_name: target === "__new__" ? indexName || name : null,
+        generation_mode: generationMode,
+      });
+      onSaved(generationMode);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Не удалось подключить репозиторий");
+      setBusyMode(null);
+    }
   };
-  return <Modal title="Подключить Git-репозиторий" onClose={onClose}><form className="modal-form" onSubmit={submit}><div className="field-row"><label>Название<input required minLength={2} value={name} onChange={(event) => setName(event.target.value)} placeholder="payments-service" /></label><label>Ref, необязательно<input value={ref} onChange={(event) => setRef(event.target.value)} placeholder="main / tag / commit" /></label></div><label>Git URL<input required value={gitUrl} onChange={(event) => setGitUrl(event.target.value)} placeholder="https://git.company.local/team/service.git" /></label><label>Целевой индекс<select value={target} onChange={(event) => setTarget(event.target.value)}>{indexes.map((index) => <option key={index.id} value={index.id}>{index.name}</option>)}<option value="__new__">＋ Создать новый индекс</option></select></label>{target === "__new__" && <label>Название нового индекса<input value={indexName} onChange={(event) => setIndexName(event.target.value)} placeholder={name || "System knowledge"} /></label>}<div className="flow-preview"><span>Git checkout</span><i>→</i><span>исходники</span><i>→</i><span>Service map</span><i>＋</i><span>RAG из openspec</span></div>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="button quiet" onClick={onClose}>Отмена</button><button className="button primary">Подключить и индексировать</button></div></form></Modal>;
+  const submitStatic = (event: FormEvent) => {
+    event.preventDefault();
+    void connect("static");
+  };
+  const submitGigacode = (event: React.MouseEvent<HTMLButtonElement>) => {
+    const form = event.currentTarget.form;
+    if (!form?.reportValidity()) return;
+    void connect("gigacode");
+  };
+  const changeGitUrl = (value: string) => {
+    setGitUrl(value);
+    if (!nameEdited) setName(repositoryNameFromGitUrl(value));
+  };
+  return (
+    <Modal title="Подключить Git-репозиторий" onClose={onClose}>
+      <form className="modal-form" onSubmit={submitStatic}>
+        <div className="field-row">
+          <label>Название<input required minLength={2} value={name} onChange={(event) => { setName(event.target.value); setNameEdited(true); }} placeholder="Заполнится из Git URL" /></label>
+          <label>Ref<input value={ref} onChange={(event) => setRef(event.target.value)} placeholder="master" /></label>
+        </div>
+        <label>Git URL<input required value={gitUrl} onChange={(event) => changeGitUrl(event.target.value)} placeholder="https://git.company.local/team/service.git" /></label>
+        <label>Целевой индекс<select value={target} onChange={(event) => setTarget(event.target.value)}>{indexes.map((index) => <option key={index.id} value={index.id}>{index.name}</option>)}<option value="__new__">＋ Создать новый индекс</option></select></label>
+        {target === "__new__" && <label>Название нового индекса<input value={indexName} onChange={(event) => setIndexName(event.target.value)} placeholder={name || "System knowledge"} /></label>}
+        {!gigacodeAvailable && <small className="gigacode-hint">GigaCode-режим недоступен: {gigacodeError || "исполняемый файл не найден"}</small>}
+        {error && <div className="form-error">{error}</div>}
+        <div className="modal-actions repository-actions">
+          <button type="button" className="button quiet" onClick={onClose} disabled={busyMode !== null}>Отмена</button>
+          <button type="submit" className="button secondary" disabled={busyMode !== null}>{busyMode === "static" ? "Подключаем…" : "Без GigaCode"}</button>
+          <button type="button" className="button precise" onClick={submitGigacode} disabled={!gigacodeAvailable || busyMode !== null} title={!gigacodeAvailable ? gigacodeError || "GigaCode недоступен" : "Создать SSOT через GigaCode и собрать индекс"}>{busyMode === "gigacode" ? "Запускаем GigaCode…" : "✦ С GigaCode"}</button>
+        </div>
+      </form>
+    </Modal>
+  );
 }
 
 function SystemSsotModal({ password, indexes, generator, serviceCount, onClose, onStarted }: {

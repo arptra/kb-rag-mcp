@@ -577,6 +577,7 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
                 "git_url": repository.as_uri(),
                 "index_id": None,
                 "index_name": "System OpenSpec",
+                "generation_mode": "static",
             },
         )
         assert queued.status_code == 202

@@ -610,8 +610,16 @@ public class GigaCodeController {
         name="GigaCode repository",
         git_url=str(repository),
         index_id=index.id,
+        generation_mode="gigacode",
     )
-    assert _wait_for_job(catalog, imported.id)["status"] == "completed"
+    imported_completed = _wait_for_job(catalog, imported.id)
+    assert imported_completed["status"] == "completed"
+    assert imported_completed["result"]["phase"] == "indexed"
+    assert imported_completed["result"]["generation_mode"] == "gigacode"
+    assert imported_completed["result"]["gigacode_used"] is True
+    import_log = catalog.job_log(imported.id)["log"]
+    assert "Static graph ready; starting GigaCode" in import_log
+    assert "GigaCode starting" in import_log
 
     options = catalog.ssot_generation_request(action="options")
     assert options["workflow"]["gigacode"]["available"] is True
