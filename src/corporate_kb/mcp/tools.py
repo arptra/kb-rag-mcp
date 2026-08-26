@@ -82,6 +82,7 @@ class KnowledgeTools:
                 source_type=source_type,
             ),
         )
+        results = [result for result in results if not self._is_legacy_graph_item(result)]
         packed_results, context_token_count = self._pack_search_results(
             query=query,
             results=results,
@@ -107,6 +108,8 @@ class KnowledgeTools:
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
         document = self._service.get_document(document_id)
+        if self._is_legacy_graph_item(document):
+            raise KeyError(f"Unknown document: {document_id}")
         excerpt = self._excerpt(
             query=document.title,
             text=document.content,
@@ -127,6 +130,8 @@ class KnowledgeTools:
     def get_chunk(self, chunk_id: str, max_tokens: int | None = None) -> dict[str, Any]:
         """Return a bounded, lazily requested source chunk from a search result."""
         chunk = self._service.get_chunk(chunk_id)
+        if self._is_legacy_graph_item(chunk):
+            raise KeyError(f"Unknown chunk: {chunk_id}")
         excerpt = self._excerpt(
             query=f"{chunk.title} {chunk.heading_path}",
             text=chunk.text,
@@ -167,6 +172,9 @@ class KnowledgeTools:
             ),
             limit=limit,
         )
+        documents = [
+            document for document in documents if not self._is_legacy_graph_item(document)
+        ]
         payload = {
             "document_count": len(documents),
             "documents": [self._document_metadata(document) for document in documents],
@@ -181,6 +189,15 @@ class KnowledgeTools:
         payload["cache_directory"] = str(self._service.settings.cache_dir)
         self.usage.record("kb_stats")
         return payload
+
+    @staticmethod
+    def _is_legacy_graph_item(item: Document | SearchResult | Any) -> bool:
+        metadata = item.metadata if isinstance(item.metadata, dict) else {}
+        return (
+            metadata.get("document_type") == "system_graph"
+            or metadata.get("authority") == "source-derived-graph"
+            or str(item.source_path).replace("\\", "/").startswith("system-graph/")
+        )
 
     def run_context_benchmark(self, password: str) -> dict[str, Any]:
         """Compare legacy full chunks with packed excerpts after secondary authentication."""

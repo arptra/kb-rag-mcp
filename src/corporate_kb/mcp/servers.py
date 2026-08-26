@@ -26,6 +26,14 @@ BUILTIN_TOOLS: tuple[dict[str, str], ...] = (
         "description": "Join service calls and repository-scoped RAG context for a feature.",
     },
     {
+        "name": "kb_system_graph",
+        "description": "Route a feature through the system graph without querying RAG.",
+    },
+    {
+        "name": "kb_search_index",
+        "description": "Search one exact RAG index selected by the system graph.",
+    },
+    {
         "name": "kb_generate_system_ssot",
         "description": (
             "Coordinate client-side SSOT generation from server analysis and source files."

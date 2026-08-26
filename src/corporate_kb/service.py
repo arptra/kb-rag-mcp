@@ -276,7 +276,12 @@ class KnowledgeService:
         """Load documents with a clear phase boundary in server logs."""
         logger.info("Loading knowledge documents from %s", self.settings.knowledge_dir)
         started = time.perf_counter()
-        documents = self.loader.load_directory(self.settings.knowledge_dir)
+        documents = [
+            document
+            for document in self.loader.load_directory(self.settings.knowledge_dir)
+            if document.metadata.get("document_type") != "system_graph"
+            and document.metadata.get("authority") != "source-derived-graph"
+        ]
         logger.info(
             "Loaded %d knowledge documents in %.3f seconds",
             len(documents),

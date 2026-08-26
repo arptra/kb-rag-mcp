@@ -127,7 +127,12 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
         ) as session:
             await session.initialize()
             listed = await session.list_tools()
-            assert {"kb_search", "kb_feature_context", "kb_generate_system_ssot"} <= {
+            assert {
+                "kb_search",
+                "kb_feature_context",
+                "kb_system_graph",
+                "kb_generate_system_ssot",
+            } <= {
                 tool.name for tool in listed.tools
             }
             ssot_tool = next(
@@ -158,6 +163,13 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
             )
             assert feature.isError is False
             assert feature.structuredContent["status"] == "empty_graph"
+            system_graph = await session.call_tool(
+                "kb_system_graph",
+                {"feature": "daily limits"},
+            )
+            assert system_graph.isError is False
+            assert system_graph.structuredContent["status"] == "empty_graph"
+            assert system_graph.structuredContent["rag_queried"] is False
 
 
 @pytest.mark.asyncio
@@ -352,10 +364,11 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
         assert server_metrics["peak_rss_mb"] > 0
 
         runtime_catalog = admin_overview.json()["tool_catalog"]
-        assert runtime_catalog["built_in_count"] == 10
+        assert runtime_catalog["built_in_count"] == 11
         assert {
             "ssot_context",
             "kb_feature_context",
+            "kb_system_graph",
             "kb_search_index",
             "kb_generate_system_ssot",
             "kb_search",
@@ -496,6 +509,7 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
             assert {tool.name for tool in listed.tools} == {
                 "ssot_context",
                 "kb_feature_context",
+                "kb_system_graph",
                 "kb_search_index",
                 "kb_generate_system_ssot",
                 "kb_search",
@@ -645,6 +659,12 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
         assert {item["type"] for item in filtered_graph.json()["nodes"]} == {"Service"}
         assert filtered_graph.json()["snapshot_id"]
 
+        legacy_graph_dir = Path(imported_index["knowledge_dir"]) / "system-graph"
+        legacy_graph_dir.mkdir(parents=True, exist_ok=True)
+        (legacy_graph_dir / "payments-service.md").write_text(
+            "---\ndocument_type: system_graph\nauthority: source-derived-graph\n---\n",
+            encoding="utf-8",
+        )
         graph_rebuild = await client.post(
             "/admin/api/graph/rebuild",
             headers=admin_headers,
@@ -664,8 +684,8 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
         graph_documents = list(
             (Path(imported_index["knowledge_dir"]) / "system-graph").glob("*.md")
         )
-        assert graph_documents
-        assert "snapshot_id:" in graph_documents[0].read_text(encoding="utf-8")
+        assert graph_documents == []
+        assert graph_job["result"]["phase"] == "published"
 
         job_log = await client.get(
             "/admin/api/jobs/log",

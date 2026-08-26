@@ -20,7 +20,8 @@ from corporate_kb.gigacode_runner import (
     GigaCodeRunner,
 )
 from gigacode_graph.config import GraphSettings
-from gigacode_graph.models import Evidence, GraphEdge, ScanIssue
+from gigacode_graph.contracts import contracts_compatible
+from gigacode_graph.models import Evidence, GraphEdge, GraphNode, ScanIssue
 from service_map import RepositoryInput, ServiceMapBuilder, ServiceMapBuildResult
 from service_map.models import ServiceDependency, ServiceMapEvidence, ServiceMapSnapshot
 
@@ -70,6 +71,48 @@ _RESULT_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
             },
         },
+        "discovered_edges": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "source_service_id": {"type": "string"},
+                    "target_service_id": {"type": "string"},
+                    "target_entrypoint_id": {"type": "string"},
+                    "protocol": {"type": "string", "enum": ["HTTP", "KAFKA"]},
+                    "operation": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["HIGH", "MEDIUM"]},
+                    "reason": {"type": "string"},
+                    "evidence": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": {"type": "string"},
+                                "line": {"type": "integer", "minimum": 1},
+                                "symbol": {"type": ["string", "null"]},
+                            },
+                            "required": ["file", "line"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": [
+                    "source_service_id",
+                    "target_service_id",
+                    "target_entrypoint_id",
+                    "protocol",
+                    "operation",
+                    "confidence",
+                    "reason",
+                    "evidence",
+                ],
+                "additionalProperties": False,
+            },
+        },
         "analyzed_files": {
             "type": "array",
             "items": {"type": "string"},
@@ -81,7 +124,7 @@ _RESULT_SCHEMA: dict[str, Any] = {
             "maxItems": 200,
         },
     },
-    "required": ["edge_updates", "analyzed_files", "warnings"],
+    "required": ["edge_updates", "discovered_edges", "analyzed_files", "warnings"],
     "additionalProperties": False,
 }
 
@@ -105,8 +148,20 @@ class EdgeUpdate(_StrictModel):
     evidence: list[VerificationEvidence] = Field(default_factory=list)
 
 
+class DiscoveredEdge(_StrictModel):
+    source_service_id: str
+    target_service_id: str
+    target_entrypoint_id: str
+    protocol: Literal["HTTP", "KAFKA"]
+    operation: str
+    confidence: Literal["HIGH", "MEDIUM"]
+    reason: str
+    evidence: list[VerificationEvidence] = Field(min_length=1)
+
+
 class VerificationPayload(_StrictModel):
     edge_updates: list[EdgeUpdate] = Field(default_factory=list)
+    discovered_edges: list[DiscoveredEdge] = Field(default_factory=list)
     analyzed_files: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
@@ -147,11 +202,12 @@ class GraphGigaCodeVerifier:
             "retargeted": 0,
             "rejected": 0,
             "unresolved": 0,
+            "discovered": 0,
             "ignored": 0,
             "warnings": [],
             "runs": [],
         }
-        if not candidates:
+        if not candidates and not verify_all:
             if progress is not None:
                 progress("GigaCode verification: no dependency candidates require review")
             return result, summary
@@ -160,9 +216,15 @@ class GraphGigaCodeVerifier:
         evidence = {item.id: item for item in result.service_map.evidence}
         repository_by_root = {str(item.path.resolve()): item for item in repositories}
         grouped: dict[str, tuple[RepositoryInput, list[ServiceDependency]]] = {}
+        if verify_all:
+            for configured_repository in repositories:
+                grouped[str(configured_repository.path.resolve())] = (
+                    configured_repository,
+                    [],
+                )
         for candidate in candidates:
             source = services.get(candidate.source_service_id)
-            repository = None
+            repository: RepositoryInput | None = None
             if source is not None and source.repository_root:
                 repository = repository_by_root.get(str(Path(source.repository_root).resolve()))
             if repository is None and source is not None:
@@ -182,11 +244,16 @@ class GraphGigaCodeVerifier:
         graph = result.graph.model_copy(deep=True)
         raw_runs: list[dict[str, Any]] = []
         for repository, repository_candidates in grouped.values():
-            for offset in range(0, len(repository_candidates), 25):
-                batch = repository_candidates[offset : offset + 25]
+            batches = [
+                repository_candidates[offset : offset + 25]
+                for offset in range(0, len(repository_candidates), 25)
+            ]
+            if not batches and verify_all:
+                batches = [[]]
+            for batch_number, batch in enumerate(batches, start=1):
                 if cancel is not None and cancel.is_set():
                     raise GigaCodeCancelled("GigaCode graph verification was cancelled")
-                label = f"graph:{repository.name}:{offset // 25 + 1}"
+                label = f"graph:{repository.name}:{batch_number}"
                 if progress is not None:
                     progress(
                         "GigaCode verification: "
@@ -208,6 +275,7 @@ class GraphGigaCodeVerifier:
                         candidates=batch,
                         services=result.service_map,
                         evidence=evidence,
+                        discover_missing=verify_all and batch_number == 1,
                     ),
                     schema=_RESULT_SCHEMA,
                     cancel=cancel,
@@ -259,7 +327,8 @@ class GraphGigaCodeVerifier:
             progress(
                 "GigaCode verification ready: "
                 f"confirmed={summary['confirmed']}; retargeted={summary['retargeted']}; "
-                f"rejected={summary['rejected']}; unresolved={summary['unresolved']}; "
+                f"discovered={summary['discovered']}; rejected={summary['rejected']}; "
+                f"unresolved={summary['unresolved']}; "
                 f"artifact={artifact}"
             )
         return projected, summary
@@ -279,6 +348,7 @@ class GraphGigaCodeVerifier:
             for item in graph.nodes
             if item.type == "Service" and item.service_id
         }
+        nodes = {item.id: item for item in graph.nodes}
         edges = {item.id: item for item in graph.edges}
         graph_evidence = {item.id: item for item in graph.evidence}
         now = datetime.now(UTC)
@@ -361,6 +431,144 @@ class GraphGigaCodeVerifier:
                 summary["retargeted" if update.decision == "retarget" else "confirmed"] += 1
             edges[edge.id] = replacement
 
+        owned_services = {
+            item.id
+            for item in service_map.services
+            if item.repository == repository.name
+            or (
+                item.repository_root is not None
+                and Path(item.repository_root).resolve() == repository.path.resolve()
+            )
+        }
+        entrypoints = {
+            entry.id: (service, entry)
+            for service in service_map.services
+            for entry in service.entrypoints
+        }
+        for discovery in payload.discovered_edges:
+            source = service_nodes.get(discovery.source_service_id)
+            target = service_nodes.get(discovery.target_service_id)
+            target_contract = entrypoints.get(discovery.target_entrypoint_id)
+            if (
+                source is None
+                or discovery.source_service_id not in owned_services
+                or target is None
+                or discovery.source_service_id == discovery.target_service_id
+                or target_contract is None
+                or target_contract[0].id != discovery.target_service_id
+            ):
+                summary["ignored"] += 1
+                summary["warnings"].append(
+                    "Rejected GigaCode discovery with an unknown source, target, or entrypoint: "
+                    f"{discovery.source_service_id} -> {discovery.target_service_id}"
+                )
+                continue
+            entrypoint = target_contract[1]
+            if not contracts_compatible(
+                discovery.protocol,
+                discovery.operation,
+                entrypoint.kind,
+                entrypoint.operation,
+            ):
+                summary["ignored"] += 1
+                summary["warnings"].append(
+                    "Rejected incompatible GigaCode discovery: "
+                    f"{discovery.operation} -> {entrypoint.operation}"
+                )
+                continue
+            source_evidence: list[str] = []
+            for proposed in discovery.evidence:
+                validated = self._validated_evidence(
+                    repository, proposed, discovery.confidence
+                )
+                if validated is not None:
+                    graph_evidence[validated.id] = validated
+                    source_evidence.append(validated.id)
+            target_evidence = [
+                evidence_id
+                for evidence_id in entrypoint.evidence_ids
+                if evidence_id in graph_evidence
+            ]
+            if not source_evidence or not target_evidence:
+                summary["ignored"] += 1
+                summary["warnings"].append(
+                    "Rejected GigaCode discovery without two-sided evidence: "
+                    f"{discovery.source_service_id} -> {discovery.target_service_id}"
+                )
+                continue
+            duplicate = next(
+                (
+                    edge
+                    for edge in edges.values()
+                    if edge.type == "DEPENDS_ON"
+                    and edge.source == source.id
+                    and edge.target == target.id
+                    and contracts_compatible(
+                        str(edge.metadata.get("protocol") or "UNKNOWN"),
+                        str(edge.metadata.get("operation") or edge.label),
+                        discovery.protocol,
+                        discovery.operation,
+                    )
+                ),
+                None,
+            )
+            if duplicate is not None:
+                summary["ignored"] += 1
+                continue
+            material = "\x1f".join(
+                (
+                    discovery.source_service_id,
+                    discovery.target_service_id,
+                    discovery.protocol,
+                    discovery.operation,
+                    discovery.target_entrypoint_id,
+                )
+            )
+            digest = hashlib.sha256(material.encode()).hexdigest()[:20]
+            exitpoint_id = f"exitpoint:gigacode:{digest}"
+            evidence_ids = list(dict.fromkeys([*source_evidence, *target_evidence]))
+            nodes[exitpoint_id] = GraphNode(
+                id=exitpoint_id,
+                type="ExitPoint",
+                label=f"{discovery.protocol} {discovery.operation}",
+                service_id=discovery.source_service_id,
+                metadata={
+                    "protocol": discovery.protocol,
+                    "operation": discovery.operation,
+                    "target_hint": discovery.target_service_id,
+                    "matcher": "gigacode-discovery",
+                },
+                evidence_ids=evidence_ids,
+            )
+            edge_metadata = {
+                "protocol": discovery.protocol,
+                "operation": discovery.operation,
+                "matcher": "gigacode-discovery",
+                "target_entrypoint_id": discovery.target_entrypoint_id,
+                "verification_reason": discovery.reason[:2000],
+            }
+            status = "confirmed" if discovery.confidence == "HIGH" else "inferred"
+            for suffix, edge_source, edge_target, edge_type in (
+                ("exit", source.id, exitpoint_id, "EXITS_VIA"),
+                ("target", exitpoint_id, target.id, "DEPENDS_ON"),
+                ("service", source.id, target.id, "DEPENDS_ON"),
+            ):
+                edge_id = f"edge:gigacode:{suffix}:{digest}"
+                edges[edge_id] = GraphEdge(
+                    id=edge_id,
+                    source=edge_source,
+                    target=edge_target,
+                    type=edge_type,
+                    label=f"{discovery.protocol} {discovery.operation}",
+                    confidence=discovery.confidence,
+                    status=status,
+                    origin="gigacode",
+                    verified_at=now,
+                    metadata=edge_metadata,
+                    evidence_ids=evidence_ids,
+                )
+            summary["discovered"] += 1
+
         issues = list(graph.issues)
         for warning in payload.warnings:
             issues.append(
@@ -368,6 +576,7 @@ class GraphGigaCodeVerifier:
             )
         return graph.model_copy(
             update={
+                "nodes": list(nodes.values()),
                 "edges": list(edges.values()),
                 "evidence": list(graph_evidence.values()),
                 "issues": issues,
@@ -417,6 +626,7 @@ class GraphGigaCodeVerifier:
         candidates: list[ServiceDependency],
         services: ServiceMapSnapshot,
         evidence: dict[str, ServiceMapEvidence],
+        discover_missing: bool,
     ) -> str:
         catalog = [
             {
@@ -425,7 +635,16 @@ class GraphGigaCodeVerifier:
                 "aliases": item.aliases,
                 "module_path": item.module_path,
                 "entrypoints": [
-                    {"kind": entry.kind, "operation": entry.operation}
+                    {
+                        "id": entry.id,
+                        "kind": entry.kind,
+                        "operation": entry.operation,
+                        "evidence": [
+                            evidence[evidence_id].model_dump(mode="json")
+                            for evidence_id in entry.evidence_ids
+                            if evidence_id in evidence
+                        ][:5],
+                    }
                     for entry in item.entrypoints[:30]
                 ],
             }
@@ -460,6 +679,15 @@ class GraphGigaCodeVerifier:
             + json.dumps(catalog, ensure_ascii=False)
             + "\n\nDEPENDENCY CANDIDATES:\n"
             + json.dumps(packets, ensure_ascii=False)
+            + "\n\nDISCOVERY MODE:\n"
+            + (
+                "Inspect this repository for outbound HTTP or Kafka calls missed by the supplied "
+                "candidates. Add discovered_edges only when the source call has file:line "
+                "evidence and it matches one exact target_entrypoint_id from SERVICE CATALOG by "
+                "protocol and operation. Do not report an existing candidate again."
+                if discover_missing
+                else "Do not discover new edges in this batch; return discovered_edges as []."
+            )
         )
 
     def _save_artifact(

@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 from xml.etree import ElementTree
 
 from gigacode_graph.config import GraphSettings
+from gigacode_graph.contracts import normalize_contract
 from gigacode_graph.java_syntax import JavaSyntaxParser
 from gigacode_graph.kotlin_syntax import KotlinSyntaxParser
 from gigacode_graph.models import (
@@ -54,6 +55,12 @@ _HTTP_ANNOTATIONS = {
     "PatchMapping": "PATCH",
     "DeleteMapping": "DELETE",
     "RequestMapping": "ANY",
+    "GetExchange": "GET",
+    "PostExchange": "POST",
+    "PutExchange": "PUT",
+    "PatchExchange": "PATCH",
+    "DeleteExchange": "DELETE",
+    "HttpExchange": "ANY",
 }
 _READ_PREFIXES = ("find", "get", "read", "load", "exists", "count", "query", "search")
 _WRITE_PREFIXES = ("save", "delete", "remove", "update", "insert", "persist", "flush")
@@ -84,7 +91,9 @@ def _simple_type(value: str) -> str:
 
 
 def _path_value(arguments: str) -> str:
-    named = re.search(r"(?:path|value)\s*=\s*(?:\{\s*)?[\"']([^\"']+)", arguments)
+    named = re.search(
+        r"(?:path|value|url)\s*=\s*(?:\{\s*)?[\"']([^\"']+)", arguments
+    )
     if named:
         return named.group(1)
     direct = re.search(r"[\"']([^\"']+)[\"']", arguments)
@@ -191,6 +200,7 @@ class ServiceScan:
     resource_files: tuple[Path, ...]
     commit: str | None
     aliases: set[str]
+    configuration: dict[str, str] = field(default_factory=dict)
     classes: dict[str, JavaClass] = field(default_factory=dict)
     entity_tables: dict[str, str] = field(default_factory=dict)
     repository_tables: dict[str, str] = field(default_factory=dict)
@@ -388,6 +398,14 @@ def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
         for alias, service_ids in alias_candidates.items()
         if len(service_ids) == 1
     }
+    inbound_http: list[tuple[GraphNode, tuple[str, str, str]]] = []
+    for node in nodes.values():
+        if node.type != "EntryPoint" or not node.service_id:
+            continue
+        if str(node.metadata.get("trigger_type") or "").upper() != "HTTP":
+            continue
+        operation = str(node.metadata.get("operation") or node.label)
+        inbound_http.append((node, normalize_contract("HTTP", operation).key))
 
     for exitpoint in list(nodes.values()):
         if exitpoint.type != "ExitPoint" or not exitpoint.service_id:
@@ -397,17 +415,51 @@ def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
             continue
         target_hint = str(exitpoint.metadata.get("target_hint") or "")
         normalized = RepositoryScanner._normalize_target(target_hint)
-        target_service = alias_map.get(normalized)
+        operation = str(exitpoint.metadata.get("operation") or exitpoint.label)
+        outbound_contract = normalize_contract(protocol, operation)
+        matched_entrypoints = [
+            node
+            for node, (_, method, address) in inbound_http
+            if protocol == "HTTP"
+            and address == outbound_contract.address
+            and (
+                method == outbound_contract.method
+                or "ANY" in {method, outbound_contract.method}
+            )
+            and node.service_id != exitpoint.service_id
+        ]
+        contract_targets = {
+            node.service_id for node in matched_entrypoints if node.service_id is not None
+        }
+        alias_target = alias_map.get(normalized)
+        allow_contract_only = (
+            not target_hint or target_hint.startswith("${") or "://" not in target_hint
+        )
+        matcher = "unresolved"
+        target_service: str | None = None
+        if alias_target and (not contract_targets or alias_target in contract_targets):
+            target_service = alias_target
+            matcher = "alias+contract" if alias_target in contract_targets else "alias"
+        elif alias_target is None and allow_contract_only and len(contract_targets) == 1:
+            target_service = next(iter(contract_targets))
+            matcher = "http-contract"
         if target_service:
             target_id = f"service:{target_service}"
-            confidence: Confidence = "HIGH"
+            confidence: Confidence = "HIGH" if matcher != "http-contract" else "MEDIUM"
+            target_evidence = [
+                evidence_id
+                for node in matched_entrypoints
+                if node.service_id == target_service
+                for evidence_id in node.evidence_ids
+            ]
         else:
             label = target_hint or "unresolved target"
             target_id = f"external:{normalized or _stable_id('unknown', label)}"
-            ambiguous = sorted(alias_candidates.get(normalized, set()))
+            ambiguous = sorted({*alias_candidates.get(normalized, set()), *contract_targets})
             confidence = (
                 "UNRESOLVED" if "${" in label or not target_hint or len(ambiguous) > 1 else "LOW"
             )
+            target_evidence = []
             builder.add_node(
                 GraphNode(
                     id=target_id,
@@ -421,8 +473,10 @@ def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
                     evidence_ids=exitpoint.evidence_ids,
                 )
             )
-        operation = str(exitpoint.metadata.get("operation") or exitpoint.label)
-        metadata = {"protocol": protocol, "operation": operation}
+        metadata = {"protocol": protocol, "operation": operation, "matcher": matcher}
+        evidence_ids = list(
+            dict.fromkeys([*exitpoint.evidence_ids, *target_evidence])
+        )
         builder.add_edge(
             source=exitpoint.id,
             target=target_id,
@@ -430,7 +484,7 @@ def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
             label=f"{protocol} {operation}",
             confidence=confidence,
             metadata=metadata,
-            evidence_ids=exitpoint.evidence_ids,
+            evidence_ids=evidence_ids,
         )
         builder.add_edge(
             source=f"service:{exitpoint.service_id}",
@@ -439,7 +493,7 @@ def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
             label=f"{protocol} {operation}",
             confidence=confidence,
             metadata=metadata,
-            evidence_ids=exitpoint.evidence_ids,
+            evidence_ids=evidence_ids,
         )
 
     publishers: dict[str, list[GraphEdge]] = {}
@@ -773,6 +827,7 @@ class RepositoryScanner:
                 f"classes={len(scan.classes)}; "
                 f"elapsed={time.monotonic() - parse_started_at:.3f}s"
             )
+        self._load_configuration(scan)
         phase_started_at = time.monotonic()
         if progress is not None:
             progress(f"Database model start: {scan.service_id}; classes={len(scan.classes)}")
@@ -811,6 +866,62 @@ class RepositoryScanner:
                 f"elapsed={time.monotonic() - started_at:.3f}s"
             )
 
+    def _load_configuration(self, scan: ServiceScan) -> None:
+        paths = sorted(
+            set(scan.resource_files)
+            if scan.resource_files
+            else {
+                path
+                for root in scan.resource_roots
+                for path in self._files(root, {".properties", ".yaml", ".yml"})
+            }
+        )
+        for path in paths:
+            if path.suffix.lower() not in {".properties", ".yaml", ".yml"}:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if path.suffix.lower() == ".properties":
+                for property_match in re.finditer(
+                    r"(?m)^\s*([\w.-]+)\s*[:=]\s*([^#\r\n]+)", text
+                ):
+                    scan.configuration.setdefault(
+                        property_match.group(1).strip(),
+                        _strip_quotes(property_match.group(2).strip()),
+                    )
+                continue
+            stack: list[tuple[int, str]] = []
+            for raw_line in text.splitlines():
+                if not raw_line.strip() or raw_line.lstrip().startswith(("#", "-")):
+                    continue
+                yaml_match = re.match(r"^(\s*)([\w.-]+)\s*:\s*(.*?)\s*$", raw_line)
+                if yaml_match is None:
+                    continue
+                indent = len(yaml_match.group(1).replace("\t", "  "))
+                key, value = yaml_match.group(2), yaml_match.group(3)
+                while stack and stack[-1][0] >= indent:
+                    stack.pop()
+                path_key = ".".join([*(item[1] for item in stack), key])
+                if value and not value.startswith(("{", "[", "|", ">")):
+                    scan.configuration.setdefault(path_key, _strip_quotes(value.split(" #", 1)[0]))
+                else:
+                    stack.append((indent, key))
+
+    @staticmethod
+    def _resolve_configuration(scan: ServiceScan, value: str) -> str:
+        resolved = value.strip()
+        for _ in range(5):
+            match = re.fullmatch(r"\$\{([^}:]+)(?::([^}]*))?}", resolved)
+            if match is None:
+                break
+            replacement = scan.configuration.get(match.group(1), match.group(2) or "")
+            if not replacement or replacement == resolved:
+                break
+            resolved = replacement.strip()
+        return resolved
+
     def _index_java_architecture(
         self,
         scan: ServiceScan,
@@ -834,13 +945,17 @@ class RepositoryScanner:
             class_annotations = java_class.annotations
             class_base = ""
             request_args = _annotation_arguments(class_annotations, "RequestMapping")
-            if request_args is not None:
-                class_base = _path_value(request_args)
+            http_exchange_args = _annotation_arguments(class_annotations, "HttpExchange")
+            if request_args is not None or http_exchange_args is not None:
+                class_base = _path_value(request_args or http_exchange_args or "")
             feign_args = _annotation_arguments(class_annotations, "FeignClient")
             if feign_args is not None:
-                target = self._feign_target(feign_args)
+                target = self._resolve_configuration(scan, self._feign_target(feign_args))
                 if target:
                     scan.feign_targets[java_class.name] = target
+            declarative_http_client = feign_args is not None or (
+                http_exchange_args is not None and java_class.kind == "interface"
+            )
             is_repository = java_class.name in scan.repository_tables
             relevant_class = (
                 any(
@@ -852,6 +967,7 @@ class RepositoryScanner:
                         "Component",
                         "Entity",
                         "FeignClient",
+                        "HttpExchange",
                     )
                 )
                 or is_repository
@@ -883,13 +999,21 @@ class RepositoryScanner:
                         )
                     )
                 for http_method, route in mappings:
-                    if feign_args is not None:
+                    if declarative_http_client:
                         evidence_id = self._builder.add_evidence(
                             scan=scan,
                             file=method.file,
                             line=method.line,
-                            snippet=f"@FeignClient({feign_args}) {http_method} {route}",
-                            extractor="spring-feign",
+                            snippet=(
+                                f"@FeignClient({feign_args}) {http_method} {route}"
+                                if feign_args is not None
+                                else f"@HttpExchange({http_exchange_args}) {http_method} {route}"
+                            ),
+                            extractor=(
+                                "spring-feign"
+                                if feign_args is not None
+                                else "spring-http-interface"
+                            ),
                         )
                         self._outbound.append(
                             OutboundFact(
@@ -913,7 +1037,7 @@ class RepositoryScanner:
                             extractor="spring-http-entrypoint",
                         )
                 if kafka_args is not None:
-                    topic = self._topic_value(kafka_args)
+                    topic = self._resolve_configuration(scan, self._topic_value(kafka_args))
                     operation_id = self._add_operation(
                         scan=scan,
                         method=method,
@@ -936,6 +1060,29 @@ class RepositoryScanner:
                                 topic=topic,
                                 action="CONSUMES",
                                 operation_id=operation_id,
+                                symbol_id=symbol_id,
+                                evidence_id=evidence_id,
+                            )
+                        )
+                send_to_args = _annotation_arguments(method.annotations, "SendTo")
+                if send_to_args is not None:
+                    send_topic = self._resolve_configuration(
+                        scan, self._topic_value(send_to_args)
+                    )
+                    if send_topic:
+                        evidence_id = self._builder.add_evidence(
+                            scan=scan,
+                            file=method.file,
+                            line=method.line,
+                            snippet=f"@SendTo({send_to_args})",
+                            extractor="spring-kafka-send-to",
+                        )
+                        self._topics.append(
+                            TopicFact(
+                                service_id=scan.service_id,
+                                topic=send_topic,
+                                action="PUBLISHES",
+                                operation_id=None,
                                 symbol_id=symbol_id,
                                 evidence_id=evidence_id,
                             )
@@ -1039,7 +1186,7 @@ class RepositoryScanner:
             r"(?:send|sendDefault)\s*\(\s*[\"']([^\"']+)[\"']",
             method.body,
         ):
-            topic = match.group(1)
+            topic = self._resolve_configuration(scan, match.group(1))
             line = method.line + _line_number(method.body, match.start()) - 1
             evidence_id = self._builder.add_evidence(
                 scan=scan,
@@ -1058,7 +1205,10 @@ class RepositoryScanner:
                     evidence_id=evidence_id,
                 )
             )
-        base_urls = re.findall(r"\.baseUrl\s*\(\s*[\"']([^\"']+)[\"']", method.body)
+        base_urls = [
+            self._resolve_configuration(scan, value)
+            for value in re.findall(r"\.baseUrl\s*\(\s*[\"']([^\"']+)[\"']", method.body)
+        ]
         request_matches = list(
             re.finditer(
                 r"\.(get|post|put|patch|delete)\s*\(\s*\).*?\.uri\s*\(\s*"
@@ -1086,6 +1236,71 @@ class RepositoryScanner:
                     target_hint=absolute,
                     protocol="HTTP",
                     operation=f"{match.group(1).upper()} {route}",
+                    symbol_id=symbol_id,
+                    evidence_id=evidence_id,
+                    confidence="MEDIUM",
+                )
+            )
+        rest_methods = {
+            "getForObject": "GET",
+            "getForEntity": "GET",
+            "postForObject": "POST",
+            "postForEntity": "POST",
+            "put": "PUT",
+            "delete": "DELETE",
+        }
+        for match in re.finditer(
+            r"\.(getForObject|getForEntity|postForObject|postForEntity|put|delete)\s*"
+            r"\(\s*[\"']([^\"']+)[\"']",
+            method.body,
+        ):
+            absolute = self._resolve_configuration(scan, match.group(2))
+            parsed = urlparse(absolute) if "://" in absolute else None
+            if parsed is None or not parsed.hostname:
+                continue
+            http_method = rest_methods[match.group(1)]
+            operation = f"{http_method} {parsed.path or '/'}"
+            evidence_id = self._builder.add_evidence(
+                scan=scan,
+                file=method.file,
+                line=method.line + _line_number(method.body, match.start()) - 1,
+                snippet=match.group(0),
+                extractor="spring-rest-template",
+                confidence="MEDIUM",
+            )
+            self._outbound.append(
+                OutboundFact(
+                    source_service=scan.service_id,
+                    target_hint=f"{parsed.scheme}://{parsed.netloc}",
+                    protocol="HTTP",
+                    operation=operation,
+                    symbol_id=symbol_id,
+                    evidence_id=evidence_id,
+                    confidence="MEDIUM",
+                )
+            )
+        for match in re.finditer(
+            r"\.exchange\s*\(\s*[\"']([^\"']+)[\"']\s*,\s*HttpMethod\.([A-Z]+)",
+            method.body,
+        ):
+            absolute = self._resolve_configuration(scan, match.group(1))
+            parsed = urlparse(absolute) if "://" in absolute else None
+            if parsed is None or not parsed.hostname:
+                continue
+            evidence_id = self._builder.add_evidence(
+                scan=scan,
+                file=method.file,
+                line=method.line + _line_number(method.body, match.start()) - 1,
+                snippet=match.group(0),
+                extractor="spring-rest-template",
+                confidence="MEDIUM",
+            )
+            self._outbound.append(
+                OutboundFact(
+                    source_service=scan.service_id,
+                    target_hint=f"{parsed.scheme}://{parsed.netloc}",
+                    protocol="HTTP",
+                    operation=f"{match.group(2)} {parsed.path or '/'}",
                     symbol_id=symbol_id,
                     evidence_id=evidence_id,
                     confidence="MEDIUM",
@@ -1504,21 +1719,67 @@ class RepositoryScanner:
             for alias, service_ids in alias_candidates.items()
             if len(service_ids) == 1
         }
+        inbound_http: list[tuple[GraphNode, tuple[str, str, str]]] = []
+        for node in self._builder.nodes.values():
+            if node.type != "EntryPoint" or not node.service_id:
+                continue
+            if str(node.metadata.get("trigger_type") or "").upper() != "HTTP":
+                continue
+            operation = str(node.metadata.get("operation") or node.label)
+            inbound_http.append((node, normalize_contract("HTTP", operation).key))
         for fact in self._outbound:
             normalized = self._normalize_target(fact.target_hint)
-            target_service = alias_map.get(normalized)
+            alias_target = alias_map.get(normalized)
+            matched_entrypoints: list[GraphNode] = []
+            if fact.protocol.upper() == "HTTP":
+                outbound_contract = normalize_contract("HTTP", fact.operation)
+                matched_entrypoints = [
+                    node
+                    for node, (_, method, address) in inbound_http
+                    if address == outbound_contract.address
+                    and (
+                        method == outbound_contract.method
+                        or "ANY" in {method, outbound_contract.method}
+                    )
+                    and node.service_id != fact.source_service
+                ]
+            contract_targets = {
+                node.service_id for node in matched_entrypoints if node.service_id is not None
+            }
+            allow_contract_only = (
+                not fact.target_hint
+                or fact.target_hint.startswith("${")
+                or "://" not in fact.target_hint
+            )
+            matcher = "unresolved"
+            target_service: str | None = None
+            if alias_target and (not contract_targets or alias_target in contract_targets):
+                target_service = alias_target
+                matcher = "alias+contract" if alias_target in contract_targets else "alias"
+            elif alias_target is None and allow_contract_only and len(contract_targets) == 1:
+                target_service = next(iter(contract_targets))
+                matcher = "http-contract"
             if target_service:
                 target_id = f"service:{target_service}"
-                confidence = fact.confidence
+                confidence = fact.confidence if matcher != "http-contract" else "MEDIUM"
+                target_evidence = [
+                    evidence_id
+                    for node in matched_entrypoints
+                    if node.service_id == target_service
+                    for evidence_id in node.evidence_ids
+                ]
             else:
                 label = fact.target_hint or "unresolved target"
                 target_id = f"external:{normalized or _stable_id('unknown', label)}"
-                ambiguous_targets = sorted(alias_candidates.get(normalized, set()))
+                ambiguous_targets = sorted(
+                    {*alias_candidates.get(normalized, set()), *contract_targets}
+                )
                 confidence = (
                     "UNRESOLVED"
                     if "${" in label or not label or len(ambiguous_targets) > 1
                     else "LOW"
                 )
+                target_evidence = []
                 self._builder.add_node(
                     GraphNode(
                         id=target_id,
@@ -1533,6 +1794,14 @@ class RepositoryScanner:
                     )
                 )
             exitpoint_id = _outbound_exit_id(fact)
+            dependency_evidence = list(
+                dict.fromkeys([fact.evidence_id, *target_evidence])
+            )
+            dependency_metadata = {
+                "protocol": fact.protocol,
+                "operation": fact.operation,
+                "matcher": matcher,
+            }
             self._builder.add_node(
                 GraphNode(
                     id=exitpoint_id,
@@ -1561,8 +1830,8 @@ class RepositoryScanner:
                 edge_type="DEPENDS_ON",
                 label=f"{fact.protocol} {fact.operation}",
                 confidence=confidence,
-                metadata={"protocol": fact.protocol, "operation": fact.operation},
-                evidence_ids=[fact.evidence_id],
+                metadata=dependency_metadata,
+                evidence_ids=dependency_evidence,
             )
             self._builder.add_edge(
                 source=f"service:{fact.source_service}",
@@ -1570,8 +1839,8 @@ class RepositoryScanner:
                 edge_type="DEPENDS_ON",
                 label=f"{fact.protocol} {fact.operation}",
                 confidence=confidence,
-                metadata={"protocol": fact.protocol, "operation": fact.operation},
-                evidence_ids=[fact.evidence_id],
+                metadata=dependency_metadata,
+                evidence_ids=dependency_evidence,
             )
 
     def _link_topic_dependencies(self) -> None:
@@ -1727,6 +1996,13 @@ class RepositoryScanner:
             method = default_method
             if annotation == "RequestMapping":
                 method_match = re.search(r"RequestMethod\.([A-Z]+)", arguments)
+                if method_match:
+                    method = method_match.group(1)
+            elif annotation == "HttpExchange":
+                method_match = re.search(
+                    r"(?:HttpMethod\.)?\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b",
+                    arguments,
+                )
                 if method_match:
                     method = method_match.group(1)
             mappings.append((method, _join_paths(base_path, _path_value(arguments))))

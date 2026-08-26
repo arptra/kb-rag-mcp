@@ -193,6 +193,175 @@ class FeatureContextPlanner:
             ],
         }
 
+    def graph_route(
+        self,
+        *,
+        feature: str,
+        start_service: str | None = None,
+        max_hops: int = 2,
+        direction: str = "both",
+        min_confidence: str = "LOW",
+        include_unresolved: bool = True,
+    ) -> dict[str, Any]:
+        """Route a feature through the graph without reading or mutating any RAG index."""
+        feature = feature.strip()
+        if not feature:
+            raise ValueError("feature must not be empty")
+        if not 0 <= max_hops <= 4:
+            raise ValueError("max_hops must be between 0 and 4")
+        if direction not in {"incoming", "outgoing", "both"}:
+            raise ValueError("direction must be incoming, outgoing, or both")
+        normalized_confidence = min_confidence.upper()
+        if normalized_confidence not in _CONFIDENCE_RANK:
+            raise ValueError(
+                "min_confidence must be DECLARED, HIGH, MEDIUM, LOW, or UNRESOLVED"
+            )
+
+        snapshot = ServiceMapSnapshot.model_validate(self._catalog.service_map())
+        if not snapshot.services:
+            return {
+                **self._empty_payload(feature, snapshot),
+                "rag_queried": False,
+                "next_calls": [],
+            }
+
+        routes = self._routes(snapshot, self._catalog.payload())
+        warnings: list[str] = []
+        roots, discovery = self._resolve_roots(
+            feature,
+            start_service,
+            snapshot,
+            routes,
+            warnings,
+            allow_rag_fallback=False,
+        )
+        if not roots:
+            return {
+                **self._empty_payload(feature, snapshot),
+                "status": "needs_service",
+                "rag_queried": False,
+                "discovery": discovery,
+                "candidate_services": self._candidate_services(snapshot),
+                "warnings": [
+                    *warnings,
+                    "The graph could not identify a starting service. Call kb_system_graph "
+                    "again with start_service from candidate_services.",
+                ],
+                "next_calls": [],
+            }
+
+        selected_ids, distances = self._neighbourhood(
+            snapshot,
+            roots,
+            max_hops,
+            direction=direction,
+            min_confidence=normalized_confidence,
+            include_unresolved=include_unresolved,
+        )
+        selected_ids = set(
+            sorted(selected_ids, key=lambda item: (distances[item], item))[
+                :_MAX_SELECTED_SERVICES
+            ]
+        )
+        calls = self._calls(
+            snapshot,
+            selected_ids,
+            warnings,
+            min_confidence=normalized_confidence,
+            include_unresolved=include_unresolved,
+        )
+        evidence_ids = {
+            evidence_id
+            for call in calls
+            for evidence_id in call.get("evidence_ids", [])
+            if isinstance(evidence_id, str)
+        }
+        evidence = [
+            item.model_dump(mode="json")
+            for item in snapshot.evidence
+            if item.id in evidence_ids
+        ][:_MAX_EVIDENCE]
+        root_ids = {item.id for item in roots}
+        services_by_id = {item.id: item for item in snapshot.services}
+        service_contexts: list[dict[str, Any]] = []
+        next_calls: list[dict[str, Any]] = []
+        for service_id in sorted(selected_ids, key=lambda item: (distances[item], item)):
+            service = services_by_id[service_id]
+            route = routes.get(service_id)
+            index_id = str(route.get("index_id") or "") if route else ""
+            query = f"{feature} {service.name} {service.id}"
+            service_contexts.append(
+                {
+                    "id": service.id,
+                    "name": service.name,
+                    "role": "root" if service.id in root_ids else "dependency",
+                    "distance_from_root": distances[service.id],
+                    "repository": service.repository,
+                    "module_path": service.module_path,
+                    "module_state": service.module_state,
+                    "source_url": service.source_url,
+                    "commit": service.commit,
+                    "entrypoints": [
+                        item.model_dump(mode="json") for item in service.entrypoints
+                    ],
+                    "outbound_interfaces": [
+                        item.model_dump(mode="json")
+                        for item in service.outbound_interfaces
+                    ],
+                    "index_route": {
+                        "index_id": index_id or None,
+                        "index_name": route.get("index_name") if route else None,
+                        "repository_id": route.get("repository_id") if route else None,
+                        "query": query,
+                    },
+                }
+            )
+            if index_id:
+                next_calls.append(
+                    {
+                        "tool": "kb_search_index",
+                        "arguments": {
+                            "index_id": index_id,
+                            "query": query,
+                            "top_k": 2,
+                            "service": service.id,
+                        },
+                    }
+                )
+            else:
+                warnings.append(f"No RAG index is connected to service {service.id}")
+
+        return {
+            "status": "ready",
+            "feature": feature,
+            "graph_revision": snapshot.snapshot_id,
+            "analysis_mode": snapshot.analysis_mode,
+            "verification": snapshot.verification,
+            "analysis_generated_at": snapshot.generated_at.isoformat(),
+            "rag_queried": False,
+            "routing": {
+                "direction": direction,
+                "max_hops": max_hops,
+                "min_confidence": normalized_confidence,
+                "include_unresolved": include_unresolved,
+            },
+            "discovery": discovery,
+            "root_services": [item.id for item in roots],
+            "service_count": len(service_contexts),
+            "call_count": len(calls),
+            "services": service_contexts,
+            "calls": calls,
+            "unresolved_targets": [item for item in calls if not item["resolved"]],
+            "evidence": evidence,
+            "warnings": list(dict.fromkeys(warnings)),
+            "next_calls": next_calls,
+            "agent_guidance": [
+                "This tool read only the graph snapshot; no RAG index was queried or changed.",
+                "Use next_calls only for services whose implementation details are needed.",
+                "Treat LOW and UNRESOLVED links as hypotheses and verify their evidence.",
+            ],
+        }
+
     @staticmethod
     def _empty_payload(feature: str, snapshot: ServiceMapSnapshot) -> dict[str, Any]:
         return {
@@ -224,6 +393,8 @@ class FeatureContextPlanner:
         snapshot: ServiceMapSnapshot,
         routes: Mapping[str, dict[str, Any]],
         warnings: list[str],
+        *,
+        allow_rag_fallback: bool = True,
     ) -> tuple[list[ServiceRecord], dict[str, Any]]:
         if start_service and start_service.strip():
             resolved = self._resolve_service(start_service, snapshot)
@@ -263,7 +434,7 @@ class FeatureContextPlanner:
                 scores[service.id] = scores.get(service.id, 0.0) + lexical
 
         method = "graph_and_interface_search"
-        if not scores:
+        if not scores and allow_rag_fallback:
             rag_scores = self._discover_from_rag(feature, snapshot, routes, warnings)
             scores.update(rag_scores)
             method = "rag_document_discovery"

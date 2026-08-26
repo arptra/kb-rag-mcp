@@ -231,3 +231,24 @@ def test_feature_context_requires_explicit_service_when_discovery_has_no_evidenc
         "orders",
         "inventory",
     }
+
+
+def test_system_graph_route_never_queries_rag_and_returns_explicit_next_calls() -> None:
+    catalog = FakeCatalog()
+    catalog._tools = {}
+
+    result = FeatureContextPlanner(catalog).graph_route(
+        feature="Create an order and reserve stock",
+        start_service="orders-service",
+        max_hops=1,
+    )
+
+    assert result["status"] == "ready"
+    assert result["rag_queried"] is False
+    assert {item["id"] for item in result["services"]} == {"orders", "inventory"}
+    assert all("rag" not in item for item in result["services"])
+    assert {item["arguments"]["index_id"] for item in result["next_calls"]} == {
+        "orders-index",
+        "inventory-index",
+    }
+    assert {item["tool"] for item in result["next_calls"]} == {"kb_search_index"}

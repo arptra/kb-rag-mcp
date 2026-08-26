@@ -14,7 +14,7 @@ import threading
 import traceback
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -1573,7 +1573,6 @@ class RagCatalog:
             force_all=True,
             analysis_mode=generation_mode,
             verify_all=verify_all,
-            publish_rag_routes=True,
         )
         self._raise_if_cancelled(cancel_event)
         partial = self._is_partial_analysis(snapshot)
@@ -2215,7 +2214,6 @@ class RagCatalog:
         force_all: bool = False,
         analysis_mode: Literal["static", "gigacode"] = "static",
         verify_all: bool = False,
-        publish_rag_routes: bool = False,
     ) -> GraphSnapshot:
         if job_id is not None and self._analysis_lock.locked():
             self._append_job_log(job_id, "Waiting for another graph analysis to finish")
@@ -2227,7 +2225,6 @@ class RagCatalog:
                 force_all=force_all,
                 analysis_mode=analysis_mode,
                 verify_all=verify_all,
-                publish_rag_routes=publish_rag_routes,
             )
 
     def _build_graph_unlocked(
@@ -2239,7 +2236,6 @@ class RagCatalog:
         force_all: bool,
         analysis_mode: Literal["static", "gigacode"],
         verify_all: bool,
-        publish_rag_routes: bool,
     ) -> GraphSnapshot:
         with self._lock:
             repositories = [item.model_copy(deep=True) for item in self._state.repositories]
@@ -2325,12 +2321,7 @@ class RagCatalog:
         )
         self._service_map_store.save(result.service_map)
         self._graph_store.save(result.graph)
-        if publish_rag_routes:
-            self._publish_graph_rag_routes(
-                result.service_map,
-                cancel_event=cancel_event,
-                job_id=job_id,
-            )
+        self._remove_legacy_graph_documents(job_id=job_id)
         manifest = self._analysis_archive.record(
             result.service_map,
             result.graph,
@@ -2346,228 +2337,34 @@ class RagCatalog:
             self._append_job_log(job_id, f"Analysis archived at {manifest['path']}")
         return result.graph
 
-    def _publish_graph_rag_routes(
-        self,
-        service_map: ServiceMapSnapshot,
-        *,
-        cancel_event: threading.Event | None,
-        job_id: str | None,
-    ) -> None:
-        """Write graph-derived service dossiers and incrementally refresh affected indexes."""
+    def _remove_legacy_graph_documents(self, *, job_id: str | None) -> None:
+        """Remove documents created by the retired graph-to-RAG publishing path."""
         with self._lock:
-            repositories = [item.model_copy(deep=True) for item in self._state.repositories]
-            indexes = {item.id: item.model_copy(deep=True) for item in self._state.indexes}
-        repository_by_root = {
-            str(Path(item.checkout_path).resolve()): item for item in repositories
-        }
-        repository_by_name = {item.name: item for item in repositories}
-        evidence = {item.id: item for item in service_map.evidence}
-        changed_indexes: set[str] = set()
-        desired_paths_by_index: dict[str, set[Path]] = {
-            item.index_id: set()
-            for item in repositories
-            if item.index_id in indexes
-        }
-        for service in service_map.services:
-            self._raise_if_cancelled(cancel_event)
-            repository = None
-            if service.repository_root:
-                repository = repository_by_root.get(
-                    str(Path(service.repository_root).resolve())
-                )
-            if repository is None:
-                repository = repository_by_name.get(service.repository)
-            if repository is None or repository.index_id not in indexes:
-                continue
-            index = indexes[repository.index_id]
-            outbound = [
-                item
-                for item in service_map.dependencies
-                if item.source_service_id == service.id and item.status != "rejected"
-            ]
-            inbound = [
-                item
-                for item in service_map.dependencies
-                if item.target_service_id == service.id and item.status != "rejected"
-            ]
-            lines = [
-                "---",
-                f"service: {json.dumps(service.id, ensure_ascii=False)}",
-                "document_type: system_graph",
-                "status: current",
-                "authority: source-derived-graph",
-                f"snapshot_id: {json.dumps(service_map.snapshot_id, ensure_ascii=False)}",
-                f"analysis_mode: {service_map.analysis_mode}",
-                "---",
-                "",
-                f"# System graph · {service.name}",
-                "",
-                f"Repository: `{service.repository}`  ",
-                f"Module: `{service.module_path}`  ",
-                f"Snapshot: `{service_map.snapshot_id or 'legacy'}`",
-                "",
-                "## Incoming interfaces",
-            ]
-            lines.extend(
-                f"- `{item.kind}` `{item.operation}`" for item in service.entrypoints
-            )
-            if not service.entrypoints:
-                lines.append("- No source-derived incoming interface found.")
-            lines.extend(["", "## Outgoing dependencies"])
-            lines.extend(self._graph_dependency_lines(outbound, evidence, outbound=True))
-            if not outbound:
-                lines.append("- No source-derived outgoing dependency found.")
-            lines.extend(["", "## Incoming dependencies"])
-            lines.extend(self._graph_dependency_lines(inbound, evidence, outbound=False))
-            if not inbound:
-                lines.append("- No source-derived incoming dependency found.")
-            if service_map.verification:
-                lines.extend(
-                    [
-                        "",
-                        "## Verification summary",
-                        "",
-                        "```json",
-                        json.dumps(service_map.verification, ensure_ascii=False, indent=2),
-                        "```",
-                    ]
-                )
-            content = "\n".join(lines).rstrip() + "\n"
-            destination = (
-                Path(index.knowledge_dir).resolve()
-                / "system-graph"
-                / f"{_slug(service.id)}.md"
-            )
-            desired_paths_by_index.setdefault(index.id, set()).add(destination)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            current = (
-                destination.read_text(encoding="utf-8")
-                if destination.is_file()
-                else None
-            )
-            if current != content:
-                temporary = destination.with_suffix(".md.tmp")
-                temporary.write_text(content, encoding="utf-8")
-                os.replace(temporary, destination)
-                changed_indexes.add(index.id)
-                if job_id is not None:
-                    self._append_job_log(
-                        job_id,
-                        f"Graph RAG document updated: index={index.id}; service={service.id}; "
-                        f"path={destination}",
-                    )
-
-        snapshot_marker = (service_map.snapshot_id or "legacy") + "\n"
-        for index_id, desired_paths in desired_paths_by_index.items():
-            index = indexes[index_id]
+            indexes = [item.model_copy(deep=True) for item in self._state.indexes]
+        removed = 0
+        for index in indexes:
             route_root = Path(index.knowledge_dir).resolve() / "system-graph"
-            if route_root.is_dir():
-                for existing in route_root.glob("*.md"):
-                    if existing in desired_paths or not existing.is_file():
-                        continue
-                    header = existing.read_text(encoding="utf-8", errors="replace")[:1000]
-                    if "authority: source-derived-graph" not in header:
-                        continue
-                    existing.unlink()
-                    changed_indexes.add(index_id)
-                    if job_id is not None:
-                        self._append_job_log(
-                            job_id,
-                            f"Stale graph RAG document removed: index={index_id}; "
-                            f"path={existing}",
-                        )
+            if not route_root.is_dir():
+                continue
+            for existing in route_root.glob("*.md"):
+                if not existing.is_file():
+                    continue
+                header = existing.read_text(encoding="utf-8", errors="replace")[:1000]
+                if "authority: source-derived-graph" not in header:
+                    continue
+                existing.unlink()
+                removed += 1
             marker = route_root / ".snapshot-id"
-            current_marker = (
-                marker.read_text(encoding="utf-8")
-                if marker.is_file()
-                else None
+            if marker.is_file():
+                marker.unlink()
+            with suppress(OSError):
+                route_root.rmdir()
+        if job_id is not None:
+            self._append_job_log(
+                job_id,
+                "Graph snapshot saved outside RAG indexes; "
+                f"removed_legacy_graph_documents={removed}",
             )
-            if current_marker != snapshot_marker:
-                changed_indexes.add(index_id)
-
-        for position, index_id in enumerate(sorted(changed_indexes), start=1):
-            self._raise_if_cancelled(cancel_event)
-            index = indexes[index_id]
-            previous_status = index.status
-            if job_id is not None:
-                self._update_job(
-                    job_id,
-                    message=(
-                        f"Updating graph documents in RAG index "
-                        f"[{position}/{len(changed_indexes)}]: {index.name}"
-                    ),
-                    result={
-                        "phase": "rag_route_indexing",
-                        "index_id": index_id,
-                        "position": position,
-                        "total": len(changed_indexes),
-                    },
-                )
-            with self._cancellable_lock(self._index_work_lock(index_id), cancel_event):
-                self._update_index(index_id, status="indexing", error=None)
-                try:
-                    IndexBuildProcessRunner(
-                        self.service_for(index_id).settings,
-                        timeout_seconds=self.settings.index_build_timeout_seconds,
-                    ).build(cancel=cancel_event)
-                    stats = self.service_for(index_id).reload_cached_index()
-                    marker = Path(index.knowledge_dir).resolve() / "system-graph" / ".snapshot-id"
-                    marker.parent.mkdir(parents=True, exist_ok=True)
-                    marker_temporary = marker.with_suffix(".tmp")
-                    marker_temporary.write_text(snapshot_marker, encoding="utf-8")
-                    os.replace(marker_temporary, marker)
-                    self._update_index(
-                        index_id,
-                        status="ready",
-                        document_count=stats.document_count,
-                        chunk_count=stats.chunk_count,
-                        updated_at=_now(),
-                        error=None,
-                    )
-                except (CatalogJobCancelled, IndexBuildCancelled):
-                    self._update_index(index_id, status=previous_status, error=None)
-                    raise
-                except Exception:
-                    self._update_index(
-                        index_id,
-                        status="error",
-                        error="Graph route indexing failed; open the job log for traceback",
-                        updated_at=_now(),
-                    )
-                    raise
-                if job_id is not None:
-                    self._append_job_log(
-                        job_id,
-                        f"Graph routes indexed: index={index_id}; "
-                        f"documents={stats.document_count}; chunks={stats.chunk_count}",
-                    )
-
-    @staticmethod
-    def _graph_dependency_lines(
-        dependencies: list[Any],
-        evidence: dict[str, Any],
-        *,
-        outbound: bool,
-    ) -> list[str]:
-        lines: list[str] = []
-        for dependency in dependencies:
-            peer = (
-                dependency.target_service_id or dependency.target_hint
-                if outbound
-                else dependency.source_service_id
-            )
-            lines.append(
-                f"- `{dependency.protocol}` `{dependency.operation}` "
-                f"{'→' if outbound else '←'} `{peer}` · "
-                f"confidence `{dependency.confidence}` · {dependency.origin}"
-            )
-            for evidence_id in dependency.evidence_ids[:3]:
-                item = evidence.get(evidence_id)
-                if item is not None:
-                    lines.append(
-                        f"  - evidence `{item.file}:{item.line}` — {item.snippet[:240]}"
-                    )
-        return lines
 
     def _index_work_lock(self, index_id: str) -> threading.Lock:
         with self._lock:

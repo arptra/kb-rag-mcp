@@ -14,7 +14,8 @@ from gigacode_graph.cli import app as graph_cli
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.http_server import create_http_app
 from gigacode_graph.mcp_server import create_mcp_server
-from gigacode_graph.scanner import RepositoryScanner
+from gigacode_graph.models import GraphNode, GraphSnapshot
+from gigacode_graph.scanner import RepositoryScanner, merge_and_relink_snapshots
 from gigacode_graph.service import GraphService
 from gigacode_graph.sources import RepositoryOperationCancelled, RepositorySourceManager
 from gigacode_graph.store import JsonGraphStore
@@ -60,6 +61,8 @@ package example;
 public interface InventoryClient {
   @GetMapping("/api/inventory/{sku}")
   StockResponse stock(String sku);
+  @PostMapping("/api/inventory/reserve")
+  void reserve(String sku);
 }
 """,
     )
@@ -146,6 +149,8 @@ package example;
 public class InventoryController {
   @GetMapping("/{sku}")
   public StockResponse stock(String sku) { return new StockResponse(); }
+  @PostMapping("/reserve")
+  public void reserve(String sku) { }
   @KafkaListener(topics = "order.created")
   public void reserve(String event) { }
 }
@@ -201,6 +206,10 @@ def test_graph_queries_return_service_dossier_and_evidence(tmp_path: Path) -> No
         "service:order-service",
         "service:inventory-service",
     }
+    http_links = [edge for edge in view["edges"] if edge["metadata"].get("protocol") == "HTTP"]
+    assert len(http_links) == 1
+    assert http_links[0]["metadata"]["operation_count"] == 2
+    assert len(http_links[0]["metadata"]["edge_ids"]) == 2
     dossier = service.service_details("order-service")
     assert dossier["business"]["operation_count"] == 1
     assert {item["type"] for item in dossier["dependencies"]["nodes"]} == {"Service"}
@@ -215,6 +224,186 @@ def test_graph_queries_return_service_dossier_and_evidence(tmp_path: Path) -> No
     )
     result = service.search("amount", service="order-service")
     assert {item["type"] for item in result["results"]} >= {"BusinessRule", "Column"}
+
+
+def test_service_view_disambiguates_same_label_modules(tmp_path: Path) -> None:
+    store = JsonGraphStore(tmp_path / "graph.json")
+    store.save(
+        GraphSnapshot(
+            nodes=[
+                GraphNode(
+                    id="service:sample-java",
+                    type="Service",
+                    label="sample-service",
+                    service_id="sample-java",
+                    metadata={"module_path": "sample-java"},
+                ),
+                GraphNode(
+                    id="service:sample-kotlin",
+                    type="Service",
+                    label="sample-service",
+                    service_id="sample-kotlin",
+                    metadata={"module_path": "sample-kotlin"},
+                ),
+            ]
+        )
+    )
+
+    payload = GraphService(store).graph(view="services")
+
+    assert {node["label"] for node in payload["nodes"]} == {
+        "sample-service · sample-java",
+        "sample-service · sample-kotlin",
+    }
+
+
+def test_http_contract_matches_unresolved_client_to_unique_endpoint(tmp_path: Path) -> None:
+    caller = tmp_path / "caller"
+    target = tmp_path / "target"
+    _write(caller, "src/main/resources/application.properties", "spring.application.name=caller\n")
+    _write(
+        caller,
+        "src/main/java/example/TargetClient.java",
+        """
+package example;
+@FeignClient(name = "${clients.unknown}")
+public interface TargetClient {
+  @PostMapping("/api/payments/{id}/cancel")
+  void cancel(String id);
+}
+""",
+    )
+    _write(
+        caller,
+        "src/main/java/example/CallerService.java",
+        """
+package example;
+@Service
+public class CallerService {
+  public void cancel(String id) {
+    restTemplate.postForObject("http://target/api/payments/{id}/cancel", id, Void.class);
+  }
+}
+""",
+    )
+    _write(target, "src/main/resources/application.properties", "spring.application.name=target\n")
+    _write(
+        target,
+        "src/main/java/example/PaymentController.java",
+        """
+package example;
+@RestController
+@RequestMapping("/api/payments")
+public class PaymentController {
+  @PostMapping("/{paymentId}/cancel")
+  public void cancel(String paymentId) { }
+}
+""",
+    )
+
+    snapshot = RepositoryScanner(GraphSettings()).scan([caller, target])
+    dependency = next(
+        edge
+        for edge in snapshot.edges
+        if edge.type == "DEPENDS_ON"
+        and edge.source == "service:caller"
+        and edge.target == "service:target"
+    )
+    assert dependency.confidence == "MEDIUM"
+    assert dependency.metadata["matcher"] in {"http-contract", "alias+contract"}
+    assert len(dependency.evidence_ids) >= 2
+    assert any(
+        item.extractor == "spring-rest-template" for item in snapshot.evidence
+    )
+
+    merged = merge_and_relink_snapshots(
+        [
+            RepositoryScanner(GraphSettings()).scan([caller]),
+            RepositoryScanner(GraphSettings()).scan([target]),
+        ]
+    )
+    merged_dependency = next(
+        edge
+        for edge in merged.edges
+        if edge.type == "DEPENDS_ON"
+        and edge.source == "service:caller"
+        and edge.target == "service:target"
+    )
+    assert merged_dependency.metadata["matcher"] in {"http-contract", "alias+contract"}
+    assert len(merged_dependency.evidence_ids) >= 2
+
+
+def test_http_exchange_and_configured_kafka_contracts_are_linked(tmp_path: Path) -> None:
+    caller = tmp_path / "caller"
+    target = tmp_path / "target"
+    _write(
+        caller,
+        "src/main/resources/application.properties",
+        "spring.application.name=caller\ntopics.orders=orders.created\n",
+    )
+    _write(
+        caller,
+        "src/main/java/example/OrdersApi.java",
+        """
+package example;
+@HttpExchange("/api/orders")
+public interface OrdersApi {
+  @GetExchange("/{id}")
+  String get(String id);
+}
+""",
+    )
+    _write(
+        caller,
+        "src/main/java/example/Publisher.java",
+        """
+package example;
+@Service
+public class Publisher {
+  public void publish(String value) {
+    kafkaTemplate.send("${topics.orders}", value);
+  }
+}
+""",
+    )
+    _write(
+        target,
+        "src/main/resources/application.properties",
+        "spring.application.name=target\ntopics.orders=orders.created\n",
+    )
+    _write(
+        target,
+        "src/main/java/example/OrdersController.java",
+        """
+package example;
+@RestController
+@RequestMapping("/api/orders")
+public class OrdersController {
+  @GetMapping("/{orderId}")
+  public String get(String orderId) { return orderId; }
+  @KafkaListener(topics = "${topics.orders}")
+  public void consume(String event) { }
+}
+""",
+    )
+
+    merged = merge_and_relink_snapshots(
+        [
+            RepositoryScanner(GraphSettings()).scan([caller]),
+            RepositoryScanner(GraphSettings()).scan([target]),
+        ]
+    )
+
+    protocols = {
+        edge.metadata.get("protocol")
+        for edge in merged.edges
+        if edge.type == "DEPENDS_ON"
+        and edge.source == "service:caller"
+        and edge.target == "service:target"
+    }
+    assert protocols == {"HTTP", "KAFKA"}
+    assert any(item.extractor == "spring-http-interface" for item in merged.evidence)
+    assert any(node.type == "Event" and node.label == "orders.created" for node in merged.nodes)
 
 
 @pytest.mark.asyncio

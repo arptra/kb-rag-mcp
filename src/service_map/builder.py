@@ -38,7 +38,7 @@ from service_map.models import (
 )
 
 _INTERFACE_KINDS = {"HTTP", "KAFKA", "SCHEDULED", "GRPC", "CLI"}
-_ANALYZER_VERSION = "service-map-v3-java-kotlin-inventory"
+_ANALYZER_VERSION = "service-map-v4-contract-matching"
 
 
 @dataclass(frozen=True, slots=True)

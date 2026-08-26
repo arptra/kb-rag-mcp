@@ -39,7 +39,12 @@ evidence, and compact RAG excerpts grouped by service. Supply start_service when
 the tool discovers likely roots. The stable graph_revision changes after rebuild and next_calls
 contains exact kb_search_index calls for affected indexes. LOW/UNRESOLVED facts and runtime order
 must be verified."""
-INDEX_SEARCH_DESCRIPTION = """Search one exact RAG index selected by kb_feature_context. Pass the
+SYSTEM_GRAPH_DESCRIPTION = """Read the standalone system dependency graph for feature planning.
+This tool never reads, writes, embeds, or rebuilds a RAG index. It identifies root and affected
+services, HTTP/Kafka calls, confidence and source evidence from the latest graph snapshot, then
+returns explicit next_calls to kb_search_index for implementation details when an index is bound.
+Call this first for a complex or cross-service feature."""
+INDEX_SEARCH_DESCRIPTION = """Search one exact RAG index selected by kb_system_graph. Pass the
 returned index_id instead of guessing a managed MCP tool name. Use this for follow-up questions
 after graph routing and cite source_path/source_url from the results."""
 GENERATE_SSOT_DESCRIPTION = """Coordinate source-backed SSOT generation with the model calling this
@@ -57,6 +62,7 @@ proxy, finish through kb_save_and_upload_ssot so a temp copy exists on the user'
 BUILTIN_TOOL_DESCRIPTIONS = {
     "ssot_context": SSOT_DESCRIPTION,
     "kb_feature_context": FEATURE_CONTEXT_DESCRIPTION,
+    "kb_system_graph": SYSTEM_GRAPH_DESCRIPTION,
     "kb_search_index": INDEX_SEARCH_DESCRIPTION,
     "kb_generate_system_ssot": GENERATE_SSOT_DESCRIPTION,
     "kb_search": SEARCH_DESCRIPTION,
@@ -102,10 +108,9 @@ def create_mcp_server(
     server = FastMCP(
         "corporate-knowledge",
         instructions=(
-            "Call kb_feature_context before cross-service implementation work so the service "
-            "graph selects the affected RAG indexes. Cite returned source_path/source_url and "
-            "graph evidence. Use kb_search for narrower follow-up questions and kb_get_chunk only "
-            "when one selected result needs more context."
+            "Call kb_system_graph before cross-service implementation work. It reads the "
+            "standalone graph and returns explicit kb_search_index next_calls without querying "
+            "RAG itself. Cite graph evidence and later RAG source_path/source_url separately."
         ),
         version=__version__,
         auth=auth,
@@ -151,6 +156,30 @@ def create_mcp_server(
         )
 
     if feature_context is not None:
+
+        @server.tool(
+            name="kb_system_graph",
+            description=description("kb_system_graph"),
+            annotations={"readOnlyHint": True, "openWorldHint": False},
+        )
+        def kb_system_graph(
+            feature: str,
+            start_service: str | None = None,
+            max_hops: int = 2,
+            direction: Literal["incoming", "outgoing", "both"] = "both",
+            min_confidence: Literal[
+                "DECLARED", "HIGH", "MEDIUM", "LOW", "UNRESOLVED"
+            ] = "LOW",
+            include_unresolved: bool = True,
+        ) -> dict[str, Any]:
+            return feature_context.graph_route(
+                feature=feature,
+                start_service=start_service,
+                max_hops=max_hops,
+                direction=direction,
+                min_confidence=min_confidence,
+                include_unresolved=include_unresolved,
+            )
 
         @server.tool(
             name="kb_feature_context",

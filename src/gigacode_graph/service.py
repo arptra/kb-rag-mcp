@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import deque
@@ -20,6 +21,7 @@ from gigacode_graph.models import (
 from gigacode_graph.store import GraphStore
 
 _SERVICE_VIEW_TYPES = {"Service", "ExternalSystem"}
+_CONFIDENCE_RANK = {"UNRESOLVED": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "DECLARED": 4}
 
 
 def _jsonable(value: Any) -> Any:
@@ -30,6 +32,105 @@ def _jsonable(value: Any) -> Any:
 
 def _tokens(value: str) -> set[str]:
     return {item for item in re.split(r"[^a-zA-Z0-9_Ѐ-ӿ-]+", value.lower()) if item}
+
+
+def _aggregate_service_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
+    """Collapse parallel API calls into one stable service-view link per protocol."""
+    groups: dict[tuple[str, str, EdgeType, str], list[GraphEdge]] = {}
+    for edge in edges:
+        protocol = str(edge.metadata.get("protocol") or "UNKNOWN").upper()
+        groups.setdefault((edge.source, edge.target, edge.type, protocol), []).append(edge)
+
+    aggregated: list[GraphEdge] = []
+    for (source, target, edge_type, protocol), group in sorted(groups.items()):
+        ordered = sorted(group, key=lambda item: item.id)
+        if len(ordered) == 1:
+            aggregated.append(ordered[0])
+            continue
+        weakest = min(ordered, key=lambda item: _CONFIDENCE_RANK[item.confidence])
+        operations = sorted(
+            {
+                str(
+                    item.metadata.get("operation")
+                    or item.metadata.get("topic")
+                    or item.label
+                )
+                for item in ordered
+                if item.metadata.get("operation") or item.metadata.get("topic") or item.label
+            }
+        )
+        material = "\x1f".join((source, target, edge_type, protocol))
+        edge_id = "service-link:" + hashlib.sha256(material.encode()).hexdigest()[:20]
+        status = (
+            "unresolved"
+            if any(item.status == "unresolved" for item in ordered)
+            else "confirmed"
+            if all(item.status == "confirmed" for item in ordered)
+            else "inferred"
+        )
+        origin = (
+            "static+gigacode"
+            if any(item.origin == "static+gigacode" for item in ordered)
+            else "gigacode"
+            if any(item.origin == "gigacode" for item in ordered)
+            else "declared"
+            if all(item.origin == "declared" for item in ordered)
+            else "static"
+        )
+        verified_values = [item.verified_at for item in ordered if item.verified_at is not None]
+        aggregated.append(
+            weakest.model_copy(
+                update={
+                    "id": edge_id,
+                    "label": f"{protocol} · {len(operations)} operations",
+                    "confidence": weakest.confidence,
+                    "status": status,
+                    "origin": origin,
+                    "verified_at": max(verified_values) if verified_values else None,
+                    "metadata": {
+                        "protocol": protocol,
+                        "operation_count": len(operations),
+                        "operations": operations,
+                        "confidence_counts": {
+                            confidence: sum(
+                                item.confidence == confidence for item in ordered
+                            )
+                            for confidence in _CONFIDENCE_RANK
+                        },
+                        "edge_ids": [item.id for item in ordered],
+                    },
+                    "evidence_ids": list(
+                        dict.fromkeys(
+                            evidence_id
+                            for item in ordered
+                            for evidence_id in item.evidence_ids
+                        )
+                    ),
+                }
+            )
+        )
+    return aggregated
+
+
+def _display_node_payloads(nodes: list[GraphNode]) -> list[dict[str, Any]]:
+    duplicate_labels: dict[str, int] = {}
+    for node in nodes:
+        if node.type == "Service":
+            key = node.label.strip().lower()
+            duplicate_labels[key] = duplicate_labels.get(key, 0) + 1
+    payloads: list[dict[str, Any]] = []
+    for node in nodes:
+        payload = node.model_dump(mode="json")
+        if node.type == "Service" and duplicate_labels.get(node.label.strip().lower(), 0) > 1:
+            qualifier = str(node.metadata.get("module_path") or node.service_id or node.id)
+            payload["label"] = f"{node.label} · {qualifier}"
+            payload["metadata"] = {
+                **payload["metadata"],
+                "original_label": node.label,
+                "display_disambiguated": True,
+            }
+        payloads.append(payload)
+    return payloads
 
 
 class GraphService:
@@ -166,6 +267,8 @@ class GraphService:
 
         if not include_rejected:
             edges = [edge for edge in edges if edge.status != "rejected"]
+        if view == "services":
+            edges = _aggregate_service_edges(edges)
         if edge_types:
             allowed_edge_types = set(edge_types)
             edges = [edge for edge in edges if edge.type in allowed_edge_types]
@@ -198,7 +301,7 @@ class GraphService:
             "view": view,
             "focus": focus_id,
             "truncated": truncated,
-            "nodes": [_jsonable(node) for node in nodes],
+            "nodes": _display_node_payloads(nodes),
             "edges": [_jsonable(edge) for edge in edges],
         }
 

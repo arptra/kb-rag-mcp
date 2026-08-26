@@ -38,10 +38,13 @@ function useGraphSize() {
   useEffect(() => {
     if (!ref.current) return;
     const observer = new ResizeObserver(([entry]) => {
-      setSize({
+      const next = {
         width: Math.max(320, Math.floor(entry.contentRect.width)),
         height: Math.max(480, Math.floor(entry.contentRect.height)),
-      });
+      };
+      setSize((current) => current.width === next.width && current.height === next.height
+        ? current
+        : next);
     });
     observer.observe(ref.current);
     return () => observer.disconnect();
@@ -55,15 +58,36 @@ export default function GraphCanvas3D({ graph, selected, onSelect }: {
   onSelect: (node: GraphNode) => void;
 }) {
   const forceRef = useRef<ForceGraphMethods<GraphNode, GraphEdge>>();
+  const nodeCache = useRef(new Map<string, GraphNode & { x?: number; y?: number; z?: number; vx?: number; vy?: number; vz?: number }>());
+  const fittedSignature = useRef("");
   const { ref: containerRef, size } = useGraphSize();
-  const graphData = useMemo(() => ({
-    nodes: graph.nodes.map((node) => ({ ...node })),
-    links: graph.edges.map((edge) => ({
-      ...edge,
-      source: edgeSource(edge),
-      target: edgeTarget(edge),
-    })),
-  }), [graph]);
+  const graphSignature = useMemo(
+    () => `${graph.snapshot_id || graph.generated_at}::${graph.nodes.map((node) => `${node.id}:${node.type}:${node.label}`).sort().join("|")}::${graph.edges.map((edge) => `${edge.id}:${edge.confidence}:${edge.status}`).sort().join("|")}`,
+    [graph.edges, graph.generated_at, graph.nodes, graph.snapshot_id],
+  );
+  const graphData = useMemo(() => {
+    const nodes = graph.nodes.map((node) => {
+      const existing = nodeCache.current.get(node.id);
+      if (existing) {
+        Object.assign(existing, node);
+        return existing;
+      }
+      const created = { ...node };
+      nodeCache.current.set(node.id, created);
+      return created;
+    });
+    const linksById = new Map<string, GraphEdge>();
+    graph.edges.forEach((edge) => {
+      if (!linksById.has(edge.id)) {
+        linksById.set(edge.id, {
+          ...edge,
+          source: edgeSource(edge),
+          target: edgeTarget(edge),
+        });
+      }
+    });
+    return { nodes, links: [...linksById.values()] };
+  }, [graphSignature]);
   const focusNode = (node: GraphNode & { x?: number; y?: number; z?: number }) => {
     onSelect(node);
     if (node.x === undefined || node.y === undefined || node.z === undefined) return;
@@ -106,7 +130,13 @@ export default function GraphCanvas3D({ graph, selected, onSelect }: {
           sprite.position.y = node.type === "Service" ? 8 : 5;
           return sprite;
         }}
-        linkLabel={(edge) => `${edge.type} · ${CONFIDENCE_LABELS[edge.confidence] || edge.confidence}`}
+        linkLabel={(edge) => {
+          const count = Number(edge.metadata?.operation_count || 0);
+          const operations = Array.isArray(edge.metadata?.operations)
+            ? edge.metadata.operations.slice(0, 8).join("<br/>")
+            : edge.label;
+          return `${edge.type} · ${CONFIDENCE_LABELS[edge.confidence] || edge.confidence}${count > 1 ? `<br/><b>${count} вызовов</b>` : ""}${operations ? `<br/>${operations}` : ""}`;
+        }}
         linkColor={(edge) => confidenceColor(edge.confidence)}
         linkWidth={(edge) => edge.confidence === "DECLARED" ? 2.8 : edge.confidence === "HIGH" ? 2.2 : edge.confidence === "MEDIUM" ? 1.5 : 1.1}
         linkOpacity={0.78}
@@ -117,9 +147,14 @@ export default function GraphCanvas3D({ graph, selected, onSelect }: {
         linkDirectionalParticleWidth={1.7}
         linkDirectionalParticleSpeed={0.004}
         linkDirectionalParticleColor={(edge) => confidenceColor(edge.confidence)}
-        cooldownTicks={160}
-        d3VelocityDecay={0.28}
-        onEngineStop={() => forceRef.current?.zoomToFit(600, 65)}
+        cooldownTicks={90}
+        d3AlphaDecay={0.045}
+        d3VelocityDecay={0.42}
+        onEngineStop={() => {
+          if (fittedSignature.current === graphSignature) return;
+          fittedSignature.current = graphSignature;
+          forceRef.current?.zoomToFit(600, 65);
+        }}
         onNodeClick={(node) => focusNode(node)}
       />
     </div>

@@ -1342,7 +1342,7 @@ function ToolsPage({ data, password, onEditManaged, onEditBuiltin, onAction }: {
           const propertyCount = Object.keys(schemaProperties(tool.input_schema)).length;
           return (
           <article className="tool-card" key={tool.name}>
-            <header><span className="tool-mark">{tool.name === "kb_feature_context" ? "⌘" : "⌁"}</span><span className={`tag ${tool.kind === "managed" ? "managed" : ""}`}>{tool.kind}</span><button className="dots" aria-label={`Настроить ${tool.name}`} onClick={() => managed ? onEditManaged(managed) : onEditBuiltin(tool)}>•••</button></header>
+            <header><span className="tool-mark">{tool.name === "kb_system_graph" ? "⌘" : tool.name === "kb_feature_context" ? "◇" : "⌁"}</span><span className={`tag ${tool.kind === "managed" ? "managed" : ""}`}>{tool.kind}</span><button className="dots" aria-label={`Настроить ${tool.name}`} onClick={() => managed ? onEditManaged(managed) : onEditBuiltin(tool)}>•••</button></header>
             <code>{tool.name}</code><p>{tool.description}</p>
             <div className="bindings">{tool.kind === "managed" ? (tool.index_ids.length ? tool.index_ids.map((id) => <span className="tag" key={id}>◇ {indexNames[id] || id}</span>) : <span className="tag warning">Не привязан</span>) : <><span className="tag">code-backed</span>{tool.description_overridden && <span className="tag managed">описание изменено</span>}</>}</div>
             <footer><span>{propertyCount} параметров · JSON Schema</span><div className="card-actions"><button onClick={() => setTesting(testing === tool.name ? null : tool.name)}>{testing === tool.name ? "Скрыть тест ↑" : "Проверить →"}</button><button onClick={() => managed ? onEditManaged(managed) : onEditBuiltin(tool)}>Изменить</button>{managed && <button className="danger" onClick={() => { if (!window.confirm(`Удалить MCP tool «${tool.name}»?`)) return; void onAction(() => post("/admin/api/tools/delete", password, { name: tool.name }), "Tool удалён"); }}>Удалить</button>}</div></footer>
@@ -1608,9 +1608,10 @@ function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction 
   const [connectivity, setConnectivity] = useState<ConnectivityFilter>("all");
   const [focusDirection, setFocusDirection] = useState<FocusDirection>("all");
   const [query, setQuery] = useState("");
+  const availableTypesKey = Object.keys(data.nodes_by_type).sort().join("\u0000");
   useEffect(() => {
     api<GraphPayload>(`/admin/api/graph?view=${view}&limit=${view === "services" ? 5000 : 10000}`, password)
-      .then((payload) => { setGraph(payload); setSelected(null); setFocusDirection("all"); setError(""); })
+      .then((payload) => { setGraph(canonicalizeGraph(payload)); setSelected(null); setFocusDirection("all"); setError(""); })
       .catch((caught) => setError(caught instanceof Error ? caught.message : "Граф недоступен"));
   }, [password, view, data.generated_at]);
   useEffect(() => {
@@ -1619,7 +1620,7 @@ function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction 
       Object.keys(data.nodes_by_type).forEach((type) => next.add(type));
       return next;
     });
-  }, [data.nodes_by_type]);
+  }, [availableTypesKey]);
 
   const filtered = useMemo(() => filterGraph(
     graph,
@@ -1661,11 +1662,11 @@ function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction 
   return (
     <div className="graph-page">
       <div className="section-intro graph-intro">
-        <div><span className="eyebrow">Source-derived topology</span><h2>Граф связей системы</h2><p>Статика быстро находит кандидатов, GigaCode проверяет направление и цель по исходникам. Цвет связи показывает уровень уверенности.</p></div>
+        <div><span className="eyebrow">Source-derived topology</span><h2>Граф связей системы</h2><p>Граф хранится отдельным snapshot и доступен через MCP tool `kb_system_graph`: rebuild не пишет документы в RAG и не перестраивает индексы. Цвет связи показывает уровень уверенности.</p></div>
         <div className="graph-head-actions">
           <div className="segmented"><button className={view === "services" ? "active" : ""} onClick={() => setView("services")}>Сервисы</button><button className={view === "full" ? "active" : ""} onClick={() => setView("full")}>Полный граф</button></div>
-          <button className="button secondary" onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "static", verify_all: false }), "Быстрое перестроение запущено")}>⌘ Быстро</button>
-          <button className="button precise" disabled={!gigacodeAvailable} title={!gigacodeAvailable ? gigacodeError || "GigaCode недоступен" : "Проверить все связи через GigaCode"} onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "gigacode", verify_all: true }), "Точное перестроение с GigaCode запущено")}>✦ Точный rebuild</button>
+          <button className="button secondary" onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "static", verify_all: false }), "Быстрое перестроение отдельного графа запущено")}>⌘ Быстро</button>
+          <button className="button precise" disabled={!gigacodeAvailable} title={!gigacodeAvailable ? gigacodeError || "GigaCode недоступен" : "Проверить связи через GigaCode без изменения RAG-индексов"} onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "gigacode", verify_all: true }), "Точное перестроение отдельного графа запущено")}>✦ Точный rebuild</button>
         </div>
       </div>
       <div className="graph-toolbar">
@@ -1685,7 +1686,7 @@ function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction 
           <div className="confidence-list">{CONFIDENCE_ORDER.map((confidence) => <button aria-pressed={selectedConfidence.has(confidence)} className={selectedConfidence.has(confidence) ? "active" : ""} key={confidence} onClick={() => toggleConfidence(confidence)}><i style={{ background: confidenceColor(confidence) }} /><span>{CONFIDENCE_LABELS[confidence]}</span></button>)}</div>
         </aside>
         <section className="graph-canvas">{error ? <div className="empty-state"><h3>{error}</h3></div> : filtered && filtered.nodes.length ? <GraphCanvas graph={filtered} selected={selected?.id || null} onSelect={setSelected} /> : <div className="empty-state"><div>⌘</div><h3>По фильтрам ничего нет</h3><p>Сбросьте фильтры или запустите перестроение.</p></div>}</section>
-        <aside className="graph-details">{selected ? <><span className="eyebrow">{selected.type}</span><h3>{selected.label}</h3><code>{selected.id}</code><div className="selected-edge-summary"><span><b>{selectedLinks.filter((edge) => edgeTarget(edge) === selected.id).length}</b> входящих</span><span><b>{selectedLinks.filter((edge) => edgeSource(edge) === selected.id).length}</b> исходящих</span></div><h4>Метаданные</h4><pre>{JSON.stringify(selected.metadata, null, 2)}</pre><h4>Evidence</h4><p>{selected.evidence_ids.length ? `${selected.evidence_ids.length} подтверждений в исходном коде` : "Для агрегированного узла evidence не записан."}</p><h4>Связи</h4><div className="edge-detail-list">{selectedLinks.slice(0, 40).map((edge) => <span key={edge.id}><i style={{ background: confidenceColor(edge.confidence) }} /><b>{edgeSource(edge) === selected.id ? "→" : "←"} {edge.type}</b><small>{CONFIDENCE_LABELS[edge.confidence] || edge.confidence}</small></span>)}</div></> : <><div className="detail-placeholder">⌖</div><h3>Выберите узел</h3><p>Кликните узел: камера приблизится, здесь появятся направления связей, confidence и evidence.</p></>}</aside>
+          <aside className="graph-details">{selected ? <><span className="eyebrow">{selected.type}</span><h3>{selected.label}</h3><code>{selected.id}</code><div className="selected-edge-summary"><span><b>{selectedLinks.filter((edge) => edgeTarget(edge) === selected.id).length}</b> входящих</span><span><b>{selectedLinks.filter((edge) => edgeSource(edge) === selected.id).length}</b> исходящих</span></div><h4>Метаданные</h4><pre>{JSON.stringify(selected.metadata, null, 2)}</pre><h4>Evidence</h4><p>{selected.evidence_ids.length ? `${selected.evidence_ids.length} подтверждений в исходном коде` : "Для агрегированного узла evidence не записан."}</p><h4>Связи</h4><div className="edge-detail-list">{selectedLinks.slice(0, 40).map((edge) => <span key={edge.id}><i style={{ background: confidenceColor(edge.confidence) }} /><b>{edgeSource(edge) === selected.id ? "→" : "←"} {edge.type}</b><small>{Number(edge.metadata?.operation_count || 0) > 1 ? `${edge.metadata.operation_count} вызовов · ` : ""}{CONFIDENCE_LABELS[edge.confidence] || edge.confidence}</small></span>)}</div></> : <><div className="detail-placeholder">⌖</div><h3>Выберите узел</h3><p>Кликните узел: камера приблизится, здесь появятся направления связей, confidence и evidence.</p></>}</aside>
       </div>
     </div>
   );
@@ -1705,6 +1706,17 @@ function edgeSource(edge: GraphPayload["edges"][number]): string {
 
 function edgeTarget(edge: GraphPayload["edges"][number]): string {
   return typeof edge.target === "object" ? edge.target.id : edge.target;
+}
+
+function canonicalizeGraph(graph: GraphPayload): GraphPayload {
+  const nodes = [...new Map(graph.nodes.map((node) => [node.id, node])).values()];
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const edges = [...new Map(
+    graph.edges
+      .filter((edge) => nodeIds.has(edgeSource(edge)) && nodeIds.has(edgeTarget(edge)))
+      .map((edge) => [edge.id, { ...edge, source: edgeSource(edge), target: edgeTarget(edge) }]),
+  ).values()];
+  return { ...graph, nodes, edges };
 }
 
 function filterGraph(

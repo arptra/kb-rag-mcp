@@ -55,12 +55,19 @@ extractor. Выводы имеют `DECLARED`, `HIGH`, `MEDIUM`, `LOW` или `U
 - **«Точный rebuild»** — тот же статический scan, затем read-only GigaCode проверяет bounded-пакеты
   уже найденных межсервисных dependency-кандидатов.
 
-Во втором режиме GigaCode не генерирует topology с нуля. Сервер передаёт ему candidate id,
-исходный/предполагаемый целевой сервис, интерфейс и имеющееся evidence. Модель возвращает только
-`confirm`, `reject`, `retarget` или `unresolved`. Сервер принимает новое evidence лишь когда файл
-находится внутри нужного checkout и указанная строка реально существует; неизвестные сервисы и
-candidate id отбрасываются. Таким образом LLM повышает precision сложных Kotlin/Java-связей, но не
-становится владельцем graph state.
+Во втором режиме сервер передаёт GigaCode candidate id, исходный/предполагаемый целевой сервис,
+интерфейс и имеющееся evidence. Модель возвращает `confirm`, `reject`, `retarget` или `unresolved`.
+Дополнительно первый пакет каждого repository разрешает discovery пропущенных custom-wrapper
+вызовов. Новый edge принимается только если GigaCode указал существующую source-строку, выбрал
+конкретный уже найденный target entrypoint и их нормализованные protocol/operation совпали. Поэтому
+у discovery-edge всегда есть evidence вызывающей и принимающей стороны; произвольные сервисы,
+строки и API сервер отбрасывает.
+
+До GigaCode работает deterministic contract matcher. Он разрешает `${property}` из `.properties` и
+простого YAML, извлекает Spring MVC, Feign, Spring HTTP Interface, WebClient/RestTemplate,
+KafkaTemplate, `@KafkaListener` и `@SendTo`. HTTP сопоставляется по service alias/hostname и
+нормализованному `method + path` (`{id}` и `{paymentId}` считаются одним шаблоном), Kafka — по
+точному topic. Если path соответствует нескольким сервисам, связь остаётся `UNRESOLVED`.
 
 Каждый опубликованный результат имеет общие для `graph.json` и `service_map.json` поля
 `schema_version`, `snapshot_id`, `analysis_mode` и `verification`. Цвета UI соответствуют confidence:
@@ -73,8 +80,9 @@ candidate id отбрасываются. Таким образом LLM повы�
 
 Отклонённые связи остаются в versioned graph для аудита, но по умолчанию не показываются в UI,
 service map и feature-routing. Raw GigaCode result записывается в
-`.cache/kb/analysis/gigacode-verification/`. После явной перестройки создаются RAG-документы
-`system-graph/<service>.md`; изменившиеся индексы перестраиваются автоматически.
+`.cache/kb/analysis/gigacode-verification/`. Перестройка сохраняет только отдельные `graph.json`,
+`service_map.json` и analysis archive. Граф не превращается в документы, не загружается в RAG и не
+запускает перестройку embeddings. Для клиентов он доступен через MCP tool `kb_system_graph`.
 
 Административный API принимает:
 
@@ -92,6 +100,12 @@ curl -X POST http://127.0.0.1:8000/admin/api/graph/rebuild \
 
 Для просмотра можно передавать CSV-фильтры `node_types`, `edge_types`, `confidences`, а также
 `connected_only=true` и `include_rejected=true` в `GET /admin/api/graph`.
+
+В service-view параллельные HTTP/Kafka операции одной пары сервисов агрегируются в одну линию по
+protocol. Hover показывает количество и список операций; цвет берётся по самой слабой из них, чтобы
+агрегация не скрывала неопределённость. Full graph по-прежнему показывает отдельные API/events.
+Frontend сохраняет координаты узлов между dashboard polling-запросами, поэтому фоновые job updates
+не перезапускают force simulation и не сбрасывают пользовательскую камеру.
 
 ## Быстрый запуск
 

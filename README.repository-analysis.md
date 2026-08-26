@@ -503,9 +503,9 @@ jq '.issues' .cache/kb/system_graph.json
 
 ## Как граф используется нейросетью вместе с RAG
 
-Основной HTTP MCP server публикует встроенный tool `kb_feature_context`. Реализация находится в
+Основной HTTP MCP server публикует встроенный tool `kb_system_graph`. Реализация находится в
 [`src/corporate_kb/feature_context.py`](src/corporate_kb/feature_context.py). Это связующий слой
-между двумя артефактами анализа и каталогом индексов:
+между отдельным snapshot графа и каталогом индексов:
 
 ```text
 feature + start_service (optional)
@@ -513,9 +513,11 @@ feature + start_service (optional)
   -> пройти incoming/outgoing dependencies до max_hops
   -> восстановить caller, callee, protocol, operation и связанный trigger/handler
   -> сопоставить service -> repository -> RAG index
-  -> выполнить ограниченный поиск в каждом индексе
-  -> вернуть единый JSON с calls, services[].rag, evidence и warnings
+  -> вернуть calls, evidence и явные next_calls к kb_search_index
 ```
+
+`kb_system_graph` сам не читает и не изменяет RAG. Граф не преобразуется в Markdown-документы и
+не входит в embeddings; поисковые вызовы выполняются клиентом отдельным следующим шагом.
 
 `invocation_contexts` строится только когда `BusinessOperation -> EXITS_VIA -> ExitPoint` можно
 связать с dependency по operation или evidence. Если такой связи нет, tool прямо пишет, что найден
