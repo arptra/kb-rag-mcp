@@ -160,11 +160,15 @@
       text-anchor: middle;
     }
 
+    .node-title-small { font-size: 17px; }
+
     .node-subtitle {
       fill: var(--muted);
       font-size: 14px;
       text-anchor: middle;
     }
+
+    .node-subtitle-small { font-size: 12px; }
 
     .node-code {
       fill: #d8f4ff;
@@ -172,6 +176,8 @@
       font-size: 14px;
       text-anchor: middle;
     }
+
+    .node-code-small { font-size: 12px; }
 
     .arrow-cyan,
     .arrow-violet,
@@ -188,6 +194,14 @@
     .arrow-red { stroke: var(--red); stroke-dasharray: 8 7; marker-end: url(#arrow-red); }
     .arrow-neutral { stroke: #668198; marker-end: url(#arrow-neutral); }
     .connector { fill: none; stroke: var(--line); stroke-width: 1.3; }
+    .arrow-label,
+    .arrow-label-yes,
+    .arrow-label-no {
+      paint-order: stroke;
+      stroke: #0b1a2b;
+      stroke-width: 5px;
+      stroke-linejoin: round;
+    }
     .arrow-label { fill: var(--muted); font-size: 13px; text-anchor: middle; }
     .arrow-label-yes { fill: var(--green); font-size: 13px; font-weight: 700; }
     .arrow-label-no { fill: var(--red); font-size: 13px; font-weight: 700; }
@@ -247,7 +261,7 @@
         <text class="lane-subtitle" x="65" y="133">Уже есть в контуре управления RAG</text>
 
         <g class="node" filter="url(#node-shadow)"><rect x="70" y="185" width="210" height="76" rx="14"/><text class="node-title" x="175" y="217">Git-репозитории</text><text class="node-subtitle" x="175" y="239">сотни сервисов</text></g>
-        <g class="node" filter="url(#node-shadow)"><rect x="70" y="282" width="210" height="76" rx="14"/><text class="node-title" x="175" y="314">OpenSpec / Confluence</text><text class="node-subtitle" x="175" y="336">ADR · правила · контракты</text></g>
+        <g class="node" filter="url(#node-shadow)"><rect x="70" y="282" width="210" height="76" rx="14"/><text class="node-title node-title-small" x="175" y="314">OpenSpec / Confluence</text><text class="node-subtitle" x="175" y="336">ADR · правила · контракты</text></g>
         <g class="node" filter="url(#node-shadow)"><rect x="70" y="379" width="210" height="76" rx="14"/><text class="node-title" x="175" y="411">Проверенные SSOT</text><text class="node-subtitle" x="175" y="433">подтверждённая истина</text></g>
 
         <path class="connector" d="M280 223 H330 M280 320 H330 M280 417 H330 M330 223 V417"/>
@@ -261,7 +275,7 @@
 
         <g class="node node-cyan"><rect x="730" y="155" width="210" height="72" rx="14"/><text class="node-title" x="835" y="185">Системный граф</text><text class="node-code" x="835" y="207">system_graph.json</text></g>
         <path class="arrow-cyan" d="M700 191 H730"/>
-        <g class="node node-cyan"><rect x="730" y="246" width="210" height="72" rx="14"/><text class="node-title" x="835" y="276">Карта сервисов</text><text class="node-code" x="835" y="298">сервис → репозиторий → API</text></g>
+        <g class="node node-cyan"><rect x="730" y="246" width="210" height="72" rx="14"/><text class="node-title" x="835" y="276">Карта сервисов</text><text class="node-code node-code-small" x="835" y="298">сервис → репозиторий → API</text></g>
         <path class="arrow-cyan" d="M700 282 H730"/>
         <g class="node node-cyan"><rect x="730" y="337" width="210" height="72" rx="14"/><text class="node-title" x="835" y="367">RAG-индексы</text><text class="node-code" x="835" y="389">по репозиторию / домену</text></g>
         <path class="arrow-cyan" d="M700 373 H730"/>
@@ -278,27 +292,27 @@
         <text class="lane-title" x="65" y="626">Найти затронутые сервисы и собрать план</text>
         <text class="lane-subtitle" x="65" y="651">Только чтение: никаких записей в Jira</text>
 
-        <g class="node node-violet" filter="url(#node-shadow)"><rect x="65" y="710" width="190" height="86" rx="15"/><text class="node-title" x="160" y="744">Описание фичи</text><text class="node-subtitle" x="160" y="768">цель · акторы · ограничения</text></g>
+        <g class="node node-violet" filter="url(#node-shadow)"><rect x="65" y="710" width="190" height="86" rx="15"/><text class="node-title" x="160" y="744">Описание фичи</text><text class="node-subtitle node-subtitle-small" x="160" y="768">цель · акторы · ограничения</text></g>
         <path class="arrow-violet" d="M255 753 H315"/>
-        <g class="node node-violet" filter="url(#node-shadow)"><rect x="315" y="694" width="215" height="118" rx="16"/><text class="node-title" x="422" y="729">Скилл планирования</text><text class="node-code" x="422" y="754">plan-feature-with-</text><text class="node-code" x="422" y="773">system-graph</text><text class="node-subtitle" x="422" y="795">нормализация требований</text></g>
+        <g class="node node-violet" filter="url(#node-shadow)"><rect x="315" y="694" width="215" height="118" rx="16"/><text class="node-title node-title-small" x="422" y="729">Скилл планирования</text><text class="node-code" x="422" y="754">plan-feature-with-</text><text class="node-code" x="422" y="773">system-graph</text><text class="node-subtitle" x="422" y="795">нормализация требований</text></g>
         <path class="arrow-violet" d="M530 753 H590"/>
-        <g class="node node-violet" filter="url(#node-shadow)"><rect x="590" y="686" width="235" height="134" rx="16"/><text class="node-title" x="707" y="721">Маршрутизация по графу</text><text class="node-code" x="707" y="748">kb_tiny_ssot</text><text class="node-code" x="707" y="769">kb_system_graph</text><text class="node-subtitle" x="707" y="793">корень · направление · глубина</text></g>
+        <g class="node node-violet" filter="url(#node-shadow)"><rect x="590" y="686" width="235" height="134" rx="16"/><text class="node-title node-title-small" x="707" y="721">Маршрутизация по графу</text><text class="node-code" x="707" y="748">kb_tiny_ssot</text><text class="node-code" x="707" y="769">kb_system_graph</text><text class="node-subtitle" x="707" y="793">корень · направление · глубина</text></g>
         <path class="arrow-violet" d="M825 753 H885"/>
-        <g class="node node-violet" filter="url(#node-shadow)"><rect x="885" y="694" width="260" height="118" rx="16"/><text class="node-title" x="1015" y="729">Затронутые сервисы</text><text class="node-subtitle" x="1015" y="754">корень + входящие + исходящие</text><text class="node-code" x="1015" y="778">сервис → репозиторий → index_id</text></g>
+        <g class="node node-violet" filter="url(#node-shadow)"><rect x="885" y="694" width="260" height="118" rx="16"/><text class="node-title" x="1015" y="729">Затронутые сервисы</text><text class="node-subtitle" x="1015" y="754">корень + входящие + исходящие</text><text class="node-code node-code-small" x="1015" y="778">сервис → репозиторий → index_id</text></g>
 
         <path class="arrow-violet" d="M1015 812 V872"/>
         <text class="arrow-label" x="1055" y="846">следующие вызовы</text>
         <g class="node node-violet" filter="url(#node-shadow)"><rect x="860" y="872" width="285" height="105" rx="16"/><text class="node-title" x="1002" y="907">Детали из нужных RAG</text><text class="node-code" x="1002" y="932">kb_search_index(index_id)</text><text class="node-subtitle" x="1002" y="955">API · Kafka · БД · развёртывание</text></g>
         <path class="arrow-violet" d="M860 924 H790"/>
-        <g class="node node-violet" filter="url(#node-shadow)"><rect x="555" y="872" width="235" height="105" rx="16"/><text class="node-title" x="672" y="907">План реализации</text><text class="node-subtitle" x="672" y="932">репозиторий → сервис → изменения</text><text class="node-subtitle" x="672" y="954">тесты · порядок · риски</text></g>
+        <g class="node node-violet" filter="url(#node-shadow)"><rect x="555" y="872" width="235" height="105" rx="16"/><text class="node-title" x="672" y="907">План реализации</text><text class="node-subtitle node-subtitle-small" x="672" y="932">репозиторий → сервис → изменения</text><text class="node-subtitle" x="672" y="954">тесты · порядок · риски</text></g>
         <path class="arrow-violet" d="M555 924 H493"/>
 
         <g class="node node-red"><polygon points="385,855 493,924 385,993 277,924"/><text class="node-title" x="385" y="912">Доказательств</text><text class="node-subtitle" x="385" y="935">достаточно?</text></g>
         <path class="arrow-red" d="M385 855 V838 H707 V820"/>
-        <text class="arrow-label-no" x="507" y="846">НЕТ: проверить / перестроить</text>
+        <text class="arrow-label-no" x="507" y="834">НЕТ: проверить / перестроить</text>
         <path class="arrow-violet" d="M277 924 H220"/>
         <text class="arrow-label-yes" x="245" y="910">ДА</text>
-        <g class="node node-green" filter="url(#node-shadow)"><rect x="65" y="872" width="155" height="105" rx="16"/><text class="node-title" x="142" y="907">Согласовать</text><text class="node-subtitle" x="142" y="932">продукт</text><text class="node-subtitle" x="142" y="952">архитектура · владельцы</text></g>
+        <g class="node node-green" filter="url(#node-shadow)"><rect x="65" y="872" width="155" height="105" rx="16"/><text class="node-title" x="142" y="907">Согласовать</text><text class="node-subtitle node-subtitle-small" x="142" y="932">продукт · владельцы</text><text class="node-subtitle" x="142" y="952">архитектура</text></g>
 
         <path class="arrow-orange" d="M142 977 V1132 H620 V1178"/>
         <text class="arrow-label" x="370" y="1120">согласованный план</text>
@@ -315,7 +329,7 @@
         <path class="arrow-orange" d="M565 1376 H635"/>
         <g class="node node-red"><polygon points="745,1304 855,1376 745,1448 635,1376"/><text class="node-title" x="745" y="1364">Маршруты</text><text class="node-subtitle" x="745" y="1387">заполнены?</text></g>
         <path class="arrow-red" d="M745 1304 V1292 H440 V1318"/>
-        <text class="arrow-label-no" x="590" y="1287">НЕТ: назначить владельца / проект</text>
+        <text class="arrow-label-no" x="590" y="1310">НЕТ: назначить владельца / проект</text>
         <path class="arrow-orange" d="M855 1376 H915"/>
         <text class="arrow-label-yes" x="884" y="1362">ДА</text>
         <g class="node node-orange" filter="url(#node-shadow)"><rect x="915" y="1324" width="230" height="104" rx="16"/><text class="node-title" x="1030" y="1359">Предпросмотр</text><text class="node-subtitle" x="1030" y="1383">проекты · задачи · связи</text><text class="node-subtitle" x="1030" y="1405">без записи в Jira</text></g>
@@ -323,20 +337,20 @@
         <path class="arrow-orange" d="M1030 1428 V1480 H862"/>
         <g class="node node-red"><polygon points="745,1450 862,1520 745,1590 628,1520"/><text class="node-title" x="745" y="1507">Создать задачи?</text><text class="node-subtitle" x="745" y="1530">явное подтверждение</text></g>
         <path class="arrow-red" d="M745 1450 V1438 H1030 V1428"/>
-        <text class="arrow-label-no" x="866" y="1452">НЕТ: исправить предпросмотр</text>
+        <text class="arrow-label-no" x="1000" y="1462">НЕТ: исправить предпросмотр</text>
         <path class="arrow-orange" d="M628 1520 H560"/>
         <text class="arrow-label-yes" x="595" y="1506">ДА</text>
-        <g class="node node-orange" filter="url(#node-shadow)"><rect x="350" y="1470" width="210" height="100" rx="16"/><text class="node-title" x="455" y="1507">API Jira</text><text class="node-subtitle" x="455" y="1531">идемпотентность + дедупликация</text><text class="node-subtitle" x="455" y="1552">создать + связать</text></g>
+        <g class="node node-orange" filter="url(#node-shadow)"><rect x="350" y="1470" width="210" height="100" rx="16"/><text class="node-title" x="455" y="1507">API Jira</text><text class="node-subtitle" x="455" y="1531">идемпотентность</text><text class="node-subtitle" x="455" y="1552">дедупликация · связи</text></g>
         <path class="arrow-orange" d="M350 1520 H290"/>
-        <g class="node node-orange" filter="url(#node-shadow)"><rect x="65" y="1470" width="225" height="100" rx="16"/><text class="node-title" x="177" y="1507">Эпик фичи</text><text class="node-subtitle" x="177" y="1531">продуктовый / владеющий проект</text><text class="jira-key" x="177" y="1553">EPIC-123</text></g>
+        <g class="node node-orange" filter="url(#node-shadow)"><rect x="65" y="1470" width="225" height="100" rx="16"/><text class="node-title" x="177" y="1507">Эпик фичи</text><text class="node-subtitle" x="177" y="1531">проект-владелец</text><text class="jira-key" x="177" y="1553">EPIC-123</text></g>
 
         <path class="jira-tree-line" d="M177 1570 V1614 H455 M177 1614 H1015"/>
         <path class="arrow-orange" d="M455 1614 V1630"/>
         <path class="arrow-orange" d="M735 1614 V1630"/>
         <path class="arrow-orange" d="M1015 1614 V1630"/>
-        <g class="node node-orange"><rect x="350" y="1630" width="210" height="56" rx="13"/><text class="node-title" x="455" y="1655">Стори · Сервис А</text><text class="node-subtitle" x="455" y="1675">КОМАНДА-А · задачи</text></g>
-        <g class="node node-orange"><rect x="630" y="1630" width="210" height="56" rx="13"/><text class="node-title" x="735" y="1655">Стори · Сервис Б</text><text class="node-subtitle" x="735" y="1675">КОМАНДА-Б · задачи</text></g>
-        <g class="node node-orange"><rect x="910" y="1630" width="210" height="56" rx="13"/><text class="node-title" x="1015" y="1655">Стори · Сервис N</text><text class="node-subtitle" x="1015" y="1675">КОМАНДА-N · задачи</text></g>
+        <g class="node node-orange"><rect x="350" y="1630" width="210" height="56" rx="13"/><text class="node-title node-title-small" x="455" y="1658">Стори · Сервис А</text><text class="node-subtitle" x="455" y="1674">КОМАНДА-А · задачи</text></g>
+        <g class="node node-orange"><rect x="630" y="1630" width="210" height="56" rx="13"/><text class="node-title node-title-small" x="735" y="1658">Стори · Сервис Б</text><text class="node-subtitle" x="735" y="1674">КОМАНДА-Б · задачи</text></g>
+        <g class="node node-orange"><rect x="910" y="1630" width="210" height="56" rx="13"/><text class="node-title node-title-small" x="1015" y="1658">Стори · Сервис N</text><text class="node-subtitle" x="1015" y="1674">КОМАНДА-N · задачи</text></g>
       </svg>
     </div>
   </main>
