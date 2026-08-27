@@ -76,4 +76,6 @@ Answer in the user's language with:
 6. ordered implementation and rollout sequence;
 7. test plan and acceptance traceability;
 8. risks, conflicts, unknowns, and explicit verification tasks;
-9. source/index/tool coverage showing which MCP tools and citations informed the plan.
+9. source/index/tool coverage showing which MCP tools and citations informed the plan;
+10. a final handoff recommending `$verify-cross-service-feature` for an independent audit before
+    implementation begins.

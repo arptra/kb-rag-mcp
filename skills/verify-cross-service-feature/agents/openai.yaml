@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verify Cross-Service Feature"
+  short_description: "Audit feature claims against current evidence"
+  default_prompt: "Use $verify-cross-service-feature to audit this feature brief and implementation plan for hallucinations, duplicates, and unsupported system claims."

@@ -46,4 +46,5 @@ Answer in the user's language and return exactly one feature brief with:
 5. proposed contract changes, explicitly distinguishing API and Kafka changes;
 6. business acceptance criteria;
 7. evidence used and unresolved assumptions;
-8. a final handoff sentence recommending `$plan-feature-with-system-graph` for implementation planning.
+8. a final handoff sentence recommending `$verify-cross-service-feature` for an independent grounding
+   audit before `$plan-feature-with-system-graph` performs implementation planning.

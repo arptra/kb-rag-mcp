@@ -367,6 +367,15 @@ RAG. В неоднозначном случае ответ имеет `status: n
 [`plan-feature-with-system-graph`](skills/plan-feature-with-system-graph/SKILL.md): модель сначала
 вызывает `kb_system_graph`, фиксирует `graph_revision`, затем исполняет возвращённые `next_calls`
 к `kb_search_index` только для затронутых сервисов и строит план по repository/service с evidence.
+Перед реализацией результат можно независимо проверить с помощью
+[`verify-cross-service-feature`](skills/verify-cross-service-feature/SKILL.md): скилл раскладывает
+feature brief и план на атомарные утверждения, повторно проверяет их по текущему SSOT, графу,
+маршрутизированным индексам и исходникам и выдаёт строгий вердикт `PASS`, `CONDITIONAL_PASS`, `FAIL`
+или `BLOCKED`. Отсутствие совпадений в semantic search он не выдаёт за доказательство отсутствия
+функционала, а ограничивает формулировкой `NOT_FOUND_IN_CHECKED_SOURCES` с явным покрытием.
+Полный безопасный цикл: `$generate-cross-service-feature` → аудит brief →
+`$plan-feature-with-system-graph` → аудит плана → реализация. Аудит желательно запускать в новой
+задаче, чтобы проверяющая модель не наследовала рассуждения генератора.
 Граф хранится отдельно от knowledge-директорий и embeddings; static и GigaCode rebuild не запускают
 индексацию. Старые автоматически созданные `system-graph/*.md` удаляются при следующем rebuild.
 
