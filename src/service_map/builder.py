@@ -78,6 +78,7 @@ class ServiceMapBuilder:
         checkpoint: Callable[[ServiceMapBuildResult], None] | None = None,
         force_service_ids: set[str] | None = None,
         force_all: bool = False,
+        skip_service_ids: set[str] | None = None,
     ) -> ServiceMapBuildResult:
         if not repositories:
             return ServiceMapBuildResult(GraphSnapshot(), ServiceMapSnapshot())
@@ -158,7 +159,20 @@ class ServiceMapBuilder:
         module_snapshots: list[GraphSnapshot] = []
         last_checkpoint_at = time.monotonic()
         forced = force_service_ids or set()
+        skipped = skip_service_ids or set()
         for position, target in enumerate(targets, start=1):
+            if target.service_id in skipped:
+                if progress is not None:
+                    progress(
+                        f"Module source scan skipped [{position}/{len(targets)}]: "
+                        f"{target.service_id}; reason=openspec-authoritative"
+                    )
+                skipped_snapshot = RepositoryScanner(self._settings).discover_targets(
+                    [target],
+                    progress=progress,
+                )
+                module_snapshots.append(skipped_snapshot)
+                continue
             if progress is not None:
                 progress(
                     f"Module cache key [{position}/{len(targets)}] start: "

@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     mcp_http_port: int = Field(default=8000, ge=1, le=65535)
     mcp_http_path: str = "/mcp"
     mcp_http_bearer_token: SecretStr | None = None
+    mcp_tls_enabled: bool = True
+    mcp_tls_cert_file: Path = Path("certs/server.crt")
+    mcp_tls_key_file: Path = Path("certs/server.key")
 
     @field_validator("mcp_http_path")
     @classmethod
@@ -131,5 +134,7 @@ class Settings(BaseSettings):
                 "analysis_archive_dir": resolve(self.analysis_archive_dir),
                 "job_logs_dir": resolve(self.job_logs_dir),
                 "ssot_skill_path": resolve(self.ssot_skill_path),
+                "mcp_tls_cert_file": resolve(self.mcp_tls_cert_file),
+                "mcp_tls_key_file": resolve(self.mcp_tls_key_file),
             }
         )

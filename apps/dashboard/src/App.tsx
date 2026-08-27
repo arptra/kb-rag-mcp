@@ -361,6 +361,17 @@ export default function App() {
             <button className="button quiet" onClick={() => void load()} disabled={loading}>↻ Обновить</button>
           {page === "indexes" && selectedIndexId && <button className="button quiet" onClick={() => setSelectedIndexId(null)}>← Все индексы</button>}
           {page === "indexes" && !selectedIndexId && <button className="button primary" onClick={() => setRepositoryModal(true)}>＋ Подключить репозиторий</button>}
+            {page === "services" && (
+              <button
+                className="button secondary"
+                disabled={loading || overview.catalog.jobs.some((job) => job.type === "ssot" && job.target_id === "all-services" && ["queued", "running", "cancelling"].includes(job.status))}
+                title="OpenSpec загружается напрямую; остальные сервисы анализируются через GigaCode, если он доступен, иначе статически. Затем обновляются привязанные индексы."
+                onClick={() => void action(
+                  () => post("/admin/api/services/refresh-all", password, {}),
+                  "Обновление SSOT всех сервисов поставлено в очередь",
+                )}
+              >↻ Обновить все SSOT</button>
+            )}
             {page === "services" && <button className="button primary" onClick={() => setSystemSsotModal(true)}>✦ Подготовить SSOT-контекст</button>}
             {page === "servers" && <button className="button primary" onClick={() => setServerModal(true)}>＋ Добавить MCP server</button>}
             {page === "tools" && <button className="button primary" onClick={() => setToolModal("new")}>＋ Новый MCP tool</button>}

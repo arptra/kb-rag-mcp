@@ -1,10 +1,11 @@
-"""Authenticated FastMCP Streamable HTTP entry point for remote clients."""
+"""TLS-enabled FastMCP Streamable HTTP entry point for remote clients."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import secrets
+import ssl
 import time
 from pathlib import Path
 from typing import Literal
@@ -215,6 +216,29 @@ def validate_http_settings(settings: Settings) -> str | None:
     return token
 
 
+def tls_uvicorn_config(settings: Settings) -> dict[str, object] | None:
+    """Validate the server certificate pair and return one-way TLS settings."""
+    if not settings.mcp_tls_enabled:
+        return None
+    certificate = settings.mcp_tls_cert_file
+    private_key = settings.mcp_tls_key_file
+    if not certificate.is_file():
+        raise ValueError(f"TLS certificate was not found: {certificate}")
+    if not private_key.is_file():
+        raise ValueError(f"TLS private key was not found: {private_key}")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        context.load_cert_chain(certfile=str(certificate), keyfile=str(private_key))
+    except (OSError, ssl.SSLError) as exc:
+        raise ValueError(f"Invalid TLS certificate/key pair: {exc}") from exc
+    return {
+        "ssl_certfile": str(certificate),
+        "ssl_keyfile": str(private_key),
+        # One-way TLS only: clients are never asked for or checked against a certificate.
+        "ssl_cert_reqs": ssl.CERT_NONE,
+    }
+
+
 class ConstantTimeTokenVerifier(TokenVerifier):
     """Validate one opaque Bearer token without exposing it in server metadata."""
 
@@ -234,7 +258,7 @@ class ConstantTimeTokenVerifier(TokenVerifier):
 
 
 def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP:
-    """Create a FastMCP server with optional token and admin authentication."""
+    """Create the shared FastMCP server; launcher defaults make it openly accessible."""
     token = validate_http_settings(settings)
     usage = UsageTracker()
     ssot_service = None
@@ -666,6 +690,20 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             if not isinstance(repository_id, str) or not repository_id:
                 raise ValueError("repository_id must be a non-empty string")
             job = catalog.start_repository_delete(repository_id)
+            return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/services/refresh-all",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_refresh_all_services(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            job = catalog.start_all_services_ssot_refresh()
             return JSONResponse(job.model_dump(mode="json"), status_code=202)
         except Exception as exc:
             return _api_error(exc)
@@ -1301,6 +1339,7 @@ def main() -> None:
     settings = Settings().resolved()
     configure_logging(settings.log_level)
     validate_http_settings(settings)
+    tls_config = tls_uvicorn_config(settings)
 
     service = create_service(settings)
     stats = service.load_read_index()
@@ -1312,7 +1351,9 @@ def main() -> None:
     )
     server = create_http_server(service, settings)
     logger.info(
-        "Starting FastMCP HTTP server on %s:%d%s (authentication=%s)",
+        "Starting FastMCP %s server on %s:%d%s "
+        "(application_authentication=%s, client_certificates=disabled)",
+        "HTTPS" if tls_config is not None else "HTTP",
         settings.mcp_http_host,
         settings.mcp_http_port,
         settings.mcp_http_path,
@@ -1327,6 +1368,7 @@ def main() -> None:
             path=settings.mcp_http_path,
             log_level=settings.log_level,
             host_origin_protection=False,
+            uvicorn_config=tls_config,
         )
     except KeyboardInterrupt:
         return

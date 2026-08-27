@@ -81,10 +81,9 @@ cd /opt/corporate-kb
 Проверка:
 
 ```bash
-curl -i 'http://127.0.0.1:8000/health'
+curl -k -i 'https://127.0.0.1:8000/health'
 
-curl -G 'http://127.0.0.1:8000/api/v1/search' \
-  -H 'Authorization: Bearer REPLACE_WITH_SERVER_TOKEN' \
+curl -k -G 'https://127.0.0.1:8000/api/v1/search' \
   --data-urlencode 'query=как восстановить сервис после сбоя' \
   --data-urlencode 'top_k=3'
 ```
@@ -97,8 +96,7 @@ curl -G 'http://127.0.0.1:8000/api/v1/search' \
 Заполните `evaluation/questions.json` реальными вопросами и ожидаемыми документами, затем выполните:
 
 ```bash
-curl -sS -X POST 'http://127.0.0.1:8000/api/v1/admin/context-benchmark' \
-  -H 'Authorization: Bearer REPLACE_WITH_SERVER_TOKEN' \
+curl -k -sS -X POST 'https://127.0.0.1:8000/api/v1/admin/context-benchmark' \
   -H 'X-KB-Benchmark-Password: REPLACE_WITH_SEPARATE_BENCHMARK_PASSWORD'
 ```
 

@@ -88,12 +88,12 @@ service map и feature-routing. Raw GigaCode result записывается в
 
 ```bash
 # быстрый режим
-curl -X POST http://127.0.0.1:8000/admin/api/graph/rebuild \
+curl -k -X POST https://127.0.0.1:8000/admin/api/graph/rebuild \
   -H 'Content-Type: application/json' \
   -d '{"generation_mode":"static","verify_all":false}'
 
 # полный проход GigaCode по всем dependency-кандидатам
-curl -X POST http://127.0.0.1:8000/admin/api/graph/rebuild \
+curl -k -X POST https://127.0.0.1:8000/admin/api/graph/rebuild \
   -H 'Content-Type: application/json' \
   -d '{"generation_mode":"gigacode","verify_all":true}'
 ```
@@ -263,7 +263,8 @@ export GIGACODE_GRAPH_BEARER_TOKEN="$(openssl rand -hex 32)"
 PYTHONPATH=src .venv/bin/python -m gigacode_graph.http_server
 ```
 
-В production TLS должен завершаться на корпоративном reverse proxy; сам процесс не реализует TLS.
+Основной RAG/MCP-процесс сам завершает TLS сертификатами из `certs/`; отдельный reverse proxy не
+обязателен.
 
 ## Жёсткие ограничения первой версии
 

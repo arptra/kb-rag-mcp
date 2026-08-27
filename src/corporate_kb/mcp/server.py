@@ -56,9 +56,8 @@ and the file manifest; action='read_file' for more source; and action='submit' t
 rebuild the index. For action='prepare', generation_mode='client' keeps generation in the calling
 client, while generation_mode='gigacode' launches an installed GigaCode CLI headlessly on the
 server, scans the checkout read-only, writes structured SSOT, and rebuilds the index automatically.
-Check
-workflow.gigacode.available in action='options' first. With client mode and the distributed stdio
-proxy, finish through kb_save_and_upload_ssot so a temp copy exists on the user's machine."""
+Check workflow.gigacode.available in action='options' first. In client mode submit the generated
+Markdown directly with action='submit'; no local stdio proxy or client runtime is required."""
 BUILTIN_TOOL_DESCRIPTIONS = {
     "ssot_context": SSOT_DESCRIPTION,
     "kb_feature_context": FEATURE_CONTEXT_DESCRIPTION,

@@ -58,6 +58,7 @@ def _build_worker(
     checkpoint_path: Path,
     force_service_ids: set[str],
     force_all: bool,
+    skip_service_ids: set[str],
     diagnostic_path: Path,
 ) -> None:
     def report(message: str) -> None:
@@ -97,7 +98,8 @@ def _build_worker(
             f"Worker started; pid={os.getpid()}; parent_pid={os.getppid()}; "
             f"thread={threading.current_thread().name}/{threading.get_ident()}; "
             f"repositories={len(repositories)}; force_all={force_all}; "
-            f"forced_services={','.join(sorted(force_service_ids)) or 'none'}"
+            f"forced_services={','.join(sorted(force_service_ids)) or 'none'}; "
+            f"skipped_services={','.join(sorted(skip_service_ids)) or 'none'}"
         )
         for position, repository in enumerate(repositories, start=1):
             report(
@@ -111,6 +113,7 @@ def _build_worker(
             checkpoint=save_checkpoint,
             force_service_ids=force_service_ids,
             force_all=force_all,
+            skip_service_ids=skip_service_ids,
         )
         report("Writing system_graph.json")
         JsonGraphStore(graph_path).save(result.graph)
@@ -144,6 +147,7 @@ class ServiceMapProcessRunner:
         checkpoint: Callable[[ServiceMapBuildResult], None] | None = None,
         force_service_ids: set[str] | None = None,
         force_all: bool = False,
+        skip_service_ids: set[str] | None = None,
     ) -> ServiceMapBuildResult:
         if cancel is not None and cancel.is_set():
             raise ServiceMapBuildCancelled("Repository analysis was cancelled")
@@ -171,6 +175,7 @@ class ServiceMapProcessRunner:
                     checkpoint_path,
                     force_service_ids or set(),
                     force_all,
+                    skip_service_ids or set(),
                     diagnostic_path,
                 ),
                 name="service-map-analysis",
@@ -186,7 +191,8 @@ class ServiceMapProcessRunner:
                     f"start_method=spawn; timeout={self._timeout_seconds}s; "
                     f"repositories={len(repositories)}; "
                     f"force_all={force_all}; "
-                    f"forced_services={','.join(sorted(force_service_ids or set())) or 'none'}"
+                    f"forced_services={','.join(sorted(force_service_ids or set())) or 'none'}; "
+                    f"skipped_services={','.join(sorted(skip_service_ids or set())) or 'none'}"
                 )
             progress_offset = 0
             diagnostic_offset = 0

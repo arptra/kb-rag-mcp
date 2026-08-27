@@ -3,7 +3,7 @@
 Это локальный MVP корпоративного RAG: документы индексируются Python-процессом, embeddings
 сохраняются в проверяемый файловый кэш, а при поиске целиком находятся в RAM. GigaCode остаётся
 единственной генеративной моделью и получает найденные фрагменты через read-only MCP tools по
-локальному `stdio` или удалённому Streamable HTTP. MCP-сервер не формулирует финальные ответы,
+общему Streamable HTTPS endpoint. MCP-сервер не формулирует финальные ответы,
 не исполняет shell-команды и не изменяет документы.
 
 Проект рассчитан на Python 3.12 и standalone `FastMCP==3.4.4`. Запуск после установки не зависит
@@ -33,7 +33,7 @@ local feature hashing (по умолчанию) или локальная embedd
        ↓
 NumPy matrix in RAM
        ↓
-MCP stdio / Streamable HTTP
+MCP Streamable HTTPS
        ↓
 GigaCode CLI
 ```
@@ -43,7 +43,7 @@ GigaCode CLI
 
 ```text
 GigaCode CLI ─┐
-GigaCode CLI ─┼─ HTTP(S), Bearer optional ─ MCP Streamable HTTP ─ in-memory index
+GigaCode CLI ─┼─ HTTPS URL ─ MCP Streamable HTTP ─ in-memory index
 GigaCode CLI ─┘
 ```
 
@@ -130,8 +130,8 @@ Repository и производные сервисы можно удалять и
 Для агентского режима кнопка **«Подготовить SSOT-контекст»** или MCP-tool
 `kb_generate_system_ssot` запускает свежий source analysis и открывает сессию чтения исходников.
 Отдельный LLM URL серверу не нужен. В `generation_mode=client` SSOT пишет нейронка, вызвавшая MCP с
-клиентского компьютера; локальный proxy сохраняет Markdown во временный каталог и загружает его в
-индекс. В `generation_mode=gigacode` сервер запускает установленный GigaCode headlessly в checkout
+клиентского компьютера, и отправляет готовый Markdown обратно через `action=submit` того же tool.
+В `generation_mode=gigacode` сервер запускает установленный GigaCode headlessly в checkout
 репозитория, получает структурированный JSON-результат, сохраняет SSOT и сразу перестраивает RAG.
 Если CLI требует первый вход, задача показывает browser URL и продолжает работу после авторизации.
 Полный action-flow описан в
@@ -154,9 +154,9 @@ signal при аварии worker. Supervisor пишет heartbeat каждые 
 - `embeddings.npy` — матрица без pickle.
 
 Это не Vector DB: нет отдельного сервиса хранения, индекса ANN или SQL. Почти все MCP-tools
-read-only; `kb_generate_system_ssot` управляет source-сессией, а локальный
-`kb_save_and_upload_ssot` сохраняет созданный клиентской моделью документ и инициирует перестроение
-выбранного индекса. Поиск выполняется полным cosine scan по NumPy-матрице в памяти, а диск
+read-only; `kb_generate_system_ssot` управляет source-сессией, принимает созданный клиентской
+моделью документ через `action=submit` и инициирует перестроение выбранного индекса. Поиск
+выполняется полным cosine scan по NumPy-матрице в памяти, а диск
 используется для ускорения старта.
 
 ## Первый запуск
@@ -173,34 +173,30 @@ Backend и frontend запускаются независимо из корня 
 ./scripts/start-frontend.sh
 ```
 
-Откройте `http://127.0.0.1:5173/admin/`. При первом запуске каждый скрипт сам установит недостающие
+Откройте `https://127.0.0.1:5173/admin/`. При первом запуске каждый скрипт сам установит недостающие
 dependencies своей части. Подробности и production-режим описаны в разделе
 [«Разработка React-панели»](#разработка-react-панели).
 
 ### Подключение сотрудника к удалённой базе
 
-RAG, индекс и документы находятся только на сервере. Для старых версий GigaCode сотруднику
-передаются [`clients/corporate_kb_stdio_proxy.py`](clients/corporate_kb_stdio_proxy.py) и
-[`clients/requirements.txt`](clients/requirements.txt). В отдельном клиентском `venv` через обычный
-`pip` устанавливается `FastMCP==3.4.4`. GigaCode запускает Python из этого `venv` как stdio MCP, а процесс ходит к удалённому
-серверу как прозрачный Streamable HTTP MCP-клиент. На клиенте нет прошитого списка tools: при
-каждом запуске он выполняет удалённый `tools/list` и зеркалирует новые имена, схемы, annotations и
-вызовы. `uv`, Node.js, `npx`, `mcp-remote`, Nginx, копия серверного проекта, документы и индекс на
-клиенте не нужны.
+RAG, индекс и документы находятся только на сервере. На клиенте нужен только GigaCode с прямым
+Streamable HTTPS transport: без Python, `venv`, FastMCP, `npx`, `mcp-remote` и stdio-proxy.
 
-Готовый settings находится в
-[`examples/gigacode-venv-stdio-settings.example.json`](examples/gigacode-venv-stdio-settings.example.json), а полная
-инструкция для сотрудника — в [`README.client.md`](README.client.md).
+Добавьте в `~/.gigacode/settings.json`:
 
-Новые версии GigaCode также могут подключаться к `/mcp` напряму через Streamable HTTP; скрипт
-`install.sh` оставлен как опциональный способ для таких клиентов.
-Скопируйте из неё `mcpServers` в `~/.gigacode/settings.json` и замените placeholder:
+```json
+{
+  "mcpServers": {
+    "corporate-kb": {
+      "httpUrl": "https://RAG-SERVER.EXAMPLE.COM:8000/mcp"
+    }
+  }
+}
+```
 
-- `REPLACE_WITH_CLIENT_DIR` — каталог с клиентским `venv` и `.py`-файлом;
-- `REPLACE_WITH_SERVER_IP_OR_DOMAIN` — адрес удалённого сервера;
-
-GigaCode запускает этот файл как локальный MCP по `stdio` через абсолютный путь к `venv/bin/python`.
-Локальный MCP обращается к общему RAG-серверу через Streamable HTTP endpoint `/mcp`.
+Готовый settings находится в [`examples/gigacode-settings.example.json`](examples/gigacode-settings.example.json),
+полная инструкция — в [`README.client.md`](README.client.md). Сертификат сервера должен быть доверен
+клиентской ОС; дополнительных паролей, токенов и клиентских сертификатов сервер не запрашивает.
 
 ### Установка серверной части
 
@@ -283,73 +279,32 @@ MCP discovery.
 
 ## Подключение к GigaCode
 
-Если MCP-серверы хранятся в отдельном каталоге, установите туда автономную runtime-копию. Скрипт
-создаёт подкаталог `corporate-kb`, копирует только необходимые файлы, создаёт собственный `.venv`,
-ставит locked runtime dependencies без dev-пакетов, строит hash-индекс и печатает готовый server
-entry для GigaCode:
-
-```bash
-./scripts/install-mcp-server.sh /absolute/path/to/mcp-servers
-```
-
-Если версия `uv` на целевой машине отличается или `uv` запрещён политиками, установите ту же
-runtime-копию через pip:
-
-```bash
-./scripts/install-mcp-server.sh /absolute/path/to/mcp-servers --pip
-```
-
-Для закрытого окружения можно сначала только скопировать файлы, затем настроить корпоративный Python
-package registry и завершить установку командами, которые напечатает скрипт:
-
-```bash
-./scripts/install-mcp-server.sh /absolute/path/to/mcp-servers --copy-only
-```
-
-Скопируйте `examples/gigacode-settings.example.json` в `.gigacode/settings.json` проекта и замените все
-`/ABSOLUTE/PATH/...` реальными абсолютными путями. Не рассчитывайте на раскрытие `${PROJECT_ROOT}`
-в JSON. В `command` указан абсолютный путь к `.venv/bin/python`, а в `args` — запуск модуля
-`corporate_kb.mcp.server`. Поэтому GigaCode не зависит от глобальных `python`, `uv`, `PATH`, shell
-activation или wrapper-скрипта.
-
-Минимальная форма server entry:
+Скопируйте `examples/gigacode-settings.example.json` в пользовательский `settings.json` GigaCode и
+замените только DNS/IP сервера. Минимальная запись:
 
 ```json
 {
-  "command": "/absolute/path/to/repository/.venv/bin/python",
-  "args": ["-m", "corporate_kb.mcp.server"],
-  "cwd": "/absolute/path/to/repository",
-  "env": {
-    "PYTHONPATH": "/absolute/path/to/repository/src"
+  "mcpServers": {
+    "corporate-kb": {
+      "httpUrl": "https://RAG-SERVER.EXAMPLE.COM:8000/mcp"
+    }
   }
 }
 ```
 
-Альтернатива через CLI (выполняйте из корня этого репозитория, подставив абсолютные пути):
+Альтернатива через CLI:
 
 ```bash
 gigacode mcp add \
-  --scope project \
+  --scope user \
+  --transport http \
   --timeout 120000 \
-  -e KB_KNOWLEDGE_DIR=/absolute/path/to/repository/knowledge \
-  -e KB_CACHE_DIR=/absolute/path/to/repository/.cache/kb \
-  -e KB_EMBEDDING_PROVIDER=hash \
-  -e KB_EMBEDDING_LOCAL_FILES_ONLY=true \
-  -e HF_HUB_OFFLINE=1 \
-  -e TRANSFORMERS_OFFLINE=1 \
-  -e PYTHONUNBUFFERED=1 \
-  -e PYTHONNOUSERSITE=1 \
-  -e PYTHONPATH=/absolute/path/to/repository/src \
-  -e KB_AUTO_INDEX=false \
-  local-corporate-kb \
-  /absolute/path/to/repository/.venv/bin/python \
-  -m corporate_kb.mcp.server
+  corporate-kb \
+  https://RAG-SERVER.EXAMPLE.COM:8000/mcp
 ```
 
-`stdio` — транспорт по умолчанию, поэтому `--transport http` здесь не нужен. Команды рассчитаны на
-корпоративную сборку GigaCode с совместимым `mcp add/remove` интерфейсом; перед распространением
-проверьте их через `gigacode mcp --help` на целевой машине. JSON-конфигурация также задаёт `cwd` и
-`trust: false`; статического фильтра tools в ней нет.
+Никаких локальных MCP-файлов или Python-окружений GigaCode не запускает. После перезапуска он сам
+получает актуальный `tools/list` с общего HTTPS endpoint.
 
 Проверка подключения:
 
@@ -386,8 +341,6 @@ gigacode
 - `kb_generate_system_ssot` — выбирает индекс и repositories, клонирует недостающий Git source,
   запускает/опрашивает analysis и либо отдаёт исходники клиентской нейронке, либо запускает
   read-only GigaCode headless scan на сервере;
-- `kb_save_and_upload_ssot` — локальный tool распределённого stdio-proxy: пишет готовый Markdown во
-  временный каталог клиентского компьютера и загружает его в выбранный server index;
 - `kb_stats` — состояние индекса и абсолютные пути.
 
 Во вкладке dashboard **«MCP tools»** отображается живой каталог FastMCP: все встроенные tools и
@@ -401,7 +354,7 @@ search-tool по-прежнему редактируются описание, �
 Пример вызова нового feature-tool через JSON API (тот же обработчик использует MCP):
 
 ```bash
-curl -sS http://127.0.0.1:8000/api/v1/feature-context \
+curl -k -sS https://127.0.0.1:8000/api/v1/feature-context \
   -H 'Content-Type: application/json' \
   -d '{"feature":"Добавить резервирование товара при создании заказа","start_service":"orders"}'
 ```
@@ -418,9 +371,8 @@ RAG. В неоднозначном случае ответ имеет `status: n
 индексацию. Старые автоматически созданные `system-graph/*.md` удаляются при следующем rebuild.
 
 Не задавайте статический `includeTools` в GigaCode settings, если используете управляемые tools из UI:
-клиентский allowlist скроет новые схемы от LLM. Прямой HTTP-клиент обновляет `/mcp` discovery, а
-однофайловый stdio proxy выполняет тот же удалённый `tools/list` после перезапуска GigaCode. Обновлять
-сам proxy-файл при добавлении server tools больше не требуется.
+клиентский allowlist скроет новые схемы от LLM. Прямой HTTPS-клиент обновляет `/mcp` discovery после
+перезапуска GigaCode и всегда получает актуальный набор server tools.
 
 ### Разработка React-панели
 
@@ -435,8 +387,8 @@ Production assets уже входят в Python-пакет и отдаются �
 ./scripts/start-backend.sh
 ```
 
-Она запускает только FastAPI/FastMCP backend на `http://127.0.0.1:8000` и MCP endpoint на
-`http://127.0.0.1:8000/mcp`. Если `.venv` ещё нет, скрипт сначала сам установит Python
+Она запускает только FastAPI/FastMCP backend на `https://127.0.0.1:8000` и MCP endpoint на
+`https://127.0.0.1:8000/mcp`. Если `.venv` ещё нет, скрипт сначала сам установит Python
 dependencies. Процесс работает в foreground и останавливается через `Ctrl+C`.
 
 Порт и адрес при необходимости переопределяются environment variables:
@@ -456,9 +408,9 @@ KB_AUTO_INDEX=false \
 ./scripts/start-frontend.sh
 ```
 
-Она запускает только React/Vite frontend. Если `node_modules` ещё нет, скрипт сначала сам выполнит
-`npm ci`. Открывайте `http://127.0.0.1:5173/admin/`. Vite автоматически проксирует `/admin/api` на
-backend `http://127.0.0.1:8000`, поэтому CORS и отдельная настройка API URL не нужны.
+Она запускает только React/Vite frontend по HTTPS. Если `node_modules` ещё нет, скрипт сначала сам
+выполнит `npm ci`. Открывайте `https://127.0.0.1:5173/admin/`. Vite автоматически проксирует
+`/admin/api` на backend `https://127.0.0.1:8000`, поэтому CORS и отдельная настройка API URL не нужны.
 
 Эквивалентный ручной запуск из каталога frontend:
 
@@ -477,19 +429,11 @@ npm run dev
 KB_MCP_HTTP_HOST=127.0.0.1 ./scripts/start-mcp-http.sh run
 ```
 
-После этого вся панель доступна через backend по `http://127.0.0.1:8000/admin`. Команда
+После этого вся панель доступна через backend по `https://127.0.0.1:8000/admin`. Команда
 `dashboard-build` выполняет TypeScript-проверку и складывает готовые assets внутрь
 `corporate_kb/mcp/admin_dist`, поэтому Node.js на production-сервере не требуется.
 
-Ручной запуск stdio server:
-
-```bash
-KB_LOG_LEVEL=DEBUG ./.venv/bin/python -m corporate_kb.mcp.server
-```
-
-stdout зарезервирован для MCP-протокола; все application logs направляются в stderr.
-
-## Удалённый MCP по HTTP
+## Удалённый MCP по HTTPS
 
 Удалённый режим заранее загружает готовый индекс и только после этого открывает порт. Поэтому все
 подключённые GigaCode CLI используют один прогретый процесс и не строят embeddings при каждом запросе.
@@ -505,12 +449,14 @@ cd /opt/corporate-kb
 ./scripts/dev.sh index-hash
 ```
 
-Для локального запуска пароль и токен не нужны:
+Сервер всегда запускается с TLS без Bearer/admin-пароля и без проверки клиентских сертификатов:
 
 ```bash
 export KB_MCP_HTTP_HOST='127.0.0.1'
 export KB_MCP_HTTP_PORT='8000'
 export KB_AUTO_INDEX='false'
+export KB_MCP_TLS_CERT_FILE='./certs/server.crt'
+export KB_MCP_TLS_KEY_FILE='./certs/server.key'
 
 ./scripts/start-mcp-http.sh
 ```
@@ -535,14 +481,14 @@ Git fetch/clone запускаются в отдельной process group: time
 Публичный health check не раскрывает тексты документов:
 
 ```bash
-curl http://10.0.0.5:8000/health
+curl https://10.0.0.5:8000/health
 ```
 
 Для кастомных HTTP-клиентов сервер также предоставляет read-only JSON API. В стандартном локальном
 режиме поиск работает без токена:
 
 ```bash
-curl -G 'http://10.0.0.5:8000/api/v1/search' \
+curl -G 'https://10.0.0.5:8000/api/v1/search' \
   --data-urlencode 'query=какой сервис владеет дневными лимитами' \
   --data-urlencode 'top_k=3'
 ```
@@ -551,33 +497,29 @@ curl -G 'http://10.0.0.5:8000/api/v1/search' \
 `/api/v1/admin/context-benchmark`, `/api/v1/documents` и `/api/v1/stats`. Они используют
 тот же прогретый индекс, что и MCP tools, не строят embeddings на клиенте и не изменяют документы.
 
-Сам `/mcp` также работает без заголовка авторизации. Если задать
-`KB_MCP_HTTP_BEARER_TOKEN`, Bearer-проверка включится одновременно для `/mcp` и JSON API.
-`KB_AUTO_INDEX=false` гарантирует, что удалённый процесс не начнёт неожиданную переиндексацию.
+Сам `/mcp` и JSON API работают без заголовка авторизации. Скрипт запуска очищает старые значения
+`KB_MCP_HTTP_BEARER_TOKEN` и `KB_ADMIN_PASSWORD`. `KB_AUTO_INDEX=false` гарантирует, что удалённый
+процесс не начнёт неожиданную переиндексацию.
 
 Проверяйте с клиентской машины не только `/health`, но и настоящий MCP `initialize`:
 
 ```bash
 curl -i --max-time 15 \
-  'http://10.0.0.5:8000/mcp' \
+  'https://10.0.0.5:8000/mcp' \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"curl-test","version":"1.0"}}}'
 ```
 
-Ожидается `HTTP/1.1 200`. При включённой защите `401` означает неверный токен, `404` — неверный путь, а `421` — что
-запущена старая сборка с Host allowlist. Прямой FastMCP listener, запущенный через Python или `uv`,
-использует обычный HTTP. `https://` указывайте только при наличии TLS reverse proxy; иначе GigaCode
-обычно сообщает `TypeError: fetch failed`.
+Ожидается `HTTP/1.1 200`. `404` означает неверный путь. Ошибка TLS означает, что сертификат не
+доверен клиенту или не содержит DNS/IP из URL.
 
 ### 2. Подключить GigaCode CLI
 
-Перед раздачей впишите в корневой `install.sh` адрес сервера. Токен оставьте пустым, если защита
-на сервере не включена:
+Перед раздачей впишите в корневой `install.sh` HTTPS-адрес сервера:
 
 ```bash
 default_mcp_url="https://kb.company.example/mcp"
-default_mcp_token=""
 ```
 
 Сотруднику передаётся только этот один файл. В любом каталоге он выполняет:
@@ -590,35 +532,12 @@ bash install.sh
 только добавляет подключение `corporate-kb` в пользовательскую конфигурацию уже установленного
 GigaCode. После запуска сотрудник перезапускает `gigacode` и проверяет соединение через `/mcp`.
 
-Если опциональный Bearer-токен всё же задан, раздавайте файл через защищённый корпоративный канал.
+### 3. Сертификаты
 
-### 3. Доступ через интернет
-
-Не передавайте Bearer-токен по открытому интернету через обычный HTTP. Оставьте backend на
-`127.0.0.1:8000`, а наружу опубликуйте его как HTTPS через Nginx, Caddy, ingress или корпоративный
-API gateway:
-
-```bash
-export KB_MCP_HTTP_BEARER_TOKEN='PASTE_GENERATED_TOKEN'
-export KB_MCP_HTTP_HOST='127.0.0.1'
-./scripts/start-mcp-http.sh
-```
-
-Минимальные существенные параметры location для Nginx:
-
-```nginx
-location /mcp {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_buffering off;
-    proxy_read_timeout 3600s;
-}
-```
-
-После этого клиент подключается к `https://kb.example.com/mcp`. TLS-сертификат и сетевой доступ
-настраиваются на reverse proxy; порт `8000` не должен быть открыт наружу.
+Backend сам завершает TLS, reverse proxy не обязателен. Положите сертификат с цепочкой и приватный
+ключ в `certs/server.crt` и `certs/server.key`. Если файлов нет, стартовый скрипт создаёт локальную
+self-signed пару. Для клиентских машин используйте сертификат корпоративного CA либо установите
+локальный `server.crt` в системное доверенное хранилище.
 
 Когда документы изменились, выполните `./scripts/dev.sh index-hash` и перезапустите HTTP-процесс.
 Уже работающий процесс намеренно продолжает обслуживать согласованную старую версию индекса до
@@ -725,8 +644,9 @@ custom_field: "неизвестные поля тоже сохраняются"
 - Нет reranker, hybrid/BM25 retrieval и отдельной оценки authority при ранжировании.
 - Точный token counter реальной модели не используется для предварительного chunking: интерфейс
   `TokenCounter` отделён, поэтому его можно подключить без связи chunker с SentenceTransformer.
-- Статический Bearer-токен даёт всем клиентам одинаковые права; для персональных учётных записей,
-  отзыва сессий и аудита нужен внешний gateway/IdP либо полноценный OAuth.
+- Текущая deployment-модель намеренно открытая: TLS шифрует соединение, но MCP и Admin API не
+  различают пользователей. Ограничивайте сетевой доступ firewall/VPN, если сервер не должен быть
+  общедоступным.
 
 Для перехода на настоящую Vector DB нужно реализовать `PostgresKnowledgeStore` или
 `QdrantKnowledgeStore` с тем же контрактом `KnowledgeStore`, выбрать реализацию при сборке

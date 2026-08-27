@@ -201,6 +201,7 @@ class RagCatalog:
         self._usage = usage
         self._lock = threading.RLock()
         self._analysis_lock = threading.Lock()
+        self._all_services_refresh_lock = threading.Lock()
         self._index_work_locks: dict[str, threading.Lock] = {}
         self._state = self._load()
         self._services: dict[str, KnowledgeService] = {"default": default_service}
@@ -433,6 +434,49 @@ class RagCatalog:
                 repository.index_id,
                 generation_mode,
             ),
+            daemon=True,
+        ).start()
+        return job
+
+    def start_all_services_ssot_refresh(self) -> CatalogJob:
+        """Refresh every connected service, preferring OpenSpec over source parsing."""
+        service_map = self._service_map_store.load()
+        if not service_map.services:
+            raise RuntimeError("No discovered services are available to refresh")
+        with self._lock:
+            active = next(
+                (
+                    item
+                    for item in self._jobs.values()
+                    if item.type == "ssot"
+                    and item.target_id == "all-services"
+                    and item.status in {"queued", "running", "cancelling"}
+                ),
+                None,
+            )
+        if active is not None:
+            raise RuntimeError(f"All-services SSOT refresh is already running: {active.id}")
+        gigacode_status = self._gigacode.status(refresh=True)
+        generation_mode: Literal["static", "gigacode"] = (
+            "gigacode" if gigacode_status["available"] else "static"
+        )
+        job = self._new_job(
+            "ssot",
+            target_id="all-services",
+            message=(
+                "All-services SSOT refresh queued with GigaCode"
+                if generation_mode == "gigacode"
+                else "All-services OpenSpec/static refresh queued"
+            ),
+        )
+        if generation_mode == "static" and gigacode_status.get("error"):
+            self._append_job_log(
+                job.id,
+                f"GigaCode unavailable; using static fallback: {gigacode_status['error']}",
+            )
+        threading.Thread(
+            target=self._run_all_services_ssot_refresh_job,
+            args=(job.id, generation_mode),
             daemon=True,
         ).start()
         return job
@@ -808,8 +852,9 @@ class RagCatalog:
                 },
             },
             "finish": (
-                "Generate one evidence-backed SSOT Markdown document. Then call the client-local "
-                "kb_save_and_upload_ssot tool with session_id, service_id, content and finalize."
+                "Generate one evidence-backed SSOT Markdown document. Then call "
+                "kb_generate_system_ssot with action='submit', job_id, service_id, content and "
+                "finalize."
             ),
         }
 
@@ -1637,6 +1682,237 @@ class RagCatalog:
             },
         )
 
+    def _run_all_services_ssot_refresh_job(
+        self,
+        job_id: str,
+        generation_mode: Literal["static", "gigacode"],
+    ) -> None:
+        cancel_event = self._cancel_event(job_id)
+        affected_index_ids: list[str] = []
+        try:
+            with self._cancellable_lock(self._all_services_refresh_lock, cancel_event):
+                with self._lock:
+                    repositories = [
+                        item.model_copy(deep=True) for item in self._state.repositories
+                    ]
+                if not repositories:
+                    raise RuntimeError("No connected repositories are available to refresh")
+                service_map = self._service_map_store.load()
+                services_by_repository: dict[str, list[ServiceRecord]] = {}
+                repository_by_service: dict[str, RepositorySource] = {}
+                for service in service_map.services:
+                    try:
+                        _mapped, repository = self._service_context(service.id)
+                    except KeyError:
+                        self._append_job_log(
+                            job_id,
+                            f"Skipping unmapped service={service.id}; repository was not found",
+                        )
+                        continue
+                    services_by_repository.setdefault(repository.id, []).append(service)
+                    repository_by_service[service.id] = repository
+                if not repository_by_service:
+                    raise RuntimeError("No services are linked to connected repositories")
+
+                affected_index_ids = sorted({item.index_id for item in repositories})
+                with self._cancellable_index_locks(affected_index_ids, cancel_event):
+                    self._update_job(
+                        job_id,
+                        status="running",
+                        message=(
+                            "Checking OpenSpec before GigaCode/static analysis"
+                        ),
+                        started_at=_now(),
+                    )
+                    for index_id in affected_index_ids:
+                        self._update_index(index_id, status="indexing", error=None)
+
+                    skipped_service_ids: set[str] = set()
+                    openspec_documents = 0
+                    for position, repository in enumerate(repositories, start=1):
+                        self._raise_if_cancelled(cancel_event)
+                        checkout = Path(repository.checkout_path).resolve()
+                        self._update_job(
+                            job_id,
+                            message=(
+                                f"OpenSpec preflight [{position}/{len(repositories)}]: "
+                                f"{repository.name}"
+                            ),
+                        )
+                        openspecs = self._find_openspecs(
+                            checkout,
+                            cancel_event=cancel_event,
+                        )
+                        document_count = self._sync_openspec(
+                            sources=openspecs,
+                            checkout=checkout,
+                            destination=(
+                                Path(self._record(repository.index_id).knowledge_dir)
+                                / "repositories"
+                                / repository.id
+                                / "openspec"
+                            ),
+                            cancel_event=cancel_event,
+                        )
+                        openspec_documents += document_count
+                        repository = repository.model_copy(
+                            update={
+                                "openspec_path": str(openspecs[0]) if openspecs else None,
+                                "openspec_paths": [str(path) for path in openspecs],
+                                "document_count": document_count,
+                                "synced_at": _now(),
+                            }
+                        )
+                        self._upsert_repository(repository)
+                        owned = self._services_owning_openspec(
+                            services_by_repository.get(repository.id, []),
+                            checkout,
+                            openspecs,
+                        )
+                        skipped_service_ids.update(owned)
+                        removed_generated = self._remove_generated_ssot(
+                            repository.index_id,
+                            owned,
+                        )
+                        paths = (
+                            ",".join(path.relative_to(checkout).as_posix() for path in openspecs)
+                            or "none"
+                        )
+                        self._append_job_log(
+                            job_id,
+                            f"OpenSpec preflight ready: repository={repository.id}; "
+                            f"roots={paths}; documents={document_count}; "
+                            f"source_scan_skipped={','.join(sorted(owned)) or 'none'}; "
+                            f"stale_generated_ssot_removed={removed_generated}",
+                        )
+
+                    analyzable_service_ids = set(repository_by_service) - skipped_service_ids
+                    self._update_job(
+                        job_id,
+                        message=(
+                            f"Static analysis: {len(analyzable_service_ids)} services; "
+                            f"OpenSpec-only: {len(skipped_service_ids)}"
+                        ),
+                    )
+                    snapshot = self._build_graph(
+                        cancel_event=cancel_event,
+                        job_id=job_id,
+                        force_service_ids=analyzable_service_ids,
+                        skip_service_ids=skipped_service_ids,
+                    )
+                    self._raise_if_cancelled(cancel_event)
+
+                    gigacode_results: list[dict[str, Any]] = []
+                    static_ssot_files: list[str] = []
+                    rebuilt_index_ids: set[str] = set()
+                    refreshed_map = self._service_map_store.load()
+                    refreshed_services = {item.id: item for item in refreshed_map.services}
+                    if generation_mode == "static" and analyzable_service_ids:
+                        static_ssot_files = self._write_static_ssot_documents(
+                            job_id,
+                            analyzable_service_ids,
+                            refreshed_map,
+                            repository_by_service,
+                        )
+                    elif generation_mode == "gigacode" and analyzable_service_ids:
+                        targets_by_index: dict[str, list[dict[str, Any]]] = {}
+                        repository_ids_by_index: dict[str, set[str]] = {}
+                        for service_id in sorted(analyzable_service_ids):
+                            target_service = refreshed_services.get(service_id)
+                            target_repository = repository_by_service.get(service_id)
+                            if target_service is None or target_repository is None:
+                                self._append_job_log(
+                                    job_id,
+                                    f"GigaCode target skipped after refresh: service={service_id}",
+                                )
+                                continue
+                            targets_by_index.setdefault(target_repository.index_id, []).append(
+                                self._ssot_target(job_id, target_service, target_repository)
+                            )
+                            repository_ids_by_index.setdefault(
+                                target_repository.index_id,
+                                set(),
+                            ).add(
+                                target_repository.id
+                            )
+                        for index_id in sorted(targets_by_index):
+                            self._raise_if_cancelled(cancel_event)
+                            result = self._generate_ssot_with_gigacode(
+                                job_id=job_id,
+                                index=self._record(index_id),
+                                targets=targets_by_index[index_id],
+                                repository_ids=sorted(repository_ids_by_index[index_id]),
+                                cancel_event=cancel_event,
+                                complete_job=False,
+                            )
+                            gigacode_results.append(result)
+                            rebuilt_index_ids.add(index_id)
+
+                    for index_id in affected_index_ids:
+                        if index_id in rebuilt_index_ids:
+                            continue
+                        self._raise_if_cancelled(cancel_event)
+                        index = self._record(index_id)
+                        self._update_job(
+                            job_id,
+                            message=f"Rebuilding linked RAG index: {index.name}",
+                        )
+                        stats = self._rebuild_index(index_id, cancel_event)
+                        self._append_job_log(
+                            job_id,
+                            f"RAG index ready: index={index_id}; "
+                            f"documents={stats.document_count}; chunks={stats.chunk_count}",
+                        )
+                        rebuilt_index_ids.add(index_id)
+
+                    self._update_job(
+                        job_id,
+                        status="completed",
+                        message=(
+                            f"Refreshed {len(repository_by_service)} services: "
+                            f"OpenSpec-only {len(skipped_service_ids)}, "
+                            f"{generation_mode} {len(analyzable_service_ids)}"
+                        ),
+                        completed_at=_now(),
+                        result={
+                            "phase": "indexed",
+                            "generation_mode": generation_mode,
+                            "service_count": len(repository_by_service),
+                            "openspec_service_count": len(skipped_service_ids),
+                            "openspec_service_ids": sorted(skipped_service_ids),
+                            "analyzed_service_count": len(analyzable_service_ids),
+                            "analyzed_service_ids": sorted(analyzable_service_ids),
+                            "openspec_document_count": openspec_documents,
+                            "index_ids": sorted(rebuilt_index_ids),
+                            "graph_node_count": len(snapshot.nodes),
+                            "graph_edge_count": len(snapshot.edges),
+                            "gigacode_results": gigacode_results,
+                            "static_ssot_files": static_ssot_files,
+                            "gigacode_used": generation_mode == "gigacode",
+                        },
+                    )
+        except (
+            CatalogJobCancelled,
+            GigaCodeCancelled,
+            IndexBuildCancelled,
+            RepositoryOperationCancelled,
+            ServiceMapBuildCancelled,
+        ):
+            for index_id in affected_index_ids:
+                self._restore_index_status(index_id)
+            self._finish_cancelled_job(job_id, None)
+        except Exception as exc:
+            for index_id in affected_index_ids:
+                self._update_index(
+                    index_id,
+                    status="error",
+                    error="All-services SSOT refresh failed; open the job log",
+                    updated_at=_now(),
+                )
+            self._fail_background_job(job_id, None, "All-services SSOT refresh failed", exc)
+        finally:
+            self._release_cancel_event(job_id)
+
     def _run_service_analysis_job(
         self,
         job_id: str,
@@ -1888,8 +2164,7 @@ class RagCatalog:
             "next": (
                 "For each targets[] item call action='context'. Review analysis and file manifest, "
                 "then call action='read_file' for any source needed. Generate Markdown with the "
-                "calling client's model. Use the local kb_save_and_upload_ssot tool so the file "
-                "is written under the client temp directory before action='submit' uploads it."
+                "calling client's model, then upload it directly with action='submit'."
             ),
         }
         self._update_job(
@@ -1911,7 +2186,8 @@ class RagCatalog:
         targets: list[dict[str, Any]],
         repository_ids: list[str],
         cancel_event: threading.Event,
-    ) -> None:
+        complete_job: bool = True,
+    ) -> dict[str, Any]:
         knowledge_root = Path(index.knowledge_dir).resolve()
         knowledge_root.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".gigacode-ssot-", dir=knowledge_root))
@@ -2030,31 +2306,186 @@ class RagCatalog:
                 updated_at=_now(),
                 error=None,
             )
-            self._update_job(
-                job_id,
-                status="completed",
-                message=(
-                    f"GigaCode analyzed {len(targets)} targets and rebuilt index {index.name}"
-                ),
-                completed_at=_now(),
-                result={
-                    "phase": "indexed",
-                    "generation_mode": "gigacode",
-                    "index_id": index.id,
-                    "index_name": index.name,
-                    "repository_ids": repository_ids,
-                    "target_count": len(targets),
-                    "targets": targets,
-                    "files": published,
-                    "gigacode_runs": gigacode_runs,
-                    "document_count": stats.document_count,
-                    "chunk_count": stats.chunk_count,
-                    "server_llm_used": False,
-                    "gigacode_used": True,
-                },
-            )
+            result_payload: dict[str, Any] = {
+                "phase": "indexed",
+                "generation_mode": "gigacode",
+                "index_id": index.id,
+                "index_name": index.name,
+                "repository_ids": repository_ids,
+                "target_count": len(targets),
+                "targets": targets,
+                "files": published,
+                "gigacode_runs": gigacode_runs,
+                "document_count": stats.document_count,
+                "chunk_count": stats.chunk_count,
+                "server_llm_used": False,
+                "gigacode_used": True,
+            }
+            if complete_job:
+                self._update_job(
+                    job_id,
+                    status="completed",
+                    message=(
+                        f"GigaCode analyzed {len(targets)} targets and rebuilt index {index.name}"
+                    ),
+                    completed_at=_now(),
+                    result=result_payload,
+                )
+            else:
+                self._append_job_log(
+                    job_id,
+                    f"GigaCode index batch ready: index={index.id}; targets={len(targets)}",
+                )
+            return result_payload
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+    @staticmethod
+    def _ssot_target(
+        job_id: str,
+        service: ServiceRecord,
+        repository: RepositorySource,
+    ) -> dict[str, Any]:
+        return {
+            "id": service.id,
+            "kind": "service",
+            "name": service.name,
+            "service_id": service.id,
+            "repository_id": repository.id,
+            "repository_name": repository.name,
+            "module_path": service.module_path,
+            "module_state": service.module_state,
+            "context_call": {
+                "action": "context",
+                "job_id": job_id,
+                "service_id": service.id,
+            },
+        }
+
+    def _write_static_ssot_documents(
+        self,
+        job_id: str,
+        service_ids: set[str],
+        service_map: ServiceMapSnapshot,
+        repository_by_service: dict[str, RepositorySource],
+    ) -> list[str]:
+        services = {item.id: item for item in service_map.services}
+        published: list[str] = []
+        for service_id in sorted(service_ids):
+            service = services.get(service_id)
+            repository = repository_by_service.get(service_id)
+            if service is None or repository is None:
+                continue
+            lines = [
+                f"# {service.name}",
+                "",
+                (
+                    "Minimal SSOT generated from static source analysis. It records only "
+                    "interfaces and relationships observed in the current checkout."
+                ),
+                "",
+                "## Service identity",
+                "",
+                f"- Service ID: `{service.id}`",
+                f"- Repository: `{repository.name}`",
+                f"- Module: `{service.module_path}`",
+                f"- Build: `{service.build_system}`",
+                f"- Module state: `{service.module_state}`",
+                f"- Owner: `{service.owner or 'unknown'}`",
+                "",
+                "## Inbound interfaces",
+                "",
+            ]
+            if service.entrypoints:
+                lines.extend(
+                    f"- {item.kind} `{item.operation}` — {item.description} "
+                    f"(evidence: {', '.join(item.evidence_ids) or 'static extractor'})"
+                    for item in service.entrypoints
+                )
+            else:
+                lines.append("- No inbound interface was found by the static analyzer.")
+            lines.extend(["", "## Outbound interfaces", ""])
+            if service.outbound_interfaces:
+                lines.extend(
+                    f"- {item.kind} `{item.operation}` → "
+                    f"`{item.target_hint or 'unresolved target'}` — {item.description} "
+                    f"(evidence: {', '.join(item.evidence_ids) or 'static extractor'})"
+                    for item in service.outbound_interfaces
+                )
+            else:
+                lines.append("- No outbound interface was found by the static analyzer.")
+            dependencies = [
+                item
+                for item in service_map.dependencies
+                if item.source_service_id == service.id
+            ]
+            lines.extend(["", "## Resolved and candidate dependencies", ""])
+            if dependencies:
+                lines.extend(
+                    f"- {item.protocol} `{item.operation}` → "
+                    f"`{item.target_service_id or item.target_hint}` "
+                    f"(confidence: {item.confidence}; status: {item.status}; "
+                    f"origin: {item.origin})"
+                    for item in dependencies
+                )
+            else:
+                lines.append("- No service dependency was found by the static analyzer.")
+            lines.extend(
+                [
+                    "",
+                    "## Analysis limits",
+                    "",
+                    (
+                        "- This document is source-derived and does not assert runtime traffic, "
+                        "deployment topology, ownership, or behavior not visible in annotations "
+                        "and configuration."
+                    ),
+                    "- Missing interfaces mean 'not detected', not necessarily 'does not exist'.",
+                ]
+            )
+            target = self._ssot_target(job_id, service, repository)
+            document = self._client_ssot_document(
+                "\n".join(lines),
+                target,
+                repository,
+                generated_by="kb_generate_system_ssot/static-analysis",
+                authority="static-source-analysis",
+            )
+            knowledge_root = Path(self._record(repository.index_id).knowledge_dir).resolve()
+            destination = (
+                knowledge_root / "ssot" / "generated" / f"{_slug(service.id)}.md"
+            ).resolve()
+            if not destination.is_relative_to(knowledge_root):
+                raise RuntimeError("Refusing to publish static SSOT outside knowledge root")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_suffix(f".{uuid.uuid4().hex}.tmp")
+            try:
+                temporary.write_text(document, encoding="utf-8")
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+            relative = destination.relative_to(knowledge_root).as_posix()
+            published.append(f"{repository.index_id}:{relative}")
+            self._append_job_log(
+                job_id,
+                f"Static SSOT ready: service={service.id}; index={repository.index_id}; "
+                f"path={relative}",
+            )
+        return published
+
+    def _remove_generated_ssot(self, index_id: str, service_ids: set[str]) -> int:
+        knowledge_root = Path(self._record(index_id).knowledge_dir).resolve()
+        removed = 0
+        for service_id in service_ids:
+            path = (
+                knowledge_root / "ssot" / "generated" / f"{_slug(service_id)}.md"
+            ).resolve()
+            if not path.is_relative_to(knowledge_root):
+                raise RuntimeError("Refusing to delete generated SSOT outside knowledge root")
+            if path.is_file():
+                path.unlink()
+                removed += 1
+        return removed
 
     def _gigacode_authentication_required(
         self,
@@ -2253,6 +2684,7 @@ class RagCatalog:
         job_id: str | None = None,
         force_service_ids: set[str] | None = None,
         force_all: bool = False,
+        skip_service_ids: set[str] | None = None,
         analysis_mode: Literal["static", "gigacode"] = "static",
         verify_all: bool = False,
     ) -> GraphSnapshot:
@@ -2264,6 +2696,7 @@ class RagCatalog:
                 job_id=job_id,
                 force_service_ids=force_service_ids,
                 force_all=force_all,
+                skip_service_ids=skip_service_ids,
                 analysis_mode=analysis_mode,
                 verify_all=verify_all,
             )
@@ -2275,6 +2708,7 @@ class RagCatalog:
         job_id: str | None,
         force_service_ids: set[str] | None,
         force_all: bool,
+        skip_service_ids: set[str] | None,
         analysis_mode: Literal["static", "gigacode"],
         verify_all: bool,
     ) -> GraphSnapshot:
@@ -2293,6 +2727,8 @@ class RagCatalog:
             build_options["force_service_ids"] = force_service_ids
         if "force_all" in build_parameters:
             build_options["force_all"] = force_all
+        if "skip_service_ids" in build_parameters:
+            build_options["skip_service_ids"] = skip_service_ids
         result = runner.build(
             inputs,
             cancel=cancel_event,
@@ -2416,6 +2852,25 @@ class RagCatalog:
             return lock
 
     @contextmanager
+    def _cancellable_index_locks(
+        self,
+        index_ids: list[str],
+        cancel_event: threading.Event | None,
+    ) -> Iterator[None]:
+        acquired: list[threading.Lock] = []
+        try:
+            for index_id in sorted(set(index_ids)):
+                lock = self._index_work_lock(index_id)
+                while not lock.acquire(timeout=0.1):
+                    self._raise_if_cancelled(cancel_event)
+                acquired.append(lock)
+                self._raise_if_cancelled(cancel_event)
+            yield
+        finally:
+            for lock in reversed(acquired):
+                lock.release()
+
+    @contextmanager
     def _cancellable_lock(
         self,
         lock: threading.Lock,
@@ -2492,6 +2947,73 @@ class RagCatalog:
                 retained.append(name)
             directories[:] = retained
         return sorted(set(found))
+
+    @staticmethod
+    def _services_owning_openspec(
+        services: list[ServiceRecord],
+        checkout: Path,
+        openspecs: list[Path],
+    ) -> set[str]:
+        """Assign each OpenSpec root to its most specific discovered service module."""
+        checkout = checkout.resolve()
+        service_roots: list[tuple[ServiceRecord, Path]] = []
+        for service in services:
+            module_path = Path(service.module_path or ".")
+            root = (checkout / module_path).resolve()
+            if root.is_relative_to(checkout):
+                service_roots.append((service, root))
+        owners: set[str] = set()
+        for openspec in openspecs:
+            matches = [
+                (service, root)
+                for service, root in service_roots
+                if openspec.resolve().is_relative_to(root)
+            ]
+            if not matches:
+                continue
+            deepest = max(len(root.parts) for _service, root in matches)
+            owners.update(
+                service.id
+                for service, root in matches
+                if len(root.parts) == deepest
+            )
+        return owners
+
+    def _rebuild_index(
+        self,
+        index_id: str,
+        cancel_event: threading.Event | None,
+    ) -> Any:
+        self._update_index(index_id, status="indexing", error=None)
+        service = self.service_for(index_id)
+        IndexBuildProcessRunner(
+            service.settings,
+            timeout_seconds=self.settings.index_build_timeout_seconds,
+        ).build(cancel=cancel_event)
+        stats = service.reload_cached_index()
+        self._update_index(
+            index_id,
+            status="ready",
+            document_count=stats.document_count,
+            chunk_count=stats.chunk_count,
+            updated_at=_now(),
+            error=None,
+        )
+        return stats
+
+    def _restore_index_status(self, index_id: str) -> None:
+        try:
+            stats = self.service_for(index_id).stats()
+            self._update_index(
+                index_id,
+                status="ready",
+                document_count=stats.document_count,
+                chunk_count=stats.chunk_count,
+                updated_at=_now(),
+                error=None,
+            )
+        except Exception:
+            self._update_index(index_id, status="empty", updated_at=_now(), error=None)
 
     def _sync_openspec(
         self,

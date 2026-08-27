@@ -1,36 +1,7 @@
 {
-  "mcp": {
-    "allowed": [
-      "local-corporate-kb"
-    ]
-  },
   "mcpServers": {
-    "local-corporate-kb": {
-      "command": "/ABSOLUTE/PATH/TO/REPOSITORY/.venv/bin/python",
-      "args": [
-        "-m",
-        "corporate_kb.mcp.server"
-      ],
-      "cwd": "/ABSOLUTE/PATH/TO/REPOSITORY",
-      "env": {
-        "PYTHONUNBUFFERED": "1",
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONPATH": "/ABSOLUTE/PATH/TO/REPOSITORY/src",
-        "KB_KNOWLEDGE_DIR": "/ABSOLUTE/PATH/TO/REPOSITORY/knowledge",
-        "KB_CACHE_DIR": "/ABSOLUTE/PATH/TO/REPOSITORY/.cache/kb",
-        "KB_EMBEDDING_PROVIDER": "hash",
-        "KB_EMBEDDING_LOCAL_FILES_ONLY": "true",
-        "KB_AUTO_INDEX": "false",
-        "HF_HUB_OFFLINE": "1",
-        "HF_DATASETS_OFFLINE": "1",
-        "HF_HUB_DISABLE_TELEMETRY": "1",
-        "TRANSFORMERS_OFFLINE": "1",
-        "DO_NOT_TRACK": "1",
-        "KB_LOG_LEVEL": "INFO"
-      },
-      "discoveryTimeoutMs": 30000,
-      "timeout": 120000,
-      "trust": false
+    "corporate-kb": {
+      "httpUrl": "https://RAG-SERVER.EXAMPLE.COM:8000/mcp"
     }
   }
 }

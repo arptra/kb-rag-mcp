@@ -15,6 +15,9 @@ def test_http_defaults_bind_only_to_loopback() -> None:
     assert Settings.model_fields["mcp_http_port"].default == 8000
     assert Settings.model_fields["mcp_http_path"].default == "/mcp"
     assert Settings.model_fields["mcp_http_bearer_token"].default is None
+    assert Settings.model_fields["mcp_tls_enabled"].default is True
+    assert Settings.model_fields["mcp_tls_cert_file"].default.as_posix() == "certs/server.crt"
+    assert Settings.model_fields["mcp_tls_key_file"].default.as_posix() == "certs/server.key"
 
 
 def test_context_defaults_keep_mcp_search_output_small() -> None:

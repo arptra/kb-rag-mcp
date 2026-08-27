@@ -94,8 +94,7 @@ KB_SSOT_ENABLED=true ./scripts/dev.sh ssot \
 HTTP-проверка удалённого сервера:
 
 ```bash
-curl -G 'http://SERVER_IP:8000/api/v1/ssot/context' \
-  -H 'Authorization: Bearer SERVER_TOKEN' \
+curl -G 'https://SERVER_IP:8000/api/v1/ssot/context' \
   --data-urlencode 'question=Как реализовать платёж с повторной проверкой лимита?' \
   --data-urlencode 'mode=implementation'
 ```

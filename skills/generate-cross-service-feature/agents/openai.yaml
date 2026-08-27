@@ -1,0 +1,4 @@
+interface:
+  display_name: "Generate Cross-Service Feature"
+  short_description: "Invent a grounded feature across 2–3 services"
+  default_prompt: "Use $generate-cross-service-feature to propose one business feature spanning two or three real services."

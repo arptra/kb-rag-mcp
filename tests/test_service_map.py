@@ -394,6 +394,49 @@ public class Controller {{
     assert any("Module cache hit" in event and "payments" in event for event in forced_events)
 
 
+def test_service_map_keeps_service_but_skips_source_scan_for_authoritative_openspec(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "documented-platform"
+    _write(repository, "settings.gradle", "include ':documented', ':code'\n")
+    for module in ("documented", "code"):
+        _write(repository, f"{module}/build.gradle", "plugins { id 'java' }\n")
+        _write(
+            repository,
+            f"{module}/src/main/java/example/Controller.java",
+            f"""
+@RestController
+public class Controller {{
+  @GetMapping("/{module}") public String get() {{ return "ok"; }}
+}}
+""",
+        )
+    settings = GraphSettings(
+        store_path=tmp_path / "system-graph.json",
+        module_cache_path=tmp_path / "module-cache",
+    ).resolved(tmp_path)
+    events: list[str] = []
+
+    result = ServiceMapBuilder(settings).build(
+        [RepositoryInput(path=repository, name="Documented platform")],
+        progress=events.append,
+        force_service_ids={"documented", "code"},
+        skip_service_ids={"documented"},
+    )
+
+    services = {item.id: item for item in result.service_map.services}
+    assert set(services) == {"documented", "code"}
+    assert services["documented"].entrypoints == []
+    assert services["code"].entrypoints[0].operation == "GET /code"
+    assert any(
+        "Module source scan skipped" in event
+        and "documented" in event
+        and "openspec-authoritative" in event
+        for event in events
+    )
+    assert not any("Module cache key" in event and "documented" in event for event in events)
+
+
 def test_service_map_process_honours_cancellation_before_start(tmp_path: Path) -> None:
     settings = GraphSettings(store_path=tmp_path / "system-graph.json").resolved(tmp_path)
     cancel = threading.Event()
@@ -540,7 +583,7 @@ def test_service_map_process_dumps_worker_stack_when_stalled(
             nonlocal diagnostic_path
             args = kwargs["args"]
             assert isinstance(args, tuple)
-            diagnostic_path = args[9]
+            diagnostic_path = args[10]
             assert isinstance(diagnostic_path, Path)
             return process
 

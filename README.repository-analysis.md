@@ -390,9 +390,8 @@ Protocol состоит из действий одного tool:
    приоритетные source-фрагменты, шаблон/skill и указание следующего вызова.
 5. Клиентская модель вызывает `action=read_file` столько раз, сколько нужно. Файл задаётся только
    безопасным repository-relative path; поддерживаются `offset` и `max_chars`.
-6. Модель создаёт один evidence-backed SSOT Markdown на target. Распределённый stdio-proxy добавляет
-   локальный tool `kb_save_and_upload_ssot`: он атомарно пишет файл в temp-каталог пользователя и
-   вызывает серверный `action=submit`.
+6. Модель создаёт один evidence-backed SSOT Markdown на target и отправляет его тем же MCP tool
+   `kb_generate_system_ssot` с `action=submit`; отдельный stdio-proxy не участвует.
 7. На последнем target передаётся `finalize=true`: сервер сохраняет документы в
    `<knowledge_dir>/ssot/generated/<service-id>.md` и ставит выбранный RAG-индекс на обновление.
 
@@ -483,9 +482,9 @@ client mode продолжает работать независимо.
 
 ```bash
 ./scripts/start-mcp-http.sh logs
-curl -s http://127.0.0.1:8000/admin/api/catalog | jq '.jobs'
-curl -s 'http://127.0.0.1:8000/admin/api/jobs/log?job_id=<job-id>' | jq -r '.log'
-curl -s http://127.0.0.1:8000/admin/api/service-map | jq '.services, .issues'
+curl -k -s https://127.0.0.1:8000/admin/api/catalog | jq '.jobs'
+curl -k -s 'https://127.0.0.1:8000/admin/api/jobs/log?job_id=<job-id>' | jq -r '.log'
+curl -k -s https://127.0.0.1:8000/admin/api/service-map | jq '.services, .issues'
 jq '.issues' .cache/kb/system_graph.json
 ```
 
@@ -531,8 +530,7 @@ feature + start_service (optional)
 2. правила `service -> repository -> index` менять в `_routes()`;
 3. привязку OpenSpec/SSOT-документов к сервису менять в `_document_belongs_to_service()`;
 4. восстановление причины вызова менять в `_invocation_contexts()`;
-5. стабильный MCP/HTTP-контракт менять одновременно в `mcp/server.py`, `mcp/http_server.py` и
-   `clients/corporate_kb_stdio_proxy.py`;
+5. стабильный MCP/HTTPS-контракт менять одновременно в `mcp/server.py` и `mcp/http_server.py`;
 6. сценарий `orders -> inventory` зафиксирован в `tests/test_feature_context.py`.
 
 ## Как расширять дальше

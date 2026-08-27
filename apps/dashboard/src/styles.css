@@ -58,7 +58,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .topbar { min-height: 92px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 18px 34px; border-bottom: 1px solid var(--line-soft); background: #0b100dcc; backdrop-filter: blur(18px); }
 .topbar h1 { margin: 3px 0 0; font-size: 23px; font-weight: 650; letter-spacing: -.03em; }
 .breadcrumb { color: #657068; font-size: var(--text-small); }
-.top-actions { display: flex; gap: 9px; }
+.top-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }
 .button { min-height: 36px; padding: 8px 13px; border: 1px solid var(--line); border-radius: 8px; background: #151c17; color: #dce6de; font-size: var(--text-body); font-weight: 620; cursor: pointer; }
 .button:hover { border-color: #3d4b40; background: #1a231c; }
 .button:disabled { opacity: .5; cursor: default; }

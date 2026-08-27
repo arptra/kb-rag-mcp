@@ -728,6 +728,129 @@ def test_catalog_indexes_all_module_openspec_roots(settings_factory, tmp_path) -
     assert any("payments/current.md" in item["source_path"] for item in payment_result["results"])
 
 
+def test_all_services_refresh_prefers_openspec_and_statically_indexes_the_rest(
+    settings_factory,
+    tmp_path,
+) -> None:
+    settings = settings_factory(gigacode_command=str(tmp_path / "missing-gigacode"))
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    index = catalog.create_index(name="Bulk static refresh")
+    repository = tmp_path / "bulk-static-repository"
+    _write(repository / "settings.gradle", "include ':documented', ':code'\n")
+    for module in ("documented", "code"):
+        _write(repository / module / "build.gradle", "plugins { id 'java' }\n")
+        _write(
+            repository / module / "src/main/java/example/Controller.java",
+            f"""
+@RestController
+public class Controller {{
+  @GetMapping("/{module}") public String get() {{ return "ok"; }}
+}}
+""",
+        )
+    _write(
+        repository / "documented/openspec/current.md",
+        "# Documented contract\n\nVersion one.",
+    )
+    imported = catalog.start_repository_ingestion(
+        name="Bulk static repository",
+        git_url=str(repository),
+        index_id=index.id,
+    )
+    assert _wait_for_job(catalog, imported.id)["status"] == "completed"
+    _write(
+        repository / "documented/openspec/current.md",
+        "# Documented contract\n\nFresh bulk refresh marker.",
+    )
+
+    job = catalog.start_all_services_ssot_refresh()
+    completed = _wait_for_job(catalog, job.id)
+
+    assert completed["status"] == "completed"
+    assert completed["result"]["generation_mode"] == "static"
+    assert completed["result"]["openspec_service_ids"] == ["documented"]
+    assert completed["result"]["analyzed_service_ids"] == ["code"]
+    assert completed["result"]["index_ids"] == [index.id]
+    assert len(completed["result"]["static_ssot_files"]) == 1
+    log = catalog.job_log(job.id)["log"]
+    assert "source_scan_skipped=documented" in log
+    assert "Module source scan skipped" in log
+    assert "GigaCode unavailable; using static fallback" in log
+    search = catalog.tools_for(index.id).search(query="Fresh bulk refresh marker", top_k=3)
+    assert any("Fresh bulk refresh marker" in item["excerpt"] for item in search["results"])
+    static_search = catalog.tools_for(index.id).search(query="GET code inbound", top_k=3)
+    assert any("/code" in item["excerpt"] for item in static_search["results"])
+
+
+def test_all_services_refresh_uses_gigacode_only_for_services_without_openspec(
+    settings_factory,
+    tmp_path,
+) -> None:
+    gigacode = _write_fake_gigacode(tmp_path / "bulk-gigacode")
+    settings = settings_factory(gigacode_command=str(gigacode))
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    index = catalog.create_index(name="Bulk GigaCode refresh")
+    repository = tmp_path / "bulk-gigacode-repository"
+    _write(repository / "settings.gradle", "include ':documented', ':code'\n")
+    for module in ("documented", "code"):
+        _write(repository / module / "build.gradle", "plugins { id 'java' }\n")
+        _write(
+            repository / module / "src/main/java/example/Controller.java",
+            f"""
+@RestController
+public class Controller {{
+  @GetMapping("/{module}") public String get() {{ return "ok"; }}
+}}
+""",
+        )
+    _write(
+        repository / "documented/openspec/current.md",
+        "# Documented contract\n\nThis service is already specified.",
+    )
+    imported = catalog.start_repository_ingestion(
+        name="Bulk GigaCode repository",
+        git_url=str(repository),
+        index_id=index.id,
+    )
+    assert _wait_for_job(catalog, imported.id)["status"] == "completed"
+
+    job = catalog.start_all_services_ssot_refresh()
+    completed = _wait_for_job(catalog, job.id)
+
+    assert completed["status"] == "completed"
+    assert completed["result"]["generation_mode"] == "gigacode"
+    assert completed["result"]["openspec_service_ids"] == ["documented"]
+    assert completed["result"]["analyzed_service_ids"] == ["code"]
+    assert len(completed["result"]["gigacode_results"]) == 1
+    batch = completed["result"]["gigacode_results"][0]
+    assert [target["id"] for target in batch["targets"]] == ["code"]
+    assert batch["gigacode_runs"][0]["service_id"] == "code"
+
+
 def test_catalog_cancels_running_graph_job_without_blocking_api(
     settings_factory,
     monkeypatch,

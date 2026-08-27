@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan Feature With System Graph"
+  short_description: "Plan changes across services from MCP evidence"
+  default_prompt: "Use $plan-feature-with-system-graph to build an evidence-backed cross-service implementation plan for this feature."

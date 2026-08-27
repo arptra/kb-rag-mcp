@@ -14,9 +14,9 @@ embeddings + файловый кэш .cache/kb
         ↓
 прогретый индекс в RAM
         ↓
-Streamable HTTP /mcp (Bearer опционален)
+Streamable HTTPS /mcp (без логина и client certificates)
         ↓
-локальные stdio MCP-клиенты сотрудников
+GigaCode клиентов по единому URL
 ```
 
 Поиск ограничивает ответ для LLM: внутри индекс ищет до 12 кандидатов, но наружу возвращаются до
@@ -24,9 +24,9 @@ Streamable HTTP /mcp (Bearer опционален)
 вызывает `kb_get_chunk`; все лимиты можно изменить через `KB_SEARCH_*` и
 `KB_DOCUMENT_CONTEXT_TOKENS`.
 
-Новые клиенты подключаются к `/mcp` напрямую. Для stdio-only клиентов однофайловый proxy также
-подключается к `/mcp`, выполняет удалённый `tools/list` и зеркалирует полный актуальный набор tools;
-JSON API остаётся доступным кастомным HTTP-интеграциям.
+Новые клиенты подключаются к `/mcp` напрямую по HTTPS и получают актуальный `tools/list` с общего
+сервера. Python, `venv`, `mcp-remote` и однофайловый stdio-proxy на клиенте не нужны. JSON API
+остаётся доступным кастомным HTTP-интеграциям.
 
 ## Требования
 
@@ -211,8 +211,8 @@ export KB_AUTO_INDEX='false'
 директорией всегда становится корень проекта, поэтому jobs и индексы не расползаются по разным
 `.cache`.
 
-Это открытый локальный запуск без паролей. Для сетевого режима явно задайте `0.0.0.0`; если сеть
-недоверенная, одновременно установите `KB_MCP_HTTP_BEARER_TOKEN` и `KB_ADMIN_PASSWORD`.
+Это открытый запуск без паролей. Для сетевого режима задайте `0.0.0.0`; TLS шифрует трафик, но
+ограничение круга клиентов выполняется firewall/VPN, а не приложением.
 
 При старте готовый индекс загружается в RAM до открытия порта. При
 `KB_AUTO_INDEX=false` сервер **не обходит `knowledge/`** и не пересчитывает hash 11 000 документов:
@@ -225,21 +225,21 @@ export KB_AUTO_INDEX='false'
 Публичная проверка процесса:
 
 ```bash
-curl -i 'http://127.0.0.1:8000/health'
+curl -k -i 'https://127.0.0.1:8000/health'
 ```
 
 Проверка индекса:
 
 ```bash
-curl -i \
-  'http://127.0.0.1:8000/api/v1/stats'
+curl -k -i \
+  'https://127.0.0.1:8000/api/v1/stats'
 ```
 
 Проверка поиска:
 
 ```bash
-curl -G \
-  'http://127.0.0.1:8000/api/v1/search' \
+curl -k -G \
+  'https://127.0.0.1:8000/api/v1/search' \
   --data-urlencode 'query=какой сервис владеет дневными лимитами' \
   --data-urlencode 'top_k=3'
 ```
@@ -249,9 +249,8 @@ curl -G \
 
 ## Client JSON API
 
-В открытом режиме endpoints не требуют Bearer-токен. Если задан
-`KB_MCP_HTTP_BEARER_TOKEN`, тот же API автоматически начинает требовать его; чтение использует
-`GET`, вызов управляемого tool и benchmark — `POST`:
+Endpoints не требуют Bearer-токен; чтение использует `GET`, вызов управляемого tool и benchmark —
+`POST`:
 
 | Endpoint | Назначение | Основные параметры |
 | --- | --- | --- |
@@ -270,7 +269,7 @@ Client API не изменяет документы и не запускает �
 Ручная проверка benchmark:
 
 ```bash
-curl -X POST 'http://127.0.0.1:8000/api/v1/admin/context-benchmark' \
+curl -k -X POST 'https://127.0.0.1:8000/api/v1/admin/context-benchmark' \
   -H 'X-KB-Benchmark-Password: REPLACE_WITH_SEPARATE_BENCHMARK_PASSWORD'
 ```
 
@@ -282,7 +281,7 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/admin/context-benchmark' \
 После запуска откройте:
 
 ```text
-http://SERVER_IP:8000/admin
+https://SERVER_IP:8000/admin
 ```
 
 React/TypeScript-панель содержит три рабочих раздела:
@@ -301,7 +300,7 @@ checkout и заменяет его OpenSpec-снимок в индексе. П�
 
 Декларативные schemas сохраняются в `KB_MANAGED_TOOLS_PATH`, каталог индексов — в
 `KB_INDEX_CATALOG_PATH`. Подключённому прямому MCP-клиенту после изменения tools нужно обновить
-discovery; однофайловому proxy — перезапустить GigaCode.
+discovery, обычно полностью перезапустив GigaCode.
 
 ## 7. Запустить как systemd service
 
@@ -389,14 +388,12 @@ sudo journalctl -u corporate-kb -f
 URL будет выглядеть так:
 
 ```text
-http://SERVER_IP:8000/mcp
+https://SERVER_IP:8000/mcp
 ```
 
-Укажите его в `CORPORATE_KB_MCP_URL`. Старая настройка
-`CORPORATE_KB_API_URL=http://SERVER_IP:8000` поддерживается для уже установленных proxy.
-
-Для публикации вне доверенной сети используйте TLS и корпоративный gateway согласно правилам вашей
-инфраструктуры. Это не требуется для работы внутри защищённой сети.
+Укажите этот URL прямо как `httpUrl` в `~/.gigacode/settings.json`. Клиентский сертификат, token,
+локальный Python и дополнительные процессы не нужны. Сертификат сервера должен быть доверен
+клиентской ОС и содержать DNS/IP, который указан в URL.
 
 ## Обновление документов
 
@@ -433,11 +430,6 @@ sudo systemctl restart corporate-kb
 
 ## Диагностика
 
-### `/health` работает, `/api/v1/*` возвращает `401`
-
-На сервере задан `KB_MCP_HTTP_BEARER_TOKEN`. Проверьте его совпадение на сервере и клиенте либо
-очистите переменную, чтобы вернуть открытый режим.
-
 ### Сервер не стартует: knowledge index is missing or incompatible
 
 Перестройте индекс:
@@ -461,8 +453,8 @@ KB_MCP_HTTP_HOST=0.0.0.0
 С клиентского компьютера проверьте:
 
 ```bash
-curl -i 'http://SERVER_IP:8000/health'
+curl -k -i 'https://SERVER_IP:8000/health'
 ```
 
 Если ответа нет, проверьте firewall, маршрут/VPN и адрес bind. Если `/health` работает, проверьте
-авторизованный `/api/v1/stats`.
+`/api/v1/stats` и доверие к сертификату.

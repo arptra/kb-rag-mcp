@@ -14,6 +14,7 @@ from corporate_kb.config import Settings
 from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
 from corporate_kb.mcp.http_server import (
     create_http_app,
+    tls_uvicorn_config,
     validate_http_settings,
 )
 from corporate_kb.mcp.servers import McpServerRegistry
@@ -74,6 +75,50 @@ def test_http_settings_allow_open_access_or_a_strong_token(
         )
         == TOKEN
     )
+
+
+def test_tls_config_requires_the_certificate_pair(
+    settings_factory, monkeypatch, tmp_path: Path
+) -> None:
+    disabled = settings_factory(mcp_tls_enabled=False)
+    assert tls_uvicorn_config(disabled) is None
+
+    missing = settings_factory(
+        mcp_tls_cert_file=tmp_path / "missing" / "server.crt",
+        mcp_tls_key_file=tmp_path / "missing" / "server.key",
+    )
+    with pytest.raises(ValueError, match="TLS certificate was not found"):
+        tls_uvicorn_config(missing)
+
+    missing.mcp_tls_cert_file.parent.mkdir(parents=True)
+    missing.mcp_tls_cert_file.write_text("test certificate", encoding="utf-8")
+    missing.mcp_tls_key_file.write_text("test private key", encoding="utf-8")
+    loaded: dict[str, Path] = {}
+
+    def load_cert_chain(
+        _context: object,
+        certfile: str | Path,
+        keyfile: str | Path | None = None,
+        password: object = None,
+    ) -> None:
+        del password
+        loaded["certificate"] = Path(certfile)
+        assert keyfile is not None
+        loaded["private_key"] = Path(keyfile)
+
+    monkeypatch.setattr(
+        "corporate_kb.mcp.http_server.ssl.SSLContext.load_cert_chain",
+        load_cert_chain,
+    )
+    config = tls_uvicorn_config(missing)
+
+    assert config is not None
+    assert config["ssl_certfile"] == str(missing.mcp_tls_cert_file)
+    assert config["ssl_keyfile"] == str(missing.mcp_tls_key_file)
+    assert loaded == {
+        "certificate": missing.mcp_tls_cert_file,
+        "private_key": missing.mcp_tls_key_file,
+    }
 
 
 @pytest.mark.asyncio
@@ -738,6 +783,27 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
                 break
             await asyncio.sleep(0.01)
         assert analysis_job["status"] == "completed"
+
+        refresh_all = await client.post(
+            "/admin/api/services/refresh-all",
+            headers=admin_headers,
+            json={},
+        )
+        assert refresh_all.status_code == 202
+        refresh_all_job_id = refresh_all.json()["id"]
+        assert refresh_all.json()["target_id"] == "all-services"
+        for _ in range(300):
+            catalog = (
+                await client.get("/admin/api/catalog", headers=admin_headers)
+            ).json()
+            refresh_all_job = next(
+                item for item in catalog["jobs"] if item["id"] == refresh_all_job_id
+            )
+            if refresh_all_job["status"] not in {"queued", "running", "cancelling"}:
+                break
+            await asyncio.sleep(0.01)
+        assert refresh_all_job["status"] == "completed"
+        assert refresh_all_job["result"]["openspec_service_count"] == 1
 
         bundle = await client.post(
             "/admin/api/analysis/ssot-bundle",
