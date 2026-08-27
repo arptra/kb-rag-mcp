@@ -1,0 +1,980 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Короткая HTML-презентация о корпоративном RAG, графе сервисов и планировании фичей.">
+  <title>Корпоративный RAG — как знания становятся контекстом разработки</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07111f;
+      --bg-deep: #030912;
+      --surface: #0d1b2c;
+      --surface-2: #11243a;
+      --text: #f4f8fb;
+      --muted: #91a7ba;
+      --line: #28425a;
+      --cyan: #54d7ff;
+      --green: #5ce3a0;
+      --violet: #af98ff;
+      --orange: #ffbd73;
+      --red: #ff7c8b;
+      --shadow: 0 28px 90px rgba(0, 0, 0, 0.34);
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+      scroll-snap-type: y mandatory;
+      background: var(--bg-deep);
+    }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at 10% 10%, rgba(84, 215, 255, 0.10), transparent 34rem),
+        radial-gradient(circle at 88% 70%, rgba(175, 152, 255, 0.09), transparent 38rem),
+        var(--bg-deep);
+      overflow-x: hidden;
+    }
+
+    button { font: inherit; }
+
+    .deck { width: 100%; }
+
+    .slide {
+      position: relative;
+      min-height: 100svh;
+      scroll-snap-align: start;
+      scroll-snap-stop: always;
+      display: grid;
+      place-items: center;
+      padding: clamp(28px, 5vw, 72px);
+      isolation: isolate;
+      overflow: hidden;
+    }
+
+    .slide::before {
+      content: "";
+      position: absolute;
+      inset: 18px;
+      z-index: -2;
+      border: 1px solid rgba(145, 167, 186, 0.18);
+      border-radius: 28px;
+      background: linear-gradient(145deg, rgba(13, 27, 44, 0.90), rgba(4, 12, 23, 0.93));
+      box-shadow: var(--shadow);
+    }
+
+    .slide::after {
+      content: "";
+      position: absolute;
+      width: 34rem;
+      height: 34rem;
+      right: -18rem;
+      top: -18rem;
+      z-index: -1;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(84, 215, 255, 0.11), transparent 70%);
+      pointer-events: none;
+    }
+
+    .slide-inner {
+      width: min(1180px, 100%);
+      display: flex;
+      flex-direction: column;
+      gap: clamp(22px, 3.2vw, 44px);
+    }
+
+    .eyebrow {
+      margin: 0;
+      color: var(--cyan);
+      font-size: clamp(0.72rem, 1vw, 0.88rem);
+      font-weight: 800;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    h1,
+    h2,
+    p { margin: 0; }
+
+    h1 {
+      max-width: 1050px;
+      font-size: clamp(3rem, 7.4vw, 7.2rem);
+      line-height: 0.93;
+      letter-spacing: -0.065em;
+    }
+
+    h2 {
+      max-width: 1000px;
+      font-size: clamp(2.15rem, 4.8vw, 5rem);
+      line-height: 0.98;
+      letter-spacing: -0.055em;
+    }
+
+    .lead {
+      max-width: 880px;
+      color: var(--muted);
+      font-size: clamp(1.08rem, 2vw, 1.75rem);
+      line-height: 1.42;
+    }
+
+    .accent { color: var(--cyan); }
+    .green { color: var(--green); }
+    .violet { color: var(--violet); }
+    .orange { color: var(--orange); }
+    .red { color: var(--red); }
+
+    .slide-number {
+      position: absolute;
+      right: clamp(34px, 5vw, 74px);
+      bottom: clamp(30px, 4vw, 56px);
+      color: rgba(145, 167, 186, 0.72);
+      font: 700 0.78rem/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.12em;
+    }
+
+    .title-slide .slide-inner { gap: clamp(20px, 4vw, 54px); }
+
+    .title-rule {
+      width: min(700px, 68vw);
+      height: 3px;
+      background: linear-gradient(90deg, var(--cyan), var(--violet), transparent);
+    }
+
+    .title-foot {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 28px;
+      color: var(--muted);
+      font-size: clamp(0.88rem, 1.2vw, 1.05rem);
+    }
+
+    .islands {
+      position: relative;
+      min-height: 300px;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      align-items: center;
+      gap: clamp(12px, 2vw, 28px);
+    }
+
+    .island {
+      position: relative;
+      min-height: 138px;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+      color: var(--text);
+      background: radial-gradient(circle at 40% 30%, rgba(84, 215, 255, 0.12), var(--surface));
+      text-align: center;
+      font-size: clamp(1rem, 1.5vw, 1.35rem);
+      font-weight: 750;
+      box-shadow: 0 18px 44px rgba(0, 0, 0, 0.24);
+    }
+
+    .island:nth-child(2) { transform: translateY(50px); }
+    .island:nth-child(3) { transform: translateY(-28px); }
+    .island:nth-child(4) { transform: translateY(28px); }
+
+    .question {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 92px;
+      height: 92px;
+      display: grid;
+      place-items: center;
+      transform: translate(-50%, -50%);
+      border: 2px solid var(--red);
+      border-radius: 50%;
+      color: var(--red);
+      background: var(--bg);
+      font-size: 3.5rem;
+      font-weight: 800;
+      box-shadow: 0 0 0 14px rgba(255, 124, 139, 0.07);
+    }
+
+    .big-claim {
+      max-width: 950px;
+      font-size: clamp(1.55rem, 3.2vw, 3rem);
+      line-height: 1.17;
+      letter-spacing: -0.035em;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(9, auto);
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .flow-step {
+      min-width: 128px;
+      min-height: 126px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 10px;
+      padding: 18px 16px;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: rgba(13, 27, 44, 0.86);
+      text-align: center;
+    }
+
+    .flow-step strong {
+      font-size: clamp(1rem, 1.5vw, 1.3rem);
+      line-height: 1.15;
+    }
+
+    .flow-step span {
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.3;
+    }
+
+    .flow-arrow {
+      color: var(--cyan);
+      font-size: clamp(1.5rem, 2.2vw, 2.4rem);
+      font-weight: 300;
+    }
+
+    .dual-layer {
+      display: grid;
+      grid-template-columns: minmax(0, 1.25fr) minmax(290px, 0.75fr);
+      gap: clamp(24px, 4vw, 54px);
+      align-items: center;
+    }
+
+    .vector-pipeline {
+      display: grid;
+      grid-template-columns: minmax(120px, 0.9fr) 38px minmax(170px, 1.15fr) 38px minmax(190px, 1.3fr);
+      align-items: center;
+      gap: 12px;
+    }
+
+    .vector-node {
+      min-height: 152px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 10px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      background: var(--surface);
+      text-align: center;
+    }
+
+    .vector-node strong {
+      font-size: clamp(1rem, 1.5vw, 1.25rem);
+      line-height: 1.2;
+    }
+
+    .vector-node code {
+      color: var(--cyan);
+      font-size: clamp(0.82rem, 1vw, 0.98rem);
+      overflow-wrap: anywhere;
+    }
+
+    .vector-node small {
+      color: var(--muted);
+      font-size: 0.78rem;
+      line-height: 1.35;
+    }
+
+    .mini-arrow {
+      color: var(--cyan);
+      font-size: 2rem;
+      text-align: center;
+    }
+
+    .truth {
+      padding-left: clamp(22px, 3vw, 38px);
+      border-left: 3px solid var(--green);
+    }
+
+    .truth strong {
+      display: block;
+      margin-bottom: 12px;
+      color: var(--green);
+      font-size: clamp(1.6rem, 2.7vw, 2.65rem);
+      line-height: 1.08;
+      letter-spacing: -0.04em;
+    }
+
+    .truth p {
+      color: var(--muted);
+      font-size: clamp(1rem, 1.5vw, 1.3rem);
+      line-height: 1.45;
+    }
+
+    .metric-flow {
+      display: grid;
+      grid-template-columns: 1fr 80px 1fr 80px 1fr;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .metric {
+      text-align: center;
+    }
+
+    .metric-value {
+      display: block;
+      color: var(--cyan);
+      font-size: clamp(4.2rem, 10vw, 9rem);
+      font-weight: 820;
+      line-height: 0.85;
+      letter-spacing: -0.07em;
+    }
+
+    .metric-label {
+      display: block;
+      max-width: 240px;
+      margin: 18px auto 0;
+      color: var(--muted);
+      font-size: clamp(0.92rem, 1.4vw, 1.2rem);
+      line-height: 1.35;
+    }
+
+    .metric-arrow {
+      color: var(--line);
+      font-size: 3rem;
+      text-align: center;
+    }
+
+    .path {
+      position: relative;
+      display: grid;
+      grid-template-columns: repeat(7, auto);
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .path-node {
+      width: clamp(142px, 17vw, 210px);
+      min-height: 154px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 10px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: var(--surface);
+      text-align: center;
+    }
+
+    .path-node strong {
+      font-size: clamp(1.02rem, 1.5vw, 1.28rem);
+      line-height: 1.18;
+    }
+
+    .path-node span {
+      color: var(--muted);
+      font-size: clamp(0.75rem, 1vw, 0.9rem);
+      line-height: 1.35;
+    }
+
+    .path-node.highlight {
+      border-color: var(--cyan);
+      background: linear-gradient(145deg, rgba(84, 215, 255, 0.13), rgba(13, 27, 44, 0.95));
+    }
+
+    .path-node.done {
+      border-color: var(--green);
+      background: linear-gradient(145deg, rgba(92, 227, 160, 0.12), rgba(13, 27, 44, 0.95));
+    }
+
+    .path-arrow {
+      color: var(--cyan);
+      font-size: 2rem;
+      text-align: center;
+    }
+
+    .complex-path {
+      display: grid;
+      grid-template-columns: repeat(9, auto);
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .complex-path .path-node {
+      width: clamp(130px, 14vw, 180px);
+      min-height: 144px;
+      padding: 16px 12px;
+    }
+
+    .route-caption {
+      padding: 18px 22px;
+      border-left: 3px solid var(--violet);
+      color: var(--muted);
+      font-size: clamp(0.94rem, 1.35vw, 1.18rem);
+      line-height: 1.45;
+    }
+
+    .comparison {
+      display: grid;
+      grid-template-columns: 1fr 72px 1fr;
+      align-items: stretch;
+      gap: clamp(16px, 3vw, 38px);
+    }
+
+    .compare-side {
+      position: relative;
+      min-height: 330px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 22px;
+      padding: clamp(24px, 3vw, 42px);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: var(--surface);
+    }
+
+    .compare-side.good { border-color: rgba(92, 227, 160, 0.58); }
+
+    .compare-side h3 {
+      margin: 0;
+      font-size: clamp(1.55rem, 2.7vw, 2.7rem);
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }
+
+    .compare-path {
+      color: var(--muted);
+      font-size: clamp(1rem, 1.45vw, 1.25rem);
+      line-height: 1.6;
+    }
+
+    .compare-path strong { color: var(--text); }
+
+    .versus {
+      display: grid;
+      place-items: center;
+      color: var(--line);
+      font-weight: 800;
+      letter-spacing: 0.08em;
+    }
+
+    .closing {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(300px, 0.7fr);
+      gap: clamp(28px, 5vw, 70px);
+      align-items: center;
+    }
+
+    .limits {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .limit {
+      display: grid;
+      grid-template-columns: 24px 1fr;
+      gap: 14px;
+      align-items: start;
+      color: var(--muted);
+      font-size: clamp(0.96rem, 1.35vw, 1.16rem);
+      line-height: 1.4;
+    }
+
+    .limit i {
+      width: 12px;
+      height: 12px;
+      margin-top: 5px;
+      border-radius: 50%;
+      background: var(--orange);
+      box-shadow: 0 0 0 6px rgba(255, 189, 115, 0.08);
+    }
+
+    .next-step {
+      padding: clamp(28px, 4vw, 48px);
+      border: 1px solid var(--green);
+      border-radius: 30px;
+      background: linear-gradient(145deg, rgba(92, 227, 160, 0.13), rgba(13, 27, 44, 0.95));
+    }
+
+    .next-step span {
+      display: block;
+      margin-bottom: 16px;
+      color: var(--green);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    .next-step strong {
+      display: block;
+      font-size: clamp(1.65rem, 3vw, 3rem);
+      line-height: 1.1;
+      letter-spacing: -0.04em;
+    }
+
+    .next-step p {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: clamp(0.95rem, 1.3vw, 1.12rem);
+      line-height: 1.45;
+    }
+
+    .slide-problem .slide-inner,
+    .slide-summary .slide-inner {
+      gap: 24px;
+    }
+
+    .slide-problem .islands { min-height: 270px; }
+
+    .slide-summary .closing { align-items: start; }
+
+    .slide-summary .next-step {
+      padding: 24px;
+    }
+
+    .slide-summary .next-step p { margin-top: 14px; }
+
+    .controls {
+      position: fixed;
+      left: 50%;
+      bottom: 18px;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px;
+      transform: translateX(-50%);
+      border: 1px solid rgba(145, 167, 186, 0.24);
+      border-radius: 999px;
+      background: rgba(3, 9, 18, 0.78);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.30);
+      backdrop-filter: blur(16px);
+    }
+
+    .controls button {
+      width: 38px;
+      height: 38px;
+      border: 0;
+      border-radius: 50%;
+      color: var(--text);
+      background: transparent;
+      cursor: pointer;
+    }
+
+    .controls button:hover,
+    .controls button:focus-visible {
+      outline: none;
+      background: var(--surface-2);
+    }
+
+    .progress {
+      min-width: 74px;
+      color: var(--muted);
+      text-align: center;
+      font: 700 0.78rem/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .kbd-hint {
+      position: fixed;
+      left: 34px;
+      bottom: 28px;
+      z-index: 10;
+      color: rgba(145, 167, 186, 0.64);
+      font-size: 0.72rem;
+    }
+
+    @media (max-width: 980px) {
+      .flow {
+        grid-template-columns: repeat(5, 1fr);
+      }
+
+      .flow-arrow { display: none; }
+
+      .flow-step { min-width: 0; }
+
+      .dual-layer,
+      .closing { grid-template-columns: 1fr; }
+
+      .vector-pipeline { max-width: 760px; }
+
+      .path,
+      .complex-path {
+        grid-template-columns: repeat(4, 1fr);
+      }
+
+      .path-arrow { display: none; }
+
+      .path-node,
+      .complex-path .path-node {
+        width: auto;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .slide {
+        min-height: 100svh;
+        padding: 44px 28px 78px;
+      }
+
+      .slide::before { inset: 8px; border-radius: 22px; }
+
+      .slide-inner { gap: 24px; }
+
+      .islands {
+        min-height: 330px;
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .island { min-height: 112px; border-radius: 28px; }
+      .island:nth-child(n) { transform: none; }
+      .question { width: 68px; height: 68px; font-size: 2.5rem; }
+
+      .flow { grid-template-columns: 1fr 1fr; }
+      .flow-step:last-child { grid-column: 1 / -1; }
+
+      .vector-pipeline {
+        grid-template-columns: 1fr;
+      }
+
+      .mini-arrow { transform: rotate(90deg); }
+
+      .metric-flow {
+        grid-template-columns: 1fr;
+        gap: 22px;
+      }
+
+      .metric-arrow { display: none; }
+
+      .path,
+      .complex-path { grid-template-columns: 1fr 1fr; }
+
+      .comparison {
+        grid-template-columns: 1fr;
+      }
+
+      .versus { min-height: 30px; }
+      .compare-side { min-height: 0; }
+
+      .controls { bottom: 10px; }
+      .kbd-hint { display: none; }
+      .slide-number { display: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+    }
+
+    @media print {
+      :root { color-scheme: light; }
+      html { scroll-snap-type: none; background: white; }
+      body { background: white; color: #0b1724; }
+      .slide {
+        min-height: 0;
+        height: 177.8mm;
+        page-break-after: always;
+        padding: 18mm;
+      }
+      .slide::before {
+        inset: 0;
+        border-color: #ccd5dd;
+        background: white;
+        box-shadow: none;
+      }
+      .controls,
+      .kbd-hint { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="deck" id="deck">
+    <section class="slide title-slide" data-title="Корпоративный RAG">
+      <div class="slide-inner">
+        <p class="eyebrow">Корпоративная разработка · RAG · граф сервисов</p>
+        <h1>Знания становятся<br><span class="accent">контекстом разработки</span></h1>
+        <div class="title-rule"></div>
+        <p class="lead">Как локальный RAG помогает находить ответы, понимать влияние изменений и планировать фичи между сервисами.</p>
+        <div class="title-foot">
+          <span>полностью локально</span>
+          <span>с доказательствами</span>
+          <span>доступно через MCP</span>
+        </div>
+      </div>
+      <span class="slide-number">01 / 08</span>
+    </section>
+
+    <section class="slide slide-problem" data-title="Проблема">
+      <div class="slide-inner">
+        <p class="eyebrow">Проблема</p>
+        <h2>Документация есть.<br><span class="red">Цельного контекста нет.</span></h2>
+        <div class="islands" aria-label="Разрозненные источники знаний">
+          <div class="island">Confluence</div>
+          <div class="island">OpenSpec<br>и ADR</div>
+          <div class="island">Git и код</div>
+          <div class="island">Знания<br>команд</div>
+          <div class="question" aria-hidden="true">?</div>
+        </div>
+        <p class="big-claim">Разработчик должен заранее знать, <span class="red">где</span> искать и <span class="red">как</span> называется нужная страница.</p>
+      </div>
+      <span class="slide-number">02 / 08</span>
+    </section>
+
+    <section class="slide" data-title="Устройство системы">
+      <div class="slide-inner">
+        <p class="eyebrow">Устройство</p>
+        <h2>RAG превращает источники<br>в <span class="accent">API знаний</span></h2>
+        <div class="flow" aria-label="Поток обработки знаний">
+          <div class="flow-step">
+            <strong>Документы<br>и Git</strong>
+            <span>SSOT · OpenSpec · ADR · код</span>
+          </div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step">
+            <strong>Структурные<br>чанки</strong>
+            <span>заголовки · таблицы · код</span>
+          </div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step">
+            <strong>RAG-индексы</strong>
+            <span>по сервисам и доменам</span>
+          </div>
+          <div class="flow-arrow" aria-hidden="true">+</div>
+          <div class="flow-step">
+            <strong>Граф<br>сервисов</strong>
+            <span>HTTP · Kafka · зависимости</span>
+          </div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step">
+            <strong>MCP<br>и GigaCode</strong>
+            <span>ответы и планы с источниками</span>
+          </div>
+        </div>
+        <p class="lead">Система не заменяет источники истины — она делает их доступными человеку и агенту в одном формате.</p>
+      </div>
+      <span class="slide-number">03 / 08</span>
+    </section>
+
+    <section class="slide" data-title="Хэши и embeddings">
+      <div class="slide-inner">
+        <p class="eyebrow">Честно про реализацию</p>
+        <h2>Вектор есть.<br><span class="orange">Но пока он лексический.</span></h2>
+        <div class="dual-layer">
+          <div class="vector-pipeline" aria-label="Построение hash-вектора">
+            <div class="vector-node">
+              <strong>Текст</strong>
+              <code>«дневной лимит»</code>
+            </div>
+            <div class="mini-arrow" aria-hidden="true">→</div>
+            <div class="vector-node">
+              <strong>Слова + триграммы</strong>
+              <code>лимит · ^ли · лим · ими…</code>
+            </div>
+            <div class="mini-arrow" aria-hidden="true">→</div>
+            <div class="vector-node">
+              <strong>Нормализованный вектор</strong>
+              <code>[0, −1, 2, 0, …]</code>
+              <small>хэширование признаков → косинусная близость</small>
+            </div>
+          </div>
+          <div class="truth">
+            <strong>Не путать<br>с SHA документа</strong>
+            <p>SHA-256 документа нужен для ID и кэша. Хэш-провайдер отдельно строит поисковый вектор из текста.</p>
+          </div>
+        </div>
+        <p class="lead"><span class="green">Семантические эмбеддинги уже поддержаны:</span> локальную Qwen-модель можно включить без изменения MCP-контракта.</p>
+      </div>
+      <span class="slide-number">04 / 08</span>
+    </section>
+
+    <section class="slide" data-title="Экономия контекста">
+      <div class="slide-inner">
+        <p class="eyebrow">Поисковый контракт</p>
+        <h2>Модель получает не архив,<br>а <span class="accent">короткое доказательство</span></h2>
+        <div class="metric-flow" aria-label="Сжатие результатов поиска">
+          <div class="metric">
+            <span class="metric-value">12</span>
+            <span class="metric-label">кандидатов ранжируются внутри RAG</span>
+          </div>
+          <div class="metric-arrow" aria-hidden="true">→</div>
+          <div class="metric">
+            <span class="metric-value">3</span>
+            <span class="metric-label">разных источника попадают в ответ</span>
+          </div>
+          <div class="metric-arrow" aria-hidden="true">→</div>
+          <div class="metric">
+            <span class="metric-value">≤1k</span>
+            <span class="metric-label">токенов контекста с цитатами</span>
+          </div>
+        </div>
+        <p class="lead">Если нужны детали, агент запрашивает конкретный чанк или документ отдельно.</p>
+      </div>
+      <span class="slide-number">05 / 08</span>
+    </section>
+
+    <section class="slide" data-title="Обычная фича">
+      <div class="slide-inner">
+        <p class="eyebrow">Обычная фича</p>
+        <h2>Один вопрос сокращает<br><span class="accent">ручной поиск</span></h2>
+        <div class="path" aria-label="Работа с обычной фичей">
+          <div class="path-node">
+            <strong>Вопрос</strong>
+            <span>«Где проверяется дневной лимит?»</span>
+          </div>
+          <div class="path-arrow" aria-hidden="true">→</div>
+          <div class="path-node highlight">
+            <strong>RAG сервиса</strong>
+            <span>поиск в нужном индексе</span>
+          </div>
+          <div class="path-arrow" aria-hidden="true">→</div>
+          <div class="path-node">
+            <strong>Доказательства</strong>
+            <span>ADR · контракт · правило</span>
+          </div>
+          <div class="path-arrow" aria-hidden="true">→</div>
+          <div class="path-node done">
+            <strong>Изменение</strong>
+            <span>код · тесты · документация</span>
+          </div>
+        </div>
+        <p class="big-claim">Не нужно угадывать название страницы. Нужен только <span class="green">вопрос по задаче</span>.</p>
+      </div>
+      <span class="slide-number">06 / 08</span>
+    </section>
+
+    <section class="slide" data-title="Сложная фича">
+      <div class="slide-inner">
+        <p class="eyebrow">Кросс-сервисная фича</p>
+        <h2>Граф определяет маршрут.<br><span class="violet">RAG наполняет его фактами.</span></h2>
+        <div class="complex-path" aria-label="Планирование сложной фичи">
+          <div class="path-node">
+            <strong>Описание<br>фичи</strong>
+            <span>цель и сценарий</span>
+          </div>
+          <div class="path-arrow" aria-hidden="true">→</div>
+          <div class="path-node highlight">
+            <strong>Граф<br>сервисов</strong>
+            <span>HTTP · Kafka · уровень уверенности</span>
+          </div>
+          <div class="path-arrow" aria-hidden="true">→</div>
+          <div class="path-node">
+            <strong>RAG каждого<br>сервиса</strong>
+            <span>локальные контракты и правила</span>
+          </div>
+          <div class="path-arrow" aria-hidden="true">→</div>
+          <div class="path-node">
+            <strong>План по<br>репозиториям</strong>
+            <span>миграции · тесты · rollout</span>
+          </div>
+          <div class="path-arrow" aria-hidden="true">→</div>
+          <div class="path-node done">
+            <strong>Эпик → История<br>→ Задача</strong>
+            <span>в Jira-проектах команд</span>
+          </div>
+        </div>
+        <p class="route-caption">Низкая уверенность и неразрешённые связи остаются гипотезами — план должен вынести их в отдельную проверку, а не выдавать за факт.</p>
+      </div>
+      <span class="slide-number">07 / 08</span>
+    </section>
+
+    <section class="slide slide-summary" data-title="Итог и развитие">
+      <div class="slide-inner">
+        <p class="eyebrow">Итог</p>
+        <h2>Confluence хранит знания.<br><span class="green">RAG доставляет контекст.</span></h2>
+        <div class="closing">
+          <div class="comparison">
+            <div class="compare-side">
+              <h3>Ручной поиск</h3>
+              <p class="compare-path">знать папку → угадать название → открыть страницы → проверить актуальность → собрать связи</p>
+            </div>
+            <div class="versus">VS</div>
+            <div class="compare-side good">
+              <h3 class="green">RAG + граф</h3>
+              <p class="compare-path"><strong>описать задачу</strong> → получить сервисы → увидеть источники → перейти к плану</p>
+            </div>
+          </div>
+          <div>
+            <div class="limits" aria-label="Текущие ограничения">
+              <div class="limit"><i></i><span>Хэш-поиск хуже понимает синонимы и смысл.</span></div>
+              <div class="limit"><i></i><span>Индекс должен регулярно обновляться.</span></div>
+              <div class="limit"><i></i><span>Статический граф — не трассировка выполнения.</span></div>
+            </div>
+            <div class="next-step" style="margin-top: 28px">
+              <span>Следующий шаг</span>
+              <strong>Семантические эмбеддинги + измерение качества</strong>
+              <p>Затем — гибридный поиск, реранкер и векторная БД по мере роста.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+      <span class="slide-number">08 / 08</span>
+    </section>
+  </main>
+
+  <div class="kbd-hint" aria-hidden="true">← → / Space · F — полный экран</div>
+  <nav class="controls" aria-label="Навигация по презентации">
+    <button type="button" id="previous" aria-label="Предыдущий слайд">←</button>
+    <span class="progress" id="progress" aria-live="polite">1 / 8</span>
+    <button type="button" id="next" aria-label="Следующий слайд">→</button>
+  </nav>
+
+  <script>
+    (() => {
+      const slides = [...document.querySelectorAll('.slide')];
+      const progress = document.querySelector('#progress');
+      let activeIndex = 0;
+
+      const show = (index) => {
+        activeIndex = Math.max(0, Math.min(slides.length - 1, index));
+        slides[activeIndex].scrollIntoView({ behavior: 'smooth', block: 'start' });
+      };
+
+      const observer = new IntersectionObserver((entries) => {
+        const visible = entries
+          .filter((entry) => entry.isIntersecting)
+          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+        if (!visible) return;
+        activeIndex = slides.indexOf(visible.target);
+        progress.textContent = `${activeIndex + 1} / ${slides.length}`;
+        document.title = `${visible.target.dataset.title} — корпоративный RAG`;
+      }, { threshold: [0.45, 0.7] });
+
+      slides.forEach((slide) => observer.observe(slide));
+      document.querySelector('#previous').addEventListener('click', () => show(activeIndex - 1));
+      document.querySelector('#next').addEventListener('click', () => show(activeIndex + 1));
+
+      document.addEventListener('keydown', (event) => {
+        if (['ArrowRight', 'ArrowDown', 'PageDown', ' '].includes(event.key)) {
+          event.preventDefault();
+          show(activeIndex + 1);
+        } else if (['ArrowLeft', 'ArrowUp', 'PageUp'].includes(event.key)) {
+          event.preventDefault();
+          show(activeIndex - 1);
+        } else if (event.key === 'Home') {
+          event.preventDefault();
+          show(0);
+        } else if (event.key === 'End') {
+          event.preventDefault();
+          show(slides.length - 1);
+        } else if (event.key.toLowerCase() === 'f') {
+          event.preventDefault();
+          if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
+          else document.exitFullscreen?.();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
