@@ -75,6 +75,23 @@ class FakeDiscoveryRunner:
         )
 
 
+class InvalidPayloadRunner:
+    def run_json(self, **_arguments: Any) -> GigaCodeJsonResult:
+        return GigaCodeJsonResult(
+            payload={
+                "edge_updates": "not-an-array",
+                "discovered_edges": [],
+                "analyzed_files": [],
+                "warnings": [],
+            },
+            analyzed_files=(),
+            session_id="invalid-session",
+            model="fake-model",
+            duration_ms=3,
+            usage={},
+        )
+
+
 def _build_result(repository: Path) -> tuple[ServiceMapBuildResult, RepositoryInput]:
     repository_input = RepositoryInput(
         path=repository,
@@ -237,3 +254,40 @@ def test_graph_verifier_discovers_missing_edge_only_with_two_sided_evidence(tmp_
     assert discovered.origin == "gigacode"
     assert len(discovered.evidence_ids) == 2
     assert summary["discovered"] == 1
+
+
+def test_graph_verifier_preserves_static_graph_when_gigacode_validation_fails(
+    tmp_path,
+) -> None:
+    repository = tmp_path / "repository"
+    (repository / "src").mkdir(parents=True)
+    (repository / "src" / "OrdersClient.kt").write_text(
+        "paymentClient.cancel()\n",
+        encoding="utf-8",
+    )
+    result, repository_input = _build_result(repository)
+    progress: list[str] = []
+    verifier = GraphGigaCodeVerifier(
+        InvalidPayloadRunner(),  # type: ignore[arg-type]
+        GraphSettings(),
+        tmp_path / "analysis",
+    )
+
+    verified, summary = verifier.verify(
+        result,
+        [repository_input],
+        verify_all=True,
+        progress=progress.append,
+    )
+
+    edge = next(item for item in verified.graph.edges if item.id == "dependency:orders:payment")
+    assert edge.target == "external:payment-api"
+    assert edge.origin == "static"
+    assert summary["processed"] == 1
+    assert summary["failed"] == 1
+    assert summary["unresolved"] == 1
+    assert summary["fallback"] == "static-graph"
+    assert summary["runs"][0]["status"] == "failed"
+    assert "ValidationError" in summary["warnings"][0]
+    assert Path(summary["artifact"]).is_file()
+    assert any("static_graph_preserved=true" in message for message in progress)

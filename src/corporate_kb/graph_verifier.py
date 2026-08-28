@@ -198,6 +198,7 @@ class GraphGigaCodeVerifier:
         summary: dict[str, Any] = {
             "requested": len(candidates),
             "processed": 0,
+            "failed": 0,
             "confirmed": 0,
             "retargeted": 0,
             "rejected": 0,
@@ -268,22 +269,56 @@ class GraphGigaCodeVerifier:
                 if authentication_complete is not None:
                     def auth_completed(current: str = label) -> None:
                         authentication_complete(current)
-                response = self._runner.run_json(
-                    checkout=repository.path,
-                    prompt=self._prompt(
-                        repository=repository,
-                        candidates=batch,
-                        services=result.service_map,
-                        evidence=evidence,
-                        discover_missing=verify_all and batch_number == 1,
-                    ),
-                    schema=_RESULT_SCHEMA,
-                    cancel=cancel,
-                    progress=progress,
-                    authentication_url=auth_required,
-                    authentication_complete=auth_completed,
-                )
-                payload = VerificationPayload.model_validate(response.payload)
+                try:
+                    response = self._runner.run_json(
+                        checkout=repository.path,
+                        prompt=self._prompt(
+                            repository=repository,
+                            candidates=batch,
+                            services=result.service_map,
+                            evidence=evidence,
+                            discover_missing=verify_all and batch_number == 1,
+                        ),
+                        schema=_RESULT_SCHEMA,
+                        cancel=cancel,
+                        progress=progress,
+                        authentication_url=auth_required,
+                        authentication_complete=auth_completed,
+                    )
+                    payload = VerificationPayload.model_validate(response.payload)
+                except GigaCodeCancelled:
+                    raise
+                except Exception as exc:
+                    error = self._failure_message(exc)
+                    summary["processed"] += len(batch)
+                    summary["failed"] += 1
+                    summary["unresolved"] += len(batch)
+                    summary["warnings"].append(
+                        f"GigaCode verification skipped {label}: {error}"
+                    )
+                    failed_run = {
+                        "repository": repository.name,
+                        "checkout": str(repository.path.resolve()),
+                        "candidate_ids": [item.id for item in batch],
+                        "status": "failed",
+                        "error": error,
+                    }
+                    raw_runs.append(failed_run)
+                    summary["runs"].append(
+                        {
+                            "repository": repository.name,
+                            "candidate_count": len(batch),
+                            "status": "failed",
+                            "error": error,
+                        }
+                    )
+                    if progress is not None:
+                        progress(
+                            "GigaCode verification fallback: "
+                            f"repository={repository.name}; candidates={len(batch)}; "
+                            f"static_graph_preserved=true; error={error}"
+                        )
+                    continue
                 raw_runs.append(
                     {
                         "repository": repository.name,
@@ -312,8 +347,14 @@ class GraphGigaCodeVerifier:
                         "session_id": response.session_id,
                         "model": response.model,
                         "candidate_count": len(batch),
+                        "status": "completed",
                     }
                 )
+
+        if summary["failed"] and not any(
+            run.get("status") == "completed" for run in summary["runs"]
+        ):
+            summary["fallback"] = "static-graph"
 
         projected = ServiceMapBuilder(self._graph_settings).from_graph(graph, repositories)
         projected = ServiceMapBuildResult(
@@ -328,10 +369,15 @@ class GraphGigaCodeVerifier:
                 "GigaCode verification ready: "
                 f"confirmed={summary['confirmed']}; retargeted={summary['retargeted']}; "
                 f"discovered={summary['discovered']}; rejected={summary['rejected']}; "
-                f"unresolved={summary['unresolved']}; "
+                f"unresolved={summary['unresolved']}; failed={summary['failed']}; "
                 f"artifact={artifact}"
             )
         return projected, summary
+
+    @staticmethod
+    def _failure_message(exc: Exception) -> str:
+        detail = " ".join(str(exc).split()) or "no error details"
+        return f"{type(exc).__name__}: {detail}"[:4000]
 
     def _apply_updates(
         self,

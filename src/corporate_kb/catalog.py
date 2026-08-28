@@ -2192,7 +2192,11 @@ class RagCatalog:
         knowledge_root.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".gigacode-ssot-", dir=knowledge_root))
         gigacode_runs: list[dict[str, Any]] = []
+        gigacode_errors: list[dict[str, str]] = []
         published: list[str] = []
+        preserved: list[str] = []
+        service_map = self._service_map_store.load()
+        services = {item.id: item for item in service_map.services}
         try:
             for position, target in enumerate(targets, start=1):
                 self._raise_if_cancelled(cancel_event)
@@ -2239,19 +2243,63 @@ class RagCatalog:
                         target_service_id,
                     )
 
-                result = self._gigacode.run(
-                    checkout=Path(repository.checkout_path),
-                    prompt=self._gigacode_ssot_prompt(
-                        target=target,
-                        repository=repository,
-                        analysis=analysis,
-                        existing_ssot=existing_ssot,
-                    ),
-                    cancel=cancel_event,
-                    progress=lambda message: self._append_job_log(job_id, message),
-                    authentication_url=authentication_required,
-                    authentication_complete=authentication_completed,
-                )
+                try:
+                    result = self._gigacode.run(
+                        checkout=Path(repository.checkout_path),
+                        prompt=self._gigacode_ssot_prompt(
+                            target=target,
+                            repository=repository,
+                            analysis=analysis,
+                            existing_ssot=existing_ssot,
+                        ),
+                        cancel=cancel_event,
+                        progress=lambda message: self._append_job_log(job_id, message),
+                        authentication_url=authentication_required,
+                        authentication_complete=authentication_completed,
+                    )
+                except GigaCodeCancelled:
+                    raise
+                except Exception as exc:
+                    error = self._gigacode_failure_message(exc)
+                    relative_path = (
+                        Path("ssot") / "generated" / f"{_slug(service_id)}.md"
+                    ).as_posix()
+                    if existing_path.is_file():
+                        fallback = "preserved-existing-ssot"
+                        preserved.append(relative_path)
+                    else:
+                        fallback = "static-analysis-ssot"
+                        service = services.get(service_id)
+                        markdown = (
+                            self._static_ssot_markdown(service, repository, service_map)
+                            if service is not None
+                            else self._repository_fallback_ssot_markdown(target, repository)
+                        )
+                        document = self._client_ssot_document(
+                            markdown,
+                            target,
+                            repository,
+                            generated_by="kb_generate_system_ssot/gigacode-fallback",
+                            authority="static-source-analysis",
+                        )
+                        (staging / f"{_slug(service_id)}.md").write_text(
+                            document,
+                            encoding="utf-8",
+                        )
+                    failure = {
+                        "service_id": service_id,
+                        "repository_id": repository.id,
+                        "error": error,
+                        "fallback": fallback,
+                    }
+                    gigacode_errors.append(failure)
+                    gigacode_runs.append({**failure, "status": "failed"})
+                    self._append_job_log(
+                        job_id,
+                        "GigaCode target fallback: "
+                        f"service={service_id}; fallback={fallback}; error={error}",
+                    )
+                    continue
                 document = self._client_ssot_document(
                     result.markdown,
                     target,
@@ -2271,6 +2319,7 @@ class RagCatalog:
                         "analyzed_files": list(result.analyzed_files),
                         "blocking_unknowns": list(result.blocking_unknowns),
                         "usage": result.usage,
+                        "status": "completed",
                     }
                 )
                 self._append_job_log(
@@ -2288,9 +2337,15 @@ class RagCatalog:
                 os.replace(staged, destination)
                 published.append(destination.relative_to(knowledge_root).as_posix())
 
+            available_files = sorted(set([*published, *preserved]))
+            successful_runs = len(gigacode_runs) - len(gigacode_errors)
+
             self._update_job(
                 job_id,
-                message=f"GigaCode generated {len(published)} SSOT files; rebuilding RAG index",
+                message=(
+                    f"GigaCode completed {successful_runs}/{len(targets)} targets; "
+                    f"fallbacks={len(gigacode_errors)}; rebuilding RAG index"
+                ),
             )
             self._update_index(index.id, status="indexing", error=None)
             IndexBuildProcessRunner(
@@ -2314,8 +2369,12 @@ class RagCatalog:
                 "repository_ids": repository_ids,
                 "target_count": len(targets),
                 "targets": targets,
-                "files": published,
+                "files": available_files,
                 "gigacode_runs": gigacode_runs,
+                "gigacode_errors": gigacode_errors,
+                "gigacode_success_count": successful_runs,
+                "gigacode_failure_count": len(gigacode_errors),
+                "fallback_used": bool(gigacode_errors),
                 "document_count": stats.document_count,
                 "chunk_count": stats.chunk_count,
                 "server_llm_used": False,
@@ -2326,7 +2385,9 @@ class RagCatalog:
                     job_id,
                     status="completed",
                     message=(
-                        f"GigaCode analyzed {len(targets)} targets and rebuilt index {index.name}"
+                        f"GigaCode analyzed {successful_runs}/{len(targets)} targets, "
+                        f"used {len(gigacode_errors)} safe fallbacks and rebuilt "
+                        f"index {index.name}"
                     ),
                     completed_at=_now(),
                     result=result_payload,
@@ -2362,6 +2423,114 @@ class RagCatalog:
             },
         }
 
+    @staticmethod
+    def _static_ssot_markdown(
+        service: ServiceRecord,
+        repository: RepositorySource,
+        service_map: ServiceMapSnapshot,
+    ) -> str:
+        lines = [
+            f"# {service.name}",
+            "",
+            (
+                "Minimal SSOT generated from static source analysis. It records only "
+                "interfaces and relationships observed in the current checkout."
+            ),
+            "",
+            "## Service identity",
+            "",
+            f"- Service ID: `{service.id}`",
+            f"- Repository: `{repository.name}`",
+            f"- Module: `{service.module_path}`",
+            f"- Build: `{service.build_system}`",
+            f"- Module state: `{service.module_state}`",
+            f"- Owner: `{service.owner or 'unknown'}`",
+            "",
+            "## Inbound interfaces",
+            "",
+        ]
+        if service.entrypoints:
+            lines.extend(
+                f"- {item.kind} `{item.operation}` — {item.description} "
+                f"(evidence: {', '.join(item.evidence_ids) or 'static extractor'})"
+                for item in service.entrypoints
+            )
+        else:
+            lines.append("- No inbound interface was found by the static analyzer.")
+        lines.extend(["", "## Outbound interfaces", ""])
+        if service.outbound_interfaces:
+            lines.extend(
+                f"- {item.kind} `{item.operation}` → "
+                f"`{item.target_hint or 'unresolved target'}` — {item.description} "
+                f"(evidence: {', '.join(item.evidence_ids) or 'static extractor'})"
+                for item in service.outbound_interfaces
+            )
+        else:
+            lines.append("- No outbound interface was found by the static analyzer.")
+        dependencies = [
+            item
+            for item in service_map.dependencies
+            if item.source_service_id == service.id
+        ]
+        lines.extend(["", "## Resolved and candidate dependencies", ""])
+        if dependencies:
+            lines.extend(
+                f"- {item.protocol} `{item.operation}` → "
+                f"`{item.target_service_id or item.target_hint}` "
+                f"(confidence: {item.confidence}; status: {item.status}; "
+                f"origin: {item.origin})"
+                for item in dependencies
+            )
+        else:
+            lines.append("- No service dependency was found by the static analyzer.")
+        lines.extend(
+            [
+                "",
+                "## Analysis limits",
+                "",
+                (
+                    "- This document is source-derived and does not assert runtime traffic, "
+                    "deployment topology, ownership, or behavior not visible in annotations "
+                    "and configuration."
+                ),
+                "- Missing interfaces mean 'not detected', not necessarily 'does not exist'.",
+            ]
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _repository_fallback_ssot_markdown(
+        target: dict[str, Any],
+        repository: RepositorySource,
+    ) -> str:
+        return "\n".join(
+            [
+                f"# {target['name']}",
+                "",
+                (
+                    "Minimal SSOT generated from the deterministic repository scan because "
+                    "optional model enrichment was unavailable."
+                ),
+                "",
+                "## Repository identity",
+                "",
+                f"- Repository: `{repository.name}`",
+                f"- Module: `{target['module_path']}`",
+                f"- Module state: `{target['module_state']}`",
+                f"- Commit: `{repository.commit or 'unknown'}`",
+                "",
+                "## Analysis limits",
+                "",
+                "- Static analysis did not discover a complete service module.",
+                "- Missing interfaces are unknown and are not evidence that they do not exist.",
+            ]
+        )
+
+    @staticmethod
+    def _gigacode_failure_message(exc: Exception) -> str:
+        detail = " ".join(str(exc).split()) or "no error details"
+        return f"{type(exc).__name__}: {detail}"[:4000]
+
     def _write_static_ssot_documents(
         self,
         job_id: str,
@@ -2376,76 +2545,10 @@ class RagCatalog:
             repository = repository_by_service.get(service_id)
             if service is None or repository is None:
                 continue
-            lines = [
-                f"# {service.name}",
-                "",
-                (
-                    "Minimal SSOT generated from static source analysis. It records only "
-                    "interfaces and relationships observed in the current checkout."
-                ),
-                "",
-                "## Service identity",
-                "",
-                f"- Service ID: `{service.id}`",
-                f"- Repository: `{repository.name}`",
-                f"- Module: `{service.module_path}`",
-                f"- Build: `{service.build_system}`",
-                f"- Module state: `{service.module_state}`",
-                f"- Owner: `{service.owner or 'unknown'}`",
-                "",
-                "## Inbound interfaces",
-                "",
-            ]
-            if service.entrypoints:
-                lines.extend(
-                    f"- {item.kind} `{item.operation}` — {item.description} "
-                    f"(evidence: {', '.join(item.evidence_ids) or 'static extractor'})"
-                    for item in service.entrypoints
-                )
-            else:
-                lines.append("- No inbound interface was found by the static analyzer.")
-            lines.extend(["", "## Outbound interfaces", ""])
-            if service.outbound_interfaces:
-                lines.extend(
-                    f"- {item.kind} `{item.operation}` → "
-                    f"`{item.target_hint or 'unresolved target'}` — {item.description} "
-                    f"(evidence: {', '.join(item.evidence_ids) or 'static extractor'})"
-                    for item in service.outbound_interfaces
-                )
-            else:
-                lines.append("- No outbound interface was found by the static analyzer.")
-            dependencies = [
-                item
-                for item in service_map.dependencies
-                if item.source_service_id == service.id
-            ]
-            lines.extend(["", "## Resolved and candidate dependencies", ""])
-            if dependencies:
-                lines.extend(
-                    f"- {item.protocol} `{item.operation}` → "
-                    f"`{item.target_service_id or item.target_hint}` "
-                    f"(confidence: {item.confidence}; status: {item.status}; "
-                    f"origin: {item.origin})"
-                    for item in dependencies
-                )
-            else:
-                lines.append("- No service dependency was found by the static analyzer.")
-            lines.extend(
-                [
-                    "",
-                    "## Analysis limits",
-                    "",
-                    (
-                        "- This document is source-derived and does not assert runtime traffic, "
-                        "deployment topology, ownership, or behavior not visible in annotations "
-                        "and configuration."
-                    ),
-                    "- Missing interfaces mean 'not detected', not necessarily 'does not exist'.",
-                ]
-            )
+            markdown = self._static_ssot_markdown(service, repository, service_map)
             target = self._ssot_target(job_id, service, repository)
             document = self._client_ssot_document(
-                "\n".join(lines),
+                markdown,
                 target,
                 repository,
                 generated_by="kb_generate_system_ssot/static-analysis",
@@ -2751,47 +2854,67 @@ class RagCatalog:
                         "generation_mode": "gigacode",
                     },
                 )
-            result, verification = self._graph_verifier.verify(
-                result,
-                inputs,
-                verify_all=verify_all,
-                cancel=cancel_event,
-                progress=(
-                    (lambda message: self._append_job_log(job_id, message))
-                    if job_id is not None
-                    else None
-                ),
-                authentication_url=(
-                    (
-                        lambda target, url: self._gigacode_authentication_required(
-                            job_id, target, url
+            try:
+                result, verification = self._graph_verifier.verify(
+                    result,
+                    inputs,
+                    verify_all=verify_all,
+                    cancel=cancel_event,
+                    progress=(
+                        (lambda message: self._append_job_log(job_id, message))
+                        if job_id is not None
+                        else None
+                    ),
+                    authentication_url=(
+                        (
+                            lambda target, url: self._gigacode_authentication_required(
+                                job_id, target, url
+                            )
                         )
-                    )
-                    if job_id is not None
-                    else None
-                ),
-                authentication_complete=(
-                    (
-                        lambda target: self._gigacode_authentication_completed(
-                            job_id, target
+                        if job_id is not None
+                        else None
+                    ),
+                    authentication_complete=(
+                        (
+                            lambda target: self._gigacode_authentication_completed(
+                                job_id, target
+                            )
                         )
+                        if job_id is not None
+                        else None
+                    ),
+                )
+            except GigaCodeCancelled:
+                raise
+            except Exception as exc:
+                error = self._gigacode_failure_message(exc)
+                verification = {
+                    "failed": 1,
+                    "fallback": "static-graph",
+                    "warnings": [f"GigaCode verification failed: {error}"],
+                }
+                if job_id is not None:
+                    self._append_job_log(
+                        job_id,
+                        "GigaCode graph fallback: static graph preserved; "
+                        f"error={error}",
                     )
-                    if job_id is not None
-                    else None
-                ),
-            )
         elif analysis_mode == "gigacode":
             verification = {
                 "skipped": True,
                 "reason": "Static analysis published only a partial checkpoint",
             }
+        gigacode_enriched = (
+            analysis_mode == "gigacode"
+            and verification.get("fallback") != "static-graph"
+        )
         result = finalize_snapshot(
             result,
             mode=(
                 "partial"
                 if result.partial
                 else "static+gigacode"
-                if analysis_mode == "gigacode"
+                if gigacode_enriched
                 else "static"
             ),
             verification=verification,

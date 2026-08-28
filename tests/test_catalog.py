@@ -683,6 +683,85 @@ public class GigaCodeController {
     assert "GigaCode starting" in card_log
 
 
+def test_gigacode_contract_failure_uses_static_ssot_and_completes_job(
+    settings_factory,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    gigacode = _write_fake_gigacode(tmp_path / "gigacode-invalid-contract")
+    settings = settings_factory(gigacode_command=str(gigacode))
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    index = catalog.create_index(name="GigaCode fallback SSOT")
+    repository = tmp_path / "gigacode-fallback-repository"
+    _write(repository / "build.gradle", "plugins { id 'java' }\n")
+    _write(
+        repository / "src/main/resources/application.properties",
+        "spring.application.name=gigacode-fallback-service\n",
+    )
+    _write(
+        repository / "src/main/java/example/FallbackController.java",
+        """
+package example;
+@RestController
+public class FallbackController {
+  @GetMapping("/fallback/status")
+  public String status() { return "ok"; }
+}
+""",
+    )
+    imported = catalog.start_repository_ingestion(
+        name="GigaCode fallback repository",
+        git_url=str(repository),
+        index_id=index.id,
+    )
+    imported_completed = _wait_for_job(catalog, imported.id)
+    assert imported_completed["status"] == "completed"
+
+    def invalid_contract(**_arguments):
+        raise RuntimeError(
+            "GigaCode result did not contain usable output for the requested contract"
+        )
+
+    monkeypatch.setattr(catalog._gigacode, "run", invalid_contract)
+    queued = catalog.ssot_generation_request(
+        action="prepare",
+        index_id=index.id,
+        repository_ids=[str(imported.target_id)],
+        refresh_analysis=False,
+        generation_mode="gigacode",
+    )
+    completed = _wait_for_job(catalog, queued["job"]["id"])
+
+    assert completed["status"] == "completed"
+    assert completed["result"]["phase"] == "indexed"
+    assert completed["result"]["gigacode_success_count"] == 0
+    assert completed["result"]["gigacode_failure_count"] == 1
+    assert completed["result"]["fallback_used"] is True
+    assert completed["result"]["gigacode_runs"][0]["status"] == "failed"
+    assert completed["result"]["gigacode_runs"][0]["fallback"] == (
+        "static-analysis-ssot"
+    )
+    generated = Path(index.knowledge_dir) / completed["result"]["files"][0]
+    content = generated.read_text(encoding="utf-8")
+    assert 'generated_by: "kb_generate_system_ssot/gigacode-fallback"' in content
+    assert "`GET /fallback/status`" in content
+    log = catalog.job_log(queued["job"]["id"])["log"]
+    assert "GigaCode target fallback" in log
+    assert "did not contain usable output" in log
+
+
 def test_catalog_indexes_all_module_openspec_roots(settings_factory, tmp_path) -> None:
     settings = settings_factory()
     settings.knowledge_dir.mkdir(parents=True)
