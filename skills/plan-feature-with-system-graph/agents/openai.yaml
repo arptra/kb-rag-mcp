@@ -1,4 +1,4 @@
 interface:
   display_name: "Plan Feature With System Graph"
-  short_description: "Plan changes across services from MCP evidence"
-  default_prompt: "Use $plan-feature-with-system-graph to build an evidence-backed cross-service implementation plan for this feature."
+  short_description: "Plan cross-service changes and create Jira tasks"
+  default_prompt: "Use $plan-feature-with-system-graph to build an evidence-backed cross-service plan, then ask which Jira space should receive one task per affected service."

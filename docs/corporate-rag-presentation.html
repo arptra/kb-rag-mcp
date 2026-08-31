@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Короткая HTML-презентация о корпоративном RAG, графе сервисов и планировании фичей.">
-  <title>Корпоративный RAG — как знания становятся контекстом разработки</title>
+  <meta name="description" content="Презентация о SDD, корпоративном RAG и планировании изменений в системе из 300+ сервисов.">
+  <title>SDD для 300+ сервисов — от знаний к проверяемому плану</title>
   <style>
     :root {
       color-scheme: dark;
@@ -208,6 +208,195 @@
       line-height: 1.17;
       letter-spacing: -0.035em;
     }
+
+    .scale-story {
+      display: grid;
+      grid-template-columns: minmax(230px, 0.68fr) minmax(0, 1.32fr);
+      gap: clamp(30px, 5vw, 76px);
+      align-items: center;
+    }
+
+    .scale-number {
+      color: var(--cyan);
+      font-size: clamp(6.5rem, 14vw, 12rem);
+      font-weight: 850;
+      line-height: 0.76;
+      letter-spacing: -0.09em;
+    }
+
+    .scale-number span {
+      display: block;
+      margin: 22px 0 0 8px;
+      color: var(--muted);
+      font-size: clamp(1rem, 1.7vw, 1.5rem);
+      font-weight: 650;
+      line-height: 1.25;
+      letter-spacing: -0.02em;
+    }
+
+    .stakes {
+      display: grid;
+      gap: 22px;
+    }
+
+    .stake {
+      padding: 0 0 20px 24px;
+      border-bottom: 1px solid var(--line);
+      border-left: 3px solid var(--red);
+    }
+
+    .stake:last-child { border-bottom: 0; }
+    .stake strong { display: block; font-size: clamp(1.2rem, 2vw, 1.8rem); }
+    .stake span { display: block; margin-top: 7px; color: var(--muted); font-size: clamp(0.9rem, 1.3vw, 1.12rem); line-height: 1.45; }
+
+    .master-compare {
+      display: grid;
+      grid-template-columns: 1fr 78px 1fr;
+      gap: clamp(18px, 3vw, 38px);
+      align-items: stretch;
+    }
+
+    .master-side {
+      min-height: 0;
+      padding: clamp(22px, 2.5vw, 32px);
+      border-top: 3px solid var(--red);
+      background: linear-gradient(180deg, rgba(255, 124, 139, 0.08), transparent 72%);
+    }
+
+    .master-side.distributed {
+      border-color: var(--green);
+      background: linear-gradient(180deg, rgba(92, 227, 160, 0.10), transparent 72%);
+    }
+
+    .master-side h3 { margin: 0 0 18px; font-size: clamp(1.55rem, 2.5vw, 2.5rem); letter-spacing: -0.04em; }
+    .master-side p { color: var(--muted); font-size: clamp(0.9rem, 1.2vw, 1.05rem); line-height: 1.45; }
+    .master-side b { color: var(--text); }
+
+    .slide-master .slide-inner,
+    .slide-benchmark .slide-inner { gap: clamp(16px, 2vw, 24px); }
+
+    .slide-master h2,
+    .slide-benchmark h2 { font-size: clamp(2.15rem, 4.2vw, 4.4rem); }
+
+    .sdd-model {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: clamp(20px, 3vw, 38px);
+      align-items: stretch;
+    }
+
+    .sdd-column { padding-top: 24px; border-top: 3px solid var(--cyan); }
+    .sdd-column:nth-child(2) { border-color: var(--violet); }
+    .sdd-column:nth-child(3) { border-color: var(--green); }
+    .sdd-column strong { display: block; font-size: clamp(1.35rem, 2.2vw, 2.15rem); line-height: 1.15; }
+    .sdd-column p { margin-top: 14px; color: var(--muted); font-size: clamp(0.95rem, 1.35vw, 1.15rem); line-height: 1.55; }
+
+    .routing {
+      display: grid;
+      grid-template-columns: 0.85fr 54px 1fr 54px 1.2fr 54px 1fr;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .routing-step {
+      min-height: 180px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 24px 20px;
+      border-top: 3px solid var(--line);
+    }
+
+    .routing-step.graph { border-color: var(--violet); }
+    .routing-step.rag { border-color: var(--cyan); }
+    .routing-step.evidence { border-color: var(--green); }
+    .routing-step strong { font-size: clamp(1.15rem, 1.8vw, 1.65rem); line-height: 1.2; }
+    .routing-step span { margin-top: 12px; color: var(--muted); font-size: clamp(0.85rem, 1.15vw, 1rem); line-height: 1.45; }
+    .routing-arrow { color: var(--line); font-size: 2.5rem; text-align: center; }
+
+    .routing-claim {
+      padding: 16px 22px;
+      border-left: 3px solid var(--cyan);
+      color: var(--muted);
+      font-size: clamp(1rem, 1.55vw, 1.3rem);
+      line-height: 1.45;
+    }
+
+    .routing-claim b { color: var(--text); }
+
+    .percent-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: clamp(16px, 2.6vw, 34px);
+    }
+
+    .percent-metric { padding-top: 22px; border-top: 3px solid var(--cyan); }
+    .percent-metric:nth-child(2) { border-color: var(--violet); }
+    .percent-metric:nth-child(3) { border-color: var(--green); }
+    .percent-metric:nth-child(4) { border-color: var(--orange); }
+    .percent-metric strong { display: block; font-size: clamp(3.1rem, 6.4vw, 6.2rem); line-height: 0.9; letter-spacing: -0.065em; }
+    .percent-metric span { display: block; margin-top: 15px; color: var(--muted); font-size: clamp(0.9rem, 1.25vw, 1.08rem); line-height: 1.4; }
+
+    .baseline-note {
+      display: grid;
+      grid-template-columns: minmax(220px, 0.55fr) minmax(0, 1.45fr);
+      gap: 24px;
+      padding: 21px 24px;
+      border: 1px solid rgba(175, 152, 255, 0.48);
+      border-radius: 22px;
+      background: rgba(175, 152, 255, 0.07);
+    }
+
+    .baseline-note strong { color: var(--violet); font-size: clamp(1.2rem, 1.8vw, 1.6rem); }
+    .baseline-note p { color: var(--muted); font-size: clamp(0.9rem, 1.22vw, 1.05rem); line-height: 1.5; }
+    .method-note { color: rgba(145, 167, 186, 0.72); font-size: clamp(0.72rem, 0.9vw, 0.84rem); line-height: 1.45; }
+
+    .audiences {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: clamp(30px, 5vw, 70px);
+    }
+
+    .audience { padding-top: 26px; border-top: 3px solid var(--green); }
+    .audience.dev { border-color: var(--cyan); }
+    .audience h3 { margin: 0 0 24px; font-size: clamp(1.8rem, 3.2vw, 3.2rem); letter-spacing: -0.045em; }
+    .audience ul { display: grid; gap: 15px; margin: 0; padding: 0; list-style: none; }
+    .audience li { position: relative; padding-left: 24px; color: var(--muted); font-size: clamp(0.95rem, 1.35vw, 1.16rem); line-height: 1.45; }
+    .audience li::before { content: "→"; position: absolute; left: 0; color: var(--green); }
+    .audience.dev li::before { color: var(--cyan); }
+
+    .guardrails {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: clamp(20px, 3.5vw, 48px);
+    }
+
+    .guardrail { padding-top: 24px; border-top: 3px solid var(--orange); }
+    .guardrail strong { display: block; font-size: clamp(1.25rem, 2vw, 1.8rem); line-height: 1.2; }
+    .guardrail p { margin-top: 13px; color: var(--muted); font-size: clamp(0.9rem, 1.25vw, 1.08rem); line-height: 1.5; }
+
+    .notes-panel {
+      position: fixed;
+      z-index: 20;
+      right: 24px;
+      bottom: 76px;
+      width: min(520px, calc(100vw - 48px));
+      max-height: min(62vh, 620px);
+      overflow: auto;
+      padding: 24px;
+      border: 1px solid rgba(84, 215, 255, 0.44);
+      border-radius: 22px;
+      background: rgba(3, 9, 18, 0.96);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+    }
+
+    .notes-panel[hidden] { display: none; }
+    .notes-panel header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 15px; }
+    .notes-panel h3 { margin: 0; color: var(--cyan); font-size: 1rem; letter-spacing: 0.08em; text-transform: uppercase; }
+    .notes-panel button { width: 32px; height: 32px; border: 1px solid var(--line); border-radius: 50%; color: var(--text); background: var(--surface); cursor: pointer; }
+    .notes-content { color: #c3d0db; font-size: 0.96rem; line-height: 1.6; }
+    .notes-content p + p { margin-top: 12px; }
 
     .flow {
       display: grid;
@@ -607,7 +796,8 @@
       .flow-step { min-width: 0; }
 
       .dual-layer,
-      .closing { grid-template-columns: 1fr; }
+      .closing,
+      .scale-story { grid-template-columns: 1fr; }
 
       .vector-pipeline { max-width: 760px; }
 
@@ -615,6 +805,10 @@
       .complex-path {
         grid-template-columns: repeat(4, 1fr);
       }
+
+      .routing { grid-template-columns: repeat(4, 1fr); }
+      .routing-arrow { display: none; }
+      .percent-grid { grid-template-columns: 1fr 1fr; }
 
       .path-arrow { display: none; }
 
@@ -666,6 +860,18 @@
         grid-template-columns: 1fr;
       }
 
+      .master-compare,
+      .sdd-model,
+      .routing,
+      .percent-grid,
+      .baseline-note,
+      .audiences,
+      .guardrails { grid-template-columns: 1fr; }
+
+      .master-side { min-height: 0; }
+      .routing-step { min-height: 0; }
+      .notes-panel { right: 12px; bottom: 66px; width: calc(100vw - 24px); }
+
       .versus { min-height: 30px; }
       .compare-side { min-height: 0; }
 
@@ -701,41 +907,99 @@
 </head>
 <body>
   <main class="deck" id="deck">
-    <section class="slide title-slide" data-title="Корпоративный RAG">
+    <section class="slide title-slide" data-title="SDD для 300+ сервисов">
       <div class="slide-inner">
-        <p class="eyebrow">Корпоративная разработка · RAG · граф сервисов</p>
-        <h1>Знания становятся<br><span class="accent">контекстом разработки</span></h1>
+        <p class="eyebrow">Spec-driven development · RAG · граф сервисов</p>
+        <h1>SDD для системы<br><span class="accent">из 300+ сервисов</span></h1>
         <div class="title-rule"></div>
-        <p class="lead">Как локальный RAG помогает находить ответы, понимать влияние изменений и планировать фичи между сервисами.</p>
+        <p class="lead">Как превратить распределённые спецификации и код в проверяемый контекст — от бизнес-идеи до плана изменений по репозиториям.</p>
         <div class="title-foot">
-          <span>полностью локально</span>
-          <span>с доказательствами</span>
-          <span>доступно через MCP</span>
+          <span>локальный контур</span>
+          <span>факты с источниками</span>
+          <span>skills поверх MCP</span>
         </div>
       </div>
-      <span class="slide-number">01 / 08</span>
+      <template class="speaker-notes">
+        <p>Открыть с главного тезиса: это не «ещё один чат с документацией». Это инфраструктура для SDD, где спецификации, код и связи между сервисами становятся доступным и проверяемым контекстом.</p>
+        <p>Обещание выступления: показать, почему подход выдерживает масштаб 300+ сервисов, какую ценность получают бизнес и разработчики, а затем подтвердить это live demo на готовых skills.</p>
+      </template>
+      <span class="slide-number">01 / 11</span>
     </section>
 
-    <section class="slide slide-problem" data-title="Проблема">
+    <section class="slide" data-title="Цена масштаба">
       <div class="slide-inner">
-        <p class="eyebrow">Проблема</p>
-        <h2>Документация есть.<br><span class="red">Цельного контекста нет.</span></h2>
-        <div class="islands" aria-label="Разрозненные источники знаний">
-          <div class="island">Confluence</div>
-          <div class="island">OpenSpec<br>и ADR</div>
-          <div class="island">Git и код</div>
-          <div class="island">Знания<br>команд</div>
-          <div class="question" aria-hidden="true">?</div>
+        <p class="eyebrow">Проблема масштаба</p>
+        <h2>После сотен сервисов поиск знаний<br>становится <span class="red">системным риском</span></h2>
+        <div class="scale-story">
+          <div class="scale-number">300+<span>сервисов, контрактов<br>и владельцев контекста</span></div>
+          <div class="stakes">
+            <div class="stake"><strong>Неполная оценка влияния</strong><span>Фича выглядит локальной, пока не обнаруживаются API, события, миграции и команды.</span></div>
+            <div class="stake"><strong>Зависимость от «тех, кто помнит»</strong><span>Поиск начинается с людей и названий страниц, а не с вопроса по задаче.</span></div>
+            <div class="stake"><strong>Планирование начинается слишком поздно</strong><span>Межсервисные риски всплывают уже после декомпозиции или реализации.</span></div>
+          </div>
         </div>
-        <p class="big-claim">Разработчик должен заранее знать, <span class="red">где</span> искать и <span class="red">как</span> называется нужная страница.</p>
       </div>
-      <span class="slide-number">02 / 08</span>
+      <template class="speaker-notes">
+        <p>Подчеркнуть: проблема не в том, что документации мало. Наоборот, её много, но она распределена по Confluence, OpenSpec, ADR, Git и знаниям команд.</p>
+        <p>На масштабе 300+ сервисов невозможно требовать от человека заранее знать правильный репозиторий, владельца и точное название документа.</p>
+      </template>
+      <span class="slide-number">02 / 11</span>
+    </section>
+
+    <section class="slide slide-master" data-title="Почему не master-spec">
+      <div class="slide-inner">
+        <p class="eyebrow">Почему не один Git</p>
+        <h2>Master-spec создаёт<br><span class="red">единое узкое место</span></h2>
+        <div class="master-compare">
+          <div class="master-side">
+            <h3 class="red">Единая master-spec</h3>
+            <p><b>Центральная очередь</b><br>изменения ждут общего владельца<br><br><b>Контекст без границ</b><br>люди и модель получают лишнее<br><br><b>Отрыв от кода</b><br>спека устаревает отдельно от сервисов</p>
+          </div>
+          <div class="versus">VS</div>
+          <div class="master-side distributed">
+            <h3 class="green">Распределённый SSOT</h3>
+            <p><b>SSOT принадлежит команде</b><br>контракты обновляются рядом с кодом<br><br><b>Контекст по запросу</b><br>RAG доставляет релевантный срез<br><br><b>Системный маршрут</b><br>граф связывает локальные спецификации</p>
+          </div>
+        </div>
+      </div>
+      <template class="speaker-notes">
+        <p>Фраза для бизнеса: Git хорошо решает версионирование, но сам по себе не решает обнаружение знаний, маршрутизацию и актуальность между сотнями владельцев.</p>
+        <p>Фраза для разработчиков: мы не создаём «главный README монолита». Источник истины остаётся рядом с кодом и командой; центральный слой хранит индекс и связи, а не переписывает всё содержание.</p>
+      </template>
+      <span class="slide-number">03 / 11</span>
+    </section>
+
+    <section class="slide" data-title="Модель SDD">
+      <div class="slide-inner">
+        <p class="eyebrow">Spec-driven development</p>
+        <h2>Спецификация остаётся распределённой.<br><span class="accent">Контекст собирается по запросу.</span></h2>
+        <div class="sdd-model">
+          <div class="sdd-column">
+            <strong>Локальные источники</strong>
+            <p>OpenSpec, ADR, контракты, код и конфигурация живут в зоне ответственности команды.</p>
+          </div>
+          <div class="sdd-column">
+            <strong>Системная карта</strong>
+            <p>Граф хранит границы сервисов, HTTP/Kafka-связи, источник evidence и уровень уверенности.</p>
+          </div>
+          <div class="sdd-column">
+            <strong>Контекст задачи</strong>
+            <p>RAG и skills собирают ровно тот срез знаний, который нужен для ответа, плана или проверки.</p>
+          </div>
+        </div>
+        <p class="big-claim">SDD здесь — это не один документ. Это <span class="green">управляемый цикл</span>: спецификация → evidence → план → проверка.</p>
+      </div>
+      <template class="speaker-notes">
+        <p>Объяснить SDD без жаргона: разработка начинается не с произвольной генерации кода, а с проверяемого описания текущего состояния и желаемого изменения.</p>
+        <p>Важный тезис: система не заменяет источники истины. Она даёт человеку и агенту единый способ найти, связать и процитировать их.</p>
+      </template>
+      <span class="slide-number">04 / 11</span>
     </section>
 
     <section class="slide" data-title="Устройство системы">
       <div class="slide-inner">
         <p class="eyebrow">Устройство</p>
-        <h2>RAG превращает источники<br>в <span class="accent">API знаний</span></h2>
+        <h2>RAG превращает распределённые источники<br>в <span class="accent">API знаний</span></h2>
         <div class="flow" aria-label="Поток обработки знаний">
           <div class="flow-step">
             <strong>Документы<br>и Git</strong>
@@ -754,80 +1018,96 @@
           <div class="flow-arrow" aria-hidden="true">+</div>
           <div class="flow-step">
             <strong>Граф<br>сервисов</strong>
-            <span>HTTP · Kafka · зависимости</span>
+            <span>HTTP · Kafka · confidence</span>
           </div>
           <div class="flow-arrow" aria-hidden="true">→</div>
           <div class="flow-step">
-            <strong>MCP<br>и GigaCode</strong>
-            <span>ответы и планы с источниками</span>
+            <strong>MCP<br>и skills</strong>
+            <span>ответы, планы и аудит</span>
           </div>
         </div>
-        <p class="lead">Система не заменяет источники истины — она делает их доступными человеку и агенту в одном формате.</p>
+        <p class="lead">GigaCode остаётся генеративной моделью. Сервер управляет знаниями, маршрутизацией и доказательствами — и почти все tools работают только на чтение.</p>
       </div>
-      <span class="slide-number">03 / 08</span>
+      <template class="speaker-notes">
+        <p>Пройти слева направо. Репозитории и документы нормализуются и индексируются. Граф извлекает связи из кода и конфигурации. MCP даёт стабильный контракт доступа, а skills задают безопасный рабочий процесс.</p>
+        <p>Для безопасности подчеркнуть: финальный ответ формирует GigaCode; RAG-сервер не исполняет произвольный код и не редактирует источники во время обычного поиска и планирования.</p>
+      </template>
+      <span class="slide-number">05 / 11</span>
     </section>
 
-    <section class="slide" data-title="Хэши и embeddings">
+    <section class="slide" data-title="Масштабирование поиска">
       <div class="slide-inner">
-        <p class="eyebrow">Честно про реализацию</p>
-        <h2>Вектор есть.<br><span class="orange">Но пока он лексический.</span></h2>
-        <div class="dual-layer">
-          <div class="vector-pipeline" aria-label="Построение hash-вектора">
-            <div class="vector-node">
-              <strong>Текст</strong>
-              <code>«дневной лимит»</code>
-            </div>
-            <div class="mini-arrow" aria-hidden="true">→</div>
-            <div class="vector-node">
-              <strong>Слова + триграммы</strong>
-              <code>лимит · ^ли · лим · ими…</code>
-            </div>
-            <div class="mini-arrow" aria-hidden="true">→</div>
-            <div class="vector-node">
-              <strong>Нормализованный вектор</strong>
-              <code>[0, −1, 2, 0, …]</code>
-              <small>хэширование признаков → косинусная близость</small>
-            </div>
+        <p class="eyebrow">Масштаб 300+</p>
+        <h2>Запрос идёт не во все сервисы,<br>а по <span class="violet">маршруту влияния</span></h2>
+        <div class="routing" aria-label="Маршрутизация запроса по системе">
+          <div class="routing-step">
+            <strong>Описание фичи</strong>
+            <span>бизнес-цель, актор и ожидаемый результат</span>
           </div>
-          <div class="truth">
-            <strong>Не путать<br>с SHA документа</strong>
-            <p>SHA-256 документа нужен для ID и кэша. Хэш-провайдер отдельно строит поисковый вектор из текста.</p>
+          <div class="routing-arrow" aria-hidden="true">→</div>
+          <div class="routing-step graph">
+            <strong>Граф системы</strong>
+            <span>определяет корень, соседей и границы репозиториев</span>
+          </div>
+          <div class="routing-arrow" aria-hidden="true">→</div>
+          <div class="routing-step rag">
+            <strong>Нужные RAG-индексы</strong>
+            <span>поиск только по затронутым сервисам и общим правилам</span>
+          </div>
+          <div class="routing-arrow" aria-hidden="true">→</div>
+          <div class="routing-step evidence">
+            <strong>Evidence</strong>
+            <span>контракты, правила и исходники с точными ссылками</span>
           </div>
         </div>
-        <p class="lead"><span class="green">Семантические эмбеддинги уже поддержаны:</span> локальную Qwen-модель можно включить без изменения MCP-контракта.</p>
+        <p class="routing-claim"><b>Масштабируется не размер промпта, а маршрутизация:</b> каждый сервис сохраняет свой индекс, а граф выбирает релевантный подграф для конкретной задачи.</p>
       </div>
-      <span class="slide-number">04 / 08</span>
+      <template class="speaker-notes">
+        <p>Это ключевой слайд про 300+ сервисов. Мы не загружаем «всю компанию» в один контекст. Сначала граф сужает область поиска, затем RAG читает детали только в выбранных индексах.</p>
+        <p>Рост системы означает больше независимых источников и связей, но не линейный рост каждого ответа модели. Это архитектурный принцип; конкретные пределы производительности нужно подтверждать нагрузочными испытаниями.</p>
+      </template>
+      <span class="slide-number">06 / 11</span>
     </section>
 
-    <section class="slide" data-title="Экономия контекста">
+    <section class="slide slide-benchmark" data-title="Эффект RAG">
       <div class="slide-inner">
-        <p class="eyebrow">Поисковый контракт</p>
-        <h2>Модель получает не архив,<br>а <span class="accent">короткое доказательство</span></h2>
-        <div class="metric-flow" aria-label="Сжатие результатов поиска">
-          <div class="metric">
-            <span class="metric-value">12</span>
-            <span class="metric-label">кандидатов ранжируются внутри RAG</span>
+        <p class="eyebrow">Пилотный benchmark репозитория</p>
+        <h2>RAG уменьшает передаваемый контекст,<br>не теряя <span class="green">попадание в источник</span></h2>
+        <div class="percent-grid" aria-label="Процентные результаты benchmark">
+          <div class="percent-metric">
+            <strong class="accent">−53,5%</strong>
+            <span>контекста модели относительно baseline</span>
           </div>
-          <div class="metric-arrow" aria-hidden="true">→</div>
-          <div class="metric">
-            <span class="metric-value">3</span>
-            <span class="metric-label">разных источника попадают в ответ</span>
+          <div class="percent-metric">
+            <strong class="violet">−45,7%</strong>
+            <span>размера поискового ответа</span>
           </div>
-          <div class="metric-arrow" aria-hidden="true">→</div>
-          <div class="metric">
-            <span class="metric-value">≤1k</span>
-            <span class="metric-label">токенов контекста с цитатами</span>
+          <div class="percent-metric">
+            <strong class="green">100%</strong>
+            <span>качества попадания сохранено в пилоте</span>
+          </div>
+          <div class="percent-metric">
+            <strong class="orange">75%</strong>
+            <span>кандидатов отсекается до контекста модели</span>
           </div>
         </div>
-        <p class="lead">Если нужны детали, агент запрашивает конкретный чанк или документ отдельно.</p>
+        <div class="baseline-note">
+          <strong>Baseline = контрольные 100%</strong>
+          <p>Это прежний формат поискового ответа с полными чанками. Он нужен как точка сравнения: проценты показывают эффект compact retrieval, а не «ускорение всей разработки».</p>
+        </div>
+        <p class="method-note">Пилотный срез текущего репозитория. Это не production SLA, не доля всей стоимости LLM и не обещание одинакового результата на любом корпусе.</p>
       </div>
-      <span class="slide-number">05 / 08</span>
+      <template class="speaker-notes">
+        <p>Сначала объяснить baseline: это контрольный старый поисковый контракт, который принимаем за 100%. С ним сравниваем новый компактный ответ.</p>
+        <p>Главный смысл не «мы сэкономили ровно половину денег», а «модель получает меньше лишнего текста при сохранённом попадании в релевантный источник». Честно назвать цифры пилотными и не переносить их автоматически на все 300+ сервисов.</p>
+      </template>
+      <span class="slide-number">07 / 11</span>
     </section>
 
     <section class="slide" data-title="Обычная фича">
       <div class="slide-inner">
         <p class="eyebrow">Обычная фича</p>
-        <h2>Один вопрос сокращает<br><span class="accent">ручной поиск</span></h2>
+        <h2>Разработчик задаёт вопрос по задаче,<br>а не угадывает <span class="accent">название страницы</span></h2>
         <div class="path" aria-label="Работа с обычной фичей">
           <div class="path-node">
             <strong>Вопрос</strong>
@@ -836,22 +1116,26 @@
           <div class="path-arrow" aria-hidden="true">→</div>
           <div class="path-node highlight">
             <strong>RAG сервиса</strong>
-            <span>поиск в нужном индексе</span>
+            <span>находит правило и связанные документы</span>
           </div>
           <div class="path-arrow" aria-hidden="true">→</div>
           <div class="path-node">
             <strong>Доказательства</strong>
-            <span>ADR · контракт · правило</span>
+            <span>ADR · контракт · путь к исходнику</span>
           </div>
           <div class="path-arrow" aria-hidden="true">→</div>
           <div class="path-node done">
             <strong>Изменение</strong>
-            <span>код · тесты · документация</span>
+            <span>код · тесты · обновление спецификации</span>
           </div>
         </div>
-        <p class="big-claim">Не нужно угадывать название страницы. Нужен только <span class="green">вопрос по задаче</span>.</p>
+        <p class="big-claim">Результат — меньше археологии и быстрее переход от требования к <span class="green">проверяемому изменению</span>.</p>
       </div>
-      <span class="slide-number">06 / 08</span>
+      <template class="speaker-notes">
+        <p>Дать простой пример перед сложной фичей. Пользователь формулирует предметный вопрос. RAG возвращает короткий ответ с источником; при необходимости агент лениво раскрывает конкретный чанк или документ.</p>
+        <p>Ценность для разработчика — не только скорость поиска, но и возможность проверить ответ, перейти в источник и обновить спецификацию вместе с кодом.</p>
+      </template>
+      <span class="slide-number">08 / 11</span>
     </section>
 
     <section class="slide" data-title="Сложная фича">
@@ -861,80 +1145,136 @@
         <div class="complex-path" aria-label="Планирование сложной фичи">
           <div class="path-node">
             <strong>Описание<br>фичи</strong>
-            <span>цель и сценарий</span>
+            <span>цель, актор и сценарий</span>
           </div>
           <div class="path-arrow" aria-hidden="true">→</div>
           <div class="path-node highlight">
             <strong>Граф<br>сервисов</strong>
-            <span>HTTP · Kafka · уровень уверенности</span>
+            <span>HTTP · Kafka · confidence</span>
           </div>
           <div class="path-arrow" aria-hidden="true">→</div>
           <div class="path-node">
-            <strong>RAG каждого<br>сервиса</strong>
-            <span>локальные контракты и правила</span>
+            <strong>RAG нужных<br>сервисов</strong>
+            <span>контракты, правила и исходники</span>
           </div>
           <div class="path-arrow" aria-hidden="true">→</div>
           <div class="path-node">
             <strong>План по<br>репозиториям</strong>
-            <span>миграции · тесты · rollout</span>
+            <span>API · события · миграции · rollout</span>
           </div>
           <div class="path-arrow" aria-hidden="true">→</div>
           <div class="path-node done">
-            <strong>Эпик → История<br>→ Задача</strong>
-            <span>в Jira-проектах команд</span>
+            <strong>Работа<br>команд</strong>
+            <span>порядок, тесты и критерии приёмки</span>
           </div>
         </div>
-        <p class="route-caption">Низкая уверенность и неразрешённые связи остаются гипотезами — план должен вынести их в отдельную проверку, а не выдавать за факт.</p>
+        <p class="route-caption">Слабые и неразрешённые связи остаются гипотезами. План превращает их в явные задачи проверки, а не выдаёт за факты.</p>
       </div>
-      <span class="slide-number">07 / 08</span>
+      <template class="speaker-notes">
+        <p>Показать отличие от обычного поиска. Граф отвечает «куда идти», RAG отвечает «что именно там сейчас есть», skill отвечает «как собрать это в последовательный план».</p>
+        <p>План группируется по репозиториям и сервисам: контрактные изменения, совместимость, миграции, наблюдаемость, тесты и порядок rollout. Точные файлы называются только при наличии source evidence.</p>
+      </template>
+      <span class="slide-number">09 / 11</span>
     </section>
 
-    <section class="slide slide-summary" data-title="Итог и развитие">
+    <section class="slide" data-title="Ценность">
       <div class="slide-inner">
-        <p class="eyebrow">Итог</p>
-        <h2>Confluence хранит знания.<br><span class="green">RAG доставляет контекст.</span></h2>
-        <div class="closing">
-          <div class="comparison">
-            <div class="compare-side">
-              <h3>Ручной поиск</h3>
-              <p class="compare-path">знать папку → угадать название → открыть страницы → проверить актуальность → собрать связи</p>
-            </div>
-            <div class="versus">VS</div>
-            <div class="compare-side good">
-              <h3 class="green">RAG + граф</h3>
-              <p class="compare-path"><strong>описать задачу</strong> → получить сервисы → увидеть источники → перейти к плану</p>
-            </div>
+        <p class="eyebrow">Ценность для двух аудиторий</p>
+        <h2>Один слой контекста.<br><span class="green">Разный практический эффект.</span></h2>
+        <div class="audiences">
+          <div class="audience">
+            <h3 class="green">Для бизнеса</h3>
+            <ul>
+              <li>видно, какие команды и сервисы затрагивает инициатива;</li>
+              <li>риски и неизвестные появляются до оценки и обещаний;</li>
+              <li>знания меньше зависят от конкретных экспертов;</li>
+              <li>план и критерии приёмки связаны с исходным требованием.</li>
+            </ul>
           </div>
-          <div>
-            <div class="limits" aria-label="Текущие ограничения">
-              <div class="limit"><i></i><span>Хэш-поиск хуже понимает синонимы и смысл.</span></div>
-              <div class="limit"><i></i><span>Индекс должен регулярно обновляться.</span></div>
-              <div class="limit"><i></i><span>Статический граф — не трассировка выполнения.</span></div>
-            </div>
-            <div class="next-step" style="margin-top: 28px">
-              <span>Следующий шаг</span>
-              <strong>Семантические эмбеддинги + измерение качества</strong>
-              <p>Затем — гибридный поиск, реранкер и векторная БД по мере роста.</p>
-            </div>
+          <div class="audience dev">
+            <h3 class="accent">Для разработки</h3>
+            <ul>
+              <li>поиск начинается с вопроса, а не с ручного обхода репозиториев;</li>
+              <li>каждый важный вывод можно проверить по evidence;</li>
+              <li>кросс-сервисный план учитывает API, Kafka, данные, тесты и rollout;</li>
+              <li>новой команде проще встроиться в существующие контракты.</li>
+            </ul>
           </div>
         </div>
       </div>
-      <span class="slide-number">08 / 08</span>
+      <template class="speaker-notes">
+        <p>Для бизнеса не обещать абстрактную «магическую скорость». Говорить о раннем обнаружении влияния, прозрачности границ команд и снижении риска пропущенных зависимостей.</p>
+        <p>Для разработчиков главный выигрыш — проверяемость. Ответ не заканчивается текстом модели: есть revision графа, confidence связи и source path для ключевых утверждений.</p>
+      </template>
+      <span class="slide-number">10 / 11</span>
+    </section>
+
+    <section class="slide" data-title="Доверие и ограничения">
+      <div class="slide-inner">
+        <p class="eyebrow">Почему результату можно доверять</p>
+        <h2>Система показывает границу<br>между <span class="green">фактом</span> и <span class="orange">гипотезой</span></h2>
+        <div class="guardrails">
+          <div class="guardrail">
+            <strong>Evidence вместо уверенного тона</strong>
+            <p>Наблюдаемое подтверждается документом, кодом или связью графа. Предлагаемое явно помечается как будущее состояние.</p>
+          </div>
+          <div class="guardrail">
+            <strong>Независимая проверка</strong>
+            <p>Отдельный skill раскладывает brief и план на утверждения и ищет противоречия, выдуманные сервисы и контракты.</p>
+          </div>
+          <div class="guardrail">
+            <strong>Ограничения видимы</strong>
+            <p>Индекс требует обновления. Статический граф не является runtime trace. Низкая уверенность не превращается в подтверждённый факт.</p>
+          </div>
+        </div>
+        <p class="big-claim">Не «AI знает систему», а <span class="accent">AI умеет предъявить основания</span> и список того, что ещё нужно проверить.</p>
+      </div>
+      <template class="speaker-notes">
+        <p>Этот слайд снимает главный вопрос доверия. Модель может ошибаться, поэтому workflow специально разделяет генерацию и независимый аудит.</p>
+        <p>Не скрывать ограничения: свежесть индекса, качество исходной документации и статический характер графа. Это не недостаток презентации, а контракт безопасного использования.</p>
+      </template>
+      <span class="slide-number">11 / 11</span>
     </section>
   </main>
 
-  <div class="kbd-hint" aria-hidden="true">← → / Space · F — полный экран</div>
+  <div class="kbd-hint" aria-hidden="true">← → / Space · F — полный экран · N — заметки</div>
   <nav class="controls" aria-label="Навигация по презентации">
     <button type="button" id="previous" aria-label="Предыдущий слайд">←</button>
-    <span class="progress" id="progress" aria-live="polite">1 / 8</span>
+    <span class="progress" id="progress" aria-live="polite">1 / 11</span>
     <button type="button" id="next" aria-label="Следующий слайд">→</button>
+    <button type="button" id="toggle-notes" aria-label="Заметки докладчика" aria-pressed="false">N</button>
   </nav>
+  <aside class="notes-panel" id="notes-panel" aria-label="Заметки докладчика" hidden>
+    <header>
+      <h3 id="notes-title">Заметки докладчика</h3>
+      <button type="button" id="close-notes" aria-label="Закрыть заметки">×</button>
+    </header>
+    <div class="notes-content" id="notes-content"></div>
+  </aside>
 
   <script>
     (() => {
       const slides = [...document.querySelectorAll('.slide')];
       const progress = document.querySelector('#progress');
+      const notesPanel = document.querySelector('#notes-panel');
+      const notesTitle = document.querySelector('#notes-title');
+      const notesContent = document.querySelector('#notes-content');
+      const notesButton = document.querySelector('#toggle-notes');
       let activeIndex = 0;
+
+      const renderNotes = () => {
+        const slide = slides[activeIndex];
+        const notes = slide.querySelector('.speaker-notes');
+        notesTitle.textContent = `Заметки · ${slide.dataset.title}`;
+        notesContent.innerHTML = notes?.innerHTML || '<p>Для этого слайда заметок нет.</p>';
+      };
+
+      const toggleNotes = (force) => {
+        const shouldOpen = typeof force === 'boolean' ? force : notesPanel.hidden;
+        notesPanel.hidden = !shouldOpen;
+        notesButton.setAttribute('aria-pressed', String(shouldOpen));
+        if (shouldOpen) renderNotes();
+      };
 
       const show = (index) => {
         activeIndex = Math.max(0, Math.min(slides.length - 1, index));
@@ -948,12 +1288,15 @@
         if (!visible) return;
         activeIndex = slides.indexOf(visible.target);
         progress.textContent = `${activeIndex + 1} / ${slides.length}`;
-        document.title = `${visible.target.dataset.title} — корпоративный RAG`;
+        document.title = `${visible.target.dataset.title} — SDD для 300+ сервисов`;
+        if (!notesPanel.hidden) renderNotes();
       }, { threshold: [0.45, 0.7] });
 
       slides.forEach((slide) => observer.observe(slide));
       document.querySelector('#previous').addEventListener('click', () => show(activeIndex - 1));
       document.querySelector('#next').addEventListener('click', () => show(activeIndex + 1));
+      notesButton.addEventListener('click', () => toggleNotes());
+      document.querySelector('#close-notes').addEventListener('click', () => toggleNotes(false));
 
       document.addEventListener('keydown', (event) => {
         if (['ArrowRight', 'ArrowDown', 'PageDown', ' '].includes(event.key)) {
@@ -972,6 +1315,11 @@
           event.preventDefault();
           if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
           else document.exitFullscreen?.();
+        } else if (event.key.toLowerCase() === 'n') {
+          event.preventDefault();
+          toggleNotes();
+        } else if (event.key === 'Escape' && !notesPanel.hidden) {
+          toggleNotes(false);
         }
       });
     })();

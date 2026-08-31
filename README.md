@@ -367,6 +367,9 @@ RAG. В неоднозначном случае ответ имеет `status: n
 [`plan-feature-with-system-graph`](skills/plan-feature-with-system-graph/SKILL.md): модель сначала
 вызывает `kb_system_graph`, фиксирует `graph_revision`, затем исполняет возвращённые `next_calls`
 к `kb_search_index` только для затронутых сервисов и строит план по repository/service с evidence.
+После показа плана skill через встроенный Jira MCP клиента спрашивает одно целевое пространство и в
+тестовом режиме создаёт там отдельную задачу на каждый подтверждённый сервис. Все задачи назначаются
+на текущего Jira-пользователя, определённого по MCP-токену; без выбора пространства Jira не изменяется.
 Перед реализацией результат можно независимо проверить с помощью
 [`verify-cross-service-feature`](skills/verify-cross-service-feature/SKILL.md): скилл раскладывает
 feature brief и план на атомарные утверждения, повторно проверяет их по текущему SSOT, графу,
