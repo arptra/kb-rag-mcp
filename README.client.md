@@ -88,3 +88,47 @@ curl -i --max-time 15 \
 
 Временный файл на клиентской машине больше не создаётся: итоговый SSOT сразу сохраняется на общем
 RAG-сервере.
+
+## Пакетное подключение сервисов из GigaCode CLI
+
+Вызовите `kb_connect_services_batch`, чтобы одним MCP-запросом поставить в очередь до 100 Git
+репозиториев:
+
+```json
+{
+  "services": [
+    {
+      "service_name": "payments-service",
+      "git_url": "ssh://git.example/payments-service.git"
+    },
+    {
+      "service_name": "limits-service",
+      "git_url": "ssh://git.example/limits-service.git",
+      "index_id": "limits-index"
+    },
+    {
+      "service_name": "legacy-service",
+      "git_url": "ssh://git.example/legacy-service.git",
+      "ref": "release/2026.08"
+    }
+  ]
+}
+```
+
+Если `ref` не указан, tool использует `master`. Если `index_id` отсутствует, для сервиса создаётся
+отдельный RAG-индекс с его именем. По умолчанию `prefer_gigacode=true`: сервер один раз проверяет
+доступность установленного GigaCode CLI и выбирает режим для всей пачки. Если CLI недоступен,
+репозитории всё равно подключаются через статический анализ. Если GigaCode запускается, но позже
+возвращает ошибку или невалидный контракт, repository job сохраняет статический результат и не
+падает.
+
+После завершения анализа сервер удаляет временный управляемый checkout. В RAG остаются только
+скопированные OpenSpec/SSOT, commit и архив source-derived анализа; при refresh исходник временно
+клонируется заново и снова удаляется. Переданный пользователем локальный каталог не удаляется.
+
+Tool возвращает отдельные `job_id`, `index_id` и `repository_id` для каждого сервиса. Состояние
+каждого job опрашивается через `kb_generate_system_ssot`:
+
+```json
+{"action":"status","job_id":"<job-id>"}
+```

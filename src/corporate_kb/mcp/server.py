@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthProvider
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from corporate_kb import __version__
 from corporate_kb.catalog import RagCatalog
@@ -58,12 +59,21 @@ client, while generation_mode='gigacode' launches an installed GigaCode CLI head
 server, scans the checkout read-only, writes structured SSOT, and rebuilds the index automatically.
 Check workflow.gigacode.available in action='options' first. In client mode submit the generated
 Markdown directly with action='submit'; no local stdio proxy or client runtime is required."""
+BATCH_CONNECT_DESCRIPTION = """Connect many service repositories from GigaCode CLI in one call.
+Pass one item per service with service_name and git_url; ref is optional and defaults to the shared
+default_ref, which is master unless explicitly changed. Each item may target an existing index_id;
+without it, the server creates a dedicated RAG index named after the service. The tool queues jobs
+and returns immediately. It prefers server-side GigaCode analysis, automatically queues static
+analysis when GigaCode is unavailable, and the repository job preserves static analysis when a
+later GigaCode run or output contract fails. Poll every returned job with
+kb_generate_system_ssot(action='status', job_id=...)."""
 BUILTIN_TOOL_DESCRIPTIONS = {
     "ssot_context": SSOT_DESCRIPTION,
     "kb_feature_context": FEATURE_CONTEXT_DESCRIPTION,
     "kb_system_graph": SYSTEM_GRAPH_DESCRIPTION,
     "kb_search_index": INDEX_SEARCH_DESCRIPTION,
     "kb_generate_system_ssot": GENERATE_SSOT_DESCRIPTION,
+    "kb_connect_services_batch": BATCH_CONNECT_DESCRIPTION,
     "kb_search": SEARCH_DESCRIPTION,
     "kb_get_document": (
         "Return a bounded extract from one normalized document after kb_search identifies its "
@@ -81,6 +91,35 @@ BUILTIN_TOOL_DESCRIPTIONS = {
     "kb_stats": "Return index counts, identity, timestamps, and resolved local directories.",
 }
 logger = logging.getLogger(__name__)
+
+
+class ServiceRepositoryBatchItem(BaseModel):
+    """One service repository accepted by the batch-connect MCP tool."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    service_name: str = Field(min_length=2, max_length=120)
+    git_url: str = Field(min_length=1, max_length=2048)
+    ref: str | None = Field(default=None, min_length=1, max_length=255)
+    index_id: str | None = Field(default=None, min_length=1, max_length=255)
+
+    @field_validator("service_name", "git_url")
+    @classmethod
+    def normalize_required_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank")
+        return normalized
+
+    @field_validator("ref", "index_id")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank")
+        return normalized
 
 
 def create_mcp_server(
@@ -297,6 +336,126 @@ def create_mcp_server(
                 content=content,
                 finalize=finalize,
             )
+
+        @server.tool(
+            name="kb_connect_services_batch",
+            description=description("kb_connect_services_batch"),
+            annotations={
+                "readOnlyHint": False,
+                "destructiveHint": False,
+                "idempotentHint": False,
+                "openWorldHint": True,
+            },
+        )
+        def kb_connect_services_batch(
+            services: Annotated[
+                list[ServiceRepositoryBatchItem],
+                Field(min_length=1, max_length=100),
+            ],
+            default_ref: Annotated[str, Field(min_length=1, max_length=255)] = "master",
+            prefer_gigacode: bool = True,
+        ) -> dict[str, Any]:
+            clean_default_ref = default_ref.strip()
+            if not clean_default_ref:
+                raise ValueError("default_ref must not be blank")
+
+            queued: list[dict[str, Any]] = []
+            failed: list[dict[str, Any]] = []
+            fallback_count = 0
+            seen: set[tuple[str, str, str | None]] = set()
+            requested_mode: Literal["static", "gigacode"] = (
+                "gigacode" if prefer_gigacode else "static"
+            )
+            queued_mode: Literal["static", "gigacode"] = requested_mode
+            fallback_reason: str | None = None
+            if prefer_gigacode:
+                try:
+                    gigacode_status = catalog.gigacode_status(refresh=True)
+                    if not gigacode_status.get("available"):
+                        queued_mode = "static"
+                        fallback_reason = str(
+                            gigacode_status.get("error") or "GigaCode is unavailable"
+                        )
+                except Exception as exc:
+                    queued_mode = "static"
+                    fallback_reason = f"Could not check GigaCode availability: {exc}"
+
+            for item in services:
+                selected_ref = item.ref or clean_default_ref
+                identity = (item.git_url, selected_ref, item.index_id)
+                if identity in seen:
+                    failed.append(
+                        {
+                            "service_name": item.service_name,
+                            "git_url": item.git_url,
+                            "ref": selected_ref,
+                            "index_id": item.index_id,
+                            "error": "Duplicate repository entry in this batch",
+                        }
+                    )
+                    continue
+                seen.add(identity)
+
+                try:
+                    job = catalog.start_repository_ingestion(
+                        name=item.service_name,
+                        git_url=item.git_url,
+                        index_id=item.index_id,
+                        index_name=item.service_name,
+                        ref=selected_ref,
+                        generation_mode=queued_mode,
+                        validate_gigacode=False,
+                    )
+                except Exception as exc:
+                    failed.append(
+                        {
+                            "service_name": item.service_name,
+                            "git_url": item.git_url,
+                            "ref": selected_ref,
+                            "index_id": item.index_id,
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+                if fallback_reason is not None:
+                    fallback_count += 1
+
+                queued.append(
+                    {
+                        "service_name": item.service_name,
+                        "git_url": item.git_url,
+                        "ref": selected_ref,
+                        "index_id": job.index_id,
+                        "repository_id": job.target_id,
+                        "requested_analysis": requested_mode,
+                        "queued_analysis": queued_mode,
+                        "fallback_reason": fallback_reason,
+                        "job": job.model_dump(mode="json"),
+                        "poll": {
+                            "tool": "kb_generate_system_ssot",
+                            "arguments": {"action": "status", "job_id": job.id},
+                        },
+                    }
+                )
+
+            status = "queued"
+            if failed and queued:
+                status = "partial"
+            elif failed:
+                status = "failed"
+            return {
+                "status": status,
+                "service_count": len(services),
+                "queued_count": len(queued),
+                "failed_count": len(failed),
+                "static_fallback_count": fallback_count,
+                "default_ref": clean_default_ref,
+                "analysis_policy": (
+                    "gigacode-with-static-fallback" if prefer_gigacode else "static-only"
+                ),
+                "queued": queued,
+                "failed": failed,
+            }
 
     @server.tool(
         name="kb_get_document",

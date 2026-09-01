@@ -348,7 +348,8 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             headers={
                 "Cache-Control": "no-store",
                 "Content-Security-Policy": (
-                    "default-src 'self'; script-src 'self'; style-src 'self'; "
+                    "default-src 'self'; script-src 'self'; "
+                    "style-src 'self' 'unsafe-inline'; "
                     "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'"
                 ),
             },
@@ -636,6 +637,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             index_name = payload.get("index_name")
             ref = payload.get("ref")
             generation_mode = payload.get("generation_mode", "static")
+            prefer_gigacode = payload.get("prefer_gigacode", False)
             if not isinstance(name, str) or not isinstance(git_url, str):
                 raise ValueError("name and git_url must be strings")
             if index_id is not None and not isinstance(index_id, str):
@@ -646,6 +648,21 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 raise ValueError("ref must be a string or null")
             if generation_mode not in {"static", "gigacode"}:
                 raise ValueError("generation_mode must be static or gigacode")
+            if not isinstance(prefer_gigacode, bool):
+                raise ValueError("prefer_gigacode must be a boolean")
+            fallback_reason: str | None = None
+            if prefer_gigacode:
+                generation_mode = "gigacode"
+                try:
+                    gigacode_status = catalog.gigacode_status(refresh=True)
+                    if not gigacode_status.get("available"):
+                        generation_mode = "static"
+                        fallback_reason = str(
+                            gigacode_status.get("error") or "GigaCode is unavailable"
+                        )
+                except Exception as exc:
+                    generation_mode = "static"
+                    fallback_reason = f"Could not check GigaCode availability: {exc}"
             job = catalog.start_repository_ingestion(
                 name=name,
                 git_url=git_url,
@@ -653,8 +670,12 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 index_name=index_name,
                 ref=ref,
                 generation_mode=generation_mode,
+                validate_gigacode=not prefer_gigacode,
             )
-            return JSONResponse(job.model_dump(mode="json"), status_code=202)
+            response = job.model_dump(mode="json")
+            response["generation_mode"] = generation_mode
+            response["fallback_reason"] = fallback_reason
+            return JSONResponse(response, status_code=202)
         except Exception as exc:
             return _api_error(exc)
 
@@ -771,6 +792,19 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                 raise ValueError("job_id must be a non-empty string")
             job = await asyncio.to_thread(catalog.cancel_job, job_id)
             return JSONResponse(job.model_dump(mode="json"), status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route("/admin/api/jobs/status", methods=["GET"], include_in_schema=False)
+    async def admin_job_status(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            job_id = _optional_query(request, "job_id")
+            if not job_id:
+                raise ValueError("job_id query parameter is required")
+            job = await asyncio.to_thread(catalog.job_status, job_id)
+            return JSONResponse(job.model_dump(mode="json"))
         except Exception as exc:
             return _api_error(exc)
 

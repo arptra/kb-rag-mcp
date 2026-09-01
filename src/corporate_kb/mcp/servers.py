@@ -39,6 +39,10 @@ BUILTIN_TOOLS: tuple[dict[str, str], ...] = (
             "Coordinate client-side SSOT generation from server analysis and source files."
         ),
     },
+    {
+        "name": "kb_connect_services_batch",
+        "description": "Connect and analyze many service repositories in one queued call.",
+    },
     {"name": "kb_search", "description": "Search indexed corporate knowledge."},
     {"name": "kb_get_document", "description": "Read a bounded document extract."},
     {"name": "kb_get_chunk", "description": "Read context around one search chunk."},

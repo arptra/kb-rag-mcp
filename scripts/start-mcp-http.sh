@@ -17,17 +17,28 @@ export KB_AUTO_INDEX="${KB_AUTO_INDEX:-false}"
 export KB_MCP_HTTP_HOST="${KB_MCP_HTTP_HOST:-0.0.0.0}"
 export KB_MCP_HTTP_PORT="${KB_MCP_HTTP_PORT:-8000}"
 export KB_MCP_HTTP_PATH="${KB_MCP_HTTP_PATH:-/mcp}"
-export KB_MCP_TLS_ENABLED=true
+export KB_MCP_TLS_ENABLED="${KB_MCP_TLS_ENABLED:-true}"
 export KB_MCP_TLS_CERT_FILE="${KB_MCP_TLS_CERT_FILE:-${project_root}/certs/server.crt}"
 export KB_MCP_TLS_KEY_FILE="${KB_MCP_TLS_KEY_FILE:-${project_root}/certs/server.key}"
 # This deployment is intentionally open: TLS encrypts traffic, but there is no Bearer/admin auth.
 export KB_MCP_HTTP_BEARER_TOKEN=""
 export KB_ADMIN_PASSWORD=""
 
-if [[ ! -f "${KB_MCP_TLS_CERT_FILE}" || ! -f "${KB_MCP_TLS_KEY_FILE}" ]]; then
-  "${script_dir}/generate-dev-certs.sh"
-fi
-server_scheme="https"
+case "${KB_MCP_TLS_ENABLED}" in
+  1|true|TRUE|yes|YES|on|ON)
+    if [[ ! -f "${KB_MCP_TLS_CERT_FILE}" || ! -f "${KB_MCP_TLS_KEY_FILE}" ]]; then
+      "${script_dir}/generate-dev-certs.sh"
+    fi
+    server_scheme="https"
+    ;;
+  0|false|FALSE|no|NO|off|OFF)
+    server_scheme="http"
+    ;;
+  *)
+    echo "KB_MCP_TLS_ENABLED must be a boolean value." >&2
+    exit 2
+    ;;
+esac
 
 runtime_dir="${project_root}/.cache/kb/runtime"
 pid_file="${runtime_dir}/mcp-http.pid"

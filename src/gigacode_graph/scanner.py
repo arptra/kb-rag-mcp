@@ -91,9 +91,7 @@ def _simple_type(value: str) -> str:
 
 
 def _path_value(arguments: str) -> str:
-    named = re.search(
-        r"(?:path|value|url)\s*=\s*(?:\{\s*)?[\"']([^\"']+)", arguments
-    )
+    named = re.search(r"(?:path|value|url)\s*=\s*(?:\{\s*)?[\"']([^\"']+)", arguments)
     if named:
         return named.group(1)
     direct = re.search(r"[\"']([^\"']+)[\"']", arguments)
@@ -237,6 +235,7 @@ class ScanTarget:
     repository_path: Path | None = None
     repository_name: str | None = None
     service_id: str | None = None
+    base_service_id: str | None = None
     display_name: str | None = None
     owner: str | None = None
     aliases: tuple[str, ...] = ()
@@ -356,8 +355,221 @@ class _GraphBuilder:
         )
 
 
+def _service_identity(node: GraphNode) -> str:
+    repository = str(
+        node.metadata.get("repository_path")
+        or node.metadata.get("source")
+        or node.metadata.get("repository")
+        or node.metadata.get("path")
+        or "unknown-repository"
+    )
+    module = str(node.metadata.get("module_path") or ".")
+    return f"{repository}\x1f{module}"
+
+
+def _collision_base_service_id(node: GraphNode) -> str:
+    return str(node.metadata.get("base_service_id") or node.service_id or "")
+
+
+def _remapped_owned_node_id(node_id: str, old_service_id: str, new_service_id: str) -> str:
+    token = f":{old_service_id}"
+    if token in node_id:
+        return node_id.replace(token, f":{new_service_id}", 1)
+    digest = hashlib.sha256(f"{node_id}\x1f{new_service_id}".encode()).hexdigest()[:10]
+    return f"{node_id}--{digest}"
+
+
+def _disambiguate_service_collisions(snapshots: list[GraphSnapshot]) -> list[GraphSnapshot]:
+    """Keep equal service ids from independently scanned repositories as separate nodes."""
+    grouped: dict[str, list[tuple[int, GraphNode]]] = {}
+    for snapshot_index, snapshot in enumerate(snapshots):
+        for node in snapshot.nodes:
+            if node.type != "Service" or not node.service_id:
+                continue
+            base_service_id = _collision_base_service_id(node)
+            if base_service_id:
+                grouped.setdefault(base_service_id, []).append((snapshot_index, node))
+
+    remaps: dict[int, dict[str, tuple[str, str]]] = {}
+    for base_service_id, entries in grouped.items():
+        identities = {_service_identity(node) for _index, node in entries}
+        if len(identities) <= 1:
+            continue
+        for snapshot_index, node in entries:
+            identity = _service_identity(node)
+            digest = hashlib.sha256(identity.encode()).hexdigest()[:8]
+            new_service_id = f"{base_service_id}--{digest}"
+            if node.service_id == new_service_id:
+                continue
+            remaps.setdefault(snapshot_index, {})[str(node.service_id)] = (
+                new_service_id,
+                base_service_id,
+            )
+
+    if not remaps:
+        return snapshots
+
+    normalized: list[GraphSnapshot] = []
+    for snapshot_index, snapshot in enumerate(snapshots):
+        service_remaps = remaps.get(snapshot_index, {})
+        if not service_remaps:
+            normalized.append(snapshot)
+            continue
+        node_id_map: dict[str, str] = {}
+        nodes: list[GraphNode] = []
+        for node in snapshot.nodes:
+            mapping = service_remaps.get(str(node.service_id or ""))
+            if mapping is None:
+                nodes.append(node)
+                continue
+            new_service_id, base_service_id = mapping
+            new_node_id = (
+                f"service:{new_service_id}"
+                if node.type == "Service"
+                else _remapped_owned_node_id(node.id, str(node.service_id), new_service_id)
+            )
+            node_id_map[node.id] = new_node_id
+            metadata = dict(node.metadata)
+            if node.type == "Service":
+                aliases = {
+                    *(str(value) for value in metadata.get("aliases", [])),
+                    base_service_id,
+                    new_service_id,
+                }
+                metadata.update(
+                    {
+                        "aliases": sorted(value for value in aliases if value),
+                        "base_service_id": base_service_id,
+                        "collision_disambiguated": True,
+                    }
+                )
+            nodes.append(
+                node.model_copy(
+                    update={
+                        "id": new_node_id,
+                        "service_id": new_service_id,
+                        "metadata": metadata,
+                    }
+                )
+            )
+
+        edges: list[GraphEdge] = []
+        for edge in snapshot.edges:
+            source = node_id_map.get(edge.source, edge.source)
+            target = node_id_map.get(edge.target, edge.target)
+            edge_id = edge.id
+            if source != edge.source or target != edge.target:
+                edge_id = _stable_id("edge-remap", edge.id, source, target)
+            edges.append(
+                edge.model_copy(update={"id": edge_id, "source": source, "target": target})
+            )
+        collision_issues = [
+            ScanIssue(
+                repository=str(
+                    node.metadata.get("repository") or node.metadata.get("repository_path")
+                ),
+                message=(
+                    f"Duplicate service id '{base_service_id}' was globally disambiguated "
+                    f"as '{new_service_id}'"
+                ),
+            )
+            for old_service_id, (new_service_id, base_service_id) in service_remaps.items()
+            for node in snapshot.nodes
+            if node.type == "Service" and node.service_id == old_service_id
+        ]
+        normalized.append(
+            snapshot.model_copy(
+                update={
+                    "nodes": nodes,
+                    "edges": edges,
+                    "issues": [*snapshot.issues, *collision_issues],
+                }
+            )
+        )
+    return normalized
+
+
+def _dependency_contract(edge: GraphEdge) -> tuple[str, str, str]:
+    protocol = str(edge.metadata.get("protocol") or "UNKNOWN")
+    operation = str(edge.metadata.get("operation") or edge.metadata.get("topic") or edge.label)
+    return normalize_contract(protocol, operation).key
+
+
+def _is_verified_dependency(edge: GraphEdge) -> bool:
+    return edge.type == "DEPENDS_ON" and (
+        edge.origin in {"gigacode", "static+gigacode"}
+        or edge.verified_at is not None
+        or edge.status == "rejected"
+    )
+
+
+def _restore_verified_dependency_decisions(
+    builder: _GraphBuilder,
+    decisions: list[GraphEdge],
+) -> None:
+    """Overlay persisted GigaCode decisions on freshly relinked static dependencies."""
+    for decision in decisions:
+        source_node = builder.nodes.get(decision.source)
+        if source_node is None or source_node.type != "Service" or not source_node.service_id:
+            continue
+        contract = _dependency_contract(decision)
+        candidates = [
+            edge
+            for edge in builder.edges.values()
+            if edge.type == "DEPENDS_ON"
+            and edge.source == decision.source
+            and _dependency_contract(edge) == contract
+        ]
+        selected = next((edge for edge in candidates if edge.id == decision.id), None)
+        if selected is None:
+            selected = next((edge for edge in candidates if edge.target == decision.target), None)
+        if selected is None and len(candidates) == 1:
+            selected = candidates[0]
+        if selected is None:
+            if decision.source in builder.nodes and decision.target in builder.nodes:
+                builder.edges[decision.id] = decision
+            continue
+
+        original_target = selected.target
+        target = decision.target if decision.target in builder.nodes else selected.target
+        update = {
+            "target": target,
+            "confidence": decision.confidence,
+            "status": decision.status,
+            "origin": decision.origin,
+            "verified_at": decision.verified_at,
+            "metadata": {**selected.metadata, **decision.metadata},
+            "evidence_ids": list(dict.fromkeys([*selected.evidence_ids, *decision.evidence_ids])),
+        }
+        builder.edges[selected.id] = selected.model_copy(update=update)
+
+        related_exitpoints = {
+            node.id
+            for node in builder.nodes.values()
+            if node.type == "ExitPoint"
+            and node.service_id == source_node.service_id
+            and normalize_contract(
+                str(node.metadata.get("protocol") or "UNKNOWN"),
+                str(node.metadata.get("operation") or node.label),
+            ).key
+            == contract
+        }
+        for edge_id, edge in list(builder.edges.items()):
+            if (
+                edge.type == "DEPENDS_ON"
+                and edge.source in related_exitpoints
+                and edge.target == original_target
+                and _dependency_contract(edge) == contract
+            ):
+                builder.edges[edge_id] = edge.model_copy(update=update)
+
+
 def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
     """Merge independently cached service scans and resolve cross-service dependencies."""
+    snapshots = _disambiguate_service_collisions(snapshots)
+    verified_decisions = [
+        edge for snapshot in snapshots for edge in snapshot.edges if _is_verified_dependency(edge)
+    ]
     builder = _GraphBuilder()
     seen_issues: set[tuple[str, str | None, str, str]] = set()
     for snapshot in snapshots:
@@ -422,10 +634,7 @@ def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
             for node, (_, method, address) in inbound_http
             if protocol == "HTTP"
             and address == outbound_contract.address
-            and (
-                method == outbound_contract.method
-                or "ANY" in {method, outbound_contract.method}
-            )
+            and (method == outbound_contract.method or "ANY" in {method, outbound_contract.method})
             and node.service_id != exitpoint.service_id
         ]
         contract_targets = {
@@ -474,9 +683,7 @@ def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
                 )
             )
         metadata = {"protocol": protocol, "operation": operation, "matcher": matcher}
-        evidence_ids = list(
-            dict.fromkeys([*exitpoint.evidence_ids, *target_evidence])
-        )
+        evidence_ids = list(dict.fromkeys([*exitpoint.evidence_ids, *target_evidence]))
         builder.add_edge(
             source=exitpoint.id,
             target=target_id,
@@ -520,6 +727,7 @@ def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
                     metadata={"protocol": "KAFKA", "topic": topic},
                     evidence_ids=[*source.evidence_ids, *target_edge.evidence_ids],
                 )
+    _restore_verified_dependency_decisions(builder, verified_decisions)
     return builder.snapshot()
 
 
@@ -730,6 +938,11 @@ class RepositoryScanner:
                 "requested_ref": source_metadata.get("ref"),
                 "owner": owner,
                 "aliases": sorted(aliases),
+                "base_service_id": (
+                    target.base_service_id
+                    if target is not None and target.base_service_id
+                    else service_id
+                ),
             },
         )
         self._builder.add_node(repository_node)
@@ -884,9 +1097,7 @@ class RepositoryScanner:
             except (OSError, UnicodeDecodeError):
                 continue
             if path.suffix.lower() == ".properties":
-                for property_match in re.finditer(
-                    r"(?m)^\s*([\w.-]+)\s*[:=]\s*([^#\r\n]+)", text
-                ):
+                for property_match in re.finditer(r"(?m)^\s*([\w.-]+)\s*[:=]\s*([^#\r\n]+)", text):
                     scan.configuration.setdefault(
                         property_match.group(1).strip(),
                         _strip_quotes(property_match.group(2).strip()),
@@ -1066,9 +1277,7 @@ class RepositoryScanner:
                         )
                 send_to_args = _annotation_arguments(method.annotations, "SendTo")
                 if send_to_args is not None:
-                    send_topic = self._resolve_configuration(
-                        scan, self._topic_value(send_to_args)
-                    )
+                    send_topic = self._resolve_configuration(scan, self._topic_value(send_to_args))
                     if send_topic:
                         evidence_id = self._builder.add_evidence(
                             scan=scan,
@@ -1794,9 +2003,7 @@ class RepositoryScanner:
                     )
                 )
             exitpoint_id = _outbound_exit_id(fact)
-            dependency_evidence = list(
-                dict.fromkeys([fact.evidence_id, *target_evidence])
-            )
+            dependency_evidence = list(dict.fromkeys([fact.evidence_id, *target_evidence]))
             dependency_metadata = {
                 "protocol": fact.protocol,
                 "operation": fact.operation,

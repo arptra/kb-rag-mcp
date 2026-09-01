@@ -28,6 +28,7 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
             "index_catalog_path": tmp_path / ".cache" / "kb" / "index_catalog.json",
             "managed_indexes_dir": tmp_path / ".cache" / "kb" / "indexes",
             "repository_cache_dir": tmp_path / ".cache" / "kb" / "repositories",
+            "repository_cleanup_after_scan": False,
             "graph_store_path": tmp_path / ".cache" / "kb" / "system_graph.json",
             "service_map_path": tmp_path / ".cache" / "kb" / "service_map.json",
             "analysis_archive_dir": tmp_path / ".cache" / "kb" / "analysis",

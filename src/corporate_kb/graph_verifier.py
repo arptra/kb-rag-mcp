@@ -235,9 +235,7 @@ class GraphGigaCodeVerifier:
                 )
             if repository is None:
                 summary["ignored"] += 1
-                summary["warnings"].append(
-                    f"No checkout found for dependency {candidate.id}"
-                )
+                summary["warnings"].append(f"No checkout found for dependency {candidate.id}")
                 continue
             key = str(repository.path.resolve())
             grouped.setdefault(key, (repository, []))[1].append(candidate)
@@ -264,11 +262,15 @@ class GraphGigaCodeVerifier:
                 auth_required: Callable[[str], None] | None = None
                 auth_completed: Callable[[], None] | None = None
                 if authentication_url is not None:
+
                     def auth_required(url: str, current: str = label) -> None:
                         authentication_url(current, url)
+
                 if authentication_complete is not None:
+
                     def auth_completed(current: str = label) -> None:
                         authentication_complete(current)
+
                 try:
                     response = self._runner.run_json(
                         checkout=repository.path,
@@ -293,9 +295,7 @@ class GraphGigaCodeVerifier:
                     summary["processed"] += len(batch)
                     summary["failed"] += 1
                     summary["unresolved"] += len(batch)
-                    summary["warnings"].append(
-                        f"GigaCode verification skipped {label}: {error}"
-                    )
+                    summary["warnings"].append(f"GigaCode verification skipped {label}: {error}")
                     failed_run = {
                         "repository": repository.name,
                         "checkout": str(repository.path.resolve()),
@@ -460,11 +460,7 @@ class GraphGigaCodeVerifier:
                     update={
                         "target": target.id,
                         "confidence": update.confidence,
-                        "status": (
-                            "confirmed"
-                            if update.confidence in {"HIGH"}
-                            else "inferred"
-                        ),
+                        "status": ("confirmed" if update.confidence in {"HIGH"} else "inferred"),
                         "origin": "static+gigacode",
                         "verified_at": now,
                         "metadata": {
@@ -524,9 +520,7 @@ class GraphGigaCodeVerifier:
                 continue
             source_evidence: list[str] = []
             for proposed in discovery.evidence:
-                validated = self._validated_evidence(
-                    repository, proposed, discovery.confidence
-                )
+                validated = self._validated_evidence(repository, proposed, discovery.confidence)
                 if validated is not None:
                     graph_evidence[validated.id] = validated
                     source_evidence.append(validated.id)
@@ -658,9 +652,7 @@ class GraphGigaCodeVerifier:
             commit=repository.commit,
             file=relative.as_posix(),
             line=proposed.line,
-            snippet=(
-                f"{proposed.symbol}: {snippet}" if proposed.symbol and snippet else snippet
-            ),
+            snippet=(f"{proposed.symbol}: {snippet}" if proposed.symbol and snippet else snippet),
             extractor="gigacode-verifier",
             confidence=confidence,
         )
@@ -685,11 +677,6 @@ class GraphGigaCodeVerifier:
                         "id": entry.id,
                         "kind": entry.kind,
                         "operation": entry.operation,
-                        "evidence": [
-                            evidence[evidence_id].model_dump(mode="json")
-                            for evidence_id in entry.evidence_ids
-                            if evidence_id in evidence
-                        ][:5],
                     }
                     for entry in item.entrypoints[:30]
                 ],
@@ -743,10 +730,7 @@ class GraphGigaCodeVerifier:
     ) -> Path:
         directory = self._artifact_root / "gigacode-verification"
         directory.mkdir(parents=True, exist_ok=True)
-        filename = (
-            f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-"
-            f"{uuid.uuid4().hex[:8]}.json"
-        )
+        filename = f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}.json"
         destination = directory / filename
         payload = json.dumps(
             {"schema_version": 1, "summary": summary, "runs": runs},

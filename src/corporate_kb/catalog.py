@@ -31,6 +31,7 @@ from corporate_kb.service import KnowledgeIndexMissingError, KnowledgeService
 from corporate_kb.usage import UsageTracker
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.models import GraphSnapshot
+from gigacode_graph.scanner import merge_and_relink_snapshots
 from gigacode_graph.service import GraphService
 from gigacode_graph.sources import (
     RepositoryOperationCancelled,
@@ -143,6 +144,9 @@ class RepositorySource(CatalogModel):
     ref: str | None = None
     index_id: str
     checkout_path: str
+    checkout_state: Literal["available", "removed", "external"] = "available"
+    checkout_removed_at: datetime | None = None
+    documentation_path: str | None = None
     openspec_path: str | None = None
     openspec_paths: list[str] = Field(default_factory=list)
     commit: str | None = None
@@ -321,6 +325,7 @@ class RagCatalog:
         index_name: str | None = None,
         ref: str | None = None,
         generation_mode: Literal["static", "gigacode"] = "static",
+        validate_gigacode: bool = True,
     ) -> CatalogJob:
         clean_name = name.strip()
         if len(clean_name) < 2:
@@ -328,7 +333,7 @@ class RagCatalog:
         clean_url = git_url.strip()
         if not clean_url:
             raise ValueError("Git URL must not be empty")
-        if generation_mode == "gigacode":
+        if generation_mode == "gigacode" and validate_gigacode:
             gigacode_status = self._gigacode.status(refresh=True)
             if not gigacode_status["available"]:
                 raise RuntimeError(str(gigacode_status["error"]))
@@ -355,6 +360,10 @@ class RagCatalog:
             daemon=True,
         ).start()
         return job
+
+    def gigacode_status(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Expose a safe availability snapshot for batch repository scheduling."""
+        return self._gigacode.status(refresh=refresh)
 
     def start_repository_refresh(self, repository_id: str) -> CatalogJob:
         """Refresh Git/OpenSpec, rebuild the RAG index, and reanalyze the source map."""
@@ -614,9 +623,7 @@ class RagCatalog:
             selected_repositories = self._normalize_selection(repository_ids)
             selected_services = self._normalize_selection(service_ids)
             if not all_services and not selected_repositories and not selected_services:
-                raise ValueError(
-                    "Select repository_ids or service_ids, or set all_services=true"
-                )
+                raise ValueError("Select repository_ids or service_ids, or set all_services=true")
             job = self.start_system_ssot_generation(
                 index_id=index_id,
                 repository_ids=list(selected_repositories),
@@ -636,9 +643,7 @@ class RagCatalog:
             return self._ssot_target_context(job_id, service_id)
         if normalized_action == "read_file":
             if not job_id or not repository_id or not file_path:
-                raise ValueError(
-                    "action='read_file' requires job_id, repository_id and file_path"
-                )
+                raise ValueError("action='read_file' requires job_id, repository_id and file_path")
             return self._ssot_read_file(
                 job_id,
                 repository_id,
@@ -752,6 +757,13 @@ class RagCatalog:
             daemon=True,
         ).start()
         return job
+
+    def job_status(self, job_id: str) -> CatalogJob:
+        with self._lock:
+            job = self._jobs.get(job_id)
+        if job is None:
+            raise KeyError(f"Unknown job: {job_id}")
+        return job.model_copy(deep=True)
 
     def job_log(self, job_id: str) -> dict[str, str]:
         with self._lock:
@@ -933,6 +945,11 @@ class RagCatalog:
         }
         self._update_job(job_id, result=updated_result)
         index_job = self.start_index_build(index_id) if finalize else None
+        if finalize:
+            self._cleanup_repository_checkouts(
+                {str(item) for item in result.get("repository_ids", [])},
+                job_id=job_id,
+            )
         return {
             "status": "indexing" if index_job is not None else "saved",
             "session_id": job_id,
@@ -1120,8 +1137,7 @@ class RagCatalog:
             "generated_at": _now().isoformat(),
         }
         yaml = "\n".join(
-            f"{key}: {json.dumps(value, ensure_ascii=False)}"
-            for key, value in frontmatter.items()
+            f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in frontmatter.items()
         )
         return f"---\n{yaml}\n---\n\n{content.rstrip()}\n"
 
@@ -1450,6 +1466,21 @@ class RagCatalog:
                     cancel_event,
                     generation_mode,
                 )
+                self._cleanup_managed_repository_checkout(
+                    self._repository_id(name, git_url, ref, index_id),
+                    job_id=job_id,
+                )
+                self._update_job(
+                    job_id,
+                    status="completed",
+                    message=(
+                        f"Imported repository {name}, completed GigaCode analysis and "
+                        "refreshed the system graph"
+                        if generation_mode == "gigacode"
+                        else f"Imported repository {name} and refreshed the system graph"
+                    ),
+                    completed_at=_now(),
+                )
         except (
             CatalogJobCancelled,
             GigaCodeCancelled,
@@ -1461,6 +1492,10 @@ class RagCatalog:
         except Exception as exc:
             self._fail_background_job(job_id, index_id, "Repository import failed", exc)
         finally:
+            self._cleanup_managed_repository_checkout(
+                self._repository_id(name, git_url, ref, index_id),
+                job_id=job_id,
+            )
             self._release_cancel_event(job_id)
 
     def _execute_repository_job(
@@ -1492,6 +1527,9 @@ class RagCatalog:
             checkout = paths[0]
             ingestion = records[0]
             repository_id = self._repository_id(name, git_url, ref, index_id)
+            documentation = (
+                Path(self._record(index_id).knowledge_dir) / "repositories" / repository_id
+            ).resolve()
             try:
                 previous = self._repository(repository_id)
                 repository = previous.model_copy(
@@ -1500,6 +1538,11 @@ class RagCatalog:
                         "git_url": git_url,
                         "ref": ref,
                         "checkout_path": str(checkout),
+                        "checkout_state": (
+                            "external" if ingestion.source_type == "local" else "available"
+                        ),
+                        "checkout_removed_at": None,
+                        "documentation_path": str(documentation),
                         "commit": ingestion.commit,
                     }
                 )
@@ -1511,6 +1554,10 @@ class RagCatalog:
                     ref=ref,
                     index_id=index_id,
                     checkout_path=str(checkout),
+                    checkout_state=(
+                        "external" if ingestion.source_type == "local" else "available"
+                    ),
+                    documentation_path=str(documentation),
                     commit=ingestion.commit,
                 )
             # Persist the source before deeper inspection. Even an empty or broken
@@ -1528,10 +1575,7 @@ class RagCatalog:
             document_count = self._sync_openspec(
                 sources=openspecs,
                 checkout=checkout,
-                destination=Path(self._record(index_id).knowledge_dir)
-                / "repositories"
-                / repository_id
-                / "openspec",
+                destination=documentation / "openspec",
                 cancel_event=cancel_event,
             )
             self._raise_if_cancelled(cancel_event)
@@ -1571,7 +1615,12 @@ class RagCatalog:
                     "after GigaCode SSOT generation",
                 )
             self._update_job(job_id, message="Building service graph")
-            self._build_graph(cancel_event=cancel_event, job_id=job_id)
+            self._build_graph(
+                cancel_event=cancel_event,
+                job_id=job_id,
+                analysis_mode=("gigacode" if generation_mode == "gigacode" else "static"),
+                verify_all=generation_mode == "gigacode",
+            )
             self._raise_if_cancelled(cancel_event)
             if generation_mode == "gigacode":
                 self._append_job_log(
@@ -1587,15 +1636,14 @@ class RagCatalog:
                     False,
                     "gigacode",
                     cancel_event,
+                    complete_job=False,
                 )
                 return
             self._update_job(
                 job_id,
-                status="completed",
                 message=(
-                    f"Imported {document_count} OpenSpec documents and refreshed the system graph"
+                    f"Imported {document_count} OpenSpec documents; finalizing checkout cleanup"
                 ),
-                completed_at=_now(),
             )
         except (
             CatalogJobCancelled,
@@ -1621,8 +1669,17 @@ class RagCatalog:
         verify_all: bool,
     ) -> None:
         cancel_event = self._cancel_event(job_id)
+        with self._lock:
+            repository_ids = {item.id for item in self._state.repositories}
         try:
             self._raise_if_cancelled(cancel_event)
+            if generation_mode == "gigacode":
+                for repository_id in sorted(repository_ids):
+                    self._ensure_repository_checkout(
+                        repository_id,
+                        job_id=job_id,
+                        cancel_event=cancel_event,
+                    )
             self._execute_graph_job(job_id, cancel_event, generation_mode, verify_all)
         except (
             CatalogJobCancelled,
@@ -1634,6 +1691,7 @@ class RagCatalog:
         except Exception as exc:
             self._fail_background_job(job_id, None, "Graph build failed", exc)
         finally:
+            self._cleanup_repository_checkouts(repository_ids, job_id=job_id)
             self._release_cancel_event(job_id)
 
     def _execute_graph_job(
@@ -1656,7 +1714,7 @@ class RagCatalog:
         snapshot = self._build_graph(
             cancel_event=cancel_event,
             job_id=job_id,
-            force_all=True,
+            force_all=generation_mode == "gigacode",
             analysis_mode=generation_mode,
             verify_all=verify_all,
         )
@@ -1689,14 +1747,22 @@ class RagCatalog:
     ) -> None:
         cancel_event = self._cancel_event(job_id)
         affected_index_ids: list[str] = []
+        checkout_repository_ids: set[str] = set()
         try:
             with self._cancellable_lock(self._all_services_refresh_lock, cancel_event):
                 with self._lock:
-                    repositories = [
-                        item.model_copy(deep=True) for item in self._state.repositories
-                    ]
+                    repositories = [item.model_copy(deep=True) for item in self._state.repositories]
                 if not repositories:
                     raise RuntimeError("No connected repositories are available to refresh")
+                checkout_repository_ids = {item.id for item in repositories}
+                repositories = [
+                    self._ensure_repository_checkout(
+                        item.id,
+                        job_id=job_id,
+                        cancel_event=cancel_event,
+                    )
+                    for item in repositories
+                ]
                 service_map = self._service_map_store.load()
                 services_by_repository: dict[str, list[ServiceRecord]] = {}
                 repository_by_service: dict[str, RepositorySource] = {}
@@ -1719,9 +1785,7 @@ class RagCatalog:
                     self._update_job(
                         job_id,
                         status="running",
-                        message=(
-                            "Checking OpenSpec before GigaCode/static analysis"
-                        ),
+                        message=("Checking OpenSpec before GigaCode/static analysis"),
                         started_at=_now(),
                     )
                     for index_id in affected_index_ids:
@@ -1832,9 +1896,7 @@ class RagCatalog:
                             repository_ids_by_index.setdefault(
                                 target_repository.index_id,
                                 set(),
-                            ).add(
-                                target_repository.id
-                            )
+                            ).add(target_repository.id)
                         for index_id in sorted(targets_by_index):
                             self._raise_if_cancelled(cancel_event)
                             result = self._generate_ssot_with_gigacode(
@@ -1911,6 +1973,7 @@ class RagCatalog:
                 )
             self._fail_background_job(job_id, None, "All-services SSOT refresh failed", exc)
         finally:
+            self._cleanup_repository_checkouts(checkout_repository_ids, job_id=job_id)
             self._release_cancel_event(job_id)
 
     def _run_service_analysis_job(
@@ -1922,9 +1985,17 @@ class RagCatalog:
         generation_mode: Literal["static", "gigacode"],
     ) -> None:
         cancel_event = self._cancel_event(job_id)
+        repository_id: str | None = None
         try:
             with self._cancellable_lock(self._index_work_lock(index_id), cancel_event):
                 self._raise_if_cancelled(cancel_event)
+                _service, repository = self._service_context(service_id)
+                repository_id = repository.id
+                self._ensure_repository_checkout(
+                    repository_id,
+                    job_id=job_id,
+                    cancel_event=cancel_event,
+                )
                 self._update_job(
                     job_id,
                     status="running",
@@ -1977,6 +2048,8 @@ class RagCatalog:
         except Exception as exc:
             self._fail_background_job(job_id, None, f"Service analysis failed: {service_id}", exc)
         finally:
+            if repository_id is not None:
+                self._cleanup_managed_repository_checkout(repository_id, job_id=job_id)
             self._release_cancel_event(job_id)
 
     def _run_system_ssot_generation_job(
@@ -1990,9 +2063,23 @@ class RagCatalog:
         generation_mode: Literal["client", "gigacode"],
     ) -> None:
         cancel_event = self._cancel_event(job_id)
+        checkout_repository_ids = set(repository_ids)
+        if all_services:
+            with self._lock:
+                checkout_repository_ids.update(item.id for item in self._state.repositories)
+        retain_for_client = False
         try:
+            for service_id in service_ids:
+                _service, repository = self._service_context(service_id)
+                checkout_repository_ids.add(repository.id)
             with self._cancellable_lock(self._index_work_lock(index_id), cancel_event):
                 self._raise_if_cancelled(cancel_event)
+                for repository_id in sorted(checkout_repository_ids):
+                    self._ensure_repository_checkout(
+                        repository_id,
+                        job_id=job_id,
+                        cancel_event=cancel_event,
+                    )
                 self._execute_system_ssot_generation_job(
                     job_id,
                     index_id,
@@ -2003,6 +2090,7 @@ class RagCatalog:
                     generation_mode,
                     cancel_event,
                 )
+                retain_for_client = generation_mode == "client"
         except (
             CatalogJobCancelled,
             IndexBuildCancelled,
@@ -2014,6 +2102,8 @@ class RagCatalog:
         except Exception as exc:
             self._fail_background_job(job_id, None, "SSOT source preparation failed", exc)
         finally:
+            if not retain_for_client:
+                self._cleanup_repository_checkouts(checkout_repository_ids, job_id=job_id)
             self._release_cancel_event(job_id)
 
     def _execute_system_ssot_generation_job(
@@ -2026,6 +2116,8 @@ class RagCatalog:
         refresh_analysis: bool,
         generation_mode: Literal["client", "gigacode"],
         cancel_event: threading.Event,
+        *,
+        complete_job: bool = True,
     ) -> None:
         self._update_job(
             job_id,
@@ -2143,13 +2235,20 @@ class RagCatalog:
 
         targets.sort(key=lambda item: str(item["id"]))
         if generation_mode == "gigacode":
-            self._generate_ssot_with_gigacode(
+            gigacode_payload = self._generate_ssot_with_gigacode(
                 job_id=job_id,
                 index=index,
                 targets=targets,
                 repository_ids=sorted(seen_repository_ids),
                 cancel_event=cancel_event,
+                complete_job=complete_job,
             )
+            if not complete_job:
+                self._update_job(
+                    job_id,
+                    message="GigaCode analysis ready; finalizing checkout cleanup",
+                    result=gigacode_payload,
+                )
             return
         result_payload: dict[str, Any] = {
             "phase": "awaiting_client_generation",
@@ -2203,9 +2302,7 @@ class RagCatalog:
                 service_id = str(target["id"])
                 repository = self._repository(str(target["repository_id"]))
                 analysis = self._ssot_analysis_for_target(target, repository)
-                existing_path = (
-                    knowledge_root / "ssot" / "generated" / f"{_slug(service_id)}.md"
-                )
+                existing_path = knowledge_root / "ssot" / "generated" / f"{_slug(service_id)}.md"
                 existing_ssot = (
                     existing_path.read_text(encoding="utf-8")[:20_000]
                     if existing_path.is_file()
@@ -2468,9 +2565,7 @@ class RagCatalog:
         else:
             lines.append("- No outbound interface was found by the static analyzer.")
         dependencies = [
-            item
-            for item in service_map.dependencies
-            if item.source_service_id == service.id
+            item for item in service_map.dependencies if item.source_service_id == service.id
         ]
         lines.extend(["", "## Resolved and candidate dependencies", ""])
         if dependencies:
@@ -2580,9 +2675,7 @@ class RagCatalog:
         knowledge_root = Path(self._record(index_id).knowledge_dir).resolve()
         removed = 0
         for service_id in service_ids:
-            path = (
-                knowledge_root / "ssot" / "generated" / f"{_slug(service_id)}.md"
-            ).resolve()
+            path = (knowledge_root / "ssot" / "generated" / f"{_slug(service_id)}.md").resolve()
             if not path.is_relative_to(knowledge_root):
                 raise RuntimeError("Refusing to delete generated SSOT outside knowledge root")
             if path.is_file():
@@ -2817,12 +2910,58 @@ class RagCatalog:
     ) -> GraphSnapshot:
         with self._lock:
             repositories = [item.model_copy(deep=True) for item in self._state.repositories]
+        available_repositories = [
+            item for item in repositories if Path(item.checkout_path).is_dir()
+        ]
+        unavailable_repositories = [
+            item for item in repositories if not Path(item.checkout_path).is_dir()
+        ]
         if job_id is not None:
-            self._append_job_log(job_id, f"Analyzing {len(repositories)} connected repositories")
-        inputs = self._repository_inputs(repositories)
+            self._append_job_log(
+                job_id,
+                f"Analyzing {len(available_repositories)} available repositories; "
+                f"retaining archived analysis for {len(unavailable_repositories)} "
+                "documentation-only repositories",
+            )
+        inputs = self._repository_inputs(available_repositories)
+        previous_graph = self._graph_store.load()
+        retained_graph = self._retained_graph_excluding(
+            previous_graph,
+            available_repositories,
+        )
+
+        def merge_retained(active_result: ServiceMapBuildResult) -> ServiceMapBuildResult:
+            if not unavailable_repositories:
+                return active_result
+            merged = merge_and_relink_snapshots([retained_graph, active_result.graph])
+            projected = ServiceMapBuilder(self._graph_settings()).from_graph(
+                merged,
+                self._repository_inputs(repositories),
+            )
+            return ServiceMapBuildResult(
+                graph=projected.graph,
+                service_map=projected.service_map,
+                partial=active_result.partial,
+            )
+
+        analysis_timeout = self.settings.repository_analysis_timeout_seconds
+        if force_all:
+            analysis_timeout = max(
+                analysis_timeout,
+                min(14_400, max(1, len(inputs)) * 30),
+            )
+            if (
+                job_id is not None
+                and analysis_timeout != self.settings.repository_analysis_timeout_seconds
+            ):
+                self._append_job_log(
+                    job_id,
+                    f"Full rebuild timeout scaled to {analysis_timeout}s for "
+                    f"{len(inputs)} repositories",
+                )
         runner = ServiceMapProcessRunner(
             self._graph_settings(),
-            timeout_seconds=self.settings.repository_analysis_timeout_seconds,
+            timeout_seconds=analysis_timeout,
         )
         build_options: dict[str, Any] = {}
         build_parameters = inspect.signature(runner.build).parameters
@@ -2840,9 +2979,26 @@ class RagCatalog:
                 if job_id is not None
                 else None
             ),
-            checkpoint=self._publish_analysis_checkpoint,
+            checkpoint=(
+                None
+                if force_all
+                else lambda checkpoint: self._publish_analysis_checkpoint(
+                    merge_retained(checkpoint)
+                )
+            ),
             **build_options,
         )
+        if force_all and result.partial:
+            if job_id is not None:
+                self._append_job_log(
+                    job_id,
+                    "Full rebuild produced only a partial checkpoint; previous graph preserved",
+                )
+            raise RuntimeError(
+                "Full graph rebuild did not finish before the analysis deadline; "
+                "the previous graph snapshot was preserved"
+            )
+        result = merge_retained(result)
         verification: dict[str, Any] = {}
         if analysis_mode == "gigacode" and not result.partial:
             if job_id is not None:
@@ -2875,11 +3031,7 @@ class RagCatalog:
                         else None
                     ),
                     authentication_complete=(
-                        (
-                            lambda target: self._gigacode_authentication_completed(
-                                job_id, target
-                            )
-                        )
+                        (lambda target: self._gigacode_authentication_completed(job_id, target))
                         if job_id is not None
                         else None
                     ),
@@ -2896,8 +3048,7 @@ class RagCatalog:
                 if job_id is not None:
                     self._append_job_log(
                         job_id,
-                        "GigaCode graph fallback: static graph preserved; "
-                        f"error={error}",
+                        f"GigaCode graph fallback: static graph preserved; error={error}",
                     )
         elif analysis_mode == "gigacode":
             verification = {
@@ -2905,9 +3056,8 @@ class RagCatalog:
                 "reason": "Static analysis published only a partial checkpoint",
             }
         gigacode_enriched = (
-            analysis_mode == "gigacode"
-            and verification.get("fallback") != "static-graph"
-        )
+            analysis_mode == "gigacode" and verification.get("fallback") != "static-graph"
+        ) or any(edge.origin in {"gigacode", "static+gigacode"} for edge in result.graph.edges)
         result = finalize_snapshot(
             result,
             mode=(
@@ -3034,6 +3184,63 @@ class RagCatalog:
             for item in repositories
         ]
 
+    @staticmethod
+    def _retained_graph_excluding(
+        graph: GraphSnapshot,
+        repositories: list[RepositorySource],
+    ) -> GraphSnapshot:
+        """Keep archived graph facts for repositories whose checkout has been removed."""
+        if not repositories:
+            return graph.model_copy(deep=True)
+        paths = {str(Path(item.checkout_path).resolve()) for item in repositories}
+        sources = {item.git_url for item in repositories}
+        repository_names = {item.name for item in repositories}
+        removed_service_ids = {
+            str(node.service_id)
+            for node in graph.nodes
+            if node.type == "Service"
+            and node.service_id
+            and (
+                str(node.metadata.get("repository_path") or "") in paths
+                or str(node.metadata.get("source") or "") in sources
+            )
+        }
+        retained_nodes = [
+            node
+            for node in graph.nodes
+            if node.service_id not in removed_service_ids
+            and not (
+                node.type == "Repository"
+                and (
+                    str(node.metadata.get("path") or "") in paths
+                    or str(node.metadata.get("source") or "") in sources
+                )
+            )
+        ]
+        retained_node_ids = {node.id for node in retained_nodes}
+        retained_edges = [
+            edge
+            for edge in graph.edges
+            if edge.source in retained_node_ids and edge.target in retained_node_ids
+        ]
+        retained_evidence_ids = {
+            evidence_id for node in retained_nodes for evidence_id in node.evidence_ids
+        }
+        retained_evidence_ids.update(
+            evidence_id for edge in retained_edges for evidence_id in edge.evidence_ids
+        )
+        return graph.model_copy(
+            update={
+                "nodes": retained_nodes,
+                "edges": retained_edges,
+                "evidence": [item for item in graph.evidence if item.id in retained_evidence_ids],
+                "issues": [
+                    item for item in graph.issues if item.repository not in repository_names
+                ],
+            },
+            deep=True,
+        )
+
     def _find_openspecs(
         self,
         checkout: Path,
@@ -3095,11 +3302,7 @@ class RagCatalog:
             if not matches:
                 continue
             deepest = max(len(root.parts) for _service, root in matches)
-            owners.update(
-                service.id
-                for service, root in matches
-                if len(root.parts) == deepest
-            )
+            owners.update(service.id for service, root in matches if len(root.parts) == deepest)
         return owners
 
     def _rebuild_index(
@@ -3342,6 +3545,100 @@ class RagCatalog:
         if target.exists():
             self._append_job_log(job_id, f"Deleting indexed documents: {target}")
             shutil.rmtree(target)
+
+    def _cleanup_managed_repository_checkout(self, repository_id: str, *, job_id: str) -> None:
+        if not self.settings.repository_cleanup_after_scan:
+            return
+        try:
+            repository = self._repository(repository_id)
+        except KeyError:
+            return
+        checkout = Path(repository.checkout_path).resolve()
+        cache_root = self.settings.repository_cache_dir.resolve()
+        marker = checkout / ".gigacode-graph-source.json"
+        try:
+            if repository.checkout_state == "removed" and not checkout.exists():
+                return
+            managed_path = checkout != cache_root and checkout.is_relative_to(cache_root)
+            if not managed_path:
+                if repository.checkout_state != "external":
+                    self._upsert_repository(
+                        repository.model_copy(update={"checkout_state": "external"})
+                    )
+                self._append_job_log(
+                    job_id,
+                    f"Checkout cleanup skipped for user-owned source: {checkout}",
+                )
+                return
+            if checkout.exists() and not marker.is_file():
+                self._append_job_log(
+                    job_id,
+                    f"Checkout cleanup refused because the managed marker is missing: {checkout}",
+                )
+                return
+            if checkout.exists():
+                shutil.rmtree(checkout)
+            removed_at = _now()
+            self._upsert_repository(
+                repository.model_copy(
+                    update={
+                        "checkout_state": "removed",
+                        "checkout_removed_at": removed_at,
+                    }
+                )
+            )
+            self._append_job_log(
+                job_id,
+                "Managed checkout removed after analysis; retained documentation at "
+                f"{repository.documentation_path or 'the linked knowledge index'}",
+            )
+        except Exception as exc:
+            self._append_job_log(
+                job_id,
+                "Checkout cleanup failed without invalidating analysis: "
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    def _ensure_repository_checkout(
+        self,
+        repository_id: str,
+        *,
+        job_id: str,
+        cancel_event: threading.Event | None,
+    ) -> RepositorySource:
+        repository = self._repository(repository_id)
+        if Path(repository.checkout_path).is_dir():
+            return repository
+        self._append_job_log(
+            job_id,
+            f"Temporarily restoring checkout for analysis: {repository.name}",
+        )
+        paths, records = RepositorySourceManager(self._graph_settings()).materialize(
+            [RepositorySpec(source=repository.git_url, ref=repository.ref)],
+            refresh=True,
+            cancel_event=cancel_event,
+        )
+        checkout = paths[0]
+        ingestion = records[0]
+        replacement = repository.model_copy(
+            update={
+                "checkout_path": str(checkout),
+                "checkout_state": ("external" if ingestion.source_type == "local" else "available"),
+                "checkout_removed_at": None,
+                "commit": ingestion.commit,
+            }
+        )
+        self._upsert_repository(replacement)
+        return replacement
+
+    def _cleanup_repository_checkouts(
+        self,
+        repository_ids: set[str],
+        *,
+        job_id: str,
+    ) -> None:
+        for repository_id in sorted(repository_ids):
+            self._cleanup_managed_repository_checkout(repository_id, job_id=job_id)
 
     def _delete_managed_checkout_if_unused(self, repository: RepositorySource) -> None:
         checkout = Path(repository.checkout_path).resolve()

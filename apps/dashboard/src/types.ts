@@ -51,6 +51,9 @@ export interface RepositorySource {
   ref: string | null;
   index_id: string;
   checkout_path: string;
+  checkout_state: "available" | "removed" | "external";
+  checkout_removed_at: string | null;
+  documentation_path: string | null;
   openspec_path: string | null;
   openspec_paths: string[];
   commit: string | null;
@@ -274,6 +277,14 @@ export interface GraphOverview {
   edge_count: number;
   evidence_count: number;
   issue_count: number;
+  service_dependency_count: number;
+  resolved_service_dependency_count: number;
+  external_dependency_count: number;
+  unresolved_dependency_count: number;
+  exitpoint_count: number;
+  services_with_outgoing_count: number;
+  services_with_incoming_count: number;
+  isolated_service_count: number;
   nodes_by_type: Record<string, number>;
   edges_by_type: Record<string, number>;
   edges_by_confidence: Record<string, number>;

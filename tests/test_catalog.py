@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
 import zipfile
@@ -201,6 +202,85 @@ def test_catalog_creates_index_and_imports_local_openspec(settings_factory, tmp_
     restored_job = next(item for item in reloaded.payload()["jobs"] if item["id"] == job.id)
     assert restored_job["status"] == "completed"
     assert reloaded.service_map_overview()["service_count"] == 1
+
+
+def test_managed_checkouts_are_removed_but_documents_and_graph_are_retained(
+    settings_factory,
+    tmp_path,
+) -> None:
+    settings = settings_factory(repository_cleanup_after_scan=True)
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+
+    def repository(name: str) -> Path:
+        root = tmp_path / name
+        _write(root / "openspec" / "current.md", f"# {name}\n\n{name} contract.")
+        subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "cleanup-test@example.test"],
+            cwd=root,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Checkout Cleanup Test"],
+            cwd=root,
+            check=True,
+        )
+        subprocess.run(["git", "add", "openspec/current.md"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "Add docs"], cwd=root, check=True)
+        return root
+
+    imported_names: list[str] = []
+    repository_ids: list[str] = []
+    for name in ("orders-service", "payments-service"):
+        index = catalog.create_index(name=f"{name} docs")
+        job = catalog.start_repository_ingestion(
+            name=name,
+            git_url=repository(name).as_uri(),
+            index_id=index.id,
+        )
+        finished = _wait_for_job(catalog, job.id)
+        assert finished["status"] == "completed"
+        imported = next(
+            item for item in catalog.payload()["repositories"] if item["name"] == name
+        )
+        imported_names.append(name)
+        repository_ids.append(str(imported["id"]))
+        assert imported["checkout_state"] == "removed"
+        assert imported["checkout_removed_at"] is not None
+        assert not Path(str(imported["checkout_path"])).exists()
+        retained = Path(str(imported["documentation_path"])) / "openspec" / "current.md"
+        assert retained.is_file()
+        assert name in retained.read_text(encoding="utf-8")
+        assert "Managed checkout removed after analysis" in catalog.job_log(job.id)["log"]
+        result = catalog.tools_for(index.id).search(query=f"{name} contract", top_k=1)
+        assert result["results"]
+
+    assert {item["label"] for item in catalog.graph_overview()["services"]} == set(
+        imported_names
+    )
+    refreshed = _wait_for_job(
+        catalog,
+        catalog.start_repository_refresh(repository_ids[0]).id,
+    )
+    assert refreshed["status"] == "completed"
+    refreshed_repository = catalog._repository(repository_ids[0])
+    assert refreshed_repository.checkout_state == "removed"
+    assert not Path(refreshed_repository.checkout_path).exists()
+    assert {item["label"] for item in catalog.graph_overview()["services"]} == set(
+        imported_names
+    )
 
 
 def test_catalog_marks_interrupted_jobs_failed_after_restart(settings_factory) -> None:
@@ -517,7 +597,7 @@ def test_ssot_workflow_clones_and_handles_an_unfinished_repository(
     settings_factory,
     tmp_path,
 ) -> None:
-    settings = settings_factory()
+    settings = settings_factory(repository_cleanup_after_scan=True)
     settings.knowledge_dir.mkdir(parents=True)
     default_service = KnowledgeService(
         settings,
@@ -535,16 +615,32 @@ def test_ssot_workflow_clones_and_handles_an_unfinished_repository(
     repository = tmp_path / "unfinished-repository"
     repository.mkdir()
     _write(repository / "README.md", "# Started but not implemented\n")
+    subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "ssot-cleanup@example.test"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "SSOT Cleanup Test"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "Add README"], cwd=repository, check=True)
 
     cloned = catalog.ssot_generation_request(
         action="clone",
         index_id=index.id,
         repository_name="Unfinished repository",
-        git_url=str(repository),
+        git_url=repository.as_uri(),
     )
     clone_job = _wait_for_job(catalog, cloned["job"]["id"])
     assert clone_job["status"] == "completed"
     repository_id = clone_job["target_id"]
+    cloned_repository = catalog._repository(str(repository_id))
+    assert cloned_repository.checkout_state == "removed"
+    assert not Path(cloned_repository.checkout_path).exists()
 
     prepared = catalog.ssot_generation_request(
         action="prepare",
@@ -567,6 +663,23 @@ def test_ssot_workflow_clones_and_handles_an_unfinished_repository(
     assert context["source_manifest"]["file_count"] == 1
     assert context["initial_source_files"][0]["path"] == "README.md"
     assert "Started but not implemented" in context["initial_source_files"][0]["content"]
+    assert Path(catalog._repository(str(repository_id)).checkout_path).is_dir()
+
+    submitted = catalog.ssot_generation_request(
+        action="submit",
+        job_id=session["id"],
+        service_id=target["id"],
+        content=(
+            "# Unfinished repository\n\n"
+            "The repository currently contains only its initial README documentation. "
+            "Runtime behavior, interfaces and deployment details remain explicitly unknown.\n"
+        ),
+        finalize=True,
+    )
+    assert _wait_for_job(catalog, submitted["index_job"]["id"])["status"] == "completed"
+    finalized_repository = catalog._repository(str(repository_id))
+    assert finalized_repository.checkout_state == "removed"
+    assert not Path(finalized_repository.checkout_path).exists()
 
 
 def test_gigacode_mode_scans_repository_generates_ssot_and_rebuilds_index(

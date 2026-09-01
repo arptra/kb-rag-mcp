@@ -14,7 +14,7 @@ from gigacode_graph.cli import app as graph_cli
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.http_server import create_http_app
 from gigacode_graph.mcp_server import create_mcp_server
-from gigacode_graph.models import GraphNode, GraphSnapshot
+from gigacode_graph.models import GraphEdge, GraphNode, GraphSnapshot
 from gigacode_graph.scanner import RepositoryScanner, merge_and_relink_snapshots
 from gigacode_graph.service import GraphService
 from gigacode_graph.sources import RepositoryOperationCancelled, RepositorySourceManager
@@ -201,6 +201,12 @@ def test_scanner_extracts_cross_repo_business_and_database_graph(tmp_path: Path)
 
 def test_graph_queries_return_service_dossier_and_evidence(tmp_path: Path) -> None:
     service, _settings = _indexed_graph(tmp_path)
+    overview = service.overview()
+    assert overview["resolved_service_dependency_count"] == 2
+    assert overview["external_dependency_count"] == 0
+    assert overview["unresolved_dependency_count"] == 0
+    assert overview["isolated_service_count"] == 0
+    assert overview["exitpoint_count"] >= 3
     view = service.graph(view="services")
     assert {node["id"] for node in view["nodes"]} == {
         "service:order-service",
@@ -255,6 +261,164 @@ def test_service_view_disambiguates_same_label_modules(tmp_path: Path) -> None:
         "sample-service · sample-java",
         "sample-service · sample-kotlin",
     }
+
+
+def test_merge_disambiguates_duplicate_service_ids_from_incremental_snapshots() -> None:
+    snapshots = []
+    for repository in ("orders-repository", "payments-repository"):
+        snapshots.append(
+            GraphSnapshot(
+                nodes=[
+                    GraphNode(
+                        id="service:application",
+                        type="Service",
+                        label=repository,
+                        service_id="application",
+                        metadata={
+                            "repository": repository,
+                            "repository_path": f"/checkouts/{repository}",
+                            "module_path": ".",
+                            "aliases": ["application", repository],
+                        },
+                    ),
+                    GraphNode(
+                        id="symbol:application:Main#run",
+                        type="CodeSymbol",
+                        label="Main#run",
+                        service_id="application",
+                    ),
+                ],
+                edges=[
+                    GraphEdge(
+                        id=f"edge:{repository}",
+                        source="service:application",
+                        target="symbol:application:Main#run",
+                        type="IMPLEMENTS",
+                    )
+                ],
+            )
+        )
+
+    merged = merge_and_relink_snapshots(snapshots)
+
+    services = [node for node in merged.nodes if node.type == "Service"]
+    assert len(services) == 2
+    assert len({node.id for node in services}) == 2
+    assert {node.label for node in services} == {
+        "orders-repository",
+        "payments-repository",
+    }
+    assert all(node.metadata["base_service_id"] == "application" for node in services)
+    assert len([node for node in merged.nodes if node.type == "CodeSymbol"]) == 2
+    assert len([edge for edge in merged.edges if edge.type == "IMPLEMENTS"]) == 2
+
+
+def test_merge_preserves_gigacode_dependency_decisions() -> None:
+    snapshot = GraphSnapshot(
+        nodes=[
+            GraphNode(
+                id="service:orders",
+                type="Service",
+                label="orders",
+                service_id="orders",
+                metadata={"aliases": ["orders"]},
+            ),
+            GraphNode(
+                id="service:payments",
+                type="Service",
+                label="payments",
+                service_id="payments",
+                metadata={"aliases": ["payments"]},
+            ),
+            GraphNode(
+                id="exitpoint:cancel",
+                type="ExitPoint",
+                label="HTTP POST /payments/cancel",
+                service_id="orders",
+                metadata={
+                    "protocol": "HTTP",
+                    "operation": "POST /payments/cancel",
+                    "target_hint": "unknown-payments",
+                },
+            ),
+            GraphNode(
+                id="exitpoint:legacy",
+                type="ExitPoint",
+                label="HTTP GET /legacy",
+                service_id="orders",
+                metadata={
+                    "protocol": "HTTP",
+                    "operation": "GET /legacy",
+                    "target_hint": "legacy-api",
+                },
+            ),
+        ],
+        edges=[
+            GraphEdge(
+                id="edge:exit:cancel",
+                source="service:orders",
+                target="exitpoint:cancel",
+                type="EXITS_VIA",
+            ),
+            GraphEdge(
+                id="edge:exit:legacy",
+                source="service:orders",
+                target="exitpoint:legacy",
+                type="EXITS_VIA",
+            ),
+            GraphEdge(
+                id="verified-retarget",
+                source="service:orders",
+                target="service:payments",
+                type="DEPENDS_ON",
+                label="HTTP POST /payments/cancel",
+                confidence="HIGH",
+                status="confirmed",
+                origin="static+gigacode",
+                metadata={
+                    "protocol": "HTTP",
+                    "operation": "POST /payments/cancel",
+                    "verification_status": "retarget",
+                },
+            ),
+            GraphEdge(
+                id="verified-reject",
+                source="service:orders",
+                target="external:legacy-api",
+                type="DEPENDS_ON",
+                label="HTTP GET /legacy",
+                confidence="LOW",
+                status="rejected",
+                origin="static+gigacode",
+                metadata={
+                    "protocol": "HTTP",
+                    "operation": "GET /legacy",
+                    "verification_status": "rejected",
+                },
+            ),
+        ],
+    )
+
+    merged = merge_and_relink_snapshots([snapshot])
+    service_dependencies = [
+        edge
+        for edge in merged.edges
+        if edge.type == "DEPENDS_ON" and edge.source == "service:orders"
+    ]
+
+    retargeted = next(
+        edge
+        for edge in service_dependencies
+        if edge.metadata.get("operation") == "POST /payments/cancel"
+    )
+    rejected = next(
+        edge for edge in service_dependencies if edge.metadata.get("operation") == "GET /legacy"
+    )
+    assert retargeted.target == "service:payments"
+    assert retargeted.origin == "static+gigacode"
+    assert retargeted.status == "confirmed"
+    assert rejected.status == "rejected"
+    assert rejected.origin == "static+gigacode"
 
 
 def test_http_contract_matches_unresolved_client_to_unique_endpoint(tmp_path: Path) -> None:
@@ -312,9 +476,7 @@ public class PaymentController {
     assert dependency.confidence == "MEDIUM"
     assert dependency.metadata["matcher"] in {"http-contract", "alias+contract"}
     assert len(dependency.evidence_ids) >= 2
-    assert any(
-        item.extractor == "spring-rest-template" for item in snapshot.evidence
-    )
+    assert any(item.extractor == "spring-rest-template" for item in snapshot.evidence)
 
     merged = merge_and_relink_snapshots(
         [

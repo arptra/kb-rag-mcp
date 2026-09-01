@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     index_catalog_path: Path = Path(".cache/kb/index_catalog.json")
     managed_indexes_dir: Path = Path(".cache/kb/indexes")
     repository_cache_dir: Path = Path(".cache/kb/repositories")
+    repository_cleanup_after_scan: bool = True
     graph_store_path: Path = Path(".cache/kb/system_graph.json")
     service_map_path: Path = Path(".cache/kb/service_map.json")
     analysis_archive_dir: Path = Path(".cache/kb/analysis")

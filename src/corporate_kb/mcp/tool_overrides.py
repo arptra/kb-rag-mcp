@@ -17,6 +17,7 @@ BUILTIN_TOOL_NAMES = frozenset(
         "kb_system_graph",
         "kb_search_index",
         "kb_generate_system_ssot",
+        "kb_connect_services_batch",
         "kb_search",
         "kb_get_document",
         "kb_get_chunk",

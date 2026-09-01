@@ -8,6 +8,7 @@ def test_embedding_defaults_are_offline() -> None:
     assert Settings.model_fields["ssot_enabled"].default is False
     assert Settings.model_fields["ssot_knowledge_dir"].default.as_posix() == "ssot"
     assert Settings.model_fields["ssot_cache_dir"].default.as_posix() == ".cache/ssot"
+    assert Settings.model_fields["repository_cleanup_after_scan"].default is True
 
 
 def test_http_defaults_bind_only_to_loopback() -> None:

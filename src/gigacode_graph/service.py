@@ -50,11 +50,7 @@ def _aggregate_service_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
         weakest = min(ordered, key=lambda item: _CONFIDENCE_RANK[item.confidence])
         operations = sorted(
             {
-                str(
-                    item.metadata.get("operation")
-                    or item.metadata.get("topic")
-                    or item.label
-                )
+                str(item.metadata.get("operation") or item.metadata.get("topic") or item.label)
                 for item in ordered
                 if item.metadata.get("operation") or item.metadata.get("topic") or item.label
             }
@@ -92,18 +88,14 @@ def _aggregate_service_edges(edges: list[GraphEdge]) -> list[GraphEdge]:
                         "operation_count": len(operations),
                         "operations": operations,
                         "confidence_counts": {
-                            confidence: sum(
-                                item.confidence == confidence for item in ordered
-                            )
+                            confidence: sum(item.confidence == confidence for item in ordered)
                             for confidence in _CONFIDENCE_RANK
                         },
                         "edge_ids": [item.id for item in ordered],
                     },
                     "evidence_ids": list(
                         dict.fromkeys(
-                            evidence_id
-                            for item in ordered
-                            for evidence_id in item.evidence_ids
+                            evidence_id for item in ordered for evidence_id in item.evidence_ids
                         )
                     ),
                 }
@@ -176,6 +168,56 @@ class GraphService:
 
     def _build_overview_payload(self) -> dict[str, Any]:
         payload = self._snapshot.stats()
+        services = [node for node in self._snapshot.nodes if node.type == "Service"]
+        nodes = {node.id: node for node in self._snapshot.nodes}
+        dependency_groups: dict[tuple[str, str, str], GraphEdge] = {}
+        for edge in self._snapshot.edges:
+            source = nodes.get(edge.source)
+            target = nodes.get(edge.target)
+            if (
+                edge.type != "DEPENDS_ON"
+                or edge.status == "rejected"
+                or source is None
+                or source.type != "Service"
+                or target is None
+                or target.type not in _SERVICE_VIEW_TYPES
+            ):
+                continue
+            protocol = str(edge.metadata.get("protocol") or "UNKNOWN").upper()
+            dependency_groups.setdefault((edge.source, edge.target, protocol), edge)
+        resolved = [
+            edge for edge in dependency_groups.values() if nodes[edge.target].type == "Service"
+        ]
+        external = [
+            edge
+            for edge in dependency_groups.values()
+            if nodes[edge.target].type == "ExternalSystem"
+        ]
+        unresolved = [
+            edge
+            for edge in dependency_groups.values()
+            if edge.status == "unresolved"
+            or edge.confidence == "UNRESOLVED"
+            or (
+                nodes[edge.target].type == "ExternalSystem"
+                and nodes[edge.target].metadata.get("resolved") is False
+            )
+        ]
+        outgoing = {edge.source for edge in resolved}
+        incoming = {edge.target for edge in resolved}
+        connected = outgoing | incoming
+        payload.update(
+            {
+                "service_dependency_count": len(dependency_groups),
+                "resolved_service_dependency_count": len(resolved),
+                "external_dependency_count": len(external),
+                "unresolved_dependency_count": len(unresolved),
+                "exitpoint_count": sum(node.type == "ExitPoint" for node in self._snapshot.nodes),
+                "services_with_outgoing_count": len(outgoing),
+                "services_with_incoming_count": len(incoming),
+                "isolated_service_count": sum(node.id not in connected for node in services),
+            }
+        )
         payload["services"] = [
             {
                 "id": node.id,
@@ -185,8 +227,7 @@ class GraphService:
                 "repository": node.metadata.get("repository"),
                 "catalog_name": node.metadata.get("catalog_name"),
             }
-            for node in self._snapshot.nodes
-            if node.type == "Service"
+            for node in services
         ]
         payload["issues"] = [item.model_dump(mode="json") for item in self._snapshot.issues[:100]]
         return payload
@@ -281,11 +322,7 @@ class GraphService:
         node_ids = {node.id for node in nodes}
         edges = [edge for edge in edges if edge.source in node_ids and edge.target in node_ids]
         if connected_only:
-            connected_ids = {
-                endpoint
-                for edge in edges
-                for endpoint in (edge.source, edge.target)
-            }
+            connected_ids = {endpoint for edge in edges for endpoint in (edge.source, edge.target)}
             nodes = [node for node in nodes if node.id in connected_ids]
 
         truncated = len(nodes) > limit

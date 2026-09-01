@@ -10,6 +10,7 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from corporate_kb.catalog import CatalogJob, RagCatalog
 from corporate_kb.config import Settings
 from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
 from corporate_kb.mcp.http_server import (
@@ -146,6 +147,12 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
                 json={"job_id": "missing-job"},
             )
         ).status_code == 404
+        assert (
+            await client.get(
+                "/admin/api/jobs/status",
+                params={"job_id": "missing-job"},
+            )
+        ).status_code == 404
         local_server = overview.json()["mcp_servers"]["servers"][0]
         assert local_server["name"] == "corporate-knowledge"
         assert local_server["status"] == "online"
@@ -215,6 +222,72 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
             assert system_graph.isError is False
             assert system_graph.structuredContent["status"] == "empty_graph"
             assert system_graph.structuredContent["rag_queried"] is False
+
+
+@pytest.mark.asyncio
+async def test_admin_repository_prefers_gigacode_with_static_fallback(
+    settings_factory,
+    monkeypatch,
+) -> None:
+    service, settings = _indexed_service(settings_factory)
+    captured: list[dict[str, object]] = []
+
+    def unavailable_gigacode(
+        _catalog: RagCatalog,
+        *,
+        refresh: bool = False,
+    ) -> dict[str, object]:
+        assert refresh is True
+        return {"available": False, "error": "GigaCode executable was not found"}
+
+    def capture_ingestion(
+        _catalog: RagCatalog,
+        **kwargs: object,
+    ) -> CatalogJob:
+        captured.append(kwargs)
+        return CatalogJob(
+            id="repository-test-job",
+            type="repository",
+            index_id="payments-index",
+            target_id="payments-repository",
+        )
+
+    monkeypatch.setattr(RagCatalog, "gigacode_status", unavailable_gigacode)
+    monkeypatch.setattr(RagCatalog, "start_repository_ingestion", capture_ingestion)
+    app = create_http_app(service, settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
+    ):
+        response = await client.post(
+            "/admin/api/repositories",
+            headers={"X-KB-Admin-Password": ADMIN_PASSWORD},
+            json={
+                "name": "payments-service",
+                "git_url": "ssh://git.company.local/payments-service.git",
+                "ref": "master",
+                "index_id": None,
+                "index_name": "payments-service",
+                "prefer_gigacode": True,
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.json()["generation_mode"] == "static"
+    assert response.json()["fallback_reason"] == "GigaCode executable was not found"
+    assert captured == [
+        {
+            "name": "payments-service",
+            "git_url": "ssh://git.company.local/payments-service.git",
+            "index_id": None,
+            "index_name": "payments-service",
+            "ref": "master",
+            "generation_mode": "static",
+            "validate_gigacode": False,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -394,6 +467,9 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
         admin_page = await anonymous_client.get("/admin")
         assert admin_page.status_code == 200
         assert "RAG Control Plane" in admin_page.text
+        assert "style-src 'self' 'unsafe-inline'" in admin_page.headers[
+            "content-security-policy"
+        ]
         assert (await anonymous_client.get("/admin/api/overview")).status_code == 403
         admin_headers = {"X-KB-Admin-Password": ADMIN_PASSWORD}
         admin_overview = await anonymous_client.get(
@@ -409,7 +485,7 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
         assert server_metrics["peak_rss_mb"] > 0
 
         runtime_catalog = admin_overview.json()["tool_catalog"]
-        assert runtime_catalog["built_in_count"] == 11
+        assert runtime_catalog["built_in_count"] == 12
         assert {
             "ssot_context",
             "kb_feature_context",
@@ -557,6 +633,7 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
                 "kb_system_graph",
                 "kb_search_index",
                 "kb_generate_system_ssot",
+                "kb_connect_services_batch",
                 "kb_search",
                 "kb_get_document",
                 "kb_get_chunk",
@@ -629,14 +706,18 @@ async def test_admin_manages_indexes_repositories_and_bound_tools(settings_facto
         job_id = queued.json()["id"]
         index_id = queued.json()["index_id"]
         for _ in range(200):
-            catalog = (
-                await client.get("/admin/api/catalog", headers=admin_headers)
-            ).json()
-            job = next(item for item in catalog["jobs"] if item["id"] == job_id)
+            status_response = await client.get(
+                "/admin/api/jobs/status",
+                headers=admin_headers,
+                params={"job_id": job_id},
+            )
+            assert status_response.status_code == 200
+            job = status_response.json()
             if job["status"] not in {"queued", "running"}:
                 break
             await asyncio.sleep(0.01)
         assert job["status"] == "completed"
+        catalog = (await client.get("/admin/api/catalog", headers=admin_headers)).json()
         imported_index = next(item for item in catalog["indexes"] if item["id"] == index_id)
         assert imported_index["name"] == "System OpenSpec"
         assert imported_index["status"] == "ready"

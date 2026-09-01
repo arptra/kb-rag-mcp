@@ -474,6 +474,7 @@ class ServiceMapBuilder:
                 )
         for repository, module in modules:
             service_id = module.service_id
+            base_service_id = module.service_id
             aliases = set(module.aliases)
             if counts[service_id] > 1:
                 digest = hashlib.sha256(
@@ -497,6 +498,7 @@ class ServiceMapBuilder:
                     repository_path=repository.path.resolve(),
                     repository_name=repository.name,
                     service_id=service_id,
+                    base_service_id=base_service_id,
                     display_name=module.display_name,
                     owner=module.owner,
                     aliases=tuple(sorted(aliases)),
