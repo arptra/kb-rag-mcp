@@ -291,6 +291,142 @@ async def test_admin_repository_prefers_gigacode_with_static_fallback(
 
 
 @pytest.mark.asyncio
+async def test_admin_repository_batch_starts_one_server_job(
+    settings_factory,
+    monkeypatch,
+) -> None:
+    service, settings = _indexed_service(settings_factory)
+    captured: list[dict[str, object]] = []
+
+    def unavailable_gigacode(
+        _catalog: RagCatalog,
+        *,
+        refresh: bool = False,
+    ) -> dict[str, object]:
+        assert refresh is True
+        return {"available": False, "error": "GigaCode executable was not found"}
+
+    def capture_batch(
+        _catalog: RagCatalog,
+        **kwargs: object,
+    ) -> CatalogJob:
+        captured.append(kwargs)
+        return CatalogJob(
+            id="repository-batch-test-job",
+            type="repository",
+            target_id="batch-test",
+            message="Repository batch queued",
+            result={
+                "scheduled_count": 1,
+                "skipped_count": 1,
+                "skipped_items": [
+                    {
+                        "position": 2,
+                        "status": "skipped",
+                        "reason": "already_connected",
+                    }
+                ],
+                "worker_count": 1,
+            },
+        )
+
+    monkeypatch.setattr(RagCatalog, "gigacode_status", unavailable_gigacode)
+    monkeypatch.setattr(RagCatalog, "start_repository_batch_ingestion", capture_batch)
+    app = create_http_app(service, settings)
+    transport = httpx.ASGITransport(app=app)
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
+    ):
+        response = await client.post(
+            "/admin/api/repositories/batch",
+            headers={"X-KB-Admin-Password": ADMIN_PASSWORD},
+            json={
+                "repositories": [
+                    {
+                        "name": "payments-service",
+                        "git_url": "ssh://git.company.local/payments-service.git",
+                        "ref": "master",
+                        "index_id": "default",
+                    },
+                    {
+                        "name": "limits-service",
+                        "git_url": "ssh://git.company.local/limits-service.git",
+                        "ref": "develop",
+                        "index_id": "default",
+                    },
+                ],
+                "worker_count": 16,
+                "prefer_gigacode": True,
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.json()["id"] == "repository-batch-test-job"
+    assert response.json()["generation_mode"] == "static"
+    assert response.json()["fallback_reason"] == "GigaCode executable was not found"
+    assert response.json()["repository_count"] == 2
+    assert response.json()["scheduled_count"] == 1
+    assert response.json()["skipped_count"] == 1
+    assert response.json()["worker_count"] == 1
+    assert len(captured) == 1
+    assert captured[0]["worker_count"] == 16
+    assert captured[0]["generation_mode"] == "static"
+    assert captured[0]["validate_gigacode"] is False
+    repositories = captured[0]["repositories"]
+    assert [item.ref for item in repositories] == ["master", "develop"]
+    assert [item.index_id for item in repositories] == ["default", "default"]
+
+
+@pytest.mark.asyncio
+async def test_admin_lists_and_clears_all_job_logs(settings_factory) -> None:
+    service, settings = _indexed_service(settings_factory)
+    app = create_http_app(service, settings)
+    transport = httpx.ASGITransport(app=app)
+    headers = {"X-KB-Admin-Password": ADMIN_PASSWORD}
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
+    ):
+        started = await client.post(
+            "/admin/api/graph/rebuild",
+            headers=headers,
+            json={"generation_mode": "static", "verify_all": False},
+        )
+        assert started.status_code == 202
+        job_id = started.json()["id"]
+        for _ in range(300):
+            status = await client.get(
+                "/admin/api/jobs/status",
+                headers=headers,
+                params={"job_id": job_id},
+            )
+            if status.json()["status"] not in {"queued", "running", "cancelling"}:
+                break
+            await asyncio.sleep(0.01)
+        assert status.json()["status"] == "completed"
+
+        history = await client.get("/admin/api/jobs", headers=headers)
+        assert history.status_code == 200
+        assert history.json()["total"] == 1
+        assert history.json()["log_file_count"] == 1
+        assert history.json()["jobs"][0]["id"] == job_id
+
+        cleared = await client.post("/admin/api/jobs/clear", headers=headers, json={})
+        assert cleared.status_code == 200
+        assert cleared.json()["cleared_job_count"] == 1
+        assert cleared.json()["deleted_log_files"] == 1
+        assert list(settings.job_logs_dir.glob("*.log")) == []
+
+        empty = await client.get("/admin/api/jobs", headers=headers)
+        assert empty.status_code == 200
+        assert empty.json()["total"] == 0
+        assert empty.json()["log_file_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_admin_browses_and_uploads_documents_to_selected_index(settings_factory) -> None:
     service, settings = _indexed_service(settings_factory)
     app = create_http_app(service, settings)

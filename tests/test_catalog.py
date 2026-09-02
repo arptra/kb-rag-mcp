@@ -8,12 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from corporate_kb.catalog import RagCatalog
+from corporate_kb.catalog import RagCatalog, RepositoryBatchItem, RepositorySource
 from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
 from corporate_kb.index_runner import IndexBuildCancelled, IndexBuildProcessRunner
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeService
 from corporate_kb.usage import UsageTracker
+from gigacode_graph.models import GraphSnapshot
 from service_map import ServiceMapBuildCancelled, ServiceMapProcessRunner
 
 
@@ -208,7 +209,11 @@ def test_managed_checkouts_are_removed_but_documents_and_graph_are_retained(
     settings_factory,
     tmp_path,
 ) -> None:
-    settings = settings_factory(repository_cleanup_after_scan=True)
+    gigacode = _write_fake_gigacode(tmp_path / "gigacode-exact-rebuild")
+    settings = settings_factory(
+        repository_cleanup_after_scan=True,
+        gigacode_command=str(gigacode),
+    )
     settings.knowledge_dir.mkdir(parents=True)
     default_service = KnowledgeService(
         settings,
@@ -281,6 +286,23 @@ def test_managed_checkouts_are_removed_but_documents_and_graph_are_retained(
     assert {item["label"] for item in catalog.graph_overview()["services"]} == set(
         imported_names
     )
+
+    exact_job = catalog.start_graph_build(
+        generation_mode="gigacode",
+        verify_all=True,
+    )
+    exact = _wait_for_job(catalog, exact_job.id)
+    assert exact["status"] == "completed"
+    assert exact["result"]["generation_mode"] == "gigacode"
+    exact_log = catalog.job_log(exact_job.id)["log"]
+    assert exact_log.count("Temporarily restoring checkout for analysis") == 2
+    assert {item["label"] for item in catalog.graph_overview()["services"]} == set(
+        imported_names
+    )
+    for repository_id in repository_ids:
+        restored = catalog._repository(repository_id)
+        assert restored.checkout_state == "removed"
+        assert not Path(restored.checkout_path).exists()
 
 
 def test_catalog_marks_interrupted_jobs_failed_after_restart(settings_factory) -> None:
@@ -1258,3 +1280,293 @@ def test_catalog_failure_log_contains_full_traceback(settings_factory, monkeypat
     log = catalog.job_log(job.id)["log"]
     assert "Traceback (most recent call last)" in log
     assert "RuntimeError: synthetic analysis failure" in log
+
+
+def test_catalog_lists_all_jobs_and_physically_clears_logs(settings_factory) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    completed = catalog._new_job("graph", message="Completed graph job")
+    catalog._update_job(
+        completed.id,
+        status="completed",
+        message="Completed graph job",
+    )
+    active = catalog._new_job("repository", message="Active repository job")
+    orphan = settings.job_logs_dir / "orphan-job.log"
+    orphan.write_text("orphan log\n", encoding="utf-8")
+
+    before = catalog.jobs_payload()
+    assert before["total"] == 2
+    assert before["active_count"] == 1
+    assert before["log_file_count"] == 3
+    assert before["log_bytes"] > 0
+
+    cleared = catalog.clear_job_history()
+
+    assert cleared == {
+        "cleared_job_count": 1,
+        "deleted_log_files": 3,
+        "deleted_log_bytes": before["log_bytes"],
+        "active_job_count": 1,
+    }
+    with pytest.raises(KeyError, match="Unknown job"):
+        catalog.job_status(completed.id)
+    assert catalog.job_status(active.id).status == "queued"
+    assert list(settings.job_logs_dir.glob("*.log")) == []
+    after = catalog.jobs_payload()
+    assert after["total"] == 1
+    assert after["log_file_count"] == 0
+
+    catalog._append_job_log(active.id, "active job continued")
+    assert catalog.job_log(active.id)["log"].endswith("active job continued\n")
+
+
+def test_repository_batch_prepares_in_parallel_and_finalizes_once(
+    settings_factory,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    index = catalog.create_index(name="Batch target")
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
+    graph_builds = 0
+    index_builds = 0
+
+    def prepare(
+        job_id: str,
+        position: int,
+        total: int,
+        item: RepositoryBatchItem,
+        cancel_event: threading.Event,
+    ) -> RepositorySource:
+        nonlocal active, max_active
+        del job_id, total, cancel_event
+        with active_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with active_lock:
+            active -= 1
+        if position == 3:
+            raise RuntimeError("synthetic repository failure")
+        return RepositorySource(
+            id=f"repository-{position}",
+            name=item.name,
+            git_url=item.git_url,
+            ref=item.ref,
+            index_id=item.index_id,
+            checkout_path=str(tmp_path / item.name),
+            checkout_state="external",
+            document_count=1,
+        )
+
+    def build_graph(**_kwargs: object) -> GraphSnapshot:
+        nonlocal graph_builds
+        graph_builds += 1
+        return GraphSnapshot()
+
+    def rebuild_index(index_id: str, cancel_event: threading.Event) -> object:
+        nonlocal index_builds
+        del index_id, cancel_event
+        index_builds += 1
+
+        class Stats:
+            document_count = 8
+            chunk_count = 16
+
+        return Stats()
+
+    monkeypatch.setattr(catalog, "_prepare_repository_batch_item", prepare)
+    monkeypatch.setattr(catalog, "_build_graph", build_graph)
+    monkeypatch.setattr(catalog, "_rebuild_index", rebuild_index)
+
+    job = catalog.start_repository_batch_ingestion(
+        repositories=[
+            RepositoryBatchItem(
+                name=f"service-{position}",
+                git_url=f"https://git.example/service-{position}.git",
+                ref="master",
+                index_id=index.id,
+            )
+            for position in range(8)
+        ],
+        worker_count=4,
+    )
+    finished = _wait_for_job(catalog, job.id)
+
+    assert finished["status"] == "completed"
+    assert finished["result"]["completed_count"] == 7
+    assert finished["result"]["failed_count"] == 1
+    assert finished["result"]["items"][2]["error"] == "synthetic repository failure"
+    assert finished["result"]["worker_count"] == 4
+    assert max_active == 4
+    assert graph_builds == 1
+    assert index_builds == 1
+
+
+def test_repository_ingestion_rejects_an_already_connected_git_source(
+    settings_factory,
+    tmp_path,
+) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    index = catalog.create_index(name="Duplicate target")
+    catalog._upsert_repository(
+        RepositorySource(
+            id="connected-service",
+            name="connected-service",
+            git_url="git@git.example:platform/connected-service.git",
+            ref="master",
+            index_id=index.id,
+            checkout_path=str(tmp_path / "connected-service"),
+            checkout_state="removed",
+        )
+    )
+
+    with pytest.raises(ValueError, match="уже подключён: connected-service"):
+        catalog.start_repository_ingestion(
+            name="same-repository-new-name",
+            git_url="https://git.example/platform/connected-service.git/",
+            ref="develop",
+            index_id=index.id,
+        )
+
+
+def test_repository_batch_skips_connected_and_repeated_git_sources(
+    settings_factory,
+    monkeypatch,
+    tmp_path,
+) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    default_service = KnowledgeService(
+        settings,
+        provider=HashEmbeddingProvider(settings.embedding_dimension),
+    )
+    default_service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(
+        settings,
+        default_service,
+        KnowledgeTools(default_service, usage=usage),
+        usage,
+    )
+    index = catalog.create_index(name="Duplicate batch target")
+    catalog._upsert_repository(
+        RepositorySource(
+            id="connected-service",
+            name="connected-service",
+            git_url="git@git.example:platform/connected-service.git",
+            index_id=index.id,
+            checkout_path=str(tmp_path / "connected-service"),
+            checkout_state="removed",
+        )
+    )
+    prepared_urls: list[str] = []
+
+    def prepare(
+        job_id: str,
+        position: int,
+        total: int,
+        item: RepositoryBatchItem,
+        cancel_event: threading.Event,
+    ) -> RepositorySource:
+        del job_id, position, total, cancel_event
+        prepared_urls.append(item.git_url)
+        return RepositorySource(
+            id="new-service",
+            name=item.name,
+            git_url=item.git_url,
+            ref=item.ref,
+            index_id=item.index_id,
+            checkout_path=str(tmp_path / item.name),
+            checkout_state="external",
+        )
+
+    class Stats:
+        document_count = 1
+        chunk_count = 1
+
+    monkeypatch.setattr(catalog, "_prepare_repository_batch_item", prepare)
+    monkeypatch.setattr(catalog, "_build_graph", lambda **_kwargs: GraphSnapshot())
+    monkeypatch.setattr(catalog, "_rebuild_index", lambda *_args: Stats())
+
+    job = catalog.start_repository_batch_ingestion(
+        repositories=[
+            RepositoryBatchItem(
+                name="connected-service",
+                git_url="https://git.example/platform/connected-service.git",
+                index_id=index.id,
+            ),
+            RepositoryBatchItem(
+                name="connected-service-again",
+                git_url="git@git.example:platform/connected-service.git",
+                ref="develop",
+                index_id=index.id,
+            ),
+            RepositoryBatchItem(
+                name="new-service",
+                git_url="https://git.example/platform/new-service.git",
+                index_id=index.id,
+            ),
+            RepositoryBatchItem(
+                name="new-service-again",
+                git_url="git@git.example:platform/new-service.git",
+                ref="develop",
+                index_id=index.id,
+            ),
+        ],
+        worker_count=16,
+    )
+    finished = _wait_for_job(catalog, job.id)
+
+    assert finished["status"] == "completed"
+    assert finished["result"]["repository_count"] == 4
+    assert finished["result"]["scheduled_count"] == 1
+    assert finished["result"]["skipped_count"] == 3
+    assert finished["result"]["worker_count"] == 1
+    assert [item["reason"] for item in finished["result"]["skipped_items"]] == [
+        "already_connected",
+        "already_connected",
+        "duplicate_in_batch",
+    ]
+    assert prepared_urls == ["https://git.example/platform/new-service.git"]

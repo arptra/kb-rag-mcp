@@ -17,7 +17,7 @@ from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Respon
 from starlette.types import ASGIApp
 
 from corporate_kb.admin import AdminController
-from corporate_kb.catalog import RagCatalog
+from corporate_kb.catalog import RagCatalog, RepositoryBatchItem
 from corporate_kb.config import Settings
 from corporate_kb.feature_context import FeatureContextPlanner
 from corporate_kb.mcp.managed_tools import ManagedToolDefinition, ManagedToolRegistry
@@ -680,6 +680,101 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             return _api_error(exc)
 
     @server.custom_route(
+        "/admin/api/repositories/batch",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_add_repository_batch(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Request body must be a JSON object")
+            raw_repositories = payload.get("repositories")
+            if not isinstance(raw_repositories, list):
+                raise ValueError("repositories must be an array")
+            if not raw_repositories:
+                raise ValueError("repositories must contain at least one item")
+            if len(raw_repositories) > 1000:
+                raise ValueError("repositories must contain at most 1000 items")
+            worker_count = _body_integer(
+                payload,
+                "worker_count",
+                4,
+                minimum=1,
+                maximum=16,
+            )
+            prefer_gigacode = payload.get("prefer_gigacode", True)
+            if not isinstance(prefer_gigacode, bool):
+                raise ValueError("prefer_gigacode must be a boolean")
+
+            repositories: list[RepositoryBatchItem] = []
+            for position, raw in enumerate(raw_repositories, start=1):
+                if not isinstance(raw, dict):
+                    raise ValueError(f"repositories[{position}] must be an object")
+                name = raw.get("name")
+                git_url = raw.get("git_url")
+                ref = raw.get("ref")
+                index_id = raw.get("index_id")
+                if not isinstance(name, str) or not isinstance(git_url, str):
+                    raise ValueError(
+                        f"repositories[{position}] name and git_url must be strings"
+                    )
+                if ref is not None and not isinstance(ref, str):
+                    raise ValueError(f"repositories[{position}] ref must be a string or null")
+                if not isinstance(index_id, str) or not index_id:
+                    raise ValueError(
+                        f"repositories[{position}] index_id must be a non-empty string"
+                    )
+                repositories.append(
+                    RepositoryBatchItem(
+                        name=name,
+                        git_url=git_url,
+                        ref=ref,
+                        index_id=index_id,
+                    )
+                )
+
+            generation_mode: Literal["static", "gigacode"] = "static"
+            fallback_reason: str | None = None
+            if prefer_gigacode:
+                generation_mode = "gigacode"
+                try:
+                    gigacode_status = catalog.gigacode_status(refresh=True)
+                    if not gigacode_status.get("available"):
+                        generation_mode = "static"
+                        fallback_reason = str(
+                            gigacode_status.get("error") or "GigaCode is unavailable"
+                        )
+                except Exception as exc:
+                    generation_mode = "static"
+                    fallback_reason = f"Could not check GigaCode availability: {exc}"
+
+            job = catalog.start_repository_batch_ingestion(
+                repositories=repositories,
+                worker_count=worker_count,
+                generation_mode=generation_mode,
+                validate_gigacode=False,
+            )
+            response = job.model_dump(mode="json")
+            batch_result = job.result or {}
+            response["generation_mode"] = generation_mode
+            response["fallback_reason"] = fallback_reason
+            response["repository_count"] = len(repositories)
+            response["scheduled_count"] = int(
+                batch_result.get("scheduled_count", len(repositories))
+            )
+            response["skipped_count"] = int(batch_result.get("skipped_count", 0))
+            response["skipped_items"] = batch_result.get("skipped_items", [])
+            response["worker_count"] = int(
+                batch_result.get("worker_count", min(worker_count, len(repositories)))
+            )
+            return JSONResponse(response, status_code=202)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
         "/admin/api/repositories/refresh",
         methods=["POST"],
         include_in_schema=False,
@@ -808,6 +903,15 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         except Exception as exc:
             return _api_error(exc)
 
+    @server.custom_route("/admin/api/jobs", methods=["GET"], include_in_schema=False)
+    async def admin_jobs(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            return JSONResponse(await asyncio.to_thread(catalog.jobs_payload))
+        except Exception as exc:
+            return _api_error(exc)
+
     @server.custom_route("/admin/api/jobs/log", methods=["GET"], include_in_schema=False)
     async def admin_job_log(request: Request) -> JSONResponse:
         if not _admin_authorized(request, settings):
@@ -817,6 +921,19 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             if not job_id:
                 raise ValueError("job_id query parameter is required")
             return JSONResponse(await asyncio.to_thread(catalog.job_log, job_id))
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/jobs/clear",
+        methods=["POST"],
+        include_in_schema=False,
+    )
+    async def admin_clear_jobs(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            return JSONResponse(await asyncio.to_thread(catalog.clear_job_history))
         except Exception as exc:
             return _api_error(exc)
 

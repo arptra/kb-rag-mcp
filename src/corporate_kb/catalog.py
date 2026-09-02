@@ -14,10 +14,12 @@ import threading
 import traceback
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -154,6 +156,13 @@ class RepositorySource(CatalogModel):
     synced_at: datetime = Field(default_factory=_now)
 
 
+class RepositoryBatchItem(CatalogModel):
+    name: str = Field(min_length=2, max_length=100)
+    git_url: str = Field(min_length=1)
+    ref: str | None = None
+    index_id: str
+
+
 class CatalogJob(CatalogModel):
     id: str
     type: Literal["index", "repository", "graph", "service", "ssot", "cleanup"]
@@ -207,6 +216,7 @@ class RagCatalog:
         self._analysis_lock = threading.Lock()
         self._all_services_refresh_lock = threading.Lock()
         self._index_work_locks: dict[str, threading.Lock] = {}
+        self._repository_import_reservations: set[str] = set()
         self._state = self._load()
         self._services: dict[str, KnowledgeService] = {"default": default_service}
         self._tools: dict[str, KnowledgeTools] = {"default": default_tools}
@@ -333,33 +343,191 @@ class RagCatalog:
         clean_url = git_url.strip()
         if not clean_url:
             raise ValueError("Git URL must not be empty")
+        source_key = self._repository_source_key(clean_url)
+        with self._lock:
+            existing = self._repository_for_source_key_locked(source_key)
+            if existing is not None:
+                raise ValueError(
+                    f"Git-репозиторий уже подключён: {existing.name}"
+                )
+            if source_key in self._repository_import_reservations:
+                raise ValueError("Этот Git-репозиторий уже подключается")
+            self._repository_import_reservations.add(source_key)
+
+        try:
+            if generation_mode == "gigacode" and validate_gigacode:
+                gigacode_status = self._gigacode.status(refresh=True)
+                if not gigacode_status["available"]:
+                    raise RuntimeError(str(gigacode_status["error"]))
+            target_id = index_id
+            if target_id is None:
+                created = self.create_index(name=index_name or clean_name)
+                target_id = created.id
+            self._record(target_id)
+            clean_ref = ref.strip() if ref else None
+            repository_id = self._repository_id(clean_name, clean_url, clean_ref, target_id)
+            job = self._new_job(
+                "repository",
+                index_id=target_id,
+                target_id=repository_id,
+                message=(
+                    "Repository import with GigaCode queued"
+                    if generation_mode == "gigacode"
+                    else "Repository import queued"
+                ),
+            )
+            threading.Thread(
+                target=self._run_repository_job,
+                args=(job.id, clean_name, clean_url, clean_ref, target_id, generation_mode),
+                daemon=True,
+            ).start()
+            return job
+        except Exception:
+            self._release_repository_import_reservation(clean_url)
+            raise
+
+    def start_repository_batch_ingestion(
+        self,
+        *,
+        repositories: list[RepositoryBatchItem],
+        worker_count: int = 4,
+        generation_mode: Literal["static", "gigacode"] = "static",
+        validate_gigacode: bool = True,
+    ) -> CatalogJob:
+        if not repositories:
+            raise ValueError("Repository batch must contain at least one repository")
+        if len(repositories) > 1000:
+            raise ValueError("Repository batch must contain at most 1000 repositories")
+        if not 1 <= worker_count <= 16:
+            raise ValueError("worker_count must be between 1 and 16")
         if generation_mode == "gigacode" and validate_gigacode:
             gigacode_status = self._gigacode.status(refresh=True)
             if not gigacode_status["available"]:
                 raise RuntimeError(str(gigacode_status["error"]))
-        target_id = index_id
-        if target_id is None:
-            created = self.create_index(name=index_name or clean_name)
-            target_id = created.id
-        self._record(target_id)
-        clean_ref = ref.strip() if ref else None
-        repository_id = self._repository_id(clean_name, clean_url, clean_ref, target_id)
-        job = self._new_job(
-            "repository",
-            index_id=target_id,
-            target_id=repository_id,
-            message=(
-                "Repository import with GigaCode queued"
-                if generation_mode == "gigacode"
-                else "Repository import queued"
-            ),
-        )
-        threading.Thread(
-            target=self._run_repository_job,
-            args=(job.id, clean_name, clean_url, clean_ref, target_id, generation_mode),
-            daemon=True,
-        ).start()
-        return job
+
+        cleaned: list[RepositoryBatchItem] = []
+        for item in repositories:
+            name = item.name.strip()
+            git_url = item.git_url.strip()
+            ref = item.ref.strip() if item.ref else None
+            if len(name) < 2:
+                raise ValueError("Repository name must contain at least two characters")
+            if not git_url:
+                raise ValueError("Git URL must not be empty")
+            self._record(item.index_id)
+            cleaned.append(
+                RepositoryBatchItem(
+                    name=name,
+                    git_url=git_url,
+                    ref=ref,
+                    index_id=item.index_id,
+                )
+            )
+
+        scheduled: list[RepositoryBatchItem] = []
+        skipped_items: list[dict[str, Any]] = []
+        reserved_source_keys: set[str] = set()
+        with self._lock:
+            existing_by_key = {
+                self._repository_source_key(repository.git_url): repository
+                for repository in self._state.repositories
+            }
+            accepted_source_keys: set[str] = set()
+            for position, item in enumerate(cleaned, start=1):
+                source_key = self._repository_source_key(item.git_url)
+                existing = existing_by_key.get(source_key)
+                reason: str | None = None
+                detail: str | None = None
+                if existing is not None:
+                    reason = "already_connected"
+                    detail = f"Уже подключён: {existing.name}"
+                elif source_key in accepted_source_keys:
+                    reason = "duplicate_in_batch"
+                    detail = "Повторяется в CSV"
+                elif source_key in self._repository_import_reservations:
+                    reason = "import_in_progress"
+                    detail = "Репозиторий уже подключается"
+
+                if reason is not None:
+                    skipped_items.append(
+                        {
+                            "position": position,
+                            "name": item.name,
+                            "git_url": item.git_url,
+                            "ref": item.ref,
+                            "index_id": item.index_id,
+                            "status": "skipped",
+                            "reason": reason,
+                            "detail": detail,
+                            "existing_repository_id": existing.id if existing else None,
+                        }
+                    )
+                    continue
+
+                accepted_source_keys.add(source_key)
+                reserved_source_keys.add(source_key)
+                self._repository_import_reservations.add(source_key)
+                scheduled.append(item)
+
+        requested_count = len(cleaned)
+        index_ids = sorted({item.index_id for item in scheduled})
+        actual_worker_count = min(worker_count, len(scheduled))
+        try:
+            job = self._new_job(
+                "repository",
+                index_id=index_ids[0] if len(index_ids) == 1 else None,
+                target_id=f"batch-{uuid.uuid4().hex[:8]}",
+                message=(
+                    f"Repository batch queued: {len(scheduled)} to scan, "
+                    f"{len(skipped_items)} skipped, {actual_worker_count} workers"
+                ),
+            )
+            initial_result = {
+                "phase": "queued" if scheduled else "skipped",
+                "generation_mode": generation_mode,
+                "repository_count": requested_count,
+                "scheduled_count": len(scheduled),
+                "skipped_count": len(skipped_items),
+                "skipped_items": skipped_items,
+                "worker_count": actual_worker_count,
+                "index_ids": index_ids,
+                "completed_count": 0,
+                "failed_count": 0,
+            }
+            if not scheduled:
+                self._update_job(
+                    job.id,
+                    status="completed",
+                    message=(
+                        f"All {requested_count} repositories skipped; "
+                        "nothing was cloned or scanned"
+                    ),
+                    completed_at=_now(),
+                    result=initial_result,
+                )
+                self._release_cancel_event(job.id)
+                return self.job_status(job.id)
+
+            self._update_job(job.id, result=initial_result)
+            threading.Thread(
+                target=self._run_repository_batch_job,
+                args=(
+                    job.id,
+                    tuple(scheduled),
+                    actual_worker_count,
+                    generation_mode,
+                    requested_count,
+                    tuple(skipped_items),
+                ),
+                daemon=True,
+            ).start()
+            return self.job_status(job.id)
+        except Exception:
+            with self._lock:
+                self._repository_import_reservations.difference_update(
+                    reserved_source_keys
+                )
+            raise
 
     def gigacode_status(self, *, refresh: bool = False) -> dict[str, Any]:
         """Expose a safe availability snapshot for batch repository scheduling."""
@@ -775,6 +943,49 @@ class RagCatalog:
             "job_id": job_id,
             "status": job.status,
             "log": path.read_text(encoding="utf-8") if path.is_file() else "",
+        }
+
+    def jobs_payload(self) -> dict[str, Any]:
+        with self._lock:
+            jobs = [item.model_copy(deep=True) for item in self._jobs.values()]
+        jobs.sort(key=lambda item: item.id, reverse=True)
+        log_files = self._job_log_files()
+        return {
+            "total": len(jobs),
+            "active_count": sum(
+                item.status in {"queued", "running", "cancelling"} for item in jobs
+            ),
+            "failed_count": sum(item.status == "failed" for item in jobs),
+            "log_file_count": len(log_files),
+            "log_bytes": sum(path.stat().st_size for path in log_files),
+            "jobs": [item.model_dump(mode="json") for item in jobs],
+        }
+
+    def clear_job_history(self) -> dict[str, Any]:
+        with self._lock:
+            active_jobs = {
+                job_id: item
+                for job_id, item in self._jobs.items()
+                if item.status in {"queued", "running", "cancelling"}
+            }
+            cleared_job_count = len(self._jobs) - len(active_jobs)
+            self._jobs = active_jobs
+            self._save_locked()
+
+        deleted_log_files = 0
+        deleted_log_bytes = 0
+        for path in self._job_log_files():
+            try:
+                deleted_log_bytes += path.stat().st_size
+                path.unlink()
+                deleted_log_files += 1
+            except FileNotFoundError:
+                continue
+        return {
+            "cleared_job_count": cleared_job_count,
+            "deleted_log_files": deleted_log_files,
+            "deleted_log_bytes": deleted_log_bytes,
+            "active_job_count": len(active_jobs),
         }
 
     def _workflow_job_status(self, job_id: str) -> dict[str, Any]:
@@ -1496,7 +1707,383 @@ class RagCatalog:
                 self._repository_id(name, git_url, ref, index_id),
                 job_id=job_id,
             )
+            self._release_repository_import_reservation(git_url)
             self._release_cancel_event(job_id)
+
+    def _run_repository_batch_job(
+        self,
+        job_id: str,
+        repositories: tuple[RepositoryBatchItem, ...],
+        worker_count: int,
+        generation_mode: Literal["static", "gigacode"],
+        requested_count: int,
+        skipped_items: tuple[dict[str, Any], ...],
+    ) -> None:
+        cancel_event = self._cancel_event(job_id)
+        affected_index_ids = sorted({item.index_id for item in repositories})
+        checkout_repository_ids = {
+            self._repository_id(item.name, item.git_url, item.ref, item.index_id)
+            for item in repositories
+        }
+        completed_items: list[dict[str, Any]] = []
+        failed_items: list[dict[str, Any]] = []
+        try:
+            with self._cancellable_index_locks(affected_index_ids, cancel_event):
+                self._update_job(
+                    job_id,
+                    status="running",
+                    message=(
+                        f"Preparing {len(repositories)} repositories with "
+                        f"{worker_count} workers"
+                    ),
+                    started_at=_now(),
+                )
+                for index_id in affected_index_ids:
+                    self._update_index(index_id, status="indexing", error=None)
+
+                with ThreadPoolExecutor(
+                    max_workers=worker_count,
+                    thread_name_prefix="repository-batch",
+                ) as executor:
+                    futures = {
+                        executor.submit(
+                            self._prepare_repository_batch_item,
+                            job_id,
+                            position,
+                            len(repositories),
+                            item,
+                            cancel_event,
+                        ): (position, item)
+                        for position, item in enumerate(repositories, start=1)
+                    }
+                    for future in as_completed(futures):
+                        position, item = futures[future]
+                        try:
+                            repository = future.result()
+                        except (
+                            CatalogJobCancelled,
+                            RepositoryOperationCancelled,
+                        ):
+                            raise
+                        except Exception as exc:
+                            error = str(exc) or type(exc).__name__
+                            failed_items.append(
+                                {
+                                    "position": position,
+                                    "name": item.name,
+                                    "git_url": item.git_url,
+                                    "ref": item.ref,
+                                    "index_id": item.index_id,
+                                    "repository_id": self._repository_id(
+                                        item.name,
+                                        item.git_url,
+                                        item.ref,
+                                        item.index_id,
+                                    ),
+                                    "status": "failed",
+                                    "error": error,
+                                }
+                            )
+                            self._append_job_log(
+                                job_id,
+                                f"Repository preparation failed [{position}/{len(repositories)}]: "
+                                f"repository={item.name}; error={type(exc).__name__}: {error}",
+                            )
+                        else:
+                            completed_items.append(
+                                {
+                                    "position": position,
+                                    "name": repository.name,
+                                    "git_url": repository.git_url,
+                                    "ref": repository.ref,
+                                    "index_id": repository.index_id,
+                                    "repository_id": repository.id,
+                                    "status": "prepared",
+                                    "document_count": repository.document_count,
+                                    "commit": repository.commit,
+                                }
+                            )
+                        processed_count = len(completed_items) + len(failed_items)
+                        self._update_job(
+                            job_id,
+                            message=(
+                                f"Prepared {processed_count}/{len(repositories)} repositories "
+                                f"with {worker_count} workers; errors={len(failed_items)}"
+                            ),
+                            result={
+                                "phase": "preparing",
+                                "generation_mode": generation_mode,
+                                "repository_count": requested_count,
+                                "scheduled_count": len(repositories),
+                                "skipped_count": len(skipped_items),
+                                "skipped_items": list(skipped_items),
+                                "worker_count": worker_count,
+                                "completed_count": len(completed_items),
+                                "failed_count": len(failed_items),
+                                "items": sorted(
+                                    [*completed_items, *failed_items],
+                                    key=lambda value: int(value["position"]),
+                                ),
+                            },
+                        )
+
+                self._raise_if_cancelled(cancel_event)
+                if not completed_items:
+                    raise RuntimeError(
+                        f"All {len(repositories)} repositories failed during preparation"
+                    )
+
+                successful_repository_ids = {
+                    str(item["repository_id"]) for item in completed_items
+                }
+                successful_index_ids = sorted(
+                    {str(item["index_id"]) for item in completed_items}
+                )
+                self._update_job(
+                    job_id,
+                    message=(
+                        f"Prepared {len(completed_items)} repositories; building one system graph"
+                    ),
+                    result={
+                        "phase": "building_graph",
+                        "generation_mode": generation_mode,
+                        "repository_count": requested_count,
+                        "scheduled_count": len(repositories),
+                        "skipped_count": len(skipped_items),
+                        "skipped_items": list(skipped_items),
+                        "worker_count": worker_count,
+                        "completed_count": len(completed_items),
+                        "failed_count": len(failed_items),
+                    },
+                )
+                snapshot = self._build_graph(
+                    cancel_event=cancel_event,
+                    job_id=job_id,
+                    analysis_mode=generation_mode,
+                    verify_all=generation_mode == "gigacode",
+                )
+                self._raise_if_cancelled(cancel_event)
+
+                gigacode_results: list[dict[str, Any]] = []
+                rebuilt_index_ids: set[str] = set()
+                if generation_mode == "gigacode":
+                    repository_ids_by_index: dict[str, list[str]] = {}
+                    for completed_item in completed_items:
+                        repository_ids_by_index.setdefault(
+                            str(completed_item["index_id"]),
+                            [],
+                        ).append(str(completed_item["repository_id"]))
+                    for index_id in successful_index_ids:
+                        self._raise_if_cancelled(cancel_event)
+                        try:
+                            self._execute_system_ssot_generation_job(
+                                job_id,
+                                index_id,
+                                tuple(sorted(repository_ids_by_index[index_id])),
+                                (),
+                                False,
+                                False,
+                                "gigacode",
+                                cancel_event,
+                                complete_job=False,
+                            )
+                            current_result = self.job_status(job_id).result or {}
+                            gigacode_results.append(dict(current_result))
+                        except (
+                            CatalogJobCancelled,
+                            GigaCodeCancelled,
+                            IndexBuildCancelled,
+                            RepositoryOperationCancelled,
+                            ServiceMapBuildCancelled,
+                        ):
+                            raise
+                        except Exception as exc:
+                            error = self._gigacode_failure_message(exc)
+                            self._append_job_log(
+                                job_id,
+                                "GigaCode index fallback: rebuilding from static/OpenSpec "
+                                f"documents; index={index_id}; error={error}",
+                            )
+                            stats = self._rebuild_index(index_id, cancel_event)
+                            gigacode_results.append(
+                                {
+                                    "index_id": index_id,
+                                    "generation_mode": "static",
+                                    "fallback_used": True,
+                                    "gigacode_error": error,
+                                    "document_count": stats.document_count,
+                                    "chunk_count": stats.chunk_count,
+                                }
+                            )
+                        rebuilt_index_ids.add(index_id)
+                else:
+                    for index_id in successful_index_ids:
+                        self._raise_if_cancelled(cancel_event)
+                        index = self._record(index_id)
+                        self._update_job(
+                            job_id,
+                            message=f"Rebuilding linked RAG index once: {index.name}",
+                        )
+                        stats = self._rebuild_index(index_id, cancel_event)
+                        self._append_job_log(
+                            job_id,
+                            f"RAG index ready: index={index_id}; "
+                            f"documents={stats.document_count}; chunks={stats.chunk_count}",
+                        )
+                        rebuilt_index_ids.add(index_id)
+
+                for index_id in set(affected_index_ids) - rebuilt_index_ids:
+                    self._restore_index_status(index_id)
+
+                ordered_items = sorted(
+                    [*completed_items, *failed_items],
+                    key=lambda value: int(value["position"]),
+                )
+                self._update_job(
+                    job_id,
+                    status="completed",
+                    message=(
+                        f"Batch imported {len(completed_items)}/{len(repositories)} scheduled "
+                        f"repositories; skipped={len(skipped_items)}; errors={len(failed_items)}; "
+                        f"rebuilt {len(rebuilt_index_ids)} indexes and one system graph"
+                    ),
+                    completed_at=_now(),
+                    result={
+                        "phase": "indexed",
+                        "generation_mode": generation_mode,
+                        "repository_count": requested_count,
+                        "scheduled_count": len(repositories),
+                        "skipped_count": len(skipped_items),
+                        "skipped_items": list(skipped_items),
+                        "worker_count": worker_count,
+                        "completed_count": len(completed_items),
+                        "failed_count": len(failed_items),
+                        "index_ids": sorted(rebuilt_index_ids),
+                        "repository_ids": sorted(successful_repository_ids),
+                        "graph_node_count": len(snapshot.nodes),
+                        "graph_edge_count": len(snapshot.edges),
+                        "gigacode_results": gigacode_results,
+                        "items": ordered_items,
+                    },
+                )
+        except (
+            CatalogJobCancelled,
+            GigaCodeCancelled,
+            IndexBuildCancelled,
+            RepositoryOperationCancelled,
+            ServiceMapBuildCancelled,
+        ):
+            for index_id in affected_index_ids:
+                self._restore_index_status(index_id)
+            self._finish_cancelled_job(job_id, None)
+        except Exception as exc:
+            for index_id in affected_index_ids:
+                self._update_index(
+                    index_id,
+                    status="error",
+                    error="Repository batch failed; open the job log",
+                    updated_at=_now(),
+                )
+            self._fail_background_job(job_id, None, "Repository batch failed", exc)
+        finally:
+            self._cleanup_repository_checkouts(checkout_repository_ids, job_id=job_id)
+            with self._lock:
+                self._repository_import_reservations.difference_update(
+                    self._repository_source_key(item.git_url) for item in repositories
+                )
+            self._release_cancel_event(job_id)
+
+    def _prepare_repository_batch_item(
+        self,
+        job_id: str,
+        position: int,
+        total: int,
+        item: RepositoryBatchItem,
+        cancel_event: threading.Event,
+    ) -> RepositorySource:
+        self._raise_if_cancelled(cancel_event)
+        self._append_job_log(
+            job_id,
+            f"Worker started [{position}/{total}]: repository={item.name}; "
+            f"ref={item.ref or 'default'}; index={item.index_id}",
+        )
+        paths, records = RepositorySourceManager(self._graph_settings()).materialize(
+            [RepositorySpec(source=item.git_url, ref=item.ref)],
+            refresh=True,
+            cancel_event=cancel_event,
+        )
+        self._raise_if_cancelled(cancel_event)
+        checkout = paths[0]
+        ingestion = records[0]
+        repository_id = self._repository_id(
+            item.name,
+            item.git_url,
+            item.ref,
+            item.index_id,
+        )
+        documentation = (
+            Path(self._record(item.index_id).knowledge_dir)
+            / "repositories"
+            / repository_id
+        ).resolve()
+        try:
+            previous = self._repository(repository_id)
+            repository = previous.model_copy(
+                update={
+                    "name": item.name,
+                    "git_url": item.git_url,
+                    "ref": item.ref,
+                    "checkout_path": str(checkout),
+                    "checkout_state": (
+                        "external" if ingestion.source_type == "local" else "available"
+                    ),
+                    "checkout_removed_at": None,
+                    "documentation_path": str(documentation),
+                    "commit": ingestion.commit,
+                }
+            )
+        except KeyError:
+            repository = RepositorySource(
+                id=repository_id,
+                name=item.name,
+                git_url=item.git_url,
+                ref=item.ref,
+                index_id=item.index_id,
+                checkout_path=str(checkout),
+                checkout_state=(
+                    "external" if ingestion.source_type == "local" else "available"
+                ),
+                documentation_path=str(documentation),
+                commit=ingestion.commit,
+            )
+        self._upsert_repository(repository)
+        openspecs = self._find_openspecs(checkout, cancel_event=cancel_event)
+        document_count = self._sync_openspec(
+            sources=openspecs,
+            checkout=checkout,
+            destination=documentation / "openspec",
+            cancel_event=cancel_event,
+        )
+        self._raise_if_cancelled(cancel_event)
+        repository = repository.model_copy(
+            update={
+                "openspec_path": str(openspecs[0]) if openspecs else None,
+                "openspec_paths": [str(path) for path in openspecs],
+                "document_count": document_count,
+                "synced_at": _now(),
+            }
+        )
+        self._upsert_repository(repository)
+        paths_summary = (
+            ",".join(path.relative_to(checkout).as_posix() for path in openspecs)
+            or "none"
+        )
+        self._append_job_log(
+            job_id,
+            f"Worker ready [{position}/{total}]: repository={repository.id}; "
+            f"openspec={paths_summary}; documents={document_count}",
+        )
+        return repository
 
     def _execute_repository_job(
         self,
@@ -1671,6 +2258,7 @@ class RagCatalog:
         cancel_event = self._cancel_event(job_id)
         with self._lock:
             repository_ids = {item.id for item in self._state.repositories}
+        cleanup_pending = set(repository_ids)
         try:
             self._raise_if_cancelled(cancel_event)
             if generation_mode == "gigacode":
@@ -1680,7 +2268,35 @@ class RagCatalog:
                         job_id=job_id,
                         cancel_event=cancel_event,
                     )
-            self._execute_graph_job(job_id, cancel_event, generation_mode, verify_all)
+            snapshot = self._execute_graph_job(
+                job_id,
+                cancel_event,
+                generation_mode,
+                verify_all,
+            )
+            self._cleanup_repository_checkouts(cleanup_pending, job_id=job_id)
+            cleanup_pending.clear()
+            partial = self._is_partial_analysis(snapshot)
+            self._update_job(
+                job_id,
+                status="completed",
+                message=(
+                    f"Published partial map with {len(snapshot.nodes)} nodes"
+                    if partial
+                    else (
+                        f"Built {len(snapshot.nodes)} nodes and {len(snapshot.edges)} edges "
+                        f"with {snapshot.analysis_mode}"
+                    )
+                ),
+                completed_at=_now(),
+                result={
+                    "phase": "published",
+                    "generation_mode": generation_mode,
+                    "snapshot_id": snapshot.snapshot_id,
+                    "verification": snapshot.verification,
+                    "checkout_cleanup": "completed",
+                },
+            )
         except (
             CatalogJobCancelled,
             GigaCodeCancelled,
@@ -1691,7 +2307,7 @@ class RagCatalog:
         except Exception as exc:
             self._fail_background_job(job_id, None, "Graph build failed", exc)
         finally:
-            self._cleanup_repository_checkouts(repository_ids, job_id=job_id)
+            self._cleanup_repository_checkouts(cleanup_pending, job_id=job_id)
             self._release_cancel_event(job_id)
 
     def _execute_graph_job(
@@ -1700,7 +2316,7 @@ class RagCatalog:
         cancel_event: threading.Event,
         generation_mode: Literal["static", "gigacode"],
         verify_all: bool,
-    ) -> None:
+    ) -> GraphSnapshot:
         self._update_job(
             job_id,
             status="running",
@@ -1719,26 +2335,7 @@ class RagCatalog:
             verify_all=verify_all,
         )
         self._raise_if_cancelled(cancel_event)
-        partial = self._is_partial_analysis(snapshot)
-        self._update_job(
-            job_id,
-            status="completed",
-            message=(
-                f"Published partial map with {len(snapshot.nodes)} nodes"
-                if partial
-                else (
-                    f"Built {len(snapshot.nodes)} nodes and {len(snapshot.edges)} edges "
-                    f"with {snapshot.analysis_mode}"
-                )
-            ),
-            completed_at=_now(),
-            result={
-                "phase": "published",
-                "generation_mode": generation_mode,
-                "snapshot_id": snapshot.snapshot_id,
-                "verification": snapshot.verification,
-            },
-        )
+        return snapshot
 
     def _run_all_services_ssot_refresh_job(
         self,
@@ -3760,6 +4357,16 @@ class RagCatalog:
             raise ValueError("Invalid job id")
         return self.settings.job_logs_dir / f"{job_id}.log"
 
+    def _job_log_files(self) -> list[Path]:
+        root = self.settings.job_logs_dir.resolve()
+        if not root.is_dir():
+            return []
+        return sorted(
+            path
+            for path in root.glob("*.log")
+            if path.parent == root and path.is_file() and not path.is_symlink()
+        )
+
     def _append_job_log(self, job_id: str, message: str) -> None:
         path = self._job_log_path(job_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3835,6 +4442,49 @@ class RagCatalog:
         ).resolved()
 
     @staticmethod
+    def _repository_source_key(git_url: str) -> str:
+        """Return one stable identity for common URL spellings of a Git repository."""
+        clean = git_url.strip().replace("\\", "/").rstrip("/")
+        parsed = urlsplit(clean)
+        if parsed.scheme and parsed.scheme != "file":
+            host = (parsed.hostname or "").casefold()
+            path = unquote(parsed.path).strip("/")
+            if path.casefold().endswith(".git"):
+                path = path[:-4]
+            return f"remote:{host}/{path.casefold()}"
+        if parsed.scheme == "file":
+            return f"local:{Path(unquote(parsed.path)).expanduser().resolve()}"
+
+        scp_match = re.fullmatch(r"(?:[^@/:]+@)?([^:]+):(.+)", clean)
+        if scp_match:
+            host, path = scp_match.groups()
+            path = path.strip("/")
+            if path.casefold().endswith(".git"):
+                path = path[:-4]
+            return f"remote:{host.casefold()}/{path.casefold()}"
+
+        return f"local:{Path(clean).expanduser().resolve()}"
+
+    def _repository_for_source_key_locked(
+        self,
+        source_key: str,
+    ) -> RepositorySource | None:
+        return next(
+            (
+                repository
+                for repository in self._state.repositories
+                if self._repository_source_key(repository.git_url) == source_key
+            ),
+            None,
+        )
+
+    def _release_repository_import_reservation(self, git_url: str) -> None:
+        with self._lock:
+            self._repository_import_reservations.discard(
+                self._repository_source_key(git_url)
+            )
+
+    @staticmethod
     def _repository_id(name: str, git_url: str, ref: str | None, index_id: str) -> str:
         digest = hashlib.sha256(f"{git_url}\x1f{ref or ''}\x1f{index_id}".encode()).hexdigest()[:10]
         return f"{_slug(name)}-{digest}"
@@ -3851,7 +4501,7 @@ class RagCatalog:
     def _save_locked(self) -> None:
         path = self.settings.index_catalog_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._state.jobs = sorted(self._jobs.values(), key=lambda item: item.id)[-100:]
+        self._state.jobs = sorted(self._jobs.values(), key=lambda item: item.id)
         payload = self._state.model_dump_json(indent=2).encode("utf-8")
         temporary: Path | None = None
         try:

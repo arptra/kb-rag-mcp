@@ -6,7 +6,6 @@ import {
   useCallback,
   useEffect,
   useMemo,
-  useRef,
   useState,
 } from "react";
 import { ApiError, api, download, post } from "./api";
@@ -23,6 +22,7 @@ import type {
   Overview,
   Page,
   RagIndex,
+  RepositorySource,
   ToolCatalogItem,
 } from "./types";
 
@@ -108,6 +108,12 @@ function short(value: string, limit = 48): string {
   return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
 }
 
+function fileSize(value: number): string {
+  if (value < 1024) return `${value} Б`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} КБ`;
+  return `${(value / (1024 * 1024)).toFixed(1)} МБ`;
+}
+
 function repositoryNameFromGitUrl(value: string): string {
   const clean = value.trim().replace(/[?#].*$/, "").replace(/\/+$/, "");
   if (!clean) return "";
@@ -120,7 +126,35 @@ function repositoryNameFromGitUrl(value: string): string {
   }
 }
 
-type RepositoryBatchStatus = "pending" | "starting" | CatalogJob["status"];
+function repositorySourceKey(value: string): string {
+  const clean = value.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  const stripGitSuffix = (path: string) => {
+    let decoded = path;
+    try {
+      decoded = decodeURIComponent(path);
+    } catch {
+      // Keep malformed percent escapes intact so typing cannot break the modal.
+    }
+    return decoded
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/\.git$/i, "")
+      .toLocaleLowerCase();
+  };
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(clean)) {
+    try {
+      const parsed = new URL(clean);
+      if (parsed.protocol === "file:") return `local:${stripGitSuffix(parsed.pathname)}`;
+      return `remote:${parsed.hostname.toLocaleLowerCase()}/${stripGitSuffix(parsed.pathname)}`;
+    } catch {
+      return clean.toLocaleLowerCase();
+    }
+  }
+  const scpMatch = clean.match(/^(?:[^@/:]+@)?([^:]+):(.+)$/);
+  if (scpMatch) {
+    return `remote:${scpMatch[1].toLocaleLowerCase()}/${stripGitSuffix(scpMatch[2])}`;
+  }
+  return `local:${clean}`;
+}
 
 type RepositoryBatchRow = {
   id: string;
@@ -128,16 +162,25 @@ type RepositoryBatchRow = {
   gitUrl: string;
   branch: string | null;
   indexId: string | null;
-  status: RepositoryBatchStatus;
-  message: string;
-  jobId: string | null;
-  generationMode: "static" | "gigacode" | null;
-  fallbackReason: string | null;
+  skipReason: string | null;
 };
 
-type RepositoryJobResponse = CatalogJob & {
+type RepositoryBatchJobResponse = CatalogJob & {
   generation_mode: "static" | "gigacode";
   fallback_reason: string | null;
+  repository_count: number;
+  scheduled_count: number;
+  skipped_count: number;
+  worker_count: number;
+};
+
+type JobHistoryResponse = {
+  total: number;
+  active_count: number;
+  failed_count: number;
+  log_file_count: number;
+  log_bytes: number;
+  jobs: CatalogJob[];
 };
 
 function parseCsv(text: string): string[][] {
@@ -193,7 +236,11 @@ function resolveRepositoryCsvIndex(
   throw new Error(`Строка ${rowNumber}: индекс «${requested}» не найден`);
 }
 
-function parseRepositoryCsv(text: string, indexes: RagIndex[]): RepositoryBatchRow[] {
+function parseRepositoryCsv(
+  text: string,
+  indexes: RagIndex[],
+  repositories: RepositorySource[],
+): RepositoryBatchRow[] {
   const rows = parseCsv(text);
   if (!rows.length) throw new Error("CSV пустой");
   const header = rows[0].map((value) => value.trim().toLocaleLowerCase());
@@ -211,6 +258,9 @@ function parseRepositoryCsv(text: string, indexes: RagIndex[]): RepositoryBatchR
   if (rows.length > 1001) throw new Error("За один запуск можно обработать не более 1000 репозиториев");
 
   const seen = new Set<string>();
+  const existingBySource = new Map(
+    repositories.map((repository) => [repositorySourceKey(repository.git_url), repository]),
+  );
   return rows.slice(1).map((columns, index) => {
     const rowNumber = index + 2;
     if (columns.length > header.length) {
@@ -218,8 +268,14 @@ function parseRepositoryCsv(text: string, indexes: RagIndex[]): RepositoryBatchR
     }
     const gitUrl = (columns[gitColumn] || "").trim();
     if (!gitUrl) throw new Error(`Строка ${rowNumber}: Git URL пустой`);
-    if (seen.has(gitUrl)) throw new Error(`Строка ${rowNumber}: репозиторий уже есть в этом CSV`);
-    seen.add(gitUrl);
+    const sourceKey = repositorySourceKey(gitUrl);
+    const existing = existingBySource.get(sourceKey);
+    const skipReason = existing
+      ? `Уже подключён: ${existing.name}`
+      : seen.has(sourceKey)
+        ? "Повторяется в CSV"
+        : null;
+    seen.add(sourceKey);
     const name = repositoryNameFromGitUrl(gitUrl);
     if (name.length < 2) throw new Error(`Строка ${rowNumber}: не удалось определить имя репозитория`);
     const branch = branchColumn >= 0 ? (columns[branchColumn] || "").trim() : "";
@@ -232,17 +288,9 @@ function parseRepositoryCsv(text: string, indexes: RagIndex[]): RepositoryBatchR
       gitUrl,
       branch: branch || null,
       indexId,
-      status: "pending",
-      message: "Ожидает запуска",
-      jobId: null,
-      generationMode: null,
-      fallbackReason: null,
+      skipReason,
     };
   });
-}
-
-function wait(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 function jobAuthenticationUrl(job: CatalogJob | null | undefined): string | null {
@@ -268,6 +316,7 @@ function Status({ value }: { value: string }) {
     "module-empty": "пустой модуль",
     unsupported: "не поддерживается",
     pending: "ожидает",
+    skipped: "пропуск",
     starting: "подключение",
   };
   return (
@@ -591,6 +640,7 @@ export default function App() {
         <RepositoryForm
           password={password}
           indexes={overview.catalog.indexes}
+          repositories={overview.catalog.repositories}
           gigacodeAvailable={overview.catalog.ssot_generation.gigacode.available}
           gigacodeError={overview.catalog.ssot_generation.gigacode.error}
           onClose={() => setRepositoryModal(false)}
@@ -599,8 +649,15 @@ export default function App() {
             setToast(mode === "gigacode" ? "Импорт и GigaCode-анализ поставлены в очередь" : "Импорт поставлен в очередь");
             void load();
           }}
-          onBatchFinished={(completed, failed, skipped) => {
-            setToast(`Пакет завершён: ${completed} успешно, ${failed} с ошибкой${skipped ? `, ${skipped} не запущено` : ""}`);
+          onBatchStarted={(count, scheduled, skipped, workers, mode, fallbackReason) => {
+            setRepositoryModal(false);
+            setToast(
+              scheduled === 0
+                ? `Все ${count} репозиториев уже подключены — сканирование не запускалось`
+                : fallbackReason
+                  ? `Запущено ${scheduled} из ${count} на ${workers} воркерах, пропущено ${skipped}; static-режим: ${fallbackReason}`
+                  : `Запущено ${scheduled} из ${count} на ${workers} воркерах, пропущено ${skipped}${mode === "gigacode" ? ", с GigaCode" : ""}`,
+            );
             void load();
           }}
         />
@@ -787,8 +844,35 @@ function OperationsPage({ data, password, onAction }: {
   password: string;
   onAction: (run: () => Promise<unknown>, message: string) => Promise<void>;
 }) {
-  const active = data.catalog.jobs.filter((job) => ["queued", "running", "cancelling"].includes(job.status)).length;
-  const failed = data.catalog.jobs.filter((job) => job.status === "failed").length;
+  const [history, setHistory] = useState<JobHistoryResponse | null>(null);
+  const [historyError, setHistoryError] = useState("");
+  const overviewActive = data.catalog.jobs.filter((job) => ["queued", "running", "cancelling"].includes(job.status)).length;
+  const loadHistory = useCallback(async () => {
+    try {
+      setHistory(await api<JobHistoryResponse>("/admin/api/jobs", password));
+      setHistoryError("");
+    } catch (caught) {
+      setHistoryError(caught instanceof Error ? caught.message : "Не удалось загрузить историю операций");
+    }
+  }, [password]);
+  useEffect(() => {
+    void loadHistory();
+    const timer = window.setInterval(() => void loadHistory(), overviewActive ? 1000 : 5000);
+    return () => window.clearInterval(timer);
+  }, [loadHistory, overviewActive]);
+  const jobs = history?.jobs ?? data.catalog.jobs;
+  const active = history?.active_count ?? overviewActive;
+  const failed = history?.failed_count ?? jobs.filter((job) => job.status === "failed").length;
+  const clearHistory = async () => {
+    if (!window.confirm(
+      "Очистить всю завершённую историю операций и физически удалить файлы из .cache/kb/job-logs? Активные задачи останутся в списке, но их накопленные логи тоже будут очищены.",
+    )) return;
+    await onAction(
+      () => post("/admin/api/jobs/clear", password, {}),
+      "История операций и файлы job-логов очищены",
+    );
+    await loadHistory();
+  };
   return (
     <>
       <div className="section-intro">
@@ -800,7 +884,7 @@ function OperationsPage({ data, password, onAction }: {
         <div className="server-summary">
           <span><b>{active}</b> выполняется</span>
           <span><b>{failed}</b> с ошибкой</span>
-          <span><b>{data.catalog.jobs.length}</b> всего</span>
+          <span><b>{history?.total ?? jobs.length}</b> всего</span>
         </div>
       </div>
       <div className="log-location-grid">
@@ -809,8 +893,17 @@ function OperationsPage({ data, password, onAction }: {
         <article className="panel log-location"><span className="eyebrow">Successful runs</span><code>.cache/kb/analysis/runs/</code><small>Полные JSON-снимки завершённых анализов для дальнейшего SSOT.</small></article>
       </div>
       <section className="panel operations-panel">
-        <PanelHeader title="Все фоновые задачи" kicker={active ? `Сейчас выполняется: ${active}` : "Активных задач нет"} />
-        <JobList password={password} jobs={data.catalog.jobs} onCancel={(job) => void onAction(() => post("/admin/api/jobs/cancel", password, { job_id: job.id }), "Отмена запрошена")} />
+        <header className="panel-header operations-header">
+          <div><span>{active ? `Сейчас выполняется: ${active}` : "Активных задач нет"}</span><h3>Все фоновые задачи</h3></div>
+          <div className="operations-actions">
+            <small>{history?.log_file_count ?? 0} файлов · {fileSize(history?.log_bytes ?? 0)}</small>
+            <button className="operations-clear" disabled={!jobs.length && !history?.log_file_count} onClick={() => void clearHistory()}>Очистить историю и логи</button>
+          </div>
+        </header>
+        {historyError && <div className="inline-error operations-error">{historyError}</div>}
+        <div className="operations-scroll">
+          <JobList password={password} jobs={jobs} onCancel={(job) => void onAction(() => post("/admin/api/jobs/cancel", password, { job_id: job.id }), "Отмена запрошена")} />
+        </div>
       </section>
     </>
   );
@@ -1765,14 +1858,22 @@ function ServerForm({ password, onClose, onSaved }: { password: string; onClose:
   );
 }
 
-function RepositoryForm({ password, indexes, gigacodeAvailable, gigacodeError, onClose, onSaved, onBatchFinished }: {
+function RepositoryForm({ password, indexes, repositories, gigacodeAvailable, gigacodeError, onClose, onSaved, onBatchStarted }: {
   password: string;
   indexes: RagIndex[];
+  repositories: RepositorySource[];
   gigacodeAvailable: boolean;
   gigacodeError: string | null;
   onClose: () => void;
   onSaved: (mode: "static" | "gigacode") => void;
-  onBatchFinished: (completed: number, failed: number, skipped: number) => void;
+  onBatchStarted: (
+    count: number,
+    scheduled: number,
+    skipped: number,
+    workers: number,
+    mode: "static" | "gigacode",
+    fallbackReason: string | null,
+  ) => void;
 }) {
   const [formMode, setFormMode] = useState<"single" | "batch">("single");
   const [name, setName] = useState("");
@@ -1789,51 +1890,12 @@ function RepositoryForm({ password, indexes, gigacodeAvailable, gigacodeError, o
   const [batchDefaultBranch, setBatchDefaultBranch] = useState("master");
   const [batchDefaultIndexId, setBatchDefaultIndexId] = useState(indexes[0]?.id || "");
   const [workerCount, setWorkerCount] = useState(4);
-  const [batchFinished, setBatchFinished] = useState<{ completed: number; failed: number; skipped: number } | null>(null);
-  const runId = useRef(0);
-
-  useEffect(() => () => { runId.current += 1; }, []);
-
-  const updateBatchRow = (index: number, patch: Partial<RepositoryBatchRow>) => {
-    setBatchRows((current) => current.map((row, rowIndex) => (
-      rowIndex === index ? { ...row, ...patch } : row
-    )));
-  };
-
-  const waitForRepositoryJob = async (
-    jobId: string,
-    currentRunId: number,
-    onProgress: (job: CatalogJob) => void,
-  ): Promise<CatalogJob | null> => {
-    let missedPolls = 0;
-    while (runId.current === currentRunId) {
-      try {
-        const job = await api<CatalogJob>(
-          `/admin/api/jobs/status?job_id=${encodeURIComponent(jobId)}`,
-          password,
-          {},
-          15000,
-        );
-        missedPolls = 0;
-        onProgress(job);
-        if (["completed", "failed", "cancelled"].includes(job.status)) return job;
-      } catch (caught) {
-        missedPolls += 1;
-        if (missedPolls >= 30) {
-          throw new Error(caught instanceof Error ? caught.message : "Не удалось получить статус операции");
-        }
-      }
-      await wait(1000);
-    }
-    return null;
-  };
 
   const loadCsv = async (file: File | undefined) => {
     if (!file) return;
     setError("");
-    setBatchFinished(null);
     try {
-      const rows = parseRepositoryCsv(await file.text(), indexes);
+      const rows = parseRepositoryCsv(await file.text(), indexes, repositories);
       setBatchRows(rows);
       setCsvFilename(file.name);
     } catch (caught) {
@@ -1856,92 +1918,43 @@ function RepositoryForm({ password, indexes, gigacodeAvailable, gigacodeError, o
     }
     const rows = batchRows.slice();
     const activeWorkerCount = Math.min(Math.max(1, Math.trunc(workerCount)), rows.length);
-    const currentRunId = runId.current + 1;
-    runId.current = currentRunId;
     setBatchRunning(true);
-    setBatchFinished(null);
     setError("");
-    setBatchRows((current) => current.map((row) => ({
-      ...row,
-      status: "pending",
-      message: "Ожидает запуска",
-      jobId: null,
-      generationMode: null,
-      fallbackReason: null,
-    })));
-    let completed = 0;
-    let failed = 0;
-    let nextIndex = 0;
-    let queueStopped = false;
-
-    const processRow = async (index: number) => {
-      const row = rows[index];
-      let jobStarted = false;
-      updateBatchRow(index, { status: "starting", message: "Подключаем репозиторий…" });
-      try {
-        const job = await post<RepositoryJobResponse>("/admin/api/repositories", password, {
-          name: row.name,
-          git_url: row.gitUrl,
-          ref: row.branch || defaultBranch,
-          index_id: row.indexId || batchDefaultIndexId,
-          index_name: null,
-          generation_mode: "static",
+    try {
+      const job = await post<RepositoryBatchJobResponse>(
+        "/admin/api/repositories/batch",
+        password,
+        {
+          repositories: rows.map((row) => ({
+            name: row.name,
+            git_url: row.gitUrl,
+            ref: row.branch || defaultBranch,
+            index_id: row.indexId || batchDefaultIndexId,
+          })),
+          worker_count: activeWorkerCount,
           prefer_gigacode: true,
-        }, 15000);
-        jobStarted = true;
-        updateBatchRow(index, {
-          status: job.status,
-          message: job.message,
-          jobId: job.id,
-          generationMode: job.generation_mode,
-          fallbackReason: job.fallback_reason,
-        });
-        const terminal = await waitForRepositoryJob(job.id, currentRunId, (progress) => {
-          updateBatchRow(index, {
-            status: progress.status,
-            message: progress.error || progress.message,
-          });
-        });
-        if (!terminal) return;
-        if (terminal.status === "completed") completed += 1;
-        else failed += 1;
-      } catch (caught) {
-        failed += 1;
-        updateBatchRow(index, {
-          status: "failed",
-          message: caught instanceof Error ? caught.message : "Не удалось обработать репозиторий",
-        });
-        if (jobStarted) {
-          queueStopped = true;
-          setBatchRows((current) => current.map((item) => (
-            item.status === "pending"
-              ? { ...item, message: "Не запущен: сервер перестал отдавать статусы операций" }
-              : item
-          )));
-        }
-      }
-    };
-
-    const worker = async () => {
-      while (runId.current === currentRunId && !queueStopped) {
-        const index = nextIndex;
-        nextIndex += 1;
-        if (index >= rows.length) return;
-        await processRow(index);
-      }
-    };
-
-    await Promise.all(Array.from({ length: activeWorkerCount }, () => worker()));
-
-    if (runId.current === currentRunId) {
-      const skipped = rows.length - completed - failed;
+        },
+        30000,
+      );
+      onBatchStarted(
+        job.repository_count,
+        job.scheduled_count,
+        job.skipped_count,
+        job.worker_count,
+        job.generation_mode,
+        job.fallback_reason,
+      );
+    } catch (caught) {
       setBatchRunning(false);
-      setBatchFinished({ completed, failed, skipped });
-      onBatchFinished(completed, failed, skipped);
+      setError(caught instanceof Error ? caught.message : "Не удалось запустить пакетный импорт");
     }
   };
 
   const connect = async (generationMode: "static" | "gigacode") => {
+    if (duplicateRepository) {
+      setError(`Git-репозиторий уже подключён: ${duplicateRepository.name}`);
+      return;
+    }
     setBusyMode(generationMode);
     setError("");
     try {
@@ -1972,6 +1985,13 @@ function RepositoryForm({ password, indexes, gigacodeAvailable, gigacodeError, o
     setGitUrl(value);
     if (!nameEdited) setName(repositoryNameFromGitUrl(value));
   };
+  const duplicateRepository = gitUrl.trim()
+    ? repositories.find(
+      (repository) => repositorySourceKey(repository.git_url) === repositorySourceKey(gitUrl),
+    ) || null
+    : null;
+  const skippedBatchCount = batchRows.filter((row) => row.skipReason !== null).length;
+  const scheduledBatchCount = batchRows.length - skippedBatchCount;
   return (
     <Modal title="Подключить Git-репозитории" onClose={onClose} closeDisabled={busyMode !== null || batchRunning} className="repository-modal">
       <div className="repository-mode-tabs" role="tablist" aria-label="Режим подключения">
@@ -1985,14 +2005,15 @@ function RepositoryForm({ password, indexes, gigacodeAvailable, gigacodeError, o
             <label>Ref<input value={ref} onChange={(event) => setRef(event.target.value)} placeholder="master" /></label>
           </div>
           <label>Git URL<input required value={gitUrl} onChange={(event) => changeGitUrl(event.target.value)} placeholder="https://git.company.local/team/service.git" /></label>
+          {duplicateRepository && <div className="duplicate-repository-hint">Этот Git-репозиторий уже подключён: <b>{duplicateRepository.name}</b>. Повторное сканирование не будет запущено.</div>}
           <label>Целевой индекс<select value={target} onChange={(event) => setTarget(event.target.value)}>{indexes.map((index) => <option key={index.id} value={index.id}>{index.name}</option>)}<option value="__new__">＋ Создать новый индекс</option></select></label>
           {target === "__new__" && <label>Название нового индекса<input value={indexName} onChange={(event) => setIndexName(event.target.value)} placeholder={name || "System knowledge"} /></label>}
           {!gigacodeAvailable && <small className="gigacode-hint">GigaCode-режим недоступен: {gigacodeError || "исполняемый файл не найден"}</small>}
           {error && <div className="form-error">{error}</div>}
           <div className="modal-actions repository-actions">
             <button type="button" className="button quiet" onClick={onClose} disabled={busyMode !== null}>Отмена</button>
-            <button type="submit" className="button secondary" disabled={busyMode !== null}>{busyMode === "static" ? "Подключаем…" : "Без GigaCode"}</button>
-            <button type="button" className="button precise" onClick={submitGigacode} disabled={!gigacodeAvailable || busyMode !== null} title={!gigacodeAvailable ? gigacodeError || "GigaCode недоступен" : "Создать SSOT через GigaCode и собрать индекс"}>{busyMode === "gigacode" ? "Запускаем GigaCode…" : "✦ С GigaCode"}</button>
+            <button type="submit" className="button secondary" disabled={busyMode !== null || duplicateRepository !== null}>{busyMode === "static" ? "Подключаем…" : "Без GigaCode"}</button>
+            <button type="button" className="button precise" onClick={submitGigacode} disabled={!gigacodeAvailable || busyMode !== null || duplicateRepository !== null} title={!gigacodeAvailable ? gigacodeError || "GigaCode недоступен" : duplicateRepository ? "Репозиторий уже подключён" : "Создать SSOT через GigaCode и собрать индекс"}>{busyMode === "gigacode" ? "Запускаем GigaCode…" : "✦ С GigaCode"}</button>
           </div>
         </form>
       ) : (
@@ -2013,7 +2034,7 @@ function RepositoryForm({ password, indexes, gigacodeAvailable, gigacodeError, o
             <p>Значения <code>branch</code> и <code>index</code> из конкретной строки CSV переопределяют эти настройки.</p>
           </div>
           <div className="batch-worker-control">
-            <div><b>Параллельная обработка</b><small>Каждый воркер берёт следующий репозиторий из очереди.</small></div>
+            <div><b>Параллельная подготовка</b><small>Воркеры одновременно клонируют и сканируют репозитории. После этого сервер один раз собирает общий граф и каждый затронутый индекс.</small></div>
             <label>Количество воркеров<input type="number" min={1} max={16} step={1} value={workerCount} disabled={batchRunning} onChange={(event) => setWorkerCount(Math.min(16, Math.max(1, Math.trunc(Number(event.target.value) || 1))))} /></label>
           </div>
           {!batchRows.length && (
@@ -2029,26 +2050,25 @@ function RepositoryForm({ password, indexes, gigacodeAvailable, gigacodeError, o
           {batchRows.length > 0 && (
             <>
               <div className="batch-head">
-                <div><b>{csvFilename}</b><small>{batchRows.length} репозиториев в очереди</small></div>
+                <div><b>{csvFilename}</b><small>{scheduledBatchCount} в обработку · {skippedBatchCount} пропустить</small></div>
                 <label className="button quiet batch-replace">Заменить CSV<input type="file" accept=".csv,text/csv" disabled={batchRunning} onChange={(event) => void loadCsv(event.target.files?.[0])} /></label>
               </div>
               <div className="batch-queue">
                 {batchRows.map((row, index) => (
-                  <article key={row.id} className={`batch-row batch-row-${row.status}`}>
+                  <article key={row.id} className={`batch-row batch-row-${row.skipReason ? "skipped" : "pending"}`}>
                     <span className="batch-number">{index + 1}</span>
-                    <div className="batch-repository"><b>{row.name}</b><small title={row.gitUrl}>{row.gitUrl}</small><em>{row.branch || batchDefaultBranch} · {indexes.find((item) => item.id === (row.indexId || batchDefaultIndexId))?.name || row.indexId || batchDefaultIndexId} · {row.message}{row.fallbackReason ? ` · static fallback: ${row.fallbackReason}` : ""}</em></div>
-                    <div className="batch-state"><Status value={row.status} />{row.generationMode && <small>{row.generationMode === "gigacode" ? "✦ GigaCode" : "static"}</small>}</div>
+                    <div className="batch-repository"><b>{row.name}</b><small title={row.gitUrl}>{row.gitUrl}</small><em>{row.skipReason || `${row.branch || batchDefaultBranch} · ${indexes.find((item) => item.id === (row.indexId || batchDefaultIndexId))?.name || row.indexId || batchDefaultIndexId}`}</em></div>
+                    <div className="batch-state"><Status value={row.skipReason ? "skipped" : "pending"} /></div>
                   </article>
                 ))}
               </div>
             </>
           )}
-          {!gigacodeAvailable && <small className="gigacode-hint">Сейчас GigaCode недоступен ({gigacodeError || "исполняемый файл не найден"}), поэтому сервер начнёт со статического анализа. Доступность перепроверяется перед каждой строкой.</small>}
-          {batchFinished && <div className={batchFinished.failed || batchFinished.skipped ? "batch-result batch-result-warning" : "batch-result"}><b>Пакет завершён</b><span>{batchFinished.completed} успешно · {batchFinished.failed} с ошибкой{batchFinished.skipped ? ` · ${batchFinished.skipped} не запущено` : ""}</span></div>}
+          {!gigacodeAvailable && <small className="gigacode-hint">Сейчас GigaCode недоступен ({gigacodeError || "исполняемый файл не найден"}), поэтому сервер запустит пакет со статическим анализом. Доступность перепроверяется при запуске пакета.</small>}
           {error && <div className="form-error">{error}</div>}
           <div className="modal-actions repository-actions">
-            <button type="button" className="button quiet" onClick={onClose} disabled={batchRunning}>{batchFinished ? "Закрыть" : "Отмена"}</button>
-            <button type="button" className="button primary" onClick={() => void runBatch()} disabled={!batchRows.length || batchRunning}>{batchRunning ? `Работают ${Math.min(workerCount, batchRows.length)} ворк.` : batchFinished ? "Запустить заново" : `Подключить ${batchRows.length || ""} · ${workerCount} ворк.`}</button>
+            <button type="button" className="button quiet" onClick={onClose} disabled={batchRunning}>Отмена</button>
+            <button type="button" className="button primary" onClick={() => void runBatch()} disabled={!batchRows.length || batchRunning}>{batchRunning ? "Проверяем и ставим в очередь…" : !batchRows.length ? "Сначала загрузите CSV" : scheduledBatchCount > 0 ? `Подключить ${scheduledBatchCount} · пропустить ${skippedBatchCount}` : `Пропустить все ${skippedBatchCount}`}</button>
           </div>
         </section>
       )}
@@ -2302,11 +2322,11 @@ function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction 
   return (
     <div className="graph-page">
       <div className="section-intro graph-intro">
-        <div><span className="eyebrow">Source-derived topology</span><h2>Граф связей системы</h2><p>Граф хранится отдельным snapshot и доступен через MCP tool `kb_system_graph`: rebuild не пишет документы в RAG и не перестраивает индексы. Цвет связи показывает уровень уверенности.</p></div>
+        <div><span className="eyebrow">Source-derived topology</span><h2>Граф связей системы</h2><p>Граф хранится отдельным snapshot и доступен через MCP tool `kb_system_graph`. Точный rebuild временно заново клонирует удалённые checkout всех подключённых репозиториев, публикует полный граф и снова удаляет исходники; документы и RAG-индексы не меняются.</p></div>
         <div className="graph-head-actions">
           <div className="segmented"><button className={view === "services" ? "active" : ""} onClick={() => setView("services")}>Сервисы</button><button className={view === "full" ? "active" : ""} onClick={() => setView("full")}>Полный граф</button></div>
           <button className="button secondary" onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "static", verify_all: false }), "Быстрое перестроение отдельного графа запущено")}>⌘ Быстро</button>
-          <button className="button precise" disabled={!gigacodeAvailable} title={!gigacodeAvailable ? gigacodeError || "GigaCode недоступен" : "Проверить связи через GigaCode без изменения RAG-индексов"} onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "gigacode", verify_all: true }), "Точное перестроение отдельного графа запущено")}>✦ Точный rebuild</button>
+          <button className="button precise" disabled={!gigacodeAvailable} title={!gigacodeAvailable ? gigacodeError || "GigaCode недоступен" : "Временно восстановить все удалённые checkout, проверить связи через GigaCode и снова удалить исходники"} onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "gigacode", verify_all: true }), "Точное перестроение отдельного графа запущено")}>✦ Точный rebuild</button>
         </div>
       </div>
       <div className="graph-toolbar">
