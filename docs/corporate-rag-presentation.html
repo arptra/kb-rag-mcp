@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Презентация о SDD, корпоративном RAG и планировании изменений в системе из 300+ сервисов.">
-  <title>SDD для 300+ сервисов — от знаний к проверяемому плану</title>
+  <meta name="description" content="Как общий контекст в RAG помогает разработке АС по SDD с 300+ микросервисами.">
+  <title>Общий контекст в RAG для разработки АС по SDD</title>
   <style>
     :root {
       color-scheme: dark;
@@ -140,6 +140,7 @@
     }
 
     .title-slide .slide-inner { gap: clamp(20px, 4vw, 54px); }
+    .report-title h1 { max-width: 1160px; font-size: clamp(2.65rem, 6vw, 5.9rem); }
 
     .title-rule {
       width: min(700px, 68vw);
@@ -722,9 +723,237 @@
       line-height: 1.45;
     }
 
+    .fact-strip {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: clamp(18px, 2.4vw, 34px);
+    }
+
+    .fact {
+      padding-top: 18px;
+      border-top: 3px solid var(--cyan);
+    }
+
+    .fact:nth-child(2) { border-color: var(--violet); }
+    .fact:nth-child(3) { border-color: var(--green); }
+
+    .fact strong {
+      display: block;
+      font-size: clamp(2rem, 4.4vw, 4.4rem);
+      line-height: 0.92;
+      letter-spacing: -0.06em;
+    }
+
+    .fact span {
+      display: block;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: clamp(0.86rem, 1.15vw, 1rem);
+      line-height: 1.4;
+    }
+
+    .skill-chain {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr auto 1fr;
+      align-items: stretch;
+      gap: clamp(10px, 1.25vw, 20px);
+    }
+
+    .skill-card {
+      min-height: 210px;
+      padding: clamp(18px, 2.2vw, 30px);
+      border: 1px solid var(--line);
+      border-top: 4px solid var(--cyan);
+      border-radius: 20px;
+      background: rgba(10, 27, 41, 0.78);
+    }
+
+    .skill-card.verify { border-top-color: var(--orange); }
+    .skill-card.plan { border-top-color: var(--violet); }
+
+    .skill-card code {
+      display: block;
+      color: var(--muted);
+      font-size: clamp(0.72rem, 0.92vw, 0.84rem);
+      line-height: 1.3;
+      overflow-wrap: anywhere;
+    }
+
+    .skill-card strong {
+      display: block;
+      margin-top: 20px;
+      font-size: clamp(1.15rem, 1.7vw, 1.55rem);
+      line-height: 1.16;
+    }
+
+    .skill-card span {
+      display: block;
+      margin-top: 13px;
+      color: var(--muted);
+      font-size: clamp(0.82rem, 1.05vw, 0.95rem);
+      line-height: 1.45;
+    }
+
+    .skill-arrow {
+      align-self: center;
+      color: var(--line);
+      font-size: clamp(1.7rem, 2.5vw, 2.4rem);
+    }
+
+    .demo-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.65fr) minmax(270px, 0.72fr);
+      gap: clamp(24px, 3vw, 48px);
+      align-items: stretch;
+    }
+
+    .screenshot-frame {
+      min-height: 350px;
+      border: 1px solid rgba(80, 218, 255, 0.42);
+      border-radius: 22px;
+      background:
+        linear-gradient(180deg, rgba(10, 27, 41, 0.94), rgba(6, 19, 31, 0.88)),
+        repeating-linear-gradient(0deg, transparent 0 28px, rgba(80, 218, 255, 0.035) 28px 29px);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 28px 70px rgba(0, 0, 0, 0.2);
+      overflow: hidden;
+    }
+
+    .screenshot-frame img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+
+    .shot-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      height: 42px;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 0.78rem;
+    }
+
+    .shot-head i {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--cyan);
+      box-shadow: 14px 0 0 var(--violet), 28px 0 0 var(--green);
+      margin-right: 28px;
+    }
+
+    .shot-placeholder {
+      min-height: 308px;
+      display: grid;
+      place-content: center;
+      gap: 12px;
+      padding: 36px;
+      text-align: center;
+    }
+
+    .shot-placeholder b {
+      color: var(--cyan);
+      font-size: clamp(1.45rem, 2.7vw, 2.6rem);
+      letter-spacing: -0.035em;
+    }
+
+    .shot-placeholder span {
+      max-width: 540px;
+      color: var(--muted);
+      font-size: clamp(0.92rem, 1.25vw, 1.08rem);
+      line-height: 1.5;
+    }
+
+    .screen-cues {
+      display: grid;
+      align-content: center;
+      gap: 18px;
+    }
+
+    .screen-cue {
+      padding-top: 16px;
+      border-top: 2px solid var(--line);
+    }
+
+    .screen-cue strong {
+      display: block;
+      color: var(--text);
+      font-size: clamp(1.05rem, 1.45vw, 1.3rem);
+    }
+
+    .screen-cue span {
+      display: block;
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: clamp(0.82rem, 1vw, 0.93rem);
+      line-height: 1.4;
+    }
+
+    .jira-rule {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 18px;
+    }
+
+    .jira-rule div {
+      padding: 16px 18px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(10, 27, 41, 0.72);
+    }
+
+    .jira-rule strong {
+      display: block;
+      color: var(--orange);
+      font-size: clamp(1.2rem, 1.9vw, 1.7rem);
+    }
+
+    .jira-rule span {
+      display: block;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: clamp(0.78rem, 0.96vw, 0.9rem);
+      line-height: 1.35;
+    }
+
     .slide-problem .slide-inner,
     .slide-summary .slide-inner {
       gap: 24px;
+    }
+
+    .slide-scale .slide-inner,
+    .slide-research .slide-inner,
+    .slide-scenarios .slide-inner,
+    .slide-skills .slide-inner,
+    .slide-demo .slide-inner,
+    .slide-jira .slide-inner {
+      gap: 20px;
+    }
+
+    .slide-scale h2,
+    .slide-research h2,
+    .slide-scenarios h2,
+    .slide-skills h2,
+    .slide-demo h2,
+    .slide-jira h2 {
+      font-size: clamp(2.15rem, 4.2vw, 4.4rem);
+    }
+
+    .slide-jira .screenshot-frame { min-height: 246px; }
+    .slide-jira .shot-placeholder { min-height: 204px; }
+
+    .slide-scenarios .compare-side {
+      min-height: 265px;
+      gap: 16px;
+      padding: clamp(22px, 2.5vw, 34px);
+    }
+
+    .slide-scenarios .route-caption {
+      padding-block: 13px;
     }
 
     .slide-problem .islands { min-height: 270px; }
@@ -809,6 +1038,9 @@
       .routing { grid-template-columns: repeat(4, 1fr); }
       .routing-arrow { display: none; }
       .percent-grid { grid-template-columns: 1fr 1fr; }
+      .skill-chain { grid-template-columns: repeat(4, 1fr); }
+      .skill-arrow { display: none; }
+      .demo-grid { grid-template-columns: minmax(0, 1.45fr) minmax(230px, 0.55fr); }
 
       .path-arrow { display: none; }
 
@@ -866,7 +1098,11 @@
       .percent-grid,
       .baseline-note,
       .audiences,
-      .guardrails { grid-template-columns: 1fr; }
+      .guardrails,
+      .fact-strip,
+      .skill-chain,
+      .demo-grid,
+      .jira-rule { grid-template-columns: 1fr; }
 
       .master-side { min-height: 0; }
       .routing-step { min-height: 0; }
@@ -907,99 +1143,138 @@
 </head>
 <body>
   <main class="deck" id="deck">
-    <section class="slide title-slide" data-title="SDD для 300+ сервисов">
+    <section class="slide title-slide report-title" data-title="Общий контекст в RAG для SDD">
       <div class="slide-inner">
-        <p class="eyebrow">Spec-driven development · RAG · граф сервисов</p>
-        <h1>SDD для системы<br><span class="accent">из 300+ сервисов</span></h1>
+        <p class="eyebrow">300+ микросервисов · SDD · единый контекст</p>
+        <h1>Как общий контекст в RAG<br>помогает разработке АС по SDD<br>с <span class="accent">300+ микросервисами</span></h1>
         <div class="title-rule"></div>
-        <p class="lead">Как превратить распределённые спецификации и код в проверяемый контекст — от бизнес-идеи до плана изменений по репозиториям.</p>
+        <p class="lead">От короткого требования — к проверяемому плану изменений, связанному с документами, кодом и зависимостями системы.</p>
         <div class="title-foot">
-          <span>локальный контур</span>
-          <span>факты с источниками</span>
-          <span>skills поверх MCP</span>
+          <span>проблема</span>
+          <span>решение</span>
+          <span>результат</span>
         </div>
       </div>
       <template class="speaker-notes">
-        <p>Открыть с главного тезиса: это не «ещё один чат с документацией». Это инфраструктура для SDD, где спецификации, код и связи между сервисами становятся доступным и проверяемым контекстом.</p>
-        <p>Обещание выступления: показать, почему подход выдерживает масштаб 300+ сервисов, какую ценность получают бизнес и разработчики, а затем подтвердить это live demo на готовых skills.</p>
+        <p>Тема доклада — не просто поиск по документам. Речь о том, как общий контекст помогает вести разработку по спецификации в большой автоматизированной системе.</p>
+        <p>Структура простая: сначала покажем проблему и её последствия, затем решение и рабочий процесс, а в конце — ограничения, выводы и живые экраны GigaCode.</p>
       </template>
-      <span class="slide-number">01 / 11</span>
+      <span class="slide-number">01 / 12</span>
     </section>
 
-    <section class="slide" data-title="Цена масштаба">
+    <section class="slide" data-title="Как начинается доработка">
+      <div class="slide-inner">
+        <p class="eyebrow">Проблема · точка старта</p>
+        <h2>Требование занимает пару строк.<br>Понимание системы — <span class="orange">часы поиска.</span></h2>
+        <div class="flow" aria-label="Путь от задачи до плана изменений">
+          <div class="flow-step">
+            <strong>Бизнес-<br>запрос</strong>
+            <span>что хотим изменить и зачем</span>
+          </div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step">
+            <strong>Владелец<br>и сервис</strong>
+            <span>где начинается нужный процесс</span>
+          </div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step">
+            <strong>Документы<br>и код</strong>
+            <span>правила · ADR · спецификации</span>
+          </div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step">
+            <strong>Связи<br>и контракты</strong>
+            <span>HTTP · Kafka · данные · команды</span>
+          </div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step">
+            <strong>План<br>изменений</strong>
+            <span>репозитории · тесты · порядок</span>
+          </div>
+        </div>
+        <p class="routing-claim"><b>Чтобы работать по SDD, сначала нужно восстановить контекст спецификации:</b> текущее поведение, владельцев, контракты, зависимости и границы изменения.</p>
+      </div>
+      <template class="speaker-notes">
+        <p>Пройти по процессу слева направо. На входе обычно есть цель и ожидаемый результат, но почти никогда нет полной карты технического влияния.</p>
+        <p>Разработчик ищет владельца, читает документы и код, уточняет контракты, собирает зависимости и только после этого может составить реалистичный план.</p>
+      </template>
+      <span class="slide-number">02 / 12</span>
+    </section>
+
+    <section class="slide slide-scale" data-title="Цена масштаба">
       <div class="slide-inner">
         <p class="eyebrow">Проблема масштаба</p>
-        <h2>После сотен сервисов поиск знаний<br>становится <span class="red">системным риском</span></h2>
+        <h2>На сотнях сервисов этот поиск<br>становится <span class="red">отдельным исследованием</span></h2>
         <div class="scale-story">
           <div class="scale-number">300+<span>сервисов, контрактов<br>и владельцев контекста</span></div>
           <div class="stakes">
-            <div class="stake"><strong>Неполная оценка влияния</strong><span>Фича выглядит локальной, пока не обнаруживаются API, события, миграции и команды.</span></div>
-            <div class="stake"><strong>Зависимость от «тех, кто помнит»</strong><span>Поиск начинается с людей и названий страниц, а не с вопроса по задаче.</span></div>
-            <div class="stake"><strong>Планирование начинается слишком поздно</strong><span>Межсервисные риски всплывают уже после декомпозиции или реализации.</span></div>
+            <div class="stake"><strong>Фича только выглядит локальной</strong><span>По ходу анализа обнаруживаются новые API, события, миграции и команды.</span></div>
+            <div class="stake"><strong>Знания распределены</strong><span>Ответ приходится собирать из Confluence, спецификаций, Git и разговоров с владельцами.</span></div>
+            <div class="stake"><strong>Риски видны слишком поздно</strong><span>Пропущенная зависимость всплывает после оценки, декомпозиции или начала реализации.</span></div>
           </div>
         </div>
       </div>
       <template class="speaker-notes">
-        <p>Подчеркнуть: проблема не в том, что документации мало. Наоборот, её много, но она распределена по Confluence, OpenSpec, ADR, Git и знаниям команд.</p>
-        <p>На масштабе 300+ сервисов невозможно требовать от человека заранее знать правильный репозиторий, владельца и точное название документа.</p>
+        <p>Проблема не в том, что информации нет. Она есть, но распределена между источниками и командами, а формулировка задачи не говорит, где именно её искать.</p>
+        <p>Чем больше сервисов, тем выше вероятность поздно обнаружить зависимость, другого владельца или ограничение контракта.</p>
       </template>
-      <span class="slide-number">02 / 11</span>
+      <span class="slide-number">03 / 12</span>
     </section>
 
-    <section class="slide slide-master" data-title="Почему не master-spec">
+    <section class="slide slide-research" data-title="Что мы выяснили">
       <div class="slide-inner">
-        <p class="eyebrow">Почему не один Git</p>
-        <h2>Master-spec создаёт<br><span class="red">единое узкое место</span></h2>
-        <div class="master-compare">
-          <div class="master-side">
-            <h3 class="red">Единая master-spec</h3>
-            <p><b>Центральная очередь</b><br>изменения ждут общего владельца<br><br><b>Контекст без границ</b><br>люди и модель получают лишнее<br><br><b>Отрыв от кода</b><br>спека устаревает отдельно от сервисов</p>
-          </div>
-          <div class="versus">VS</div>
-          <div class="master-side distributed">
-            <h3 class="green">Распределённый SSOT</h3>
-            <p><b>SSOT принадлежит команде</b><br>контракты обновляются рядом с кодом<br><br><b>Контекст по запросу</b><br>RAG доставляет релевантный срез<br><br><b>Системный маршрут</b><br>граф связывает локальные спецификации</p>
-          </div>
-        </div>
-      </div>
-      <template class="speaker-notes">
-        <p>Фраза для бизнеса: Git хорошо решает версионирование, но сам по себе не решает обнаружение знаний, маршрутизацию и актуальность между сотнями владельцев.</p>
-        <p>Фраза для разработчиков: мы не создаём «главный README монолита». Источник истины остаётся рядом с кодом и командой; центральный слой хранит индекс и связи, а не переписывает всё содержание.</p>
-      </template>
-      <span class="slide-number">03 / 11</span>
-    </section>
-
-    <section class="slide" data-title="Модель SDD">
-      <div class="slide-inner">
-        <p class="eyebrow">Spec-driven development</p>
-        <h2>Спецификация остаётся распределённой.<br><span class="accent">Контекст собирается по запросу.</span></h2>
+        <p class="eyebrow">Как подошли к проблеме</p>
+        <h2>Мы изучили материалы и прошли этот путь<br><span class="accent">вместе с коллегами</span></h2>
         <div class="sdd-model">
           <div class="sdd-column">
-            <strong>Локальные источники</strong>
-            <p>OpenSpec, ADR, контракты, код и конфигурация живут в зоне ответственности команды.</p>
+            <strong>Посмотрели источники</strong>
+            <p>Разобрали, где сегодня живут спецификации, ADR, правила, контракты, код и конфигурация.</p>
           </div>
           <div class="sdd-column">
-            <strong>Системная карта</strong>
-            <p>Граф хранит границы сервисов, HTTP/Kafka-связи, источник evidence и уровень уверенности.</p>
+            <strong>Обсудили реальные задачи</strong>
+            <p>Сверили с коллегами, как они ищут владельцев, зависимости и актуальное поведение перед доработкой.</p>
           </div>
           <div class="sdd-column">
-            <strong>Контекст задачи</strong>
-            <p>RAG и skills собирают ровно тот срез знаний, который нужен для ответа, плана или проверки.</p>
+            <strong>Нашли общий барьер</strong>
+            <p>Каждый источник полезен сам по себе, но между вопросом по задаче и нужным контекстом нет единого маршрута.</p>
           </div>
         </div>
-        <p class="big-claim">SDD здесь — это не один документ. Это <span class="green">управляемый цикл</span>: спецификация → evidence → план → проверка.</p>
+        <p class="big-claim">Главная проблема — не отсутствие знаний, а <span class="orange">стоимость их обнаружения и связывания</span>.</p>
       </div>
       <template class="speaker-notes">
-        <p>Объяснить SDD без жаргона: разработка начинается не с произвольной генерации кода, а с проверяемого описания текущего состояния и желаемого изменения.</p>
-        <p>Важный тезис: система не заменяет источники истины. Она даёт человеку и агенту единый способ найти, связать и процитировать их.</p>
+        <p>Здесь важно говорить без выдуманных цифр и исследований: мы посмотрели существующие материалы, обсудили путь с коллегами и сопоставили повторяющиеся шаги.</p>
+        <p>Общий вывод: знания уже создаются командами, но пользователю нужно заранее угадать правильного владельца, репозиторий и название документа.</p>
       </template>
-      <span class="slide-number">04 / 11</span>
+      <span class="slide-number">04 / 12</span>
     </section>
 
-    <section class="slide" data-title="Устройство системы">
+    <section class="slide slide-master" data-title="Принцип решения">
       <div class="slide-inner">
-        <p class="eyebrow">Устройство</p>
-        <h2>RAG превращает распределённые источники<br>в <span class="accent">API знаний</span></h2>
+        <p class="eyebrow">К какому решению пришли</p>
+        <h2>Источники оставляем у команд.<br><span class="green">Объединяем доступ к знаниям.</span></h2>
+        <div class="master-compare">
+          <div class="master-side">
+            <h3 class="red">Не одна master-spec</h3>
+            <p><b>Единый владелец</b><br>создаёт очередь на обновления<br><br><b>Огромный общий контекст</b><br>смешивает лишние домены и детали<br><br><b>Документ отдельно от кода</b><br>быстро теряет актуальность</p>
+          </div>
+          <div class="versus">→</div>
+          <div class="master-side distributed">
+            <h3 class="green">Единый RAG системы</h3>
+            <p><b>Истина остаётся у команды</b><br>спецификации и код живут рядом<br><br><b>Единая точка поиска</b><br>вопрос задаётся по смыслу задачи<br><br><b>Контекст собирается на лету</b><br>только из затронутых частей системы</p>
+          </div>
+        </div>
+      </div>
+      <template class="speaker-notes">
+        <p>Мы не стали переносить все знания в один гигантский документ. Такой документ создаёт нового центрального владельца и сам становится источником рассинхронизации.</p>
+        <p>Решение — сохранить распределённую ответственность команд, но дать единый слой поиска и связывания: корпоративный RAG системы.</p>
+      </template>
+      <span class="slide-number">05 / 12</span>
+    </section>
+
+    <section class="slide" data-title="Архитектура общего контекста">
+      <div class="slide-inner">
+        <p class="eyebrow">Решение</p>
+        <h2>Единый RAG собирает контекст<br>из <span class="accent">распределённых источников</span></h2>
         <div class="flow" aria-label="Поток обработки знаний">
           <div class="flow-step">
             <strong>Документы<br>и Git</strong>
@@ -1023,21 +1298,25 @@
           <div class="flow-arrow" aria-hidden="true">→</div>
           <div class="flow-step">
             <strong>MCP<br>и skills</strong>
-            <span>ответы, планы и аудит</span>
+            <span>ответы · планы · аудит</span>
           </div>
         </div>
-        <p class="lead">GigaCode остаётся генеративной моделью. Сервер управляет знаниями, маршрутизацией и доказательствами — и почти все tools работают только на чтение.</p>
+        <div class="fact-strip" aria-label="Проверяемые характеристики решения">
+          <div class="fact"><strong class="accent">2</strong><span>слоя контекста:<br>RAG + граф системы</span></div>
+          <div class="fact"><strong class="violet">3</strong><span>skills в рабочем цикле:<br>brief · plan · verify</span></div>
+          <div class="fact"><strong class="green">1</strong><span>интерфейс для GigaCode:<br>MCP</span></div>
+        </div>
       </div>
       <template class="speaker-notes">
-        <p>Пройти слева направо. Репозитории и документы нормализуются и индексируются. Граф извлекает связи из кода и конфигурации. MCP даёт стабильный контракт доступа, а skills задают безопасный рабочий процесс.</p>
-        <p>Для безопасности подчеркнуть: финальный ответ формирует GigaCode; RAG-сервер не исполняет произвольный код и не редактирует источники во время обычного поиска и планирования.</p>
+        <p>Пройти слева направо. Документы и репозитории нормализуются и индексируются. Граф связывает сервисы по HTTP и Kafka. MCP даёт GigaCode стабильный доступ к поиску, графу и evidence.</p>
+        <p>Skills задают воспроизводимый процесс: найти контекст, построить план и отдельно проверить, что модель не добавила неподтверждённые детали.</p>
       </template>
-      <span class="slide-number">05 / 11</span>
+      <span class="slide-number">06 / 12</span>
     </section>
 
-    <section class="slide" data-title="Масштабирование поиска">
+    <section class="slide" data-title="Маршрут влияния">
       <div class="slide-inner">
-        <p class="eyebrow">Масштаб 300+</p>
+        <p class="eyebrow">Как это работает на масштабе</p>
         <h2>Запрос идёт не во все сервисы,<br>а по <span class="violet">маршруту влияния</span></h2>
         <div class="routing" aria-label="Маршрутизация запроса по системе">
           <div class="routing-step">
@@ -1060,158 +1339,114 @@
             <span>контракты, правила и исходники с точными ссылками</span>
           </div>
         </div>
-        <p class="routing-claim"><b>Масштабируется не размер промпта, а маршрутизация:</b> каждый сервис сохраняет свой индекс, а граф выбирает релевантный подграф для конкретной задачи.</p>
+        <p class="routing-claim"><b>Масштабируется маршрутизация, а не размер промпта:</b> граф выбирает релевантный подграф, а поиск читает детали только нужных сервисов.</p>
       </div>
       <template class="speaker-notes">
-        <p>Это ключевой слайд про 300+ сервисов. Мы не загружаем «всю компанию» в один контекст. Сначала граф сужает область поиска, затем RAG читает детали только в выбранных индексах.</p>
-        <p>Рост системы означает больше независимых источников и связей, но не линейный рост каждого ответа модели. Это архитектурный принцип; конкретные пределы производительности нужно подтверждать нагрузочными испытаниями.</p>
+        <p>Мы не отправляем модели всю систему. Сначала граф сужает область анализа, затем RAG поднимает подробности только из выбранных индексов.</p>
+        <p>Это архитектурный принцип. Конкретные пределы производительности и свежесть каждого индекса всё равно требуют эксплуатации и измерений.</p>
       </template>
-      <span class="slide-number">06 / 11</span>
+      <span class="slide-number">07 / 12</span>
     </section>
 
-    <section class="slide slide-benchmark" data-title="Эффект RAG">
+    <section class="slide slide-skills" data-title="Цепочка skills">
       <div class="slide-inner">
-        <p class="eyebrow">Пилотный benchmark репозитория</p>
-        <h2>RAG уменьшает передаваемый контекст,<br>не теряя <span class="green">попадание в источник</span></h2>
-        <div class="percent-grid" aria-label="Процентные результаты benchmark">
-          <div class="percent-metric">
-            <strong class="accent">−53,5%</strong>
-            <span>контекста модели относительно baseline</span>
+        <p class="eyebrow">Повторяемый процесс в GigaCode</p>
+        <h2>Три skills ведут фичу<br>от требования до <span class="accent">проверяемого плана</span></h2>
+        <div class="skill-chain" aria-label="Цепочка skills для работы с кросс-сервисной фичей">
+          <div class="skill-card">
+            <code>$generate-cross-service-feature</code>
+            <strong>Собирает brief</strong>
+            <span>цель, акторы, сценарии, ограничения и критерии приёмки</span>
           </div>
-          <div class="percent-metric">
-            <strong class="violet">−45,7%</strong>
-            <span>размера поискового ответа</span>
+          <div class="skill-arrow" aria-hidden="true">→</div>
+          <div class="skill-card verify">
+            <code>$verify-cross-service-feature</code>
+            <strong>Проверяет brief</strong>
+            <span>отделяет требования от фактов и ищет неподтверждённые детали</span>
           </div>
-          <div class="percent-metric">
-            <strong class="green">100%</strong>
-            <span>качества попадания сохранено в пилоте</span>
+          <div class="skill-arrow" aria-hidden="true">→</div>
+          <div class="skill-card plan">
+            <code>$plan-feature-with-system-graph</code>
+            <strong>Строит план</strong>
+            <span>раскладывает изменения по репозиториям, сервисам и Jira drafts</span>
           </div>
-          <div class="percent-metric">
-            <strong class="orange">75%</strong>
-            <span>кандидатов отсекается до контекста модели</span>
+          <div class="skill-arrow" aria-hidden="true">→</div>
+          <div class="skill-card verify">
+            <code>$verify-cross-service-feature</code>
+            <strong>Проверяет план</strong>
+            <span>повторно сверяет сервисы, контракты, evidence и неизвестные</span>
           </div>
         </div>
-        <div class="baseline-note">
-          <strong>Baseline = контрольные 100%</strong>
-          <p>Это прежний формат поискового ответа с полными чанками. Он нужен как точка сравнения: проценты показывают эффект compact retrieval, а не «ускорение всей разработки».</p>
-        </div>
-        <p class="method-note">Пилотный срез текущего репозитория. Это не production SLA, не доля всей стоимости LLM и не обещание одинакового результата на любом корпусе.</p>
+        <p class="route-caption">Генератор и проверяющий разделены: уверенная формулировка модели сама по себе не считается доказательством.</p>
       </div>
       <template class="speaker-notes">
-        <p>Сначала объяснить baseline: это контрольный старый поисковый контракт, который принимаем за 100%. С ним сравниваем новый компактный ответ.</p>
-        <p>Главный смысл не «мы сэкономили ровно половину денег», а «модель получает меньше лишнего текста при сохранённом попадании в релевантный источник». Честно назвать цифры пилотными и не переносить их автоматически на все 300+ сервисов.</p>
+        <p>Это не один большой промпт. Brief сначала структурирует требование. Затем независимый verifier проверяет его по текущему контексту. Планировщик строит изменения по сервисам, а verifier повторно проверяет уже план.</p>
+        <p>Три разных skills задают роли и правила работы; verification skill используется дважды. Поэтому процесс можно повторить для другой фичи и получить результат в том же формате.</p>
       </template>
-      <span class="slide-number">07 / 11</span>
+      <span class="slide-number">08 / 12</span>
     </section>
 
-    <section class="slide" data-title="Обычная фича">
+    <section class="slide slide-demo" data-title="План в GigaCode">
       <div class="slide-inner">
-        <p class="eyebrow">Обычная фича</p>
-        <h2>Разработчик задаёт вопрос по задаче,<br>а не угадывает <span class="accent">название страницы</span></h2>
-        <div class="path" aria-label="Работа с обычной фичей">
-          <div class="path-node">
-            <strong>Вопрос</strong>
-            <span>«Где проверяется дневной лимит?»</span>
+        <p class="eyebrow">Скриншот · GigaCode</p>
+        <h2>На экране — не «ответ AI»,<br>а <span class="green">план с основаниями</span></h2>
+        <div class="demo-grid">
+          <div class="screenshot-frame" aria-label="Место для реального скриншота GigaCode с планом фичи">
+            <div class="shot-head"><i></i>GigaCode · feature planning</div>
+            <div class="shot-placeholder">
+              <b>План кросс-сервисной фичи</b>
+              <span>Здесь будет реальный скриншот запуска skill и ответа с маршрутом сервисов, evidence и неизвестными.</span>
+            </div>
           </div>
-          <div class="path-arrow" aria-hidden="true">→</div>
-          <div class="path-node highlight">
-            <strong>RAG сервиса</strong>
-            <span>находит правило и связанные документы</span>
-          </div>
-          <div class="path-arrow" aria-hidden="true">→</div>
-          <div class="path-node">
-            <strong>Доказательства</strong>
-            <span>ADR · контракт · путь к исходнику</span>
-          </div>
-          <div class="path-arrow" aria-hidden="true">→</div>
-          <div class="path-node done">
-            <strong>Изменение</strong>
-            <span>код · тесты · обновление спецификации</span>
+          <div class="screen-cues">
+            <div class="screen-cue"><strong>Маршрут</strong><span>корневой и затронутые сервисы</span></div>
+            <div class="screen-cue"><strong>Evidence</strong><span>ссылки на документы, код и связи графа</span></div>
+            <div class="screen-cue"><strong>Изменения</strong><span>контракты, данные, тесты и rollout</span></div>
+            <div class="screen-cue"><strong>Unknowns</strong><span>что ещё нельзя считать подтверждённым</span></div>
           </div>
         </div>
-        <p class="big-claim">Результат — меньше археологии и быстрее переход от требования к <span class="green">проверяемому изменению</span>.</p>
       </div>
       <template class="speaker-notes">
-        <p>Дать простой пример перед сложной фичей. Пользователь формулирует предметный вопрос. RAG возвращает короткий ответ с источником; при необходимости агент лениво раскрывает конкретный чанк или документ.</p>
-        <p>Ценность для разработчика — не только скорость поиска, но и возможность проверить ответ, перейти в источник и обновить спецификацию вместе с кодом.</p>
+        <p>Заменить заглушку реальным скриншотом GigaCode. Лучше показать верх ответа с вызванным skill и часть таблицы плана, где видны service/repository, evidence и unknowns.</p>
+        <p>Во время доклада не читать весь ответ. Подсветить четыре элемента справа: маршрут, источники, конкретные изменения и честно указанные неизвестные.</p>
       </template>
-      <span class="slide-number">08 / 11</span>
+      <span class="slide-number">09 / 12</span>
     </section>
 
-    <section class="slide" data-title="Сложная фича">
+    <section class="slide slide-jira" data-title="Задачи в Jira">
       <div class="slide-inner">
-        <p class="eyebrow">Кросс-сервисная фича</p>
-        <h2>Граф определяет маршрут.<br><span class="violet">RAG наполняет его фактами.</span></h2>
-        <div class="complex-path" aria-label="Планирование сложной фичи">
-          <div class="path-node">
-            <strong>Описание<br>фичи</strong>
-            <span>цель, актор и сценарий</span>
+        <p class="eyebrow">Скриншот · GigaCode + Jira</p>
+        <h2>После подтверждения план превращается<br>в <span class="orange">Jira-задачи по сервисам</span></h2>
+        <div class="demo-grid">
+          <div class="screenshot-frame" aria-label="Место для реального скриншота создания Jira-задач из GigaCode">
+            <div class="shot-head"><i></i>GigaCode · Jira publication</div>
+            <div class="shot-placeholder">
+              <b>Предпросмотр → выбор проекта → Task</b>
+              <span>Здесь будет реальный скриншот: список черновиков, вопрос о целевом Jira-проекте и созданные ключи задач.</span>
+            </div>
           </div>
-          <div class="path-arrow" aria-hidden="true">→</div>
-          <div class="path-node highlight">
-            <strong>Граф<br>сервисов</strong>
-            <span>HTTP · Kafka · confidence</span>
-          </div>
-          <div class="path-arrow" aria-hidden="true">→</div>
-          <div class="path-node">
-            <strong>RAG нужных<br>сервисов</strong>
-            <span>контракты, правила и исходники</span>
-          </div>
-          <div class="path-arrow" aria-hidden="true">→</div>
-          <div class="path-node">
-            <strong>План по<br>репозиториям</strong>
-            <span>API · события · миграции · rollout</span>
-          </div>
-          <div class="path-arrow" aria-hidden="true">→</div>
-          <div class="path-node done">
-            <strong>Работа<br>команд</strong>
-            <span>порядок, тесты и критерии приёмки</span>
+          <div class="screen-cues">
+            <div class="screen-cue"><strong>Сначала preview</strong><span>до выбора проекта Jira не изменяется</span></div>
+            <div class="screen-cue"><strong>Явное подтверждение</strong><span>пользователь выбирает один доступный проект</span></div>
+            <div class="screen-cue"><strong>Проверка результата</strong><span>созданная задача читается обратно</span></div>
           </div>
         </div>
-        <p class="route-caption">Слабые и неразрешённые связи остаются гипотезами. План превращает их в явные задачи проверки, а не выдаёт за факты.</p>
-      </div>
-      <template class="speaker-notes">
-        <p>Показать отличие от обычного поиска. Граф отвечает «куда идти», RAG отвечает «что именно там сейчас есть», skill отвечает «как собрать это в последовательный план».</p>
-        <p>План группируется по репозиториям и сервисам: контрактные изменения, совместимость, миграции, наблюдаемость, тесты и порядок rollout. Точные файлы называются только при наличии source evidence.</p>
-      </template>
-      <span class="slide-number">09 / 11</span>
-    </section>
-
-    <section class="slide" data-title="Ценность">
-      <div class="slide-inner">
-        <p class="eyebrow">Ценность для двух аудиторий</p>
-        <h2>Один слой контекста.<br><span class="green">Разный практический эффект.</span></h2>
-        <div class="audiences">
-          <div class="audience">
-            <h3 class="green">Для бизнеса</h3>
-            <ul>
-              <li>видно, какие команды и сервисы затрагивает инициатива;</li>
-              <li>риски и неизвестные появляются до оценки и обещаний;</li>
-              <li>знания меньше зависят от конкретных экспертов;</li>
-              <li>план и критерии приёмки связаны с исходным требованием.</li>
-            </ul>
-          </div>
-          <div class="audience dev">
-            <h3 class="accent">Для разработки</h3>
-            <ul>
-              <li>поиск начинается с вопроса, а не с ручного обхода репозиториев;</li>
-              <li>каждый важный вывод можно проверить по evidence;</li>
-              <li>кросс-сервисный план учитывает API, Kafka, данные, тесты и rollout;</li>
-              <li>новой команде проще встроиться в существующие контракты.</li>
-            </ul>
-          </div>
+        <div class="jira-rule" aria-label="Правила тестового режима Jira">
+          <div><strong>1 проект</strong><span>один выбранный пользователем Jira-проект</span></div>
+          <div><strong>1 сервис = 1 Task</strong><span>только для подтверждённых сервисов</span></div>
+          <div><strong>0 скрытых записей</strong><span>без подтверждения публикации нет</span></div>
         </div>
       </div>
       <template class="speaker-notes">
-        <p>Для бизнеса не обещать абстрактную «магическую скорость». Говорить о раннем обнаружении влияния, прозрачности границ команд и снижении риска пропущенных зависимостей.</p>
-        <p>Для разработчиков главный выигрыш — проверяемость. Ответ не заканчивается текстом модели: есть revision графа, confidence связи и source path для ключевых утверждений.</p>
+        <p>Заменить заглушку реальным скриншотом GigaCode: вопрос о Jira-пространстве, выбранный проект и итоговую таблицу service → Jira key → URL.</p>
+        <p>Важно честно назвать границу текущего тестового режима: все задачи создаются в одном выбранном проекте, одна Task на подтверждённый сервис, с назначением на текущего Jira-пользователя. Автоматической маршрутизации по нескольким командным проектам, эпиков и связей этот сценарий пока не обещает.</p>
       </template>
-      <span class="slide-number">10 / 11</span>
+      <span class="slide-number">10 / 12</span>
     </section>
 
     <section class="slide" data-title="Доверие и ограничения">
       <div class="slide-inner">
-        <p class="eyebrow">Почему результату можно доверять</p>
+        <p class="eyebrow">Как контролируем галлюцинации</p>
         <h2>Система показывает границу<br>между <span class="green">фактом</span> и <span class="orange">гипотезой</span></h2>
         <div class="guardrails">
           <div class="guardrail">
@@ -1224,23 +1459,54 @@
           </div>
           <div class="guardrail">
             <strong>Ограничения видимы</strong>
-            <p>Индекс требует обновления. Статический граф не является runtime trace. Низкая уверенность не превращается в подтверждённый факт.</p>
+            <p>Индекс требует обновления. Статический граф не является runtime trace. Низкая уверенность не превращается в факт.</p>
           </div>
         </div>
-        <p class="big-claim">Не «AI знает систему», а <span class="accent">AI умеет предъявить основания</span> и список того, что ещё нужно проверить.</p>
+        <p class="big-claim">Не «AI знает систему», а <span class="accent">AI предъявляет основания</span> и показывает, что ещё нужно проверить.</p>
       </div>
       <template class="speaker-notes">
-        <p>Этот слайд снимает главный вопрос доверия. Модель может ошибаться, поэтому workflow специально разделяет генерацию и независимый аудит.</p>
-        <p>Не скрывать ограничения: свежесть индекса, качество исходной документации и статический характер графа. Это не недостаток презентации, а контракт безопасного использования.</p>
+        <p>Модель может ошибаться, поэтому генерация и проверка разделены. Важные утверждения должны вести к документу, коду или evidence графа.</p>
+        <p>Не скрывать ограничения: свежесть индекса, качество исходной документации и статический характер графа. Это контракт безопасного использования, а не обещание абсолютной истины.</p>
       </template>
-      <span class="slide-number">11 / 11</span>
+      <span class="slide-number">11 / 12</span>
+    </section>
+
+    <section class="slide" data-title="Выводы">
+      <div class="slide-inner">
+        <p class="eyebrow">Выводы</p>
+        <h2>Общий контекст делает SDD<br><span class="green">рабочим на масштабе</span></h2>
+        <div class="audiences">
+          <div class="audience">
+            <h3 class="green">Для бизнеса</h3>
+            <ul>
+              <li>затронутые команды и сервисы видны до оценки;</li>
+              <li>риски и неизвестные появляются до обещаний;</li>
+              <li>план и задачи связаны с исходным требованием.</li>
+            </ul>
+          </div>
+          <div class="audience dev">
+            <h3 class="accent">Для разработки</h3>
+            <ul>
+              <li>поиск начинается с вопроса, а не обхода репозиториев;</li>
+              <li>ключевые выводы можно проверить по evidence;</li>
+              <li>план учитывает контракты, данные, тесты и rollout.</li>
+            </ul>
+          </div>
+        </div>
+        <p class="routing-claim"><b>Главный результат:</b> единый RAG не заменяет владельцев знаний — он связывает их источники в повторяемый и проверяемый процесс разработки.</p>
+      </div>
+      <template class="speaker-notes">
+        <p>Финальный тезис: это не просто более удобный поиск. Общий контекст связывает спецификацию, текущее состояние системы, план изменений и постановку задач.</p>
+        <p>После вывода вернуться к реальным скриншотам или перейти в live demo: вызвать feature skill, показать сервисный план, прогнать аудит и подтвердить создание задач в выбранном Jira-проекте.</p>
+      </template>
+      <span class="slide-number">12 / 12</span>
     </section>
   </main>
 
   <div class="kbd-hint" aria-hidden="true">← → / Space · F — полный экран · N — заметки</div>
   <nav class="controls" aria-label="Навигация по презентации">
     <button type="button" id="previous" aria-label="Предыдущий слайд">←</button>
-    <span class="progress" id="progress" aria-live="polite">1 / 11</span>
+    <span class="progress" id="progress" aria-live="polite">1 / 12</span>
     <button type="button" id="next" aria-label="Следующий слайд">→</button>
     <button type="button" id="toggle-notes" aria-label="Заметки докладчика" aria-pressed="false">N</button>
   </nav>
@@ -1288,7 +1554,7 @@
         if (!visible) return;
         activeIndex = slides.indexOf(visible.target);
         progress.textContent = `${activeIndex + 1} / ${slides.length}`;
-        document.title = `${visible.target.dataset.title} — SDD для 300+ сервисов`;
+        document.title = `${visible.target.dataset.title} — единый RAG системы`;
         if (!notesPanel.hidden) renderNotes();
       }, { threshold: [0.45, 0.7] });
 
