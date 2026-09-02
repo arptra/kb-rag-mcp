@@ -35,7 +35,7 @@ For Jira, never assume tool names or argument fields. Discover the actual client
 
 Do not publish if the client Jira MCP is absent, the authenticated principal cannot be resolved, the selected space cannot be verified as writable, or the create schema cannot set an assignee during creation. Return the complete Jira drafts and the exact missing capability instead.
 
-If `kb_tiny_ssot` is missing, continue with the remaining evidence so the user still gets a plan, but put the missing tool/index first in the limitations section.
+If `kb_tiny_ssot` is missing, continue with the remaining evidence so the user still gets a plan, but set the plan status to `BLOCKED`, record the gap first in Sections 9 and 11 of the output contract, and make restoration the first next action. Do not publish Jira tasks while the mandatory compact SSOT view is unavailable.
 
 ## Workflow
 
@@ -108,26 +108,24 @@ Do not invent Jira components, labels, teams, sprints, estimates, priorities, du
 - Never state that a proposed field, endpoint, event, table, or class already exists unless retrieval evidence confirms it.
 - When tools disagree, show the conflict and choose a conservative plan with a verification step.
 
-## Output
+## Output contract
 
-In the planning response, answer in the user's language with:
+Before composing every planning response, read and follow
+[PLAN_OUTPUT_V1](references/plan-output-contract.md) completely. It is mandatory for both the
+initial plan and the post-publication response.
 
-1. implementation summary and root/affected service path;
-2. current-state evidence and graph revision;
-3. end-to-end target flow;
-4. repository-by-repository, service-by-service change plan;
-5. contract and data migration table;
-6. ordered implementation and rollout sequence;
-7. test plan and acceptance traceability;
-8. risks, conflicts, unknowns, and explicit verification tasks;
-9. source/index/tool coverage showing which MCP tools and citations informed the plan;
-10. a Jira draft table with one row per confirmed service, proposed summary, assignee resolved from the MCP token, and creation status;
-11. the single target-space question when a destination was not already supplied;
-12. a handoff recommending `$verify-cross-service-feature` for an independent audit before implementation begins.
+Return exactly one `PLAN_OUTPUT_V1` Markdown document in the user's language. Preserve all 12
+numbered section IDs, their order, the header field order, table columns, identifier prefixes, and
+enum values. Do not add a preamble, skip empty sections, rename sections, or replace required tables
+with prose. Use the contract's explicit empty-value markers instead of guessing or silently omitting
+information.
 
-After Jira publication, append:
+The business summary must remain a concise projection of the detailed plan, never a separate source
+of facts. The service map is the canonical affected-service set. Every confirmed service must have
+one engineering subsection and one Jira row; candidates and excluded services must have neither.
+Every material change must trace to evidence or an explicit requirement and to at least one
+acceptance criterion.
 
-- selected Jira space/project and authenticated assignee;
-- service/repository → Jira key and URL;
-- which tasks were created, reused by marker, or failed;
-- verification results for destination, issue type, assignee, and marker.
+Jira publication updates Section 10 in place. Never append a differently shaped publication result,
+and never invent issue keys, URLs, assignees, or projects. Before returning, run the structural check
+defined by `PLAN_OUTPUT_V1`; if an invariant fails, repair the document before presenting it.
