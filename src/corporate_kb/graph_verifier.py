@@ -196,7 +196,9 @@ class GraphGigaCodeVerifier:
             if verify_all or not item.resolved or item.confidence in {"LOW", "UNRESOLVED"}
         ]
         summary: dict[str, Any] = {
+            "eligible": len(candidates),
             "requested": len(candidates),
+            "deferred": 0,
             "processed": 0,
             "failed": 0,
             "confirmed": 0,
@@ -239,6 +241,30 @@ class GraphGigaCodeVerifier:
                 continue
             key = str(repository.path.resolve())
             grouped.setdefault(key, (repository, []))[1].append(candidate)
+
+        candidate_limit = self._graph_settings.gigacode_max_candidates_per_repository
+        requested = 0
+        for repository, repository_candidates in grouped.values():
+            if len(repository_candidates) > candidate_limit:
+                repository_candidates.sort(
+                    key=lambda item: (
+                        {"UNRESOLVED": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(
+                            item.confidence,
+                            4,
+                        ),
+                        item.resolved,
+                        item.id,
+                    )
+                )
+                deferred = len(repository_candidates) - candidate_limit
+                del repository_candidates[candidate_limit:]
+                summary["deferred"] += deferred
+                summary["warnings"].append(
+                    f"Deferred {deferred} lower-priority GigaCode candidates for "
+                    f"{repository.name}; per-repository limit={candidate_limit}"
+                )
+            requested += len(repository_candidates)
+        summary["requested"] = requested
 
         graph = result.graph.model_copy(deep=True)
         raw_runs: list[dict[str, Any]] = []
@@ -715,9 +741,12 @@ class GraphGigaCodeVerifier:
             + "\n\nDISCOVERY MODE:\n"
             + (
                 "Inspect this repository for outbound HTTP or Kafka calls missed by the supplied "
-                "candidates. Add discovered_edges only when the source call has file:line "
-                "evidence and it matches one exact target_entrypoint_id from SERVICE CATALOG by "
-                "protocol and operation. Do not report an existing candidate again."
+                "candidates. Start from Spring @Service/@Component orchestrators, including local "
+                "composed stereotype annotations, and follow injected clients, gateways, adapters "
+                "and project-specific HTTP/Kafka wrappers. Add discovered_edges only when the "
+                "source call has file:line evidence and it matches one exact "
+                "target_entrypoint_id from SERVICE CATALOG by protocol and operation. Do not "
+                "report an existing candidate again."
                 if discover_missing
                 else "Do not discover new edges in this batch; return discovered_edges as []."
             )

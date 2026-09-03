@@ -64,6 +64,60 @@ _HTTP_ANNOTATIONS = {
 }
 _READ_PREFIXES = ("find", "get", "read", "load", "exists", "count", "query", "search")
 _WRITE_PREFIXES = ("save", "delete", "remove", "update", "insert", "persist", "flush")
+_TRACE_STEREOTYPES = {
+    "Component",
+    "Configuration",
+    "Controller",
+    "RestController",
+    "Service",
+}
+_CLIENT_TYPE_SUFFIXES = (
+    "Adapter",
+    "Api",
+    "Client",
+    "Connector",
+    "Gateway",
+    "Grpc",
+    "Invoker",
+    "Port",
+    "Producer",
+    "Proxy",
+    "Publisher",
+    "Remote",
+    "Sender",
+    "Service",
+    "Stub",
+)
+_FRAMEWORK_CALL_TYPES = {
+    "ApplicationEventPublisher",
+    "Clock",
+    "EntityManager",
+    "JdbcTemplate",
+    "KafkaTemplate",
+    "Logger",
+    "MeterRegistry",
+    "ObjectMapper",
+    "RestTemplate",
+    "StreamBridge",
+    "TransactionTemplate",
+    "WebClient",
+}
+_DIRECT_CALL_KEYWORDS = {
+    "catch",
+    "do",
+    "else",
+    "for",
+    "if",
+    "new",
+    "return",
+    "super",
+    "switch",
+    "synchronized",
+    "throw",
+    "try",
+    "when",
+    "while",
+}
 
 
 def _stable_id(prefix: str, *parts: object) -> str:
@@ -86,7 +140,7 @@ def _strip_quotes(value: str) -> str:
 
 
 def _simple_type(value: str) -> str:
-    cleaned = re.sub(r"<.*>", "", value).replace("[]", "").strip()
+    cleaned = re.sub(r"<.*>", "", value).replace("[]", "").strip().removesuffix("?")
     return cleaned.rsplit(".", 1)[-1]
 
 
@@ -107,6 +161,18 @@ def _annotation_arguments(annotations: str, name: str) -> str | None:
 
 def _annotation_present(annotations: str, name: str) -> bool:
     return bool(re.search(rf"@(?:[\w.]+\.)?{re.escape(name)}\b", annotations))
+
+
+def _annotation_names(annotations: str) -> set[str]:
+    return {
+        match.rsplit(".", 1)[-1]
+        for match in re.findall(r"@([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)", annotations)
+    }
+
+
+def _camel_to_kebab(value: str) -> str:
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", value)
+    return re.sub(r"[^a-zA-Z0-9]+", "-", separated).strip("-").lower()
 
 
 def _join_paths(base: str, child: str) -> str:
@@ -204,6 +270,7 @@ class ServiceScan:
     repository_tables: dict[str, str] = field(default_factory=dict)
     feign_targets: dict[str, str] = field(default_factory=dict)
     operation_methods: dict[str, JavaMethod] = field(default_factory=dict)
+    trace_seed_classes: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -602,14 +669,8 @@ def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
             *(str(value) for value in node.metadata.get("aliases", [])),
         }
         for alias in aliases:
-            normalized = RepositoryScanner._normalize_target(alias)
-            if normalized:
+            for normalized in RepositoryScanner._target_keys(alias):
                 alias_candidates.setdefault(normalized, set()).add(node.service_id)
-    alias_map = {
-        alias: next(iter(service_ids))
-        for alias, service_ids in alias_candidates.items()
-        if len(service_ids) == 1
-    }
     inbound_http: list[tuple[GraphNode, tuple[str, str, str]]] = []
     for node in nodes.values():
         if node.type != "EntryPoint" or not node.service_id:
@@ -626,6 +687,7 @@ def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
         if protocol == "KAFKA":
             continue
         target_hint = str(exitpoint.metadata.get("target_hint") or "")
+        target_keys = RepositoryScanner._target_keys(target_hint)
         normalized = RepositoryScanner._normalize_target(target_hint)
         operation = str(exitpoint.metadata.get("operation") or exitpoint.label)
         outbound_contract = normalize_contract(protocol, operation)
@@ -640,7 +702,12 @@ def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
         contract_targets = {
             node.service_id for node in matched_entrypoints if node.service_id is not None
         }
-        alias_target = alias_map.get(normalized)
+        alias_matches = {
+            service_id
+            for key in target_keys
+            for service_id in alias_candidates.get(key, set())
+        }
+        alias_target = next(iter(alias_matches)) if len(alias_matches) == 1 else None
         allow_contract_only = (
             not target_hint or target_hint.startswith("${") or "://" not in target_hint
         )
@@ -664,7 +731,7 @@ def merge_and_relink_snapshots(snapshots: list[GraphSnapshot]) -> GraphSnapshot:
         else:
             label = target_hint or "unresolved target"
             target_id = f"external:{normalized or _stable_id('unknown', label)}"
-            ambiguous = sorted({*alias_candidates.get(normalized, set()), *contract_targets})
+            ambiguous = sorted({*alias_matches, *contract_targets})
             confidence = (
                 "UNRESOLVED" if "${" in label or not target_hint or len(ambiguous) > 1 else "LOW"
             )
@@ -1133,6 +1200,36 @@ class RepositoryScanner:
             resolved = replacement.strip()
         return resolved
 
+    @staticmethod
+    def _annotation_definitions(scan: ServiceScan) -> dict[str, str]:
+        return {
+            java_class.name: java_class.annotations
+            for java_class in scan.classes.values()
+            if java_class.kind == "annotation type"
+            or re.search(r"\bannotation\s+class\b", java_class.extends)
+        }
+
+    @staticmethod
+    def _expanded_annotations(
+        annotations: str,
+        definitions: dict[str, str],
+    ) -> str:
+        """Expand local composed annotations without loading or executing application code."""
+        parts = [annotations] if annotations.strip() else []
+        pending = list(_annotation_names(annotations))
+        visited: set[str] = set()
+        while pending:
+            annotation = pending.pop()
+            if annotation in visited:
+                continue
+            visited.add(annotation)
+            meta = definitions.get(annotation, "")
+            if not meta:
+                continue
+            parts.append(meta)
+            pending.extend(_annotation_names(meta) - visited)
+        return "\n".join(parts)
+
     def _index_java_architecture(
         self,
         scan: ServiceScan,
@@ -1140,6 +1237,7 @@ class RepositoryScanner:
         progress: Callable[[str], None] | None = None,
     ) -> None:
         classes = list(scan.classes.values())
+        annotation_definitions = self._annotation_definitions(scan)
         started_at = time.monotonic()
         last_report_at = started_at
         for position, java_class in enumerate(classes, start=1):
@@ -1153,7 +1251,10 @@ class RepositoryScanner:
                     f"elapsed={now - started_at:.1f}s"
                 )
                 last_report_at = now
-            class_annotations = java_class.annotations
+            class_annotations = self._expanded_annotations(
+                java_class.annotations,
+                annotation_definitions,
+            )
             class_base = ""
             request_args = _annotation_arguments(class_annotations, "RequestMapping")
             http_exchange_args = _annotation_arguments(class_annotations, "HttpExchange")
@@ -1168,6 +1269,15 @@ class RepositoryScanner:
                 http_exchange_args is not None and java_class.kind == "interface"
             )
             is_repository = java_class.name in scan.repository_tables
+            is_annotation_declaration = java_class.kind == "annotation type" or bool(
+                re.search(r"\bannotation\s+class\b", java_class.extends)
+            )
+            is_trace_seed = not is_annotation_declaration and any(
+                _annotation_present(class_annotations, annotation)
+                for annotation in _TRACE_STEREOTYPES
+            )
+            if is_trace_seed:
+                scan.trace_seed_classes.add(java_class.name)
             relevant_class = (
                 any(
                     _annotation_present(class_annotations, annotation)
@@ -1176,6 +1286,7 @@ class RepositoryScanner:
                         "Controller",
                         "Service",
                         "Component",
+                        "Configuration",
                         "Entity",
                         "FeignClient",
                         "HttpExchange",
@@ -1184,11 +1295,20 @@ class RepositoryScanner:
                 or is_repository
             )
             for method in java_class.methods:
-                mappings = self._http_mappings(method.annotations, class_base)
-                kafka_args = _annotation_arguments(method.annotations, "KafkaListener")
-                scheduled = _annotation_present(method.annotations, "Scheduled")
+                method_annotations = self._expanded_annotations(
+                    method.annotations,
+                    annotation_definitions,
+                )
+                mappings = self._http_mappings(method_annotations, class_base)
+                kafka_args = _annotation_arguments(method_annotations, "KafkaListener")
+                send_to_args = _annotation_arguments(method_annotations, "SendTo")
+                scheduled = _annotation_present(method_annotations, "Scheduled")
                 method_relevant = (
-                    relevant_class or bool(mappings) or kafka_args is not None or scheduled
+                    relevant_class
+                    or bool(mappings)
+                    or kafka_args is not None
+                    or send_to_args is not None
+                    or scheduled
                 )
                 symbol_id = f"symbol:{scan.service_id}:{method.symbol}"
                 if method_relevant:
@@ -1275,7 +1395,6 @@ class RepositoryScanner:
                                 evidence_id=evidence_id,
                             )
                         )
-                send_to_args = _annotation_arguments(method.annotations, "SendTo")
                 if send_to_args is not None:
                     send_topic = self._resolve_configuration(scan, self._topic_value(send_to_args))
                     if send_topic:
@@ -1390,6 +1509,18 @@ class RepositoryScanner:
     def _collect_literal_outbound(
         self, scan: ServiceScan, method: JavaMethod, symbol_id: str
     ) -> None:
+        def ensure_source_symbol(evidence_id: str) -> None:
+            self._builder.add_node(
+                GraphNode(
+                    id=symbol_id,
+                    type="CodeSymbol",
+                    label=method.symbol,
+                    service_id=scan.service_id,
+                    metadata={"class": method.class_name, "method": method.name},
+                    evidence_ids=[evidence_id],
+                )
+            )
+
         for match in re.finditer(
             r"(?:kafkaTemplate|KafkaTemplate|streamBridge|StreamBridge)\s*\.\s*"
             r"(?:send|sendDefault)\s*\(\s*[\"']([^\"']+)[\"']",
@@ -1404,6 +1535,7 @@ class RepositoryScanner:
                 snippet=match.group(0),
                 extractor="spring-kafka-producer",
             )
+            ensure_source_symbol(evidence_id)
             self._topics.append(
                 TopicFact(
                     service_id=scan.service_id,
@@ -1439,6 +1571,7 @@ class RepositoryScanner:
                 extractor="spring-rest-client",
                 confidence="MEDIUM",
             )
+            ensure_source_symbol(evidence_id)
             self._outbound.append(
                 OutboundFact(
                     source_service=scan.service_id,
@@ -1477,6 +1610,7 @@ class RepositoryScanner:
                 extractor="spring-rest-template",
                 confidence="MEDIUM",
             )
+            ensure_source_symbol(evidence_id)
             self._outbound.append(
                 OutboundFact(
                     source_service=scan.service_id,
@@ -1504,6 +1638,7 @@ class RepositoryScanner:
                 extractor="spring-rest-template",
                 confidence="MEDIUM",
             )
+            ensure_source_symbol(evidence_id)
             self._outbound.append(
                 OutboundFact(
                     source_service=scan.service_id,
@@ -1523,15 +1658,229 @@ class RepositoryScanner:
         progress: Callable[[str], None] | None = None,
     ) -> None:
         started_at = time.monotonic()
-        if progress is not None:
-            progress(
-                f"Call tracing start: {scan.service_id}; "
-                f"operations={len(scan.operation_methods)}; depth={self.settings.call_depth}"
-            )
         method_lookup: dict[tuple[str, str], JavaMethod] = {}
         for java_class in scan.classes.values():
             for method in java_class.methods:
                 method_lookup.setdefault((java_class.name, method.name), method)
+        implementation_index = self._implementation_index(scan)
+        operation_roots = {method.symbol: method for method in scan.operation_methods.values()}
+        service_roots = {
+            method.symbol: method
+            for class_name in scan.trace_seed_classes
+            for method in scan.classes[class_name].methods
+        }
+        seed_methods = list(operation_roots.values())
+        seed_methods.extend(
+            method
+            for symbol, method in sorted(service_roots.items())
+            if symbol not in operation_roots
+        )
+        seed_truncated = len(seed_methods) > self.settings.max_service_seed_methods
+        seed_methods = seed_methods[: self.settings.max_service_seed_methods]
+        if progress is not None:
+            progress(
+                f"Call tracing start: {scan.service_id}; operations={len(scan.operation_methods)}; "
+                f"stereotype_classes={len(scan.trace_seed_classes)}; seeds={len(seed_methods)}; "
+                f"depth={self.settings.call_depth}"
+            )
+
+        # Build the technical call graph once. Business-operation projection below only walks
+        # this compact adjacency list instead of reparsing the same method body for every API.
+        call_graph: dict[
+            str,
+            list[tuple[JavaMethod | None, str, str, str, str]],
+        ] = {}
+        queue = deque((method, 0) for method in seed_methods)
+        visited: set[str] = set()
+        call_keys: set[tuple[str, str, int]] = set()
+        weak_keys: set[tuple[str, str, str, int]] = set()
+        call_edges = 0
+        weak_outbound = 0
+        trace_truncated = seed_truncated
+        calls_truncated = False
+        weak_truncated = False
+        last_report_at = started_at
+
+        def add_call(
+            source_method: JavaMethod,
+            target_type: str,
+            called_name: str,
+            target_method: JavaMethod | None,
+            call_start: int,
+            snippet: str,
+            *,
+            weak_candidate: bool,
+        ) -> None:
+            nonlocal call_edges, calls_truncated, weak_outbound, weak_truncated
+            source_symbol_id = f"symbol:{scan.service_id}:{source_method.symbol}"
+            target_label = (
+                target_method.symbol
+                if target_method is not None
+                else f"{target_type}#{called_name}"
+            )
+            target_class_name = (
+                target_method.class_name if target_method is not None else target_type
+            )
+            target_symbol_id = f"symbol:{scan.service_id}:{target_label}"
+            line = source_method.line + _line_number(source_method.body, call_start) - 1
+            call_key = (source_method.symbol, target_label, line)
+            if call_key in call_keys:
+                return
+            call_keys.add(call_key)
+            if call_edges >= self.settings.max_call_edges_per_service:
+                calls_truncated = True
+                return
+            evidence_id = self._builder.add_evidence(
+                scan=scan,
+                file=source_method.file,
+                line=line,
+                snippet=snippet,
+                extractor="source-call",
+                confidence="MEDIUM",
+            )
+            self._builder.add_node(
+                GraphNode(
+                    id=source_symbol_id,
+                    type="CodeSymbol",
+                    label=source_method.symbol,
+                    service_id=scan.service_id,
+                    metadata={"class": source_method.class_name, "method": source_method.name},
+                )
+            )
+            self._builder.add_node(
+                GraphNode(
+                    id=target_symbol_id,
+                    type="CodeSymbol",
+                    label=target_label,
+                    service_id=scan.service_id,
+                    metadata={"class": target_class_name, "method": called_name},
+                    evidence_ids=[evidence_id],
+                )
+            )
+            self._builder.add_edge(
+                source=source_symbol_id,
+                target=target_symbol_id,
+                edge_type="CALLS",
+                confidence="MEDIUM",
+                evidence_ids=[evidence_id],
+            )
+            call_graph.setdefault(source_method.symbol, []).append(
+                (target_method, target_type, called_name, target_symbol_id, evidence_id)
+            )
+            call_edges += 1
+
+            if not weak_candidate:
+                return
+            target_hint = self._weak_target_hint(target_type)
+            weak_key = (source_method.symbol, target_hint, called_name, line)
+            if not target_hint or weak_key in weak_keys:
+                return
+            weak_keys.add(weak_key)
+            if weak_outbound >= self.settings.max_weak_outbound_per_service:
+                weak_truncated = True
+                return
+            weak_evidence_id = self._builder.add_evidence(
+                scan=scan,
+                file=source_method.file,
+                line=line,
+                snippet=snippet,
+                extractor="injected-client-call",
+                confidence="LOW",
+            )
+            self._outbound.append(
+                OutboundFact(
+                    source_service=scan.service_id,
+                    target_hint=target_hint,
+                    protocol="UNKNOWN",
+                    operation=f"CALL {target_type}#{called_name}",
+                    symbol_id=source_symbol_id,
+                    evidence_id=weak_evidence_id,
+                    confidence="LOW",
+                )
+            )
+            weak_outbound += 1
+
+        while queue:
+            method, depth = queue.popleft()
+            if method.symbol in visited or depth > self.settings.call_depth:
+                continue
+            if len(visited) >= self.settings.max_traced_methods_per_service:
+                trace_truncated = True
+                break
+            visited.add(method.symbol)
+            now = time.monotonic()
+            if progress is not None and (len(visited) % 250 == 0 or now - last_report_at >= 2):
+                progress(
+                    f"Call tracing running: {scan.service_id}; visited={len(visited)}; "
+                    f"calls={call_edges}; weak={weak_outbound}; queued={len(queue)}; "
+                    f"elapsed={now - started_at:.1f}s"
+                )
+                last_report_at = now
+            current_class = scan.classes.get(method.class_name)
+            if current_class is None:
+                continue
+            for call in re.finditer(
+                r"\b([a-zA-Z_]\w*)\s*\.\s*([a-zA-Z_]\w*)\s*\(",
+                method.body,
+            ):
+                variable, called_name = call.group(1), call.group(2)
+                field_info = current_class.fields.get(variable)
+                if field_info is None:
+                    continue
+                target_type = _simple_type(field_info.type_name)
+                declared_method = method_lookup.get((target_type, called_name))
+                target_method = self._concrete_method(
+                    target_type,
+                    called_name,
+                    declared_method,
+                    method_lookup,
+                    implementation_index,
+                    scan,
+                )
+                target_class = scan.classes.get(target_type)
+                has_concrete_local_target = target_method is not None and (
+                    bool(target_method.body.strip())
+                    or (target_class is not None and target_class.kind != "interface")
+                    or target_method.class_name != target_type
+                )
+                weak_candidate = (
+                    target_type not in scan.feign_targets
+                    and target_type not in scan.repository_tables
+                    and target_type not in _FRAMEWORK_CALL_TYPES
+                    and not has_concrete_local_target
+                    and self._looks_like_outbound_type(target_type)
+                )
+                add_call(
+                    method,
+                    target_type,
+                    called_name,
+                    target_method,
+                    call.start(),
+                    call.group(0),
+                    weak_candidate=weak_candidate,
+                )
+                if target_method is not None:
+                    queue.append((target_method, depth + 1))
+
+            # Direct calls such as validateOrder() are common inside orchestrators and services.
+            for call in re.finditer(r"(?<![.\w])([A-Za-z_]\w*)\s*\(", method.body):
+                called_name = call.group(1)
+                if called_name in _DIRECT_CALL_KEYWORDS:
+                    continue
+                target_method = method_lookup.get((current_class.name, called_name))
+                if target_method is None:
+                    continue
+                add_call(
+                    method,
+                    current_class.name,
+                    called_name,
+                    target_method,
+                    call.start(),
+                    call.group(0),
+                    weak_candidate=False,
+                )
+                queue.append((target_method, depth + 1))
+
         topic_by_symbol: dict[str, list[TopicFact]] = {}
         for fact in self._topics:
             if fact.service_id == scan.service_id and fact.symbol_id:
@@ -1541,103 +1890,36 @@ class RepositoryScanner:
             if outbound_fact.source_service == scan.service_id and outbound_fact.symbol_id:
                 outbound_by_symbol.setdefault(outbound_fact.symbol_id, []).append(outbound_fact)
 
-        operation_count = len(scan.operation_methods)
-        for operation_position, (operation_id, root_method) in enumerate(
-            scan.operation_methods.items(), start=1
-        ):
-            operation_started_at = time.monotonic()
-            last_report_at = operation_started_at
-            if progress is not None:
-                progress(
-                    f"Call tracing operation [{operation_position}/{operation_count}] start: "
-                    f"{scan.service_id}; root={root_method.symbol}"
-                )
-            queue = deque([(root_method, 0)])
-            visited: set[str] = set()
-            while queue:
-                method, depth = queue.popleft()
-                if method.symbol in visited or depth > self.settings.call_depth:
+        for operation_id, root_method in scan.operation_methods.items():
+            operation_queue = deque([(root_method, 0)])
+            operation_visited: set[str] = set()
+            while operation_queue:
+                method, depth = operation_queue.popleft()
+                if method.symbol in operation_visited or depth > self.settings.call_depth:
                     continue
-                visited.add(method.symbol)
-                now = time.monotonic()
-                if progress is not None and (len(visited) % 100 == 0 or now - last_report_at >= 2):
-                    progress(
-                        f"Call tracing operation running: {scan.service_id}; "
-                        f"root={root_method.symbol}; visited={len(visited)}; "
-                        f"queued={len(queue)}; elapsed={now - operation_started_at:.1f}s"
-                    )
-                    last_report_at = now
+                operation_visited.add(method.symbol)
                 symbol_id = f"symbol:{scan.service_id}:{method.symbol}"
-                self._builder.add_node(
-                    GraphNode(
-                        id=symbol_id,
-                        type="CodeSymbol",
-                        label=method.symbol,
-                        service_id=scan.service_id,
-                        metadata={"class": method.class_name, "method": method.name},
-                    )
-                )
                 self._extract_rules(scan, operation_id, method)
-                current_class = scan.classes.get(method.class_name)
-                if current_class is None:
-                    continue
-                call_pattern = r"\b([a-zA-Z_]\w*)\s*\.\s*([a-zA-Z_]\w*)\s*\("
-                for call in re.finditer(call_pattern, method.body):
-                    variable, called_name = call.group(1), call.group(2)
-                    field_info = current_class.fields.get(variable)
-                    if field_info is None:
-                        continue
-                    target_type = _simple_type(field_info.type_name)
-                    target_symbol_id = f"symbol:{scan.service_id}:{target_type}#{called_name}"
-                    target_method = method_lookup.get((target_type, called_name))
-                    evidence_id = self._builder.add_evidence(
-                        scan=scan,
-                        file=method.file,
-                        line=method.line + _line_number(method.body, call.start()) - 1,
-                        snippet=call.group(0),
-                        extractor="java-call",
-                        confidence="MEDIUM",
-                    )
-                    self._builder.add_node(
-                        GraphNode(
-                            id=target_symbol_id,
-                            type="CodeSymbol",
-                            label=f"{target_type}#{called_name}",
-                            service_id=scan.service_id,
-                            metadata={"class": target_type, "method": called_name},
+                for (
+                    target_method,
+                    target_type,
+                    called_name,
+                    _target_id,
+                    evidence_id,
+                ) in call_graph.get(method.symbol, []):
+                    table = scan.repository_tables.get(target_type)
+                    access = self._repository_access(called_name) if table else None
+                    if table and access:
+                        self._builder.add_edge(
+                            source=operation_id,
+                            target=f"table:{scan.service_id}:{table}",
+                            edge_type=access,
+                            label=called_name,
+                            confidence="MEDIUM",
                             evidence_ids=[evidence_id],
                         )
-                    )
-                    self._builder.add_edge(
-                        source=symbol_id,
-                        target=target_symbol_id,
-                        edge_type="CALLS",
-                        confidence="MEDIUM",
-                        evidence_ids=[evidence_id],
-                    )
-                    table = scan.repository_tables.get(target_type)
-                    if table:
-                        access = self._repository_access(called_name)
-                        if access:
-                            self._builder.add_edge(
-                                source=operation_id,
-                                target=f"table:{scan.service_id}:{table}",
-                                edge_type=access,
-                                label=called_name,
-                                confidence="MEDIUM",
-                                evidence_ids=[evidence_id],
-                            )
                     if target_method is not None:
-                        queue.append((target_method, depth + 1))
-                    if target_type in scan.feign_targets:
-                        for outbound in outbound_by_symbol.get(target_symbol_id, []):
-                            self._builder.add_edge(
-                                source=operation_id,
-                                target=target_symbol_id,
-                                edge_type="CALLS",
-                                label=outbound.operation,
-                                evidence_ids=[evidence_id, outbound.evidence_id],
-                            )
+                        operation_queue.append((target_method, depth + 1))
                 for outbound in outbound_by_symbol.get(symbol_id, []):
                     self._builder.add_edge(
                         source=operation_id,
@@ -1664,17 +1946,115 @@ class RepositoryScanner:
                             label=topic.topic,
                             evidence_ids=[topic.evidence_id],
                         )
-            if progress is not None:
-                progress(
-                    f"Call tracing operation [{operation_position}/{operation_count}] ready: "
-                    f"{scan.service_id}; visited={len(visited)}; "
-                    f"elapsed={time.monotonic() - operation_started_at:.3f}s"
+
+        coverage = {
+            "source_class_count": len(scan.classes),
+            "source_method_count": len(method_lookup),
+            "operation_count": len(scan.operation_methods),
+            "stereotype_class_count": len(scan.trace_seed_classes),
+            "seed_method_count": len(seed_methods),
+            "traced_method_count": len(visited),
+            "call_edge_count": call_edges,
+            "weak_outbound_count": weak_outbound,
+            "truncated": trace_truncated or calls_truncated or weak_truncated,
+            "limits": {
+                "seed_methods": self.settings.max_service_seed_methods,
+                "traced_methods": self.settings.max_traced_methods_per_service,
+                "call_edges": self.settings.max_call_edges_per_service,
+                "weak_outbound": self.settings.max_weak_outbound_per_service,
+            },
+        }
+        current_service = self._builder.nodes[f"service:{scan.service_id}"]
+        self._builder.add_node(
+            current_service.model_copy(
+                update={"metadata": {**current_service.metadata, "analysis_coverage": coverage}}
+            )
+        )
+        if coverage["truncated"]:
+            self._builder.issues.append(
+                ScanIssue(
+                    repository=scan.repository_name,
+                    message=(
+                        f"Call graph budget reached for {scan.service_id}; "
+                        f"coverage={json.dumps(coverage, sort_keys=True)}"
+                    ),
                 )
+            )
         if progress is not None:
             progress(
                 f"Call tracing ready: {scan.service_id}; "
+                f"visited={len(visited)}; calls={call_edges}; weak={weak_outbound}; "
+                f"truncated={coverage['truncated']}; "
                 f"elapsed={time.monotonic() - started_at:.3f}s"
             )
+
+    @staticmethod
+    def _implemented_types(java_class: JavaClass) -> set[str]:
+        header = java_class.extends
+        declarations: list[str] = []
+        java_match = re.search(r"\bimplements\s+(.+)$", header, re.S)
+        if java_match is not None:
+            declarations.append(java_match.group(1))
+        if java_class.kind == "interface":
+            extends_match = re.search(r"\bextends\s+(.+)$", header, re.S)
+            if extends_match is not None:
+                declarations.append(extends_match.group(1))
+        kotlin_match = re.search(r"\)\s*:\s*(.+)$", header, re.S)
+        if kotlin_match is not None:
+            declarations.append(kotlin_match.group(1))
+        result: set[str] = set()
+        for declaration in declarations:
+            for item in declaration.split(","):
+                match = re.match(r"\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)", item)
+                if match is not None:
+                    result.add(_simple_type(match.group(1)))
+        return result
+
+    @classmethod
+    def _implementation_index(cls, scan: ServiceScan) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for java_class in scan.classes.values():
+            for implemented in cls._implemented_types(java_class):
+                result.setdefault(implemented, []).append(java_class.name)
+        return result
+
+    @staticmethod
+    def _concrete_method(
+        target_type: str,
+        called_name: str,
+        declared_method: JavaMethod | None,
+        method_lookup: dict[tuple[str, str], JavaMethod],
+        implementation_index: dict[str, list[str]],
+        scan: ServiceScan,
+    ) -> JavaMethod | None:
+        declared_class = scan.classes.get(target_type)
+        if declared_method is not None and (
+            declared_class is None
+            or declared_class.kind != "interface"
+            or declared_method.body.strip()
+        ):
+            return declared_method
+        implementations = [
+            method_lookup[(implementation, called_name)]
+            for implementation in implementation_index.get(target_type, [])
+            if (implementation, called_name) in method_lookup
+        ]
+        if len(implementations) == 1:
+            return implementations[0]
+        return declared_method
+
+    @staticmethod
+    def _looks_like_outbound_type(type_name: str) -> bool:
+        return any(type_name.endswith(suffix) for suffix in _CLIENT_TYPE_SUFFIXES)
+
+    @staticmethod
+    def _weak_target_hint(type_name: str) -> str:
+        base = type_name
+        for suffix in _CLIENT_TYPE_SUFFIXES:
+            if base.endswith(suffix) and len(base) > len(suffix):
+                base = base[: -len(suffix)]
+                break
+        return _camel_to_kebab(base)
 
     def _extract_rules(self, scan: ServiceScan, operation_id: str, method: JavaMethod) -> None:
         for match in re.finditer(r"\bif\s*\(([^\n{}]{1,400})\)", method.body):
@@ -1920,14 +2300,8 @@ class RepositoryScanner:
         alias_candidates: dict[str, set[str]] = {}
         for service_id, scan in self._scans.items():
             for alias in scan.aliases:
-                normalized_alias = self._normalize_target(alias)
-                if normalized_alias:
+                for normalized_alias in self._target_keys(alias):
                     alias_candidates.setdefault(normalized_alias, set()).add(service_id)
-        alias_map = {
-            alias: next(iter(service_ids))
-            for alias, service_ids in alias_candidates.items()
-            if len(service_ids) == 1
-        }
         inbound_http: list[tuple[GraphNode, tuple[str, str, str]]] = []
         for node in self._builder.nodes.values():
             if node.type != "EntryPoint" or not node.service_id:
@@ -1937,8 +2311,14 @@ class RepositoryScanner:
             operation = str(node.metadata.get("operation") or node.label)
             inbound_http.append((node, normalize_contract("HTTP", operation).key))
         for fact in self._outbound:
+            target_keys = self._target_keys(fact.target_hint)
             normalized = self._normalize_target(fact.target_hint)
-            alias_target = alias_map.get(normalized)
+            alias_matches = {
+                service_id
+                for key in target_keys
+                for service_id in alias_candidates.get(key, set())
+            }
+            alias_target = next(iter(alias_matches)) if len(alias_matches) == 1 else None
             matched_entrypoints: list[GraphNode] = []
             if fact.protocol.upper() == "HTTP":
                 outbound_contract = normalize_contract("HTTP", fact.operation)
@@ -1981,7 +2361,7 @@ class RepositoryScanner:
                 label = fact.target_hint or "unresolved target"
                 target_id = f"external:{normalized or _stable_id('unknown', label)}"
                 ambiguous_targets = sorted(
-                    {*alias_candidates.get(normalized, set()), *contract_targets}
+                    {*alias_matches, *contract_targets}
                 )
                 confidence = (
                     "UNRESOLVED"
@@ -2031,6 +2411,15 @@ class RepositoryScanner:
                 confidence=fact.confidence,
                 evidence_ids=[fact.evidence_id],
             )
+            if fact.symbol_id:
+                self._builder.add_edge(
+                    source=fact.symbol_id,
+                    target=exitpoint_id,
+                    edge_type="EXITS_VIA",
+                    label=fact.operation,
+                    confidence=fact.confidence,
+                    evidence_ids=[fact.evidence_id],
+                )
             self._builder.add_edge(
                 source=exitpoint_id,
                 target=target_id,
@@ -2092,6 +2481,14 @@ class RepositoryScanner:
                     label=fact.topic,
                     evidence_ids=[fact.evidence_id],
                 )
+                if fact.symbol_id:
+                    self._builder.add_edge(
+                        source=fact.symbol_id,
+                        target=exitpoint_id,
+                        edge_type="EXITS_VIA",
+                        label=fact.topic,
+                        evidence_ids=[fact.evidence_id],
+                    )
                 self._builder.add_edge(
                     source=exitpoint_id,
                     target=event_id,
@@ -2342,3 +2739,16 @@ class RepositoryScanner:
         for suffix in (".default.svc.cluster.local", ".svc.cluster.local", ".svc"):
             raw = raw.removesuffix(suffix)
         return re.sub(r"[^a-z0-9_-]", "", raw)
+
+    @classmethod
+    def _target_keys(cls, value: str) -> set[str]:
+        normalized = cls._normalize_target(value)
+        if not normalized or normalized.startswith("${"):
+            return {normalized} if normalized else set()
+        keys = {normalized}
+        compact = normalized.replace("_", "-")
+        keys.add(compact)
+        for suffix in ("-service", "service"):
+            if compact.endswith(suffix) and len(compact) > len(suffix):
+                keys.add(compact[: -len(suffix)].rstrip("-"))
+        return {key for key in keys if key}

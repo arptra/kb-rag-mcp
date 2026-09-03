@@ -38,7 +38,7 @@ from service_map.models import (
 )
 
 _INTERFACE_KINDS = {"HTTP", "KAFKA", "SCHEDULED", "GRPC", "CLI"}
-_ANALYZER_VERSION = "service-map-v4-contract-matching"
+_ANALYZER_VERSION = "service-map-v5-service-call-coverage"
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,7 +245,14 @@ class ServiceMapBuilder:
     ) -> Path:
         digest = hashlib.sha256()
         digest.update(_ANALYZER_VERSION.encode())
-        digest.update(str(self._settings.call_depth).encode())
+        for setting in (
+            self._settings.call_depth,
+            self._settings.max_service_seed_methods,
+            self._settings.max_traced_methods_per_service,
+            self._settings.max_call_edges_per_service,
+            self._settings.max_weak_outbound_per_service,
+        ):
+            digest.update(f"\x00{setting}".encode())
         for value in (
             target.repository_name,
             target.service_id,

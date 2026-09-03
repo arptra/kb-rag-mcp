@@ -287,6 +287,17 @@ def test_managed_checkouts_are_removed_but_documents_and_graph_are_retained(
         imported_names
     )
 
+    static_job = catalog.start_graph_build()
+    static = _wait_for_job(catalog, static_job.id)
+    assert static["status"] == "completed"
+    assert static["result"]["generation_mode"] == "static"
+    static_log = catalog.job_log(static_job.id)["log"]
+    assert static_log.count("Temporarily restoring checkout for analysis") == 2
+    for repository_id in repository_ids:
+        restored = catalog._repository(repository_id)
+        assert restored.checkout_state == "removed"
+        assert not Path(restored.checkout_path).exists()
+
     exact_job = catalog.start_graph_build(
         generation_mode="gigacode",
         verify_all=True,

@@ -197,6 +197,8 @@ def test_scanner_extracts_cross_repo_business_and_database_graph(tmp_path: Path)
     )
     assert snapshot.evidence
     assert all(item.file and item.line >= 1 for item in snapshot.evidence)
+    node_ids = {node.id for node in snapshot.nodes}
+    assert all(edge.source in node_ids and edge.target in node_ids for edge in snapshot.edges)
 
 
 def test_graph_queries_return_service_dossier_and_evidence(tmp_path: Path) -> None:
@@ -566,6 +568,171 @@ public class OrdersController {
     assert protocols == {"HTTP", "KAFKA"}
     assert any(item.extractor == "spring-http-interface" for item in merged.evidence)
     assert any(node.type == "Event" and node.label == "orders.created" for node in merged.nodes)
+
+
+def test_composed_service_annotation_traces_internal_and_weak_client_calls(
+    tmp_path: Path,
+) -> None:
+    caller = tmp_path / "checkout"
+    target = tmp_path / "billing"
+    _write(
+        caller,
+        "src/main/resources/application.properties",
+        "spring.application.name=checkout-service\n",
+    )
+    _write(
+        caller,
+        "src/main/java/example/Orchestrator.java",
+        """
+package example;
+@Service
+@Target(ElementType.TYPE)
+public @interface Orchestrator { }
+""",
+    )
+    _write(
+        caller,
+        "src/main/java/example/BillingService.java",
+        """
+package example;
+public interface BillingService {
+  void debit(String orderId);
+}
+""",
+    )
+    _write(
+        caller,
+        "src/main/java/example/FraudPort.java",
+        """
+package example;
+public interface FraudPort {
+  void check(String orderId);
+}
+""",
+    )
+    _write(
+        caller,
+        "src/main/java/example/FraudChecker.java",
+        """
+package example;
+public class FraudChecker implements FraudPort {
+  public void check(String orderId) { }
+}
+""",
+    )
+    _write(
+        caller,
+        "src/main/java/example/CheckoutFlow.java",
+        """
+package example;
+@Orchestrator
+public class CheckoutFlow {
+  private final BillingService billingService;
+  private final FraudPort fraudPort;
+  public void execute(String orderId) {
+    validate(orderId);
+    fraudPort.check(orderId);
+    billingService.debit(orderId);
+  }
+  private void validate(String orderId) { }
+}
+""",
+    )
+    _write(
+        target,
+        "src/main/resources/application.properties",
+        "spring.application.name=billing-service\n",
+    )
+    _write(
+        target,
+        "src/main/java/example/BillingController.java",
+        """
+package example;
+@RestController
+public class BillingController {
+  @PostMapping("/billing/{orderId}/debit")
+  public void debit(String orderId) { }
+}
+""",
+    )
+
+    snapshot = RepositoryScanner(GraphSettings()).scan([caller, target])
+
+    dependency = next(
+        edge
+        for edge in snapshot.edges
+        if edge.type == "DEPENDS_ON"
+        and edge.source == "service:checkout-service"
+        and edge.target == "service:billing-service"
+        and edge.metadata.get("protocol") == "UNKNOWN"
+    )
+    assert dependency.confidence == "LOW"
+    assert dependency.metadata["matcher"] == "alias"
+    assert any(
+        edge.type == "CALLS"
+        and edge.source == "symbol:checkout-service:CheckoutFlow#execute"
+        and edge.target == "symbol:checkout-service:CheckoutFlow#validate"
+        for edge in snapshot.edges
+    )
+    assert any(
+        edge.type == "CALLS"
+        and edge.source == "symbol:checkout-service:CheckoutFlow#execute"
+        and edge.target == "symbol:checkout-service:FraudChecker#check"
+        for edge in snapshot.edges
+    )
+    exitpoint = next(
+        node
+        for node in snapshot.nodes
+        if node.type == "ExitPoint"
+        and node.service_id == "checkout-service"
+        and node.metadata.get("operation") == "CALL BillingService#debit"
+    )
+    assert any(
+        edge.type == "EXITS_VIA"
+        and edge.source == "symbol:checkout-service:CheckoutFlow#execute"
+        and edge.target == exitpoint.id
+        for edge in snapshot.edges
+    )
+    service = next(node for node in snapshot.nodes if node.id == "service:checkout-service")
+    assert service.metadata["analysis_coverage"]["stereotype_class_count"] == 1
+    assert service.metadata["analysis_coverage"]["weak_outbound_count"] == 1
+    assert any(item.extractor == "injected-client-call" for item in snapshot.evidence)
+
+
+def test_call_graph_budgets_report_partial_coverage(tmp_path: Path) -> None:
+    repository = tmp_path / "budgeted"
+    _write(
+        repository,
+        "src/main/resources/application.properties",
+        "spring.application.name=budgeted\n",
+    )
+    _write(
+        repository,
+        "src/main/java/example/BudgetedService.java",
+        """
+package example;
+@Service
+public class BudgetedService {
+  private final FirstClient firstClient;
+  private final SecondClient secondClient;
+  public void execute() {
+    firstClient.call();
+    secondClient.call();
+  }
+}
+""",
+    )
+
+    snapshot = RepositoryScanner(
+        GraphSettings(max_call_edges_per_service=1, max_weak_outbound_per_service=1)
+    ).scan([repository])
+
+    service = next(node for node in snapshot.nodes if node.id == "service:budgeted")
+    coverage = service.metadata["analysis_coverage"]
+    assert coverage["call_edge_count"] == 1
+    assert coverage["weak_outbound_count"] == 1
+    assert coverage["truncated"] is True
+    assert any("Call graph budget reached" in item.message for item in snapshot.issues)
 
 
 @pytest.mark.asyncio

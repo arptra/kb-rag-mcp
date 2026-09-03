@@ -24,6 +24,11 @@ class GraphSettings(BaseSettings):
     ingestion_path: Path = Path(".cache/gigacode-graph/ingestion.json")
     max_java_file_bytes: int = Field(default=2_000_000, ge=10_000, le=20_000_000)
     call_depth: int = Field(default=6, ge=1, le=20)
+    max_service_seed_methods: int = Field(default=5_000, ge=1, le=100_000)
+    max_traced_methods_per_service: int = Field(default=20_000, ge=1, le=500_000)
+    max_call_edges_per_service: int = Field(default=100_000, ge=1, le=2_000_000)
+    max_weak_outbound_per_service: int = Field(default=5_000, ge=0, le=100_000)
+    gigacode_max_candidates_per_repository: int = Field(default=250, ge=1, le=10_000)
     git_timeout_seconds: int = Field(default=180, ge=10, le=1800)
     http_host: str = "127.0.0.1"
     http_port: int = Field(default=8077, ge=1, le=65535)

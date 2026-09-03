@@ -2261,13 +2261,12 @@ class RagCatalog:
         cleanup_pending = set(repository_ids)
         try:
             self._raise_if_cancelled(cancel_event)
-            if generation_mode == "gigacode":
-                for repository_id in sorted(repository_ids):
-                    self._ensure_repository_checkout(
-                        repository_id,
-                        job_id=job_id,
-                        cancel_event=cancel_event,
-                    )
+            for repository_id in sorted(repository_ids):
+                self._ensure_repository_checkout(
+                    repository_id,
+                    job_id=job_id,
+                    cancel_event=cancel_event,
+                )
             snapshot = self._execute_graph_job(
                 job_id,
                 cancel_event,

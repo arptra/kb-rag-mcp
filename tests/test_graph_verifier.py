@@ -92,6 +92,27 @@ class InvalidPayloadRunner:
         )
 
 
+class EmptyCapturingRunner:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def run_json(self, **arguments: Any) -> GigaCodeJsonResult:
+        self.calls.append(arguments)
+        return GigaCodeJsonResult(
+            payload={
+                "edge_updates": [],
+                "discovered_edges": [],
+                "analyzed_files": [],
+                "warnings": [],
+            },
+            analyzed_files=(),
+            session_id="empty-session",
+            model="fake-model",
+            duration_ms=1,
+            usage={},
+        )
+
+
 def _build_result(repository: Path) -> tuple[ServiceMapBuildResult, RepositoryInput]:
     repository_input = RepositoryInput(
         path=repository,
@@ -291,3 +312,62 @@ def test_graph_verifier_preserves_static_graph_when_gigacode_validation_fails(
     assert "ValidationError" in summary["warnings"][0]
     assert Path(summary["artifact"]).is_file()
     assert any("static_graph_preserved=true" in message for message in progress)
+
+
+def test_graph_verifier_caps_repository_candidates_and_prioritizes_uncertain_edges(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    (repository / "src").mkdir(parents=True)
+    (repository / "src" / "OrdersClient.kt").write_text(
+        "paymentClient.cancel()\n",
+        encoding="utf-8",
+    )
+    result, repository_input = _build_result(repository)
+    base_edge = result.graph.edges[0]
+    extra_nodes = [
+        GraphNode(
+            id=f"external:extra-{index}",
+            type="ExternalSystem",
+            label=f"extra-{index}",
+            metadata={"target_hint": f"extra-{index}"},
+        )
+        for index in range(2)
+    ]
+    extra_edges = [
+        base_edge.model_copy(
+            update={
+                "id": f"dependency:extra-{index}",
+                "target": f"external:extra-{index}",
+                "confidence": "HIGH",
+                "status": "inferred",
+                "metadata": {
+                    "protocol": "HTTP",
+                    "operation": f"GET /extra/{index}",
+                },
+            }
+        )
+        for index in range(2)
+    ]
+    graph = result.graph.model_copy(
+        update={
+            "nodes": [*result.graph.nodes, *extra_nodes],
+            "edges": [*result.graph.edges, *extra_edges],
+        }
+    )
+    result = ServiceMapBuilder(GraphSettings()).from_graph(graph, [repository_input])
+    runner = EmptyCapturingRunner()
+    verifier = GraphGigaCodeVerifier(
+        runner,  # type: ignore[arg-type]
+        GraphSettings(gigacode_max_candidates_per_repository=1),
+        tmp_path / "analysis",
+    )
+
+    _verified, summary = verifier.verify(result, [repository_input], verify_all=True)
+
+    assert summary["eligible"] == 3
+    assert summary["requested"] == 1
+    assert summary["deferred"] == 2
+    assert summary["processed"] == 1
+    assert len(runner.calls) == 1
+    assert "dependency:orders:payment" in runner.calls[0]["prompt"]

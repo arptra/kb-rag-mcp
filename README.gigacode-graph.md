@@ -38,7 +38,10 @@ flowchart LR
 - имя сервиса из `gigacode-graph.json`, `spring.application.name`, Maven `artifactId` или имени
   каталога;
 - Spring MVC endpoints, Feign-клиенты, `@KafkaListener`, literal Kafka producers и `@Scheduled`;
-- неглубокий Java call graph от точек входа;
+- ограниченный по бюджету Java/Kotlin call graph от точек входа и всех классов с
+  `@Service`/`@Component`/`@Configuration` (включая локальные составные аннотации);
+- слабые кандидаты зависимостей для вызовов внедрённых `*Client`, `*Gateway`, `*Api`,
+  `*Service`, `*Adapter` и похожих портов, даже если transport пока не распознан;
 - сырые условия `if` как кандидаты бизнес-правил;
 - JPA entities, tables, columns и Spring Data repositories;
 - таблицы из Flyway/Liquibase SQL, YAML и XML migrations;
@@ -58,7 +61,10 @@ extractor. Выводы имеют `DECLARED`, `HIGH`, `MEDIUM`, `LOW` или `U
 Во втором режиме сервер передаёт GigaCode candidate id, исходный/предполагаемый целевой сервис,
 интерфейс и имеющееся evidence. Модель возвращает `confirm`, `reject`, `retarget` или `unresolved`.
 Дополнительно первый пакет каждого repository разрешает discovery пропущенных custom-wrapper
-вызовов. Новый edge принимается только если GigaCode указал существующую source-строку, выбрал
+вызовов, начиная с service/component-оркестраторов. Сначала проверяются `UNRESOLVED` и `LOW`
+кандидаты; один repository по умолчанию отдаёт модели не более 250 кандидатов за rebuild, чтобы
+массовый граф не создавал неограниченное число model runs. Новый edge принимается только если
+GigaCode указал существующую source-строку, выбрал
 конкретный уже найденный target entrypoint и их нормализованные protocol/operation совпали. Поэтому
 у discovery-edge всегда есть evidence вызывающей и принимающей стороны; произвольные сервисы,
 строки и API сервер отбрасывает.
@@ -83,6 +89,11 @@ service map и feature-routing. Raw GigaCode result записывается в
 `.cache/kb/analysis/gigacode-verification/`. Перестройка сохраняет только отдельные `graph.json`,
 `service_map.json` и analysis archive. Граф не превращается в документы, не загружается в RAG и не
 запускает перестройку embeddings. Для клиентов он доступен через MCP tool `kb_system_graph`.
+
+Явный rebuild временно восстанавливает каждый отсутствующий managed checkout и удерживает все
+исходники до конца цепочки static scan → global relink → GigaCode verification → publication.
+После завершения, отмены или ошибки checkout-ы удаляются в `finally`, если включён cleanup.
+Локальные пользовательские checkout-ы этим lifecycle не удаляются.
 
 Административный API принимает:
 

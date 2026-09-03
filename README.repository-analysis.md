@@ -243,11 +243,12 @@ CST Java и Kotlin.
 
 | Область | Что извлекается | Ограничение |
 |---|---|---|
-| HTTP inbound | Spring MVC `Get/Post/Put/Patch/Delete/RequestMapping` | custom composed annotations пока не раскрываются |
+| HTTP inbound | Spring MVC `Get/Post/Put/Patch/Delete/RequestMapping`, локальные composed annotations | параметры сложных composed annotations могут остаться unresolved |
 | HTTP outbound | Feign clients и некоторые literal WebClient-style calls | вычисляемые URL остаются unresolved |
 | Kafka | `@KafkaListener`, literal `KafkaTemplate.send`, `StreamBridge.send` | placeholder/dynamic topics неполны |
 | Scheduled | `@Scheduled` entrypoints | cron semantics не интерпретируются |
-| Calls | простые field method calls от entrypoint, depth 6 | нет полного Java symbol solver и polymorphism |
+| Calls | field/direct method calls от entrypoints и Spring service/component/configuration, depth 6 | нет полного classpath symbol solver; неоднозначный polymorphism остаётся слабым |
+| Weak dependencies | внедрённые `*Client/*Gateway/*Api/*Service/*Adapter/...` без локальной реализации | `LOW`-кандидат до проверки alias/GigaCode, а не доказанный runtime-вызов |
 | Data | JPA entity/table/column и Spring Data repository access | это static indication, не runtime DB ownership |
 | Migration | `create table` и Liquibase `tableName` | SQL/YAML/XML разбираются эвристически |
 | Rules | условия `if` в достижимых methods | кандидат rule, не доказанный бизнес-смысл |
@@ -324,6 +325,14 @@ graph/map выполняется как согласованный полный 
 service является причиной и UI target операции, но scanner пересматривает всю карту. Это немного
 дороже точечного merge, зато не оставляет устаревшие межсервисные edges. Worker по-прежнему
 изолирован отдельным процессом и ограничен общим analysis timeout.
+
+### Полная перестройка графа
+
+`POST /admin/api/graph/rebuild` в обоих режимах сначала восстанавливает отсутствующие managed
+checkout-ы всех подключённых repositories. Исходники живут до завершения static scan, глобального
+relink, опциональной GigaCode-проверки и атомарной публикации snapshot. Cleanup выполняется после
+всей цепочки и также в `finally` при cancel/error. Каталоги вне managed cache считаются
+пользовательскими и никогда не удаляются.
 
 ### Удаление сервиса
 
@@ -491,7 +500,6 @@ jq '.issues' .cache/kb/system_graph.json
 ## Текущие ограничения
 
 - Gradle custom `projectDir` mapping пока не поддерживается; нестандартный путь задаётся manifest;
-- Kotlin source может участвовать в layout, но Java Tree-sitter extractor его не индексирует;
 - нет полного Java type/symbol solver, classpath и dependency resolution;
 - reflection, generated code, Lombok-generated methods, runtime proxies и external configuration не
   восстанавливаются;
