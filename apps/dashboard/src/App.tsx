@@ -6,9 +6,24 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { ApiError, api, download, post } from "./api";
+import {
+  CONFIDENCE_INFO,
+  CONFIDENCE_ORDER,
+  EDGE_ORIGIN_LABELS,
+  EDGE_SCOPE_INFO,
+  EDGE_TYPE_INFO,
+  NODE_TYPE_INFO,
+  NODE_TYPE_ORDER,
+  confidenceColor,
+  confidenceTooltip,
+  edgeServiceScope,
+  nodeColor,
+  nodeTypeTooltip,
+} from "./graphSemantics";
 import type {
   CatalogJob,
   GraphNode,
@@ -2237,16 +2252,41 @@ function ToolForm({ password, indexes, tool, onClose, onSaved }: { password: str
 }
 
 type ConnectivityFilter = "all" | "connected" | "incoming" | "outgoing" | "bidirectional" | "isolated";
+type EdgeScopeFilter = "all" | "internal" | "cross" | "unknown";
 type FocusDirection = "all" | "incoming" | "outgoing" | "both";
 
-const CONFIDENCE_ORDER = ["DECLARED", "HIGH", "MEDIUM", "LOW", "UNRESOLVED"] as const;
-const CONFIDENCE_LABELS: Record<string, string> = {
-  DECLARED: "Декларативно",
-  HIGH: "Подтверждено",
-  MEDIUM: "Вероятно",
-  LOW: "Сомнительно",
-  UNRESOLVED: "Не определено",
+const CONNECTIVITY_INFO: Record<ConnectivityFilter, { label: string; meaning: string; example: string }> = {
+  all: { label: "Все узлы", meaning: "Показывает и связанные, и изолированные узлы после остальных фильтров.", example: "OrderService.createOrder() и найденный, но ни с чем не связанный helper." },
+  connected: { label: "Есть любые связи", meaning: "У узла есть хотя бы одна входящая или исходящая стрелка.", example: "OrderController.createOrder() → OrderService.createOrder(): оба узла останутся." },
+  incoming: { label: "Есть входящие", meaning: "На узел указывает хотя бы одна стрелка: его вызывает или использует другой узел.", example: "OrderService.createOrder() остаётся, если его вызывает OrderController." },
+  outgoing: { label: "Есть исходящие", meaning: "Из узла выходит хотя бы одна стрелка: он вызывает или использует другой узел.", example: "OrderService.createOrder() остаётся, если вызывает OrderRepository.save()." },
+  bidirectional: { label: "Входящие и исходящие", meaning: "Узел одновременно кем-то используется и сам использует следующий узел.", example: "OrderService.createOrder(): вызван controller и сам вызывает repository." },
+  isolated: { label: "Изолированные", meaning: "После фильтра типов и уверенности у узла нет ни одной стрелки.", example: "Метод helper(), найденный парсером, но не попавший ни в одну прослеженную цепочку." },
 };
+
+const EDGE_SCOPE_FILTER_INFO: Record<EdgeScopeFilter, { label: string; meaning: string; example: string }> = {
+  all: { label: "Все границы", meaning: "Оставляет внутренние, межсервисные и пока не классифицированные рёбра.", example: "И OrderController → OrderService, и orders-service → payments-service." },
+  internal: { label: "Внутри сервиса", meaning: "Показывает только рёбра, у которых оба конца имеют одинаковый service_id.", example: "OrderController.createOrder() → OrderService.createOrder() внутри orders-service." },
+  cross: { label: "Между сервисами", meaning: "Показывает только рёбра между разными service_id.", example: "orders-service → payments-service." },
+  unknown: { label: "Граница неизвестна", meaning: "Показывает рёбра, у которых хотя бы один конец не имеет service_id.", example: "Найден вызов paymentClient, но сервис-владелец не определён." },
+};
+
+function GraphHelpModal({ onClose }: { onClose: () => void }) {
+  return (
+    <Modal title="Как читать граф системы" onClose={onClose} className="graph-help-modal">
+      <div className="graph-help-content">
+        <div className="callout"><b>Откуда берутся данные.</b> Backend сохраняет versioned snapshot последнего анализа. Извлечённые из кода факты ссылаются на evidence: repository, commit, файл, строку, фрагмент и extractor; структурные и агрегированные узлы могут не иметь собственного evidence. «Быстро» использует только детерминированный статический анализ; «Точный rebuild» дополнительно проверяет кандидаты связей через GigaCode.</div>
+        <div className="callout"><b>Связи бывают и внутри сервиса.</b> У каждого узла может быть service_id. Одинаковый service_id на концах ребра означает внутреннюю связь; разные значения — межсервисную; отсутствие service_id — граница пока неизвестна. В режиме «По сервисам» цвет узлов показывает кластер, внутреннее ребро получает цвет своего сервиса, межсервисное становится оранжевым.</div>
+        <div className="callout"><b>Не каждая стрелка — сетевой вызов.</b> Например, CALLS означает обычный вызов метода внутри цепочки кода, HANDLED_BY связывает endpoint с handler, а DEPENDS_ON показывает зависимость сервиса от другого сервиса или внешней системы. Точный смысл всегда задаёт тип ребра и виден при наведении.</div>
+        <section><h3>Фильтр связности</h3><div className="graph-help-list">{Object.entries(CONNECTIVITY_INFO).map(([value, info]) => <article key={value}><code>{value}</code><b>{info.label}</b><p>{info.meaning}</p><small><strong>Пример:</strong> {info.example}</small></article>)}</div></section>
+        <section><h3>Фильтр границы связи</h3><div className="graph-help-list">{Object.entries(EDGE_SCOPE_FILTER_INFO).map(([value, info]) => <article key={value}><code>{value}</code><b>{info.label}</b><p>{info.meaning}</p><small><strong>Пример:</strong> {info.example}</small></article>)}</div></section>
+        <section><h3>Типы узлов</h3><div className="graph-help-list">{NODE_TYPE_ORDER.map((type) => { const info = NODE_TYPE_INFO[type]; return <article key={type}><code>{type}</code><b>{info.label}</b><p>{info.meaning}</p><small><strong>Пример:</strong> {info.example}</small><small>Источник: {info.source}</small></article>; })}</div></section>
+        <section><h3>Что с чем связывается</h3><div className="graph-help-list edges">{Object.entries(EDGE_TYPE_INFO).map(([type, info]) => <article key={type}><code>{type}</code><b>{info.label} · {info.direction}</b><p>{info.meaning}</p><small><strong>Пример:</strong> {info.example}</small><small>Источник: {info.source}</small></article>)}</div></section>
+        <section><h3>Уверенность</h3><div className="graph-help-list confidence">{CONFIDENCE_ORDER.map((confidence) => { const info = CONFIDENCE_INFO[confidence]; return <article key={confidence}><i style={{ background: confidenceColor(confidence) }} /><b>{info.label} · {confidence}</b><p>{info.meaning}</p><small><strong>Пример:</strong> {info.example}</small><small>Источник: {info.source}</small></article>; })}</div></section>
+      </div>
+    </Modal>
+  );
+}
 
 function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction }: {
   data: GraphOverview;
@@ -2266,40 +2306,72 @@ function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction 
     () => new Set(CONFIDENCE_ORDER),
   );
   const [connectivity, setConnectivity] = useState<ConnectivityFilter>("all");
+  const [edgeScope, setEdgeScope] = useState<EdgeScopeFilter>("all");
   const [focusDirection, setFocusDirection] = useState<FocusDirection>("all");
   const [query, setQuery] = useState("");
-  const availableTypesKey = Object.keys(data.nodes_by_type).sort().join("\u0000");
+  const [loading, setLoading] = useState(true);
+  const [showHelp, setShowHelp] = useState(false);
+  const graphRequest = useRef(0);
   useEffect(() => {
+    const request = ++graphRequest.current;
+    setGraph(null);
+    setLoading(true);
+    setError("");
     api<GraphPayload>(`/admin/api/graph?view=${view}&limit=${view === "services" ? 5000 : 10000}`, password)
-      .then((payload) => { setGraph(canonicalizeGraph(payload)); setSelected(null); setFocusDirection("all"); setError(""); })
-      .catch((caught) => setError(caught instanceof Error ? caught.message : "Граф недоступен"));
+      .then((payload) => {
+        if (graphRequest.current !== request) return;
+        const canonical = canonicalizeGraph(payload);
+        setGraph(canonical);
+        setSelectedTypes(new Set(canonical.nodes.map((node) => node.type)));
+        setSelected(null);
+        setFocusDirection("all");
+      })
+      .catch((caught) => {
+        if (graphRequest.current === request) setError(caught instanceof Error ? caught.message : "Граф недоступен");
+      })
+      .finally(() => {
+        if (graphRequest.current === request) setLoading(false);
+      });
   }, [password, view, data.generated_at]);
-  useEffect(() => {
-    setSelectedTypes((current) => {
-      const next = new Set(current);
-      Object.keys(data.nodes_by_type).forEach((type) => next.add(type));
-      return next;
-    });
-  }, [availableTypesKey]);
 
   const filtered = useMemo(() => filterGraph(
     graph,
     selectedTypes,
     selectedConfidence,
     connectivity,
+    edgeScope,
     selected?.id || null,
     focusDirection,
     query,
-  ), [graph, selectedTypes, selectedConfidence, connectivity, selected?.id, focusDirection, query]);
+  ), [graph, selectedTypes, selectedConfidence, connectivity, edgeScope, selected?.id, focusDirection, query]);
   const visibleTypeCounts = useMemo(() => {
     const counts: Record<string, number> = {};
     filtered?.nodes.forEach((node) => { counts[node.type] = (counts[node.type] || 0) + 1; });
     return counts;
   }, [filtered]);
+  const graphTypeCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    graph?.nodes.forEach((node) => { counts[node.type] = (counts[node.type] || 0) + 1; });
+    return counts;
+  }, [graph]);
+  const graphTypeEntries = useMemo(() => Object.entries(graphTypeCounts).sort(([left], [right]) => {
+    const leftIndex = NODE_TYPE_ORDER.indexOf(left as typeof NODE_TYPE_ORDER[number]);
+    const rightIndex = NODE_TYPE_ORDER.indexOf(right as typeof NODE_TYPE_ORDER[number]);
+    return (leftIndex < 0 ? 999 : leftIndex) - (rightIndex < 0 ? 999 : rightIndex) || left.localeCompare(right);
+  }), [graphTypeCounts]);
   const selectedLinks = useMemo(() => {
     if (!filtered || !selected) return [];
     return filtered.edges.filter((edge) => edgeSource(edge) === selected.id || edgeTarget(edge) === selected.id);
   }, [filtered, selected]);
+  const filteredNodesById = useMemo(
+    () => new Map(filtered?.nodes.map((node) => [node.id, node]) || []),
+    [filtered],
+  );
+  const edgeScopeCounts = useMemo(() => {
+    const counts = { internal: 0, cross: 0, unknown: 0 };
+    filtered?.edges.forEach((edge) => { counts[edgeServiceScope(edge, filteredNodesById)] += 1; });
+    return counts;
+  }, [filtered, filteredNodesById]);
 
   const toggleType = (type: string) => setSelectedTypes((current) => {
     const next = new Set(current);
@@ -2312,9 +2384,10 @@ function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction 
     return next;
   });
   const resetFilters = () => {
-    setSelectedTypes(new Set(Object.keys(data.nodes_by_type)));
+    setSelectedTypes(new Set(Object.keys(graphTypeCounts)));
     setSelectedConfidence(new Set(CONFIDENCE_ORDER));
     setConnectivity("all");
+    setEdgeScope("all");
     setFocusDirection("all");
     setQuery("");
   };
@@ -2324,53 +2397,48 @@ function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction 
       <div className="section-intro graph-intro">
         <div><span className="eyebrow">Source-derived topology</span><h2>Граф связей системы</h2><p>Граф хранится отдельным snapshot и доступен через MCP tool `kb_system_graph`. Точный rebuild временно заново клонирует удалённые checkout всех подключённых репозиториев, публикует полный граф и снова удаляет исходники; документы и RAG-индексы не меняются.</p></div>
         <div className="graph-head-actions">
-          <div className="segmented"><button className={view === "services" ? "active" : ""} onClick={() => setView("services")}>Сервисы</button><button className={view === "full" ? "active" : ""} onClick={() => setView("full")}>Полный граф</button></div>
-          <button className="button secondary" onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "static", verify_all: false }), "Быстрое перестроение отдельного графа запущено")}>⌘ Быстро</button>
+          <button className="button quiet graph-help-button" title="Открыть справочник: что означает каждый тип узла и связи, откуда берутся evidence и confidence" onClick={() => setShowHelp(true)}>?</button>
+          <div className="segmented"><button title="Показать только сервисы и внешние системы. Параллельные вызовы между одной парой агрегируются по протоколу; это основной режим для карты 700+ сервисов." className={view === "services" ? "active" : ""} onClick={() => setView("services")}>Сервисы</button><button title="Загрузить технический snapshot: операции, методы, правила, входы, выходы, события и таблицы. Для большого графа автоматически включается облегчённая отрисовка и лимит визуализации." className={view === "full" ? "active" : ""} onClick={() => setView("full")}>Полный граф</button></div>
+          <button className="button secondary" title="Заново просканировать доступные исходники детерминированными правилами без LLM. Обновляет только snapshot графа; RAG-документы и индексы не меняет." onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "static", verify_all: false }), "Быстрое перестроение отдельного графа запущено")}>⌘ Быстро</button>
           <button className="button precise" disabled={!gigacodeAvailable} title={!gigacodeAvailable ? gigacodeError || "GigaCode недоступен" : "Временно восстановить все удалённые checkout, проверить связи через GigaCode и снова удалить исходники"} onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "gigacode", verify_all: true }), "Точное перестроение отдельного графа запущено")}>✦ Точный rebuild</button>
         </div>
       </div>
       <div className="graph-toolbar">
-        <label className="graph-search"><span>Поиск</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Сервис, API, событие…" /></label>
-        <label><span>Связность</span><select value={connectivity} onChange={(event) => setConnectivity(event.target.value as ConnectivityFilter)}><option value="all">Все узлы</option><option value="connected">Есть любые связи</option><option value="incoming">Есть входящие</option><option value="outgoing">Есть исходящие</option><option value="bidirectional">Входящие и исходящие</option><option value="isolated">Изолированные</option></select></label>
-        {selected && <label><span>Окружение выбранного</span><select value={focusDirection} onChange={(event) => setFocusDirection(event.target.value as FocusDirection)}><option value="all">Весь граф</option><option value="incoming">Только входящие</option><option value="outgoing">Только исходящие</option><option value="both">Оба направления</option></select></label>}
-        <button className="button quiet" onClick={resetFilters}>Сбросить фильтры</button>
+        <label className="graph-search" title="Ищет по названию, id, типу и metadata узла; оставляет прямых соседей найденных узлов."><span>Поиск</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Сервис, API, событие…" /></label>
+        <label title={`${CONNECTIVITY_INFO[connectivity].meaning} Пример: ${CONNECTIVITY_INFO[connectivity].example}`}><span>Связность</span><select aria-label={`Связность. ${CONNECTIVITY_INFO[connectivity].meaning} Пример: ${CONNECTIVITY_INFO[connectivity].example}`} value={connectivity} onChange={(event) => setConnectivity(event.target.value as ConnectivityFilter)}>{Object.entries(CONNECTIVITY_INFO).map(([value, info]) => <option key={value} value={value}>{info.label}</option>)}</select><small className="graph-control-example">Пример: {CONNECTIVITY_INFO[connectivity].example}</small></label>
+        <label title={`${EDGE_SCOPE_FILTER_INFO[edgeScope].meaning} Пример: ${EDGE_SCOPE_FILTER_INFO[edgeScope].example}`}><span>Граница связи</span><select aria-label={`Граница связи. ${EDGE_SCOPE_FILTER_INFO[edgeScope].meaning} Пример: ${EDGE_SCOPE_FILTER_INFO[edgeScope].example}`} value={edgeScope} onChange={(event) => setEdgeScope(event.target.value as EdgeScopeFilter)}>{Object.entries(EDGE_SCOPE_FILTER_INFO).map(([value, info]) => <option key={value} value={value}>{info.label}</option>)}</select><small className="graph-control-example">Пример: {EDGE_SCOPE_FILTER_INFO[edgeScope].example}</small></label>
+        {selected && <label title="Ограничивает граф прямыми соседями выбранного узла в нужном направлении; исходный snapshot не меняется."><span>Окружение выбранного</span><select value={focusDirection} onChange={(event) => setFocusDirection(event.target.value as FocusDirection)}><option value="all">Весь граф</option><option value="incoming">Только входящие</option><option value="outgoing">Только исходящие</option><option value="both">Оба направления</option></select></label>}
+        <button className="button quiet" title="Включить все типы узлов, confidence и границы текущего режима; убрать поиск, связность и фокус на выбранном узле." onClick={resetFilters}>Сбросить фильтры</button>
       </div>
       <div className="graph-layout">
         <aside className="graph-stats">
-          <span className="eyebrow">Snapshot</span><h3>{number(filtered?.nodes.length || 0)} / {number(data.node_count)} узлов</h3>
+          <span className="eyebrow">Snapshot</span><h3 title="Слева — узлы после фильтров, справа — узлы, полученные API для текущего режима.">{number(filtered?.nodes.length || 0)} / {number(graph?.nodes.length || 0)} узлов</h3>
           <div className="graph-metrics">
-            <span><b>{number(filtered?.edges.length || 0)}</b> {view === "services" ? "видимых зависимостей" : "технических рёбер"}</span>
+            <span title="Количество рёбер после выбранных фильтров. В режиме «Сервисы» повторные операции одной пары и протокола объединены в одну линию."><b>{number(filtered?.edges.length || 0)}</b> {view === "services" ? "видимых зависимостей" : "технических рёбер"}</span>
             {view === "services" ? <>
-              <span><b>{number(data.resolved_service_dependency_count)}</b> сервис → сервис</span>
-              <span><b>{number(data.external_dependency_count)}</b> во внешние системы</span>
-              <span><b>{number(data.unresolved_dependency_count)}</b> не разрешено</span>
-              <span><b>{number(data.isolated_service_count)}</b> изолированных сервисов</span>
-              <span><b>{number(data.exitpoint_count)}</b> найденных выходов</span>
+              <span title="Уникальные пары source service → target service с учётом протокола."><b>{number(data.resolved_service_dependency_count)}</b> сервис → сервис</span>
+              <span title="Зависимости на ExternalSystem: цель исходящего вызова не совпала с известным сервисом."><b>{number(data.external_dependency_count)}</b> во внешние системы</span>
+              <span title="Связи с UNRESOLVED status/confidence либо неоднозначной внешней целью."><b>{number(data.unresolved_dependency_count)}</b> не разрешено</span>
+              <span title="Сервисы без входящих и исходящих разрешённых service → service зависимостей."><b>{number(data.isolated_service_count)}</b> изолированных сервисов</span>
+              <span title="Все найденные исходящие HTTP/Kafka точки в полном snapshot до агрегирования."><b>{number(data.exitpoint_count)}</b> найденных выходов</span>
             </> : <>
-              <span><b>{number(data.evidence_count)}</b> evidence</span>
-              <span><b>{number(data.services.length)}</b> сервисов</span>
-              <span><b>{number(data.issue_count)}</b> замечаний</span>
+              <span title={`${EDGE_SCOPE_INFO.internal.meaning} Например: OrderController → OrderService внутри orders-service.`}><b>{number(edgeScopeCounts.internal)}</b> внутри сервисов</span>
+              <span title={`${EDGE_SCOPE_INFO.cross.meaning} Например: orders-service → payments-service.`}><b>{number(edgeScopeCounts.cross)}</b> между сервисами</span>
+              <span title={`${EDGE_SCOPE_INFO.unknown.meaning} Например: URL вызова найден, но сервис-владелец не определён.`}><b>{number(edgeScopeCounts.unknown)}</b> без service_id</span>
             </>}
           </div>
-          <div className="snapshot-meta"><b>{data.analysis_mode === "static+gigacode" ? "✦ Static + GigaCode" : data.analysis_mode || "Static"}</b><code>{short(data.snapshot_id || "legacy snapshot", 28)}</code></div>
+          <div className="snapshot-meta" title="Неизменяемая версия результата последнего анализа. Фильтры меняют только отображение."><b>{data.analysis_mode === "static+gigacode" ? "✦ Static + GigaCode" : data.analysis_mode || "Static"}</b><code>{short(data.snapshot_id || "legacy snapshot", 28)}</code>{graph?.truncated && <small>API-ответ усечён лимитом</small>}</div>
           <h4>Типы узлов · multi-select</h4>
-          <div className="filter-chip-list">{Object.entries(data.nodes_by_type).map(([type, count]) => <button aria-pressed={selectedTypes.has(type)} className={selectedTypes.has(type) ? "active" : ""} key={type} onClick={() => toggleType(type)}><i style={{ background: nodeColor(type) }} /><span>{type}</span><b>{visibleTypeCounts[type] || 0}/{count}</b></button>)}</div>
+          <div className="filter-chip-list">{graphTypeEntries.map(([type, count]) => <button aria-pressed={selectedTypes.has(type)} aria-label={nodeTypeTooltip(type, visibleTypeCounts[type] || 0, count)} title={nodeTypeTooltip(type, visibleTypeCounts[type] || 0, count)} className={selectedTypes.has(type) ? "active" : ""} key={type} onClick={() => toggleType(type)}><i style={{ background: nodeColor(type) }} /><span>{NODE_TYPE_INFO[type]?.label || type}</span><b>{visibleTypeCounts[type] || 0}/{count}</b></button>)}</div>
           <h4>Уверенность связей</h4>
-          <div className="confidence-list">{CONFIDENCE_ORDER.map((confidence) => <button aria-pressed={selectedConfidence.has(confidence)} className={selectedConfidence.has(confidence) ? "active" : ""} key={confidence} onClick={() => toggleConfidence(confidence)}><i style={{ background: confidenceColor(confidence) }} /><span>{CONFIDENCE_LABELS[confidence]}</span></button>)}</div>
+          <div className="confidence-list">{CONFIDENCE_ORDER.map((confidence) => <button aria-pressed={selectedConfidence.has(confidence)} aria-label={confidenceTooltip(confidence)} title={confidenceTooltip(confidence)} className={selectedConfidence.has(confidence) ? "active" : ""} key={confidence} onClick={() => toggleConfidence(confidence)}><i style={{ background: confidenceColor(confidence) }} /><span>{CONFIDENCE_INFO[confidence].label}</span></button>)}</div>
         </aside>
-        <section className="graph-canvas">{error ? <div className="empty-state"><h3>{error}</h3></div> : filtered && filtered.nodes.length ? <GraphCanvas graph={filtered} selected={selected?.id || null} onSelect={setSelected} /> : <div className="empty-state"><div>⌘</div><h3>По фильтрам ничего нет</h3><p>Сбросьте фильтры или запустите перестроение.</p></div>}</section>
-          <aside className="graph-details">{selected ? <><span className="eyebrow">{selected.type}</span><h3>{selected.label}</h3><code>{selected.id}</code><div className="selected-edge-summary"><span><b>{selectedLinks.filter((edge) => edgeTarget(edge) === selected.id).length}</b> входящих</span><span><b>{selectedLinks.filter((edge) => edgeSource(edge) === selected.id).length}</b> исходящих</span></div><h4>Метаданные</h4><pre>{JSON.stringify(selected.metadata, null, 2)}</pre><h4>Evidence</h4><p>{selected.evidence_ids.length ? `${selected.evidence_ids.length} подтверждений в исходном коде` : "Для агрегированного узла evidence не записан."}</p><h4>Связи</h4><div className="edge-detail-list">{selectedLinks.slice(0, 40).map((edge) => <span key={edge.id}><i style={{ background: confidenceColor(edge.confidence) }} /><b>{edgeSource(edge) === selected.id ? "→" : "←"} {edge.type}</b><small>{Number(edge.metadata?.operation_count || 0) > 1 ? `${edge.metadata.operation_count} вызовов · ` : ""}{CONFIDENCE_LABELS[edge.confidence] || edge.confidence}</small></span>)}</div></> : <><div className="detail-placeholder">⌖</div><h3>Выберите узел</h3><p>Кликните узел: камера приблизится, здесь появятся направления связей, confidence и evidence.</p></>}</aside>
+        <section className="graph-canvas">{error ? <div className="empty-state"><h3>{error}</h3></div> : loading ? <div className="graph-loading"><span>✦</span><b>Загружаем {view === "services" ? "карту сервисов" : "технический граф"}…</b></div> : filtered && filtered.nodes.length ? <GraphCanvas graph={filtered} selected={selected?.id || null} onSelect={setSelected} /> : <div className="empty-state"><div>⌘</div><h3>По фильтрам ничего нет</h3><p>Сбросьте фильтры или запустите перестроение.</p></div>}</section>
+          <aside className="graph-details">{selected ? <><span className="eyebrow">{NODE_TYPE_INFO[selected.type]?.label || selected.type} · {selected.type}</span><h3>{selected.label}</h3><code>{selected.id}</code><div className="selected-edge-summary"><span title="Рёбра, у которых выбранный узел является target."><b>{selectedLinks.filter((edge) => edgeTarget(edge) === selected.id).length}</b> входящих</span><span title="Рёбра, у которых выбранный узел является source."><b>{selectedLinks.filter((edge) => edgeSource(edge) === selected.id).length}</b> исходящих</span></div><h4>Метаданные</h4><pre>{JSON.stringify(selected.metadata, null, 2)}</pre><h4>Evidence</h4><p>{selected.evidence_ids.length ? `${selected.evidence_ids.length} подтверждений в исходном коде` : "Для агрегированного узла evidence не записан."}</p><h4>Связи</h4><div className="edge-detail-list">{selectedLinks.slice(0, 40).map((edge) => { const info = EDGE_TYPE_INFO[edge.type]; const scope = EDGE_SCOPE_INFO[edgeServiceScope(edge, filteredNodesById)]; return <span title={`${scope.label}. ${scope.meaning} ${info?.label || edge.type}: ${info?.direction || "source → target"}. ${info?.meaning || edge.label} Пример: ${info?.example || "—"} Источник: ${info?.source || EDGE_ORIGIN_LABELS[edge.origin] || edge.origin}. Evidence: ${edge.evidence_ids.length}.`} key={edge.id}><i style={{ background: confidenceColor(edge.confidence) }} /><b>{edgeSource(edge) === selected.id ? "→" : "←"} {info?.label || edge.type}</b><small>{scope.label} · {Number(edge.metadata?.operation_count || 0) > 1 ? `${edge.metadata.operation_count} вызовов · ` : ""}{CONFIDENCE_INFO[edge.confidence]?.label || edge.confidence} · {EDGE_ORIGIN_LABELS[edge.origin] || edge.origin}</small></span>; })}</div>{selectedLinks.length > 40 && <p>Показаны первые 40 из {selectedLinks.length} связей. Сузьте направление или фильтры.</p>}</> : <><div className="detail-placeholder">⌖</div><h3>Выберите узел</h3><p>Кликните узел: камера приблизится, здесь появятся направления связей, confidence и evidence.</p></>}</aside>
       </div>
+      {showHelp && <GraphHelpModal onClose={() => setShowHelp(false)} />}
     </div>
   );
-}
-
-function nodeColor(type: string): string {
-  return ({ Service: "#b6f36b", ExternalSystem: "#ffb45d", BusinessOperation: "#78a7ff", BusinessRule: "#df83ff", EntryPoint: "#6ee7d8", ExitPoint: "#ff7e67", Event: "#ff7690", Table: "#f4d269", DomainEntity: "#a78bfa", Repository: "#8795aa" } as Record<string, string>)[type] || "#728096";
-}
-
-function confidenceColor(confidence: string): string {
-  return ({ DECLARED: "#55e89a", HIGH: "#74a7ff", MEDIUM: "#f3c76b", LOW: "#ff9b55", UNRESOLVED: "#ff5f7d" } as Record<string, string>)[confidence] || "#8795aa";
 }
 
 function edgeSource(edge: GraphPayload["edges"][number]): string {
@@ -2397,6 +2465,7 @@ function filterGraph(
   selectedTypes: Set<string>,
   selectedConfidence: Set<string>,
   connectivity: ConnectivityFilter,
+  edgeScope: EdgeScopeFilter,
   selectedId: string | null,
   focusDirection: FocusDirection,
   query: string,
@@ -2405,7 +2474,11 @@ function filterGraph(
   const normalizedQuery = query.trim().toLowerCase();
   const baseNodes = graph.nodes.filter((node) => selectedTypes.has(node.type));
   const baseIds = new Set(baseNodes.map((node) => node.id));
-  let edges = graph.edges.filter((edge) => selectedConfidence.has(edge.confidence) && baseIds.has(edgeSource(edge)) && baseIds.has(edgeTarget(edge)));
+  const allNodesById = new Map(graph.nodes.map((node) => [node.id, node]));
+  let edges = graph.edges.filter((edge) => selectedConfidence.has(edge.confidence)
+    && baseIds.has(edgeSource(edge))
+    && baseIds.has(edgeTarget(edge))
+    && (edgeScope === "all" || edgeServiceScope(edge, allNodesById) === edgeScope));
   const incoming = new Map<string, number>();
   const outgoing = new Map<string, number>();
   edges.forEach((edge) => {
@@ -2423,9 +2496,10 @@ function filterGraph(
     return true;
   });
   if (normalizedQuery) {
-    const matches = new Set(nodes.filter((node) => `${node.label} ${node.id} ${node.type} ${JSON.stringify(node.metadata)}`.toLowerCase().includes(normalizedQuery)).map((node) => node.id));
+    const directMatches = new Set(nodes.filter((node) => `${node.label} ${node.id} ${node.type} ${JSON.stringify(node.metadata)}`.toLowerCase().includes(normalizedQuery)).map((node) => node.id));
+    const matches = new Set(directMatches);
     edges.forEach((edge) => {
-      if (matches.has(edgeSource(edge)) || matches.has(edgeTarget(edge))) {
+      if (directMatches.has(edgeSource(edge)) || directMatches.has(edgeTarget(edge))) {
         matches.add(edgeSource(edge)); matches.add(edgeTarget(edge));
       }
     });

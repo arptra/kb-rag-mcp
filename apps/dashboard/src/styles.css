@@ -381,6 +381,7 @@ input, textarea, select { min-height: 38px; padding: 8px 10px; border: 1px solid
 
 /* Interactive 3D system graph. */
 .graph-head-actions { display: flex; align-items: center; justify-content: flex-end; gap: 9px; flex-wrap: wrap; }
+.graph-help-button { width: 34px; min-width: 34px; padding-inline: 0; border-radius: 50%; font-weight: 800; }
 .button.precise { border-color: #6f5a9e; background: linear-gradient(135deg, #2d2141, #19241a); color: #e4d9ff; }
 .button.precise:hover { border-color: var(--violet); background: linear-gradient(135deg, #3b2859, #20301f); }
 .button.precise:disabled { border-color: #333a35; background: #151a17; color: #626b65; }
@@ -388,6 +389,7 @@ input, textarea, select { min-height: 38px; padding: 8px 10px; border: 1px solid
 .graph-toolbar label { min-width: 190px; color: #829087; font-size: 13px; font-weight: 650; }
 .graph-toolbar label > span { display: block; margin-bottom: 5px; }
 .graph-toolbar input, .graph-toolbar select { width: 100%; min-height: 38px; }
+.graph-control-example { display: block; max-width: 340px; margin-top: 5px; color: #637168; font-size: 10px; font-weight: 450; line-height: 1.35; }
 .graph-toolbar .graph-search { min-width: 260px; flex: 1; }
 .graph-toolbar > .button { margin-left: auto; white-space: nowrap; }
 .graph-page .graph-layout { height: calc(100vh - 302px); min-height: 650px; grid-template-columns: 280px minmax(0, 1fr) 320px; }
@@ -399,6 +401,7 @@ input, textarea, select { min-height: 38px; padding: 8px 10px; border: 1px solid
 .snapshot-meta { display: grid; gap: 5px; margin-top: 14px; padding: 11px; border: 1px solid #29352c; border-radius: 8px; background: #111a13; }
 .snapshot-meta b { color: #d1ddcf; font-size: 13px; }
 .snapshot-meta code { overflow: hidden; color: #77847b; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.snapshot-meta small { color: var(--amber); font-size: 11px; }
 .filter-chip-list, .confidence-list { display: grid; gap: 6px; }
 .filter-chip-list button, .confidence-list button { width: 100%; min-height: 38px; display: flex; align-items: center; gap: 9px; padding: 7px 9px; border: 1px solid #253029; border-radius: 7px; background: #0b110d; color: #7e8b81; font-size: 13px; text-align: left; cursor: pointer; opacity: .58; }
 .filter-chip-list button:hover, .confidence-list button:hover { border-color: #425046; color: #d6e0d8; opacity: .9; }
@@ -417,6 +420,19 @@ input, textarea, select { min-height: 38px; padding: 8px 10px; border: 1px solid
 .graph-camera-actions button { min-height: 30px; padding: 5px 9px; border: 1px solid #34423a; border-radius: 6px; background: #172019; color: #b6c2b8; font-size: 12px; cursor: pointer; }
 .graph-camera-actions button:hover { border-color: var(--lime); color: var(--lime); }
 .graph-camera-actions span { padding: 0 6px; color: #6d7970; font-size: 12px; }
+.graph-color-panel { position: absolute; z-index: 4; top: 12px; right: 12px; display: grid; justify-items: end; gap: 7px; max-width: min(430px, calc(100% - 24px)); }
+.graph-color-toggle { display: flex; padding: 4px; border: 1px solid #334039; border-radius: 9px; background: #09100be8; backdrop-filter: blur(8px); }
+.graph-color-toggle button { min-height: 29px; padding: 4px 9px; border: 0; border-radius: 6px; background: transparent; color: #758179; font-size: 11px; cursor: pointer; }
+.graph-color-toggle button:hover { color: #d4ded6; }
+.graph-color-toggle button.active { background: #233128; color: #e0eae2; }
+.graph-scope-legend { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px 11px; padding: 7px 9px; border: 1px solid #334039; border-radius: 8px; background: #09100be8; color: #87948a; font-size: 10px; backdrop-filter: blur(8px); }
+.graph-scope-legend span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.graph-scope-legend i { width: 14px; height: 3px; border-radius: 2px; }
+.graph-scope-legend .scope-internal { background: linear-gradient(90deg, #78a7ff, #df83ff, #55e89a); }
+.graph-scope-legend .scope-cross { background: #ff9b55; }
+.graph-scope-legend .scope-unknown { background: #8795aa; }
+.graph-scope-legend small { width: 100%; color: #657269; text-align: right; }
+.graph-performance-note { position: absolute; z-index: 4; bottom: 12px; left: 12px; max-width: min(520px, calc(100% - 24px)); padding: 7px 10px; border: 1px solid #4b442d; border-radius: 7px; background: #18170fd9; color: #baa86f; font-size: 11px; line-height: 1.4; pointer-events: none; backdrop-filter: blur(8px); }
 .graph-details h3 { font-size: 20px; line-height: 1.25; }
 .graph-details > code { font-size: 12px; }
 .selected-edge-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 16px; }
@@ -427,6 +443,19 @@ input, textarea, select { min-height: 38px; padding: 8px 10px; border: 1px solid
 .edge-detail-list i { grid-row: span 2; width: 8px; height: 8px; border-radius: 50%; }
 .edge-detail-list b { overflow: hidden; color: #b9c6bb; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .edge-detail-list small { color: #68746b; font-size: 11px; }
+.graph-help-modal { width: min(980px, 100%); }
+.graph-help-content { display: grid; gap: 22px; padding: 22px; }
+.graph-help-content .callout b { color: #d5e1d7; }
+.graph-help-content section h3 { margin: 0 0 10px; font-size: 15px; }
+.graph-help-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.graph-help-list article { min-width: 0; padding: 11px 12px; border: 1px solid #28342b; border-radius: 8px; background: #0d130f; }
+.graph-help-list article code { display: block; margin-bottom: 6px; color: var(--lime); font-size: 11px; }
+.graph-help-list article b { display: block; color: #cbd7cd; font-size: 13px; }
+.graph-help-list article p { margin: 5px 0; color: #87938a; font-size: 12px; line-height: 1.45; }
+.graph-help-list article small { display: block; margin-top: 5px; color: #647067; font-size: 11px; line-height: 1.4; }
+.graph-help-list article small strong { color: #9eaaa1; }
+.graph-help-list.confidence article { position: relative; padding-left: 30px; }
+.graph-help-list.confidence article > i { position: absolute; top: 14px; left: 12px; width: 8px; height: 8px; border-radius: 50%; }
 
 @media (max-width: 1180px) {
   .graph-page .graph-layout { grid-template-columns: 230px minmax(0, 1fr) 270px; }
@@ -441,4 +470,5 @@ input, textarea, select { min-height: 38px; padding: 8px 10px; border: 1px solid
   .graph-page .graph-stats { display: block; max-height: 420px; border-bottom: 1px solid var(--line); }
   .graph-page .graph-canvas { min-height: 650px; }
   .graph-page .graph-details { min-height: 260px; }
+  .graph-help-list { grid-template-columns: 1fr; }
 }

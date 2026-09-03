@@ -5,14 +5,17 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
+const tlsEnabled = !["0", "false", "no", "off"].includes(
+  (process.env.VITE_TLS_ENABLED ?? "true").toLowerCase(),
+);
 const certificate = process.env.VITE_TLS_CERT_FILE ?? resolve(projectRoot, "certs/server.crt");
 const privateKey = process.env.VITE_TLS_KEY_FILE ?? resolve(projectRoot, "certs/server.key");
-const tls = existsSync(certificate) && existsSync(privateKey)
+const tls = tlsEnabled && existsSync(certificate) && existsSync(privateKey)
   ? { cert: readFileSync(certificate), key: readFileSync(privateKey) }
   : undefined;
 
 export default defineConfig(({ command }) => {
-  if (command === "serve" && tls === undefined) {
+  if (command === "serve" && tlsEnabled && tls === undefined) {
     throw new Error(
       `HTTPS certificate pair is missing: ${certificate}, ${privateKey}. `
       + "Run ../../scripts/generate-dev-certs.sh first.",
