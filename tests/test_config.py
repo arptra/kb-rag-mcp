@@ -52,3 +52,5 @@ def test_ssot_source_context_defaults_are_bounded() -> None:
     assert settings.gigacode_max_session_turns == 30
     assert settings.gigacode_max_tool_calls == 50
     assert settings.domscribe_enabled is False
+    assert settings.domscribe_max_attempts == 3
+    assert settings.domscribe_retry_backoff_seconds == 2.0

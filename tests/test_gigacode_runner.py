@@ -202,6 +202,8 @@ if "--version" in sys.argv:
 excluded = sys.argv[sys.argv.index("--exclude-tools") + 1]
 if "write" in excluded or "edit" in excluded:
     raise SystemExit(9)
+if sys.argv[sys.argv.index("--approval-mode") + 1] != "auto-edit":
+    raise SystemExit(11)
 prompt = sys.stdin.read()
 if '"changed_files"' not in prompt or "read-only tool calls" in prompt:
     raise SystemExit(10)
@@ -235,7 +237,9 @@ print(json.dumps({
 
     assert result.payload["status"] == "completed"
     assert result.payload["changed_files"] == ["src/Button.tsx"]
-    assert json.loads((debug_directory / "invocation.json").read_text())["read_only"] is False
+    invocation = json.loads((debug_directory / "invocation.json").read_text())
+    assert invocation["read_only"] is False
+    assert invocation["approval_mode"] == "auto-edit"
 
 
 def test_gigacode_runner_accepts_plain_markdown_result(

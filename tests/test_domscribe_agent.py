@@ -32,6 +32,26 @@ class FakeRunner:
         )
 
 
+class FlakyRunner(FakeRunner):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+        self.debug_directories: list[Path] = []
+
+    def run_workspace_edit(
+        self,
+        *,
+        prompt: str,
+        debug_directory: Path,
+        **kwargs: Any,
+    ) -> GigaCodeJsonResult:
+        self.debug_directories.append(debug_directory)
+        if len(self.debug_directories) <= self.failures:
+            self.prompts.append(prompt)
+            raise RuntimeError("temporary GigaCode failure")
+        return super().run_workspace_edit(prompt=prompt, **kwargs)
+
+
 class FakeRelay:
     def __init__(self, annotations: list[dict[str, Any]]) -> None:
         self.annotations = deque(annotations)
@@ -118,3 +138,39 @@ def test_domscribe_agent_processes_annotations_in_fifo_order(
         ("ann_ABCDEFGH_2000", "processed"),
     ]
     assert all("Файлы: apps/dashboard/src/App.tsx" in message for _, message in relay.responses)
+
+
+def test_domscribe_agent_retries_transient_gigacode_failure(
+    settings_factory,
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    source = workspace / "apps" / "dashboard" / "src" / "App.tsx"
+    source.parent.mkdir(parents=True)
+    source.write_text("export function App() { return null }\n", encoding="utf-8")
+    relay = FakeRelay([_annotation("ann_ABCDEFGH_3000", "Сделай кнопку синей", source)])
+    runner = FlakyRunner(failures=2)
+    agent = DomscribeGigaCodeAgent(
+        settings_factory(
+            domscribe_workspace_root=workspace,
+            domscribe_max_attempts=3,
+            domscribe_retry_backoff_seconds=0,
+        ),
+        runner=runner,  # type: ignore[arg-type]
+        relay=relay,  # type: ignore[arg-type]
+    )
+
+    assert agent.process_once() is True
+
+    assert len(runner.prompts) == 3
+    assert [path.name for path in runner.debug_directories] == [
+        "attempt-1",
+        "attempt-2",
+        "attempt-3",
+    ]
+    assert [item[:2] for item in relay.status_updates] == [
+        ("ann_ABCDEFGH_3000", "processed"),
+    ]
+    assert agent.status()["current_attempt"] == 0
+    assert agent.status()["completed_count"] == 1
+    assert agent.status()["failed_count"] == 0

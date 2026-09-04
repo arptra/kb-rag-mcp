@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     domscribe_enabled: bool = False
     domscribe_workspace_root: Path = Path(".")
     domscribe_poll_interval_seconds: float = Field(default=0.5, ge=0.1, le=10.0)
+    domscribe_max_attempts: int = Field(default=3, ge=1, le=10)
+    domscribe_retry_backoff_seconds: float = Field(default=2.0, ge=0.0, le=60.0)
     benchmark_questions_path: Path = Path("evaluation/questions.json")
     benchmark_password: SecretStr | None = None
     benchmark_max_questions: int = Field(default=100, ge=1, le=1000)

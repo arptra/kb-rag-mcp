@@ -14,7 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from corporate_kb.config import Settings
-from corporate_kb.gigacode_runner import GigaCodeRunner
+from corporate_kb.gigacode_runner import (
+    GigaCodeCancelled,
+    GigaCodeJsonResult,
+    GigaCodeRunner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +159,8 @@ class DomscribeGigaCodeAgent:
             "queue": {},
             "current_annotation_id": None,
             "current_intent": None,
+            "current_attempt": 0,
+            "max_attempts": settings.domscribe_max_attempts,
             "authentication_url": None,
             "last_error": None,
             "last_progress": None,
@@ -184,6 +190,8 @@ class DomscribeGigaCodeAgent:
         if refresh:
             self._refresh_relay_status()
         gigacode = self._runner.status()
+        gigacode["read_only"] = False
+        gigacode["approval_mode"] = "auto-edit"
         with self._state_lock:
             state = dict(self._state)
             state["queue"] = dict(self._state["queue"])
@@ -227,19 +235,7 @@ class DomscribeGigaCodeAgent:
 
         try:
             self._validate_source_location(claimed)
-            result = self._runner.run_workspace_edit(
-                checkout=self._workspace_root,
-                prompt=self._edit_prompt(claimed, intent),
-                cancel=self._stop,
-                progress=self._progress,
-                authentication_url=lambda url: self._set_state(authentication_url=url),
-                authentication_complete=lambda: self._set_state(authentication_url=None),
-                debug_directory=(
-                    self._settings.analysis_archive_dir
-                    / "domscribe-agent"
-                    / annotation_id
-                ),
-            )
+            result = self._run_with_retries(claimed, intent, annotation_id)
             payload = result.payload
             message = str(payload.get("message") or "Изменение выполнено.").strip()
             changed_files = payload.get("changed_files")
@@ -278,10 +274,67 @@ class DomscribeGigaCodeAgent:
             self._set_state(
                 current_annotation_id=None,
                 current_intent=None,
+                current_attempt=0,
                 authentication_url=None,
             )
             self._refresh_relay_status()
         return True
+
+    def _run_with_retries(
+        self,
+        claimed: dict[str, Any],
+        intent: str,
+        annotation_id: str,
+    ) -> GigaCodeJsonResult:
+        max_attempts = self._settings.domscribe_max_attempts
+        debug_root = (
+            self._settings.analysis_archive_dir
+            / "domscribe-agent"
+            / annotation_id
+        )
+        for attempt in range(1, max_attempts + 1):
+            self._set_state(
+                current_attempt=attempt,
+                last_error=None,
+                last_progress=f"GigaCode attempt {attempt}/{max_attempts}",
+            )
+            try:
+                return self._runner.run_workspace_edit(
+                    checkout=self._workspace_root,
+                    prompt=self._edit_prompt(claimed, intent),
+                    cancel=self._stop,
+                    progress=self._progress,
+                    authentication_url=lambda url: self._set_state(authentication_url=url),
+                    authentication_complete=lambda: self._set_state(
+                        authentication_url=None
+                    ),
+                    debug_directory=debug_root / f"attempt-{attempt}",
+                )
+            except GigaCodeCancelled:
+                raise
+            except Exception as exc:
+                if attempt >= max_attempts:
+                    raise
+                detail = " ".join(str(exc).split())[:1000] or type(exc).__name__
+                delay = self._settings.domscribe_retry_backoff_seconds * (2 ** (attempt - 1))
+                logger.warning(
+                    "Domscribe annotation %s attempt %d/%d failed; retrying in %.1fs: %s",
+                    annotation_id,
+                    attempt,
+                    max_attempts,
+                    delay,
+                    detail,
+                )
+                self._set_state(
+                    last_error=detail,
+                    last_progress=(
+                        f"GigaCode attempt {attempt}/{max_attempts} failed; "
+                        f"retrying in {delay:g}s"
+                    ),
+                )
+                if self._stop.wait(delay):
+                    raise GigaCodeCancelled("GigaCode retry was cancelled") from exc
+        raise RuntimeError("GigaCode retry loop exhausted")
 
     def _run_loop(self) -> None:
         poll_seconds = self._settings.domscribe_poll_interval_seconds

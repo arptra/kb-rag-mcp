@@ -259,6 +259,8 @@ class GigaCodeRunner:
             "--max-session-turns",
             str(self._settings.gigacode_max_session_turns),
         ]
+        if allow_edits:
+            command.extend(["--approval-mode", "auto-edit"])
         environment = os.environ.copy()
         environment.setdefault("NO_COLOR", "1")
         creation: dict[str, Any] = {"start_new_session": os.name != "nt"}
@@ -274,7 +276,9 @@ class GigaCodeRunner:
                 f"auth_timeout={self._settings.gigacode_auth_timeout_seconds}s; "
                 f"max_turns={self._settings.gigacode_max_session_turns}; "
                 f"max_tools_advisory={self._settings.gigacode_max_tool_calls}; "
-                f"read_only={str(not allow_edits).lower()}; schema_delivery=prompt"
+                f"read_only={str(not allow_edits).lower()}; "
+                f"approval_mode={'auto-edit' if allow_edits else 'default'}; "
+                "schema_delivery=prompt"
             )
         bounded_prompt = self._prompt_with_output_contract(
             prompt,
@@ -294,6 +298,7 @@ class GigaCodeRunner:
                         "command": command,
                         "cwd": str(root),
                         "read_only": not allow_edits,
+                        "approval_mode": "auto-edit" if allow_edits else "default",
                         "timeout_seconds": self._settings.gigacode_timeout_seconds,
                         "max_session_turns": self._settings.gigacode_max_session_turns,
                         "max_tool_calls_advisory": self._settings.gigacode_max_tool_calls,

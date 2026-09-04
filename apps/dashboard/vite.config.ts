@@ -26,10 +26,18 @@ function domscribeBasePath(): Plugin {
     transformIndexHtml: {
       order: "post",
       handler(html) {
-        return html.replaceAll(
-          "import('/@domscribe/react-init.js')",
-          "import('/admin/@domscribe/react-init.js')",
-        );
+        return html
+          .replaceAll(
+            "import('/@domscribe/react-init.js')",
+            "import('/admin/@domscribe/react-init.js')",
+          )
+          // React init imports the pre-bundled overlay. Drop the base plugin's
+          // second /node_modules import, which ignores Vite's /admin/ base and
+          // can register the same custom elements twice after reconnects.
+          .replaceAll(
+            "import('/node_modules/@domscribe/overlay/index.js').then(m => m.initOverlay()).catch(e => console.warn('[domscribe] Failed to load overlay:', e.message));",
+            "",
+          );
       },
     },
   };
