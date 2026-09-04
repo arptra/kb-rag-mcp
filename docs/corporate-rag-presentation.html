@@ -1168,19 +1168,37 @@
     }
 
     @media print {
-      :root { color-scheme: light; }
-      html { scroll-snap-type: none; background: white; }
-      body { background: white; color: #0b1724; }
+      @page { size: 13.333in 7.5in; margin: 0; }
+
+      :root { color-scheme: dark; }
+      html,
+      body {
+        width: 13.333in;
+        height: 7.5in;
+        margin: 0;
+        scroll-snap-type: none;
+        background: var(--bg-deep);
+      }
+      body {
+        color: var(--text);
+        background:
+          radial-gradient(circle at 10% 10%, rgba(84, 215, 255, 0.10), transparent 34rem),
+          radial-gradient(circle at 88% 70%, rgba(175, 152, 255, 0.09), transparent 38rem),
+          var(--bg-deep);
+      }
       .slide {
         min-height: 0;
-        height: 177.8mm;
+        width: 13.333in;
+        height: 7.5in;
+        break-after: page;
         page-break-after: always;
         padding: 18mm;
       }
+      .slide:last-child { break-after: auto; page-break-after: auto; }
       .slide::before {
         inset: 0;
-        border-color: #ccd5dd;
-        background: white;
+        border-color: rgba(145, 167, 186, 0.18);
+        background: linear-gradient(145deg, rgba(13, 27, 44, 0.90), rgba(4, 12, 23, 0.93));
         box-shadow: none;
       }
       .controls,
