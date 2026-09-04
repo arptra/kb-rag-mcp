@@ -260,6 +260,7 @@ export interface GraphPayload {
   snapshot_id: string | null;
   analysis_mode: "static" | "static+gigacode" | "partial";
   verification: Record<string, unknown>;
+  algorithm: Partial<GraphAlgorithmDescriptor>;
   generated_at: string;
   view: string;
   truncated: boolean;
@@ -272,6 +273,7 @@ export interface GraphOverview {
   snapshot_id: string | null;
   analysis_mode: "static" | "static+gigacode" | "partial";
   verification: Record<string, unknown>;
+  algorithm: Partial<GraphAlgorithmDescriptor>;
   generated_at: string;
   node_count: number;
   edge_count: number;
@@ -297,4 +299,18 @@ export interface GraphOverview {
     catalog_name?: string | null;
   }>;
   issues: Array<{ repository: string; file: string | null; message: string }>;
+}
+
+export interface GraphAlgorithmDescriptor {
+  id: string;
+  version: string;
+  description: string;
+  cache_namespace: string;
+  capabilities: string[];
+}
+
+export interface GraphAlgorithmsResponse {
+  default_algorithm: string;
+  current_algorithm: Partial<GraphAlgorithmDescriptor>;
+  algorithms: GraphAlgorithmDescriptor[];
 }

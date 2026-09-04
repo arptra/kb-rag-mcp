@@ -1085,6 +1085,19 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         except Exception as exc:
             return _api_error(exc)
 
+    @server.custom_route(
+        "/admin/api/graph/algorithms",
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    async def admin_graph_algorithms(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            return JSONResponse(await asyncio.to_thread(catalog.graph_algorithms))
+        except Exception as exc:
+            return _api_error(exc)
+
     @server.custom_route("/admin/api/graph", methods=["GET"], include_in_schema=False)
     async def admin_graph(request: Request) -> JSONResponse:
         if not _admin_authorized(request, settings):

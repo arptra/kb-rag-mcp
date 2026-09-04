@@ -31,7 +31,7 @@ from corporate_kb.loaders.filesystem import SUPPORTED_DOCUMENT_SUFFIXES
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeIndexMissingError, KnowledgeService
 from corporate_kb.usage import UsageTracker
-from gigacode_graph.algorithms import get_graph_algorithm
+from gigacode_graph.algorithms import get_graph_algorithm, registry
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.models import GraphSnapshot
 from gigacode_graph.scanner import merge_and_relink_snapshots
@@ -1565,6 +1565,16 @@ class RagCatalog:
 
     def graph_overview(self) -> dict[str, Any]:
         return self._graph_service.overview()
+
+    def graph_algorithms(self) -> dict[str, Any]:
+        """Return executable builders; lifecycle YAML never invents UI options."""
+        overview = self._graph_service.overview()
+        current = overview.get("algorithm")
+        return {
+            "default_algorithm": self._graph_settings().builder_algorithm,
+            "current_algorithm": current if isinstance(current, dict) else {},
+            "algorithms": [item.as_dict() for item in registry.descriptors()],
+        }
 
     def graph(
         self,

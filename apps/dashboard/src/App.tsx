@@ -26,6 +26,8 @@ import {
 } from "./graphSemantics";
 import type {
   CatalogJob,
+  GraphAlgorithmDescriptor,
+  GraphAlgorithmsResponse,
   GraphNode,
   GraphOverview,
   GraphPayload,
@@ -2311,7 +2313,39 @@ function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction 
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [showHelp, setShowHelp] = useState(false);
+  const [algorithms, setAlgorithms] = useState<GraphAlgorithmDescriptor[]>([]);
+  const [algorithmsError, setAlgorithmsError] = useState("");
+  const [selectedAlgorithm, setSelectedAlgorithm] = useState(
+    () => sessionStorage.getItem("rag-graph-algorithm") || data.algorithm.id || "",
+  );
   const graphRequest = useRef(0);
+  useEffect(() => {
+    let active = true;
+    setAlgorithmsError("");
+    api<GraphAlgorithmsResponse>("/admin/api/graph/algorithms", password)
+      .then((payload) => {
+        if (!active) return;
+        setAlgorithms(payload.algorithms);
+        setSelectedAlgorithm((current) => {
+          const available = new Set(payload.algorithms.map((item) => item.id));
+          const next = available.has(current)
+            ? current
+            : available.has(payload.default_algorithm)
+              ? payload.default_algorithm
+              : payload.algorithms[0]?.id || "";
+          if (next) sessionStorage.setItem("rag-graph-algorithm", next);
+          return next;
+        });
+      })
+      .catch((caught) => {
+        if (active) {
+          setAlgorithmsError(
+            caught instanceof Error ? caught.message : "Список алгоритмов недоступен",
+          );
+        }
+      });
+    return () => { active = false; };
+  }, [password]);
   useEffect(() => {
     const request = ++graphRequest.current;
     setGraph(null);
@@ -2372,6 +2406,7 @@ function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction 
     filtered?.edges.forEach((edge) => { counts[edgeServiceScope(edge, filteredNodesById)] += 1; });
     return counts;
   }, [filtered, filteredNodesById]);
+  const selectedAlgorithmInfo = algorithms.find((item) => item.id === selectedAlgorithm);
 
   const toggleType = (type: string) => setSelectedTypes((current) => {
     const next = new Set(current);
@@ -2399,8 +2434,24 @@ function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction 
         <div className="graph-head-actions">
           <button className="button quiet graph-help-button" title="Открыть справочник: что означает каждый тип узла и связи, откуда берутся evidence и confidence" onClick={() => setShowHelp(true)}>?</button>
           <div className="segmented"><button title="Показать только сервисы и внешние системы. Параллельные вызовы между одной парой агрегируются по протоколу; это основной режим для карты 700+ сервисов." className={view === "services" ? "active" : ""} onClick={() => setView("services")}>Сервисы</button><button title="Загрузить технический snapshot: операции, методы, правила, входы, выходы, события и таблицы. Для большого графа автоматически включается облегчённая отрисовка и лимит визуализации." className={view === "full" ? "active" : ""} onClick={() => setView("full")}>Полный граф</button></div>
-          <button className="button secondary" title="Заново просканировать доступные исходники детерминированными правилами без LLM. Обновляет только snapshot графа; RAG-документы и индексы не меняет." onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "static", verify_all: false }), "Быстрое перестроение отдельного графа запущено")}>⌘ Быстро</button>
-          <button className="button precise" disabled={!gigacodeAvailable} title={!gigacodeAvailable ? gigacodeError || "GigaCode недоступен" : "Временно восстановить все удалённые checkout, проверить связи через GigaCode и снова удалить исходники"} onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "gigacode", verify_all: true }), "Точное перестроение отдельного графа запущено")}>✦ Точный rebuild</button>
+          <label className="graph-algorithm-picker" title={selectedAlgorithmInfo?.description || algorithmsError || "Загружаем установленные реализации из backend registry"}>
+            <span>Алгоритм построения</span>
+            <select
+              aria-label="Алгоритм построения графа"
+              value={selectedAlgorithm}
+              disabled={!algorithms.length}
+              onChange={(event) => {
+                setSelectedAlgorithm(event.target.value);
+                sessionStorage.setItem("rag-graph-algorithm", event.target.value);
+              }}
+            >
+              {!algorithms.length && <option value="">{algorithmsError ? "Недоступно" : "Загрузка…"}</option>}
+              {algorithms.map((item) => <option key={`${item.id}@${item.version}`} value={item.id}>{item.id} · v{item.version}</option>)}
+            </select>
+            <small>{selectedAlgorithmInfo?.description || algorithmsError || "Установленные реализации backend"}</small>
+          </label>
+          <button className="button secondary" disabled={!selectedAlgorithm} title={`Перестроить алгоритмом ${selectedAlgorithm || "—"} без LLM. Обновляет только snapshot графа; RAG-документы и индексы не меняет.`} onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "static", verify_all: false, algorithm: selectedAlgorithm }), `Быстрое перестроение алгоритмом ${selectedAlgorithm} запущено`)}>⌘ Быстро</button>
+          <button className="button precise" disabled={!gigacodeAvailable || !selectedAlgorithm} title={!gigacodeAvailable ? gigacodeError || "GigaCode недоступен" : `Построить алгоритмом ${selectedAlgorithm}, затем проверить все связи через GigaCode`} onClick={() => void onAction(() => post("/admin/api/graph/rebuild", password, { generation_mode: "gigacode", verify_all: true, algorithm: selectedAlgorithm }), `Точное перестроение алгоритмом ${selectedAlgorithm} запущено`)}>✦ Точный rebuild</button>
         </div>
       </div>
       <div className="graph-toolbar">
@@ -2427,7 +2478,7 @@ function GraphPage({ data, password, gigacodeAvailable, gigacodeError, onAction 
               <span title={`${EDGE_SCOPE_INFO.unknown.meaning} Например: URL вызова найден, но сервис-владелец не определён.`}><b>{number(edgeScopeCounts.unknown)}</b> без service_id</span>
             </>}
           </div>
-          <div className="snapshot-meta" title="Неизменяемая версия результата последнего анализа. Фильтры меняют только отображение."><b>{data.analysis_mode === "static+gigacode" ? "✦ Static + GigaCode" : data.analysis_mode || "Static"}</b><code>{short(data.snapshot_id || "legacy snapshot", 28)}</code>{graph?.truncated && <small>API-ответ усечён лимитом</small>}</div>
+          <div className="snapshot-meta" title="Неизменяемая версия результата последнего анализа. Фильтры меняют только отображение."><b>{data.analysis_mode === "static+gigacode" ? "✦ Static + GigaCode" : data.analysis_mode || "Static"}</b>{data.algorithm.id && <small>Алгоритм: {data.algorithm.id} · v{data.algorithm.version || "?"}</small>}<code>{short(data.snapshot_id || "legacy snapshot", 28)}</code>{graph?.truncated && <small>API-ответ усечён лимитом</small>}</div>
           <h4>Типы узлов · multi-select</h4>
           <div className="filter-chip-list">{graphTypeEntries.map(([type, count]) => <button aria-pressed={selectedTypes.has(type)} aria-label={nodeTypeTooltip(type, visibleTypeCounts[type] || 0, count)} title={nodeTypeTooltip(type, visibleTypeCounts[type] || 0, count)} className={selectedTypes.has(type) ? "active" : ""} key={type} onClick={() => toggleType(type)}><i style={{ background: nodeColor(type) }} /><span>{NODE_TYPE_INFO[type]?.label || type}</span><b>{visibleTypeCounts[type] || 0}/{count}</b></button>)}</div>
           <h4>Уверенность связей</h4>

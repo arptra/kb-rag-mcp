@@ -390,10 +390,26 @@ async def test_admin_lists_and_clears_all_job_logs(settings_factory) -> None:
         app.router.lifespan_context(app),
         httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
     ):
+        algorithms = await client.get("/admin/api/graph/algorithms", headers=headers)
+        assert algorithms.status_code == 200
+        algorithms_payload = algorithms.json()
+        assert algorithms_payload["default_algorithm"] == "static-v2"
+        assert len(algorithms_payload["algorithms"]) == 1
+        descriptor = algorithms_payload["algorithms"][0]
+        assert descriptor["id"] == "static-v2"
+        assert descriptor["version"] == "2.0.0"
+        assert descriptor["description"]
+        assert descriptor["cache_namespace"] == "static-v2-service-map-v5"
+        assert {"java", "kotlin", "http"} <= set(descriptor["capabilities"])
+
         started = await client.post(
             "/admin/api/graph/rebuild",
             headers=headers,
-            json={"generation_mode": "static", "verify_all": False},
+            json={
+                "generation_mode": "static",
+                "verify_all": False,
+                "algorithm": "static-v2",
+            },
         )
         assert started.status_code == 202
         job_id = started.json()["id"]
@@ -407,6 +423,8 @@ async def test_admin_lists_and_clears_all_job_logs(settings_factory) -> None:
                 break
             await asyncio.sleep(0.01)
         assert status.json()["status"] == "completed"
+        assert status.json()["result"]["algorithm"]["id"] == "static-v2"
+        assert status.json()["result"]["algorithm"]["version"] == "2.0.0"
 
         history = await client.get("/admin/api/jobs", headers=headers)
         assert history.status_code == 200
