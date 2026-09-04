@@ -116,6 +116,7 @@ class GigaCodeRunner:
         progress: Callable[[str], None] | None = None,
         authentication_url: Callable[[str], None] | None = None,
         authentication_complete: Callable[[], None] | None = None,
+        debug_directory: Path | None = None,
     ) -> GigaCodeResult:
         """Execute one single-shot structured repository analysis."""
         invocation = self._run_payload(
@@ -128,6 +129,7 @@ class GigaCodeRunner:
             progress=progress,
             authentication_url=authentication_url,
             authentication_complete=authentication_complete,
+            debug_directory=debug_directory,
         )
         return self._validated_result(invocation.payload, invocation.result_event)
 
@@ -141,6 +143,7 @@ class GigaCodeRunner:
         progress: Callable[[str], None] | None = None,
         authentication_url: Callable[[str], None] | None = None,
         authentication_complete: Callable[[], None] | None = None,
+        debug_directory: Path | None = None,
     ) -> GigaCodeJsonResult:
         """Execute one strict JSON-contract analysis without accepting prose fallback."""
         invocation = self._run_payload(
@@ -153,6 +156,7 @@ class GigaCodeRunner:
             progress=progress,
             authentication_url=authentication_url,
             authentication_complete=authentication_complete,
+            debug_directory=debug_directory,
         )
         event = invocation.result_event
         analyzed_files = invocation.payload.get("analyzed_files", [])
@@ -186,6 +190,7 @@ class GigaCodeRunner:
         progress: Callable[[str], None] | None = None,
         authentication_url: Callable[[str], None] | None = None,
         authentication_complete: Callable[[], None] | None = None,
+        debug_directory: Path | None = None,
     ) -> _InvocationResult:
         """Run the shared supervised process and return its structured payload."""
         status = self.status(refresh=True)
@@ -224,6 +229,29 @@ class GigaCodeRunner:
                 f"max_tools_advisory={self._settings.gigacode_max_tool_calls}; "
                 "read_only=true; schema_delivery=prompt"
             )
+        bounded_prompt = self._prompt_with_output_contract(prompt, schema=schema)
+        if debug_directory is not None:
+            debug_directory.mkdir(parents=True, exist_ok=True)
+            (debug_directory / "prompt.txt").write_text(bounded_prompt, encoding="utf-8")
+            (debug_directory / "schema.json").write_text(
+                json.dumps(schema, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            (debug_directory / "invocation.json").write_text(
+                json.dumps(
+                    {
+                        "command": command,
+                        "cwd": str(root),
+                        "read_only": True,
+                        "timeout_seconds": self._settings.gigacode_timeout_seconds,
+                        "max_session_turns": self._settings.gigacode_max_session_turns,
+                        "max_tool_calls_advisory": self._settings.gigacode_max_tool_calls,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
         process = subprocess.Popen(
             command,
             cwd=root,
@@ -254,7 +282,6 @@ class GigaCodeRunner:
             reader.start()
         assert process.stdin is not None
         try:
-            bounded_prompt = self._prompt_with_output_contract(prompt, schema=schema)
             process.stdin.write(bounded_prompt)
             if not bounded_prompt.endswith("\n"):
                 process.stdin.write("\n")
@@ -271,6 +298,11 @@ class GigaCodeRunner:
         stream_text_parts: list[str] = []
         reported_auth_urls: set[str] = set()
         waiting_for_authentication = False
+        debug_stdout: TextIO | None = None
+        debug_stderr: TextIO | None = None
+        if debug_directory is not None:
+            debug_stdout = (debug_directory / "stdout.jsonl").open("w", encoding="utf-8")
+            debug_stderr = (debug_directory / "stderr.log").open("w", encoding="utf-8")
         try:
             while process.poll() is None or open_streams:
                 if cancel is not None and cancel.is_set():
@@ -306,11 +338,17 @@ class GigaCodeRunner:
                     if authentication_url is not None:
                         authentication_url(auth_url)
                 if source == "stderr":
+                    if debug_stderr is not None:
+                        debug_stderr.write(f"{line}\n")
+                        debug_stderr.flush()
                     stderr_tail = self._tail(stderr_tail, line)
                     if progress is not None:
                         progress(f"GigaCode stderr | {line[:2000]}")
                     continue
                 stdout_tail = self._tail(stdout_tail, line)
+                if debug_stdout is not None:
+                    debug_stdout.write(f"{line}\n")
+                    debug_stdout.flush()
                 event = self._parse_event(line)
                 if event is None:
                     if progress is not None:
@@ -339,23 +377,36 @@ class GigaCodeRunner:
                         authentication_complete()
                 if progress is not None:
                     progress(self._event_summary(event))
+        except BaseException as exc:
+            self._write_debug_failure(debug_directory, exc)
+            raise
         finally:
             for reader in readers:
                 reader.join(timeout=1)
+            if debug_stdout is not None:
+                debug_stdout.close()
+            if debug_stderr is not None:
+                debug_stderr.close()
         return_code = process.wait(timeout=2)
         if return_code != 0:
             detail_lines = [*stderr_tail[-20:], *stdout_tail[-10:]]
             detail = "\n".join(detail_lines)
-            raise RuntimeError(
+            error = RuntimeError(
                 f"GigaCode exited with code {return_code}"
                 + (f": {detail[-4000:]}" if detail else "")
             )
+            self._write_debug_failure(debug_directory, error)
+            raise error
         if result_event is None:
-            raise RuntimeError("GigaCode completed without a result event")
+            error = RuntimeError("GigaCode completed without a result event")
+            self._write_debug_failure(debug_directory, error)
+            raise error
         if bool(result_event.get("is_error")):
-            raise RuntimeError(
+            error = RuntimeError(
                 f"GigaCode result failed: {self._result_error(result_event)}"
             )
+            self._write_debug_failure(debug_directory, error)
+            raise error
         structured, parse_mode = self._result_contract(
             result_event,
             assistant_messages,
@@ -369,11 +420,44 @@ class GigaCodeRunner:
             diagnostic = self._result_diagnostic(result_event, assistant_messages)
             if progress is not None:
                 progress(f"GigaCode output contract failed: {diagnostic}")
-            raise RuntimeError(
+            error = RuntimeError(
                 "GigaCode result did not contain usable output for the requested contract; "
                 + diagnostic
             )
+            self._write_debug_failure(debug_directory, error)
+            raise error
+        if debug_directory is not None:
+            (debug_directory / "result.json").write_text(
+                json.dumps(
+                    {
+                        "parse_mode": parse_mode,
+                        "payload": structured,
+                        "result_event": result_event,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
         return _InvocationResult(structured, result_event, parse_mode)
+
+    @staticmethod
+    def _write_debug_failure(directory: Path | None, exc: BaseException) -> None:
+        if directory is None:
+            return
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "failure.json").write_text(
+            json.dumps(
+                {
+                    "type": type(exc).__name__,
+                    "message": " ".join(str(exc).split())[:8000],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     def _probe(self) -> dict[str, Any]:
         command = self._settings.gigacode_command.strip()

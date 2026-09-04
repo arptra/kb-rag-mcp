@@ -10,10 +10,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from gigacode_graph.algorithms import (
+    GraphBuildAlgorithm,
+    GraphBuildContext,
+    GraphBuildRequest,
+    get_graph_algorithm,
+)
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.models import GraphNode, GraphSnapshot, ScanIssue
 from gigacode_graph.scanner import (
-    RepositoryScanner,
     ScanTarget,
     merge_and_relink_snapshots,
 )
@@ -38,7 +43,7 @@ from service_map.models import (
 )
 
 _INTERFACE_KINDS = {"HTTP", "KAFKA", "SCHEDULED", "GRPC", "CLI"}
-_ANALYZER_VERSION = "service-map-v5-service-call-coverage"
+_ANALYZER_VERSION = "service-map-v6-pluggable-algorithm"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +72,32 @@ def _interface_kind(value: object) -> InterfaceKind:
 class ServiceMapBuilder:
     """Scan repositories once and produce both graph and lightweight map snapshots."""
 
-    def __init__(self, settings: GraphSettings) -> None:
+    def __init__(
+        self,
+        settings: GraphSettings,
+        algorithm: GraphBuildAlgorithm | None = None,
+    ) -> None:
         self._settings = settings
+        self._algorithm = algorithm or get_graph_algorithm(settings.builder_algorithm)
+
+    def _run_algorithm(
+        self,
+        targets: list[ScanTarget],
+        *,
+        discovery_only: bool,
+        progress: Callable[[str], None] | None,
+    ) -> GraphSnapshot:
+        result = self._algorithm.build(
+            GraphBuildRequest(
+                targets=tuple(targets),
+                discovery_only=discovery_only,
+            ),
+            GraphBuildContext(settings=self._settings, progress=progress),
+        )
+        return result.graph
+
+    def _stamp_algorithm(self, graph: GraphSnapshot) -> GraphSnapshot:
+        return graph.model_copy(update={"algorithm": self._algorithm.descriptor.as_dict()})
 
     def build(
         self,
@@ -81,7 +110,10 @@ class ServiceMapBuilder:
         skip_service_ids: set[str] | None = None,
     ) -> ServiceMapBuildResult:
         if not repositories:
-            return ServiceMapBuildResult(GraphSnapshot(), ServiceMapSnapshot())
+            return ServiceMapBuildResult(
+                self._stamp_algorithm(GraphSnapshot()),
+                ServiceMapSnapshot(algorithm=self._algorithm.descriptor.as_dict()),
+            )
 
         build_started_at = time.monotonic()
         ordered = sorted(repositories, key=lambda value: str(value.path.resolve()))
@@ -138,8 +170,9 @@ class ServiceMapBuilder:
                 f"unsupported={unsupported}; layout_issues={len(issues)}"
             )
         if targets and checkpoint is not None:
-            layout_graph = RepositoryScanner(self._settings).discover_targets(
+            layout_graph = self._run_algorithm(
                 targets,
+                discovery_only=True,
                 progress=progress,
             )
             if issues:
@@ -167,8 +200,9 @@ class ServiceMapBuilder:
                         f"Module source scan skipped [{position}/{len(targets)}]: "
                         f"{target.service_id}; reason=openspec-authoritative"
                     )
-                skipped_snapshot = RepositoryScanner(self._settings).discover_targets(
+                skipped_snapshot = self._run_algorithm(
                     [target],
+                    discovery_only=True,
                     progress=progress,
                 )
                 module_snapshots.append(skipped_snapshot)
@@ -202,8 +236,9 @@ class ServiceMapBuilder:
                     progress(
                         f"Module cache {reason} [{position}/{len(targets)}]: {target.service_id}"
                     )
-                snapshot = RepositoryScanner(self._settings).scan_targets(
+                snapshot = self._run_algorithm(
                     [target],
+                    discovery_only=False,
                     progress=progress,
                 )
                 JsonGraphStore(cache_path).save(snapshot)
@@ -219,7 +254,12 @@ class ServiceMapBuilder:
         merge_started_at = time.monotonic()
         if progress is not None:
             progress(f"Global snapshot merge start: modules={len(module_snapshots)}")
-        graph = merge_and_relink_snapshots(module_snapshots) if targets else GraphSnapshot()
+        graph = (
+            merge_and_relink_snapshots(module_snapshots)
+            if targets
+            else GraphSnapshot()
+        )
+        graph = self._stamp_algorithm(graph)
         if progress is not None:
             progress(
                 f"Global snapshot merge ready: nodes={len(graph.nodes)}; "
@@ -245,6 +285,11 @@ class ServiceMapBuilder:
     ) -> Path:
         digest = hashlib.sha256()
         digest.update(_ANALYZER_VERSION.encode())
+        descriptor = self._algorithm.descriptor
+        digest.update(
+            f"\x00{descriptor.id}\x00{descriptor.version}\x00"
+            f"{descriptor.cache_namespace}".encode()
+        )
         for setting in (
             self._settings.call_depth,
             self._settings.max_service_seed_methods,
@@ -655,6 +700,7 @@ class ServiceMapBuilder:
         issues = [ServiceMapIssue.model_validate(item.model_dump()) for item in graph.issues]
         return ServiceMapSnapshot(
             generated_at=graph.generated_at,
+            algorithm=graph.algorithm,
             services=sorted(services, key=lambda item: (item.name.lower(), item.id)),
             dependencies=dependencies,
             evidence=sorted(evidence, key=lambda item: item.id),

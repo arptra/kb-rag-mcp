@@ -1,0 +1,34 @@
+schema_version: 1
+id: order-payment-http
+description: Order orchestrator must expose its API and call the payment API.
+algorithm: static-v2
+mode: static
+verify_all: false
+repositories:
+  - name: orders-repository
+    source: /absolute/path/to/orders-repository
+  - name: payments-repository
+    source: ssh://git.example.internal/team/payments.git
+    ref: main
+expectations:
+  counts:
+    min_services: 2
+    min_entrypoints: 2
+    min_exitpoints: 1
+    min_dependencies: 1
+    max_issues: 20
+  services:
+    - service: order-service
+      min_entrypoints: 1
+      min_exitpoints: 1
+    - service: payment-service
+      min_entrypoints: 1
+  required_edges:
+    - source: order-service
+      target: payment-service
+      protocol: HTTP
+      operation_contains: /payments
+  forbidden_edges:
+    - source: payment-service
+      target: order-service
+      protocol: HTTP

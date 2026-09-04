@@ -1,0 +1,17 @@
+schema_version: 1
+quality:
+  required_edge_recall: 0.95
+  forbidden_edge_precision: 1.0
+  evidence_file_line_validity: 1.0
+  stable_id_replay: 1.0
+performance:
+  target_repository_count: 707
+  maximum_wall_time_seconds: 14400
+  maximum_peak_memory_mb: 8192
+  maximum_gigacode_candidates_per_repository: 250
+  maximum_gigacode_batch_size: 25
+release_gates:
+  required_passed_cases: 1
+  allow_contract_failures: false
+  allow_regressions_against_production: false
+  require_human_patch_review: true

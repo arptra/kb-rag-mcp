@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 import uuid
 from collections.abc import Callable
@@ -179,6 +180,10 @@ class GraphGigaCodeVerifier:
         self._graph_settings = graph_settings
         self._artifact_root = artifact_root
 
+    @property
+    def id(self) -> str:
+        return "gigacode-verifier-v1"
+
     def verify(
         self,
         result: ServiceMapBuildResult,
@@ -189,6 +194,7 @@ class GraphGigaCodeVerifier:
         progress: Callable[[str], None] | None = None,
         authentication_url: Callable[[str, str], None] | None = None,
         authentication_complete: Callable[[str], None] | None = None,
+        debug_root: Path | None = None,
     ) -> tuple[ServiceMapBuildResult, dict[str, Any]]:
         candidates = [
             item
@@ -312,6 +318,13 @@ class GraphGigaCodeVerifier:
                         progress=progress,
                         authentication_url=auth_required,
                         authentication_complete=auth_completed,
+                        debug_directory=(
+                            debug_root
+                            / re.sub(r"[^a-zA-Z0-9_.-]+", "-", repository.name)
+                            / f"batch-{batch_number:04d}"
+                            if debug_root is not None
+                            else None
+                        ),
                     )
                     payload = VerificationPayload.model_validate(response.payload)
                 except GigaCodeCancelled:

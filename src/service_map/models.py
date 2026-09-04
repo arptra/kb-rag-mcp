@@ -82,6 +82,7 @@ class ServiceMapSnapshot(ServiceMapModel):
     snapshot_id: str | None = None
     analysis_mode: Literal["static", "static+gigacode", "partial"] = "static"
     verification: dict[str, Any] = Field(default_factory=dict)
+    algorithm: dict[str, Any] = Field(default_factory=dict)
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     services: list[ServiceRecord] = Field(default_factory=list)
     dependencies: list[ServiceDependency] = Field(default_factory=list)
@@ -97,6 +98,7 @@ class ServiceMapSnapshot(ServiceMapModel):
             "snapshot_id": self.snapshot_id,
             "analysis_mode": self.analysis_mode,
             "verification": self.verification,
+            "algorithm": self.algorithm,
             "generated_at": self.generated_at.isoformat(),
             "service_count": len(self.services),
             "entrypoint_count": entrypoint_count,

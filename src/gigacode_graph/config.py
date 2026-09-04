@@ -22,6 +22,7 @@ class GraphSettings(BaseSettings):
     repository_cache_path: Path = Path(".cache/gigacode-graph/repositories")
     module_cache_path: Path = Path(".cache/gigacode-graph/module-analysis")
     ingestion_path: Path = Path(".cache/gigacode-graph/ingestion.json")
+    builder_algorithm: str = "static-v2"
     max_java_file_bytes: int = Field(default=2_000_000, ge=10_000, le=20_000_000)
     call_depth: int = Field(default=6, ge=1, le=20)
     max_service_seed_methods: int = Field(default=5_000, ge=1, le=100_000)

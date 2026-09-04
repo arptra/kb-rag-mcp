@@ -78,6 +78,7 @@ def finalize_snapshot(
         deep=True,
     )
     canonical = {
+        "algorithm": graph.algorithm,
         "nodes": [item.model_dump(mode="json") for item in graph.nodes],
         "edges": [item.model_dump(mode="json") for item in graph.edges],
         "evidence": [item.model_dump(mode="json") for item in graph.evidence],

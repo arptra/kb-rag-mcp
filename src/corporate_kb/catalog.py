@@ -31,6 +31,7 @@ from corporate_kb.loaders.filesystem import SUPPORTED_DOCUMENT_SUFFIXES
 from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeIndexMissingError, KnowledgeService
 from corporate_kb.usage import UsageTracker
+from gigacode_graph.algorithms import get_graph_algorithm
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.models import GraphSnapshot
 from gigacode_graph.scanner import merge_and_relink_snapshots
@@ -561,7 +562,10 @@ class RagCatalog:
         *,
         generation_mode: Literal["static", "gigacode"] = "static",
         verify_all: bool = False,
+        algorithm: str | None = None,
     ) -> CatalogJob:
+        selected_algorithm = algorithm or self._graph_settings().builder_algorithm
+        get_graph_algorithm(selected_algorithm)
         if generation_mode == "gigacode":
             gigacode_status = self._gigacode.status(refresh=True)
             if not gigacode_status["available"]:
@@ -576,7 +580,7 @@ class RagCatalog:
         )
         threading.Thread(
             target=self._run_graph_job,
-            args=(job.id, generation_mode, verify_all),
+            args=(job.id, generation_mode, verify_all, selected_algorithm),
             daemon=True,
         ).start()
         return job
@@ -2254,6 +2258,7 @@ class RagCatalog:
         job_id: str,
         generation_mode: Literal["static", "gigacode"],
         verify_all: bool,
+        algorithm: str,
     ) -> None:
         cancel_event = self._cancel_event(job_id)
         with self._lock:
@@ -2272,6 +2277,7 @@ class RagCatalog:
                 cancel_event,
                 generation_mode,
                 verify_all,
+                algorithm,
             )
             self._cleanup_repository_checkouts(cleanup_pending, job_id=job_id)
             cleanup_pending.clear()
@@ -2293,6 +2299,7 @@ class RagCatalog:
                     "generation_mode": generation_mode,
                     "snapshot_id": snapshot.snapshot_id,
                     "verification": snapshot.verification,
+                    "algorithm": snapshot.algorithm,
                     "checkout_cleanup": "completed",
                 },
             )
@@ -2315,6 +2322,7 @@ class RagCatalog:
         cancel_event: threading.Event,
         generation_mode: Literal["static", "gigacode"],
         verify_all: bool,
+        algorithm: str,
     ) -> GraphSnapshot:
         self._update_job(
             job_id,
@@ -2332,6 +2340,7 @@ class RagCatalog:
             force_all=generation_mode == "gigacode",
             analysis_mode=generation_mode,
             verify_all=verify_all,
+            algorithm=algorithm,
         )
         self._raise_if_cancelled(cancel_event)
         return snapshot
@@ -3479,6 +3488,7 @@ class RagCatalog:
         skip_service_ids: set[str] | None = None,
         analysis_mode: Literal["static", "gigacode"] = "static",
         verify_all: bool = False,
+        algorithm: str | None = None,
     ) -> GraphSnapshot:
         if job_id is not None and self._analysis_lock.locked():
             self._append_job_log(job_id, "Waiting for another graph analysis to finish")
@@ -3491,6 +3501,7 @@ class RagCatalog:
                 skip_service_ids=skip_service_ids,
                 analysis_mode=analysis_mode,
                 verify_all=verify_all,
+                algorithm=algorithm,
             )
 
     def _build_graph_unlocked(
@@ -3503,6 +3514,7 @@ class RagCatalog:
         skip_service_ids: set[str] | None,
         analysis_mode: Literal["static", "gigacode"],
         verify_all: bool,
+        algorithm: str | None,
     ) -> GraphSnapshot:
         with self._lock:
             repositories = [item.model_copy(deep=True) for item in self._state.repositories]
@@ -3526,11 +3538,13 @@ class RagCatalog:
             available_repositories,
         )
 
+        graph_settings = self._graph_settings(algorithm)
+
         def merge_retained(active_result: ServiceMapBuildResult) -> ServiceMapBuildResult:
             if not unavailable_repositories:
                 return active_result
             merged = merge_and_relink_snapshots([retained_graph, active_result.graph])
-            projected = ServiceMapBuilder(self._graph_settings()).from_graph(
+            projected = ServiceMapBuilder(graph_settings).from_graph(
                 merged,
                 self._repository_inputs(repositories),
             )
@@ -3556,7 +3570,7 @@ class RagCatalog:
                     f"{len(inputs)} repositories",
                 )
         runner = ServiceMapProcessRunner(
-            self._graph_settings(),
+            graph_settings,
             timeout_seconds=analysis_timeout,
         )
         build_options: dict[str, Any] = {}
@@ -4431,13 +4445,14 @@ class RagCatalog:
             for item in self._state.indexes
         ]
 
-    def _graph_settings(self) -> GraphSettings:
+    def _graph_settings(self, algorithm: str | None = None) -> GraphSettings:
         return GraphSettings(
             store_path=self.settings.graph_store_path,
             repository_cache_path=self.settings.repository_cache_dir,
             module_cache_path=self.settings.repository_cache_dir.parent / "module-analysis",
             ingestion_path=self.settings.repository_cache_dir.parent / "graph-ingestion.json",
             git_timeout_seconds=self.settings.repository_git_timeout_seconds,
+            builder_algorithm=algorithm or GraphSettings().builder_algorithm,
         ).resolved()
 
     @staticmethod

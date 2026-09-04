@@ -1,0 +1,13 @@
+schema_version: 1
+active: static-v2
+algorithms:
+  - id: static-v2
+    version: 2.0.0
+    stage: production
+    implementation: gigacode_graph.algorithms.static_v2.StaticV2Algorithm
+    targets:
+      - spring-entrypoint-recall
+      - service-orchestrator-outbound-recall
+      - bounded-analysis
+    evidence_runs: []
+    notes: Initial contract-backed release; evidence runs are environment-local until promoted.

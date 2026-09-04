@@ -1064,9 +1064,13 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             verify_all = payload.get("verify_all", False)
             if not isinstance(verify_all, bool):
                 raise ValueError("verify_all must be boolean")
+            algorithm = payload.get("algorithm")
+            if algorithm is not None and not isinstance(algorithm, str):
+                raise ValueError("algorithm must be a string")
             job = catalog.start_graph_build(
                 generation_mode=generation_mode,
                 verify_all=verify_all,
+                algorithm=algorithm,
             )
             return JSONResponse(job.model_dump(mode="json"), status_code=202)
         except Exception as exc:

@@ -1,5 +1,8 @@
 # Repository Graph для GigaCode
 
+> Для разработки альтернативных алгоритмов, воспроизводимых CASE.yaml, replay,
+> GigaCode debug bundle и безопасного repair workflow см. [Graph Lab](graph-lab/README.md).
+
 Изолированный модуль `gigacode_graph` принимает Git URL или локальные checkout-ы и строит
 evidence-backed граф Java/Spring-сервисов. Git URL автоматически клонируются в управляемый cache;
 при следующем запуске тот же command обновляет их до нового commit. Один snapshot используется

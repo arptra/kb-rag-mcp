@@ -9,8 +9,28 @@ from typing import Annotated, Any
 
 import typer
 
+from gigacode_graph.algorithms import (
+    GraphBuildContext,
+    GraphBuildRequest,
+    get_graph_algorithm,
+    registry,
+)
 from gigacode_graph.config import GraphSettings
-from gigacode_graph.scanner import RepositoryScanner
+from gigacode_graph.lab.models import GraphLabCase, load_yaml_model
+from gigacode_graph.lab.repair import (
+    apply_repair,
+    prepare_repair,
+    promote_algorithm,
+    run_repair,
+)
+from gigacode_graph.lab.runner import GraphLabRunner
+from gigacode_graph.lab.validation import (
+    compare_graphs,
+    explain_edge,
+    explain_missing,
+    validate_graph,
+)
+from gigacode_graph.scanner import ScanTarget
 from gigacode_graph.service import GraphService
 from gigacode_graph.sources import RepositorySourceManager, RepositorySpec
 from gigacode_graph.store import JsonGraphStore
@@ -19,6 +39,10 @@ app = typer.Typer(
     no_args_is_help=True,
     help="Индексатор и read-only граф Java/Spring сервисов для GigaCode.",
 )
+algorithm_app = typer.Typer(no_args_is_help=True, help="Версии и реализации алгоритмов графа.")
+debug_app = typer.Typer(no_args_is_help=True, help="Воспроизводимые graph-lab прогоны и ремонт.")
+app.add_typer(algorithm_app, name="algorithm")
+app.add_typer(debug_app, name="debug")
 
 
 def _dump(value: Any) -> str:
@@ -74,16 +98,21 @@ def _ingest(
     store: Path | None,
     ref: str | None,
     refresh: bool,
+    algorithm: str,
 ) -> tuple[GraphSettings, dict[str, Any]]:
     specs = [RepositorySpec(source=value, ref=ref) for value in repositories or []]
     if manifest is not None:
         specs.extend(_manifest_repositories(manifest.resolve()))
     if not specs:
         raise ValueError("Pass Git URLs, repository paths, or --manifest")
-    settings = _settings(store)
+    settings = _settings(store).model_copy(update={"builder_algorithm": algorithm})
     source_manager = RepositorySourceManager(settings)
     paths, records = source_manager.materialize(specs, refresh=refresh)
-    snapshot = RepositoryScanner(settings).scan(paths)
+    implementation = get_graph_algorithm(algorithm)
+    snapshot = implementation.build(
+        GraphBuildRequest(targets=tuple(ScanTarget(path=path) for path in paths)),
+        GraphBuildContext(settings=settings),
+    ).graph
     JsonGraphStore(settings.store_path).save(snapshot)
     source_manager.save_manifest(records, snapshot)
     payload = snapshot.stats()
@@ -116,6 +145,10 @@ def index(
         bool,
         typer.Option("--refresh/--no-refresh", help="Обновить уже клонированные Git URL."),
     ] = True,
+    algorithm: Annotated[
+        str,
+        typer.Option("--algorithm", help="ID реализации из algorithm list."),
+    ] = "static-v2",
 ) -> None:
     """Скачать Git URL и собрать готовые graph/ingestion artifacts."""
     _settings_used, payload = _ingest(
@@ -124,6 +157,7 @@ def index(
         store=store,
         ref=ref,
         refresh=refresh,
+        algorithm=algorithm,
     )
     typer.echo(_dump(payload))
 
@@ -140,6 +174,7 @@ def up(
     refresh: Annotated[bool, typer.Option("--refresh/--no-refresh")] = True,
     host: Annotated[str | None, typer.Option("--host")] = None,
     port: Annotated[int | None, typer.Option("--port", min=1, max=65535)] = None,
+    algorithm: Annotated[str, typer.Option("--algorithm")] = "static-v2",
 ) -> None:
     """Скачать repositories, построить граф и сразу поднять UI + MCP."""
     settings, payload = _ingest(
@@ -148,6 +183,7 @@ def up(
         store=store,
         ref=ref,
         refresh=refresh,
+        algorithm=algorithm,
     )
     updates: dict[str, Any] = {}
     if host is not None:
@@ -236,6 +272,229 @@ def data_model(
 ) -> None:
     """Показать сущности, таблицы, колонки, миграции и READS/WRITES."""
     typer.echo(_dump(_service(store).data_model(service=service, table=table, limit=limit)))
+
+
+@algorithm_app.command(name="list")
+def algorithm_list() -> None:
+    """Показать встроенные и установленные через entry point алгоритмы."""
+    typer.echo(_dump({"algorithms": [item.as_dict() for item in registry.descriptors()]}))
+
+
+@algorithm_app.command(name="contract")
+def algorithm_contract() -> None:
+    """Показать точку расширения для отдельного Python-пакета."""
+    typer.echo(
+        _dump(
+            {
+                "python_contract": "gigacode_graph.algorithms.GraphBuildAlgorithm",
+                "optional_base_class": "gigacode_graph.algorithms.BaseGraphBuildAlgorithm",
+                "entry_point_group": "corporate_kb.graph_algorithms",
+                "required_members": ["descriptor", "build(request, context)"],
+                "reference": "gigacode_graph.algorithms.static_v2.StaticV2Algorithm",
+            }
+        )
+    )
+
+
+@algorithm_app.command(name="promote")
+def algorithm_promote(
+    algorithm: Annotated[str, typer.Argument(help="ID установленного алгоритма.")],
+    version: Annotated[str, typer.Option("--version")],
+    evidence_run: Annotated[Path, typer.Option("--evidence-run")],
+    stage: Annotated[
+        str,
+        typer.Option("--stage", help="experimental, candidate, production или retired."),
+    ] = "candidate",
+    registry_path: Annotated[
+        Path,
+        typer.Option("--registry", help="Версионируемый ALGORITHMS.yaml."),
+    ] = Path("graph-lab/ALGORITHMS.yaml"),
+) -> None:
+    """Повысить версию только при наличии успешного validation run."""
+    if stage not in {"experimental", "candidate", "production", "retired"}:
+        raise ValueError("stage must be experimental, candidate, production or retired")
+    updated = promote_algorithm(
+        registry_path,
+        algorithm_id=algorithm,
+        version=version,
+        stage=stage,
+        evidence_run=evidence_run,
+    )
+    typer.echo(updated.model_dump_json(indent=2))
+
+
+@debug_app.command(name="run")
+def debug_run(
+    case: Annotated[Path, typer.Argument(help="CASE.yaml с repositories и expectations.")],
+    lab_root: Annotated[Path, typer.Option("--lab-root")] = Path("graph-lab"),
+    mode: Annotated[str | None, typer.Option("--mode", help="static или gigacode.")] = None,
+    algorithm: Annotated[str | None, typer.Option("--algorithm")] = None,
+    keep_checkouts: Annotated[bool, typer.Option("--keep-checkouts")] = False,
+) -> None:
+    """Запустить изолированный анализ и собрать полный debug bundle."""
+    if mode is not None and mode not in {"static", "gigacode"}:
+        raise ValueError("mode must be static or gigacode")
+    run_directory = GraphLabRunner(lab_root).run(
+        case,
+        mode=mode,  # type: ignore[arg-type]
+        algorithm=algorithm,
+        cleanup=not keep_checkouts,
+    )
+    payload = json.loads((run_directory / "run.json").read_text(encoding="utf-8"))
+    typer.echo(_dump({"run_directory": str(run_directory), "run": payload}))
+    if payload.get("status") != "passed":
+        raise typer.Exit(code=2)
+
+
+@debug_app.command(name="validate")
+def debug_validate(
+    graph: Annotated[Path, typer.Argument(help="graph.json для проверки.")],
+    case: Annotated[Path | None, typer.Option("--case")] = None,
+) -> None:
+    """Проверить ID, ссылки, evidence и ожидания CASE.yaml без перестройки."""
+    snapshot = JsonGraphStore(graph.resolve()).load()
+    expectations = load_yaml_model(case.resolve(), GraphLabCase) if case else None
+    result = validate_graph(snapshot, expectations)
+    typer.echo(_dump(result))
+    if result["status"] != "passed":
+        raise typer.Exit(code=2)
+
+
+@debug_app.command(name="explain-edge")
+def debug_explain_edge(
+    graph: Annotated[Path, typer.Argument()],
+    edge_id: Annotated[str, typer.Argument()],
+) -> None:
+    """Show origin, confidence, matcher and source evidence for one edge."""
+    typer.echo(_dump(explain_edge(JsonGraphStore(graph.resolve()).load(), edge_id)))
+
+
+@debug_app.command(name="explain-missing")
+def debug_explain_missing(
+    graph: Annotated[Path, typer.Argument()],
+    source: Annotated[str, typer.Option("--source")],
+    target: Annotated[str | None, typer.Option("--target")] = None,
+    protocol: Annotated[str | None, typer.Option("--protocol")] = None,
+    operation: Annotated[str | None, typer.Option("--operation")] = None,
+) -> None:
+    """Объяснить, на каком шаге могла потеряться ожидаемая связь."""
+    typer.echo(
+        _dump(
+            explain_missing(
+                JsonGraphStore(graph.resolve()).load(),
+                source=source,
+                target=target,
+                protocol=protocol,
+                operation=operation,
+            )
+        )
+    )
+
+
+@debug_app.command(name="compare")
+def debug_compare(
+    before: Annotated[Path, typer.Argument()],
+    after: Annotated[Path, typer.Argument()],
+) -> None:
+    """Compare graph IDs and, for run directories, wall time and memory."""
+    before_path = before.resolve()
+    after_path = after.resolve()
+    before_graph = before_path / "final-graph.json" if before_path.is_dir() else before_path
+    after_graph = after_path / "final-graph.json" if after_path.is_dir() else after_path
+    comparison = compare_graphs(
+        JsonGraphStore(before_graph).load(),
+        JsonGraphStore(after_graph).load(),
+    )
+    if before_path.is_dir() and after_path.is_dir():
+        before_run = json.loads((before_path / "run.json").read_text(encoding="utf-8"))
+        after_run = json.loads((after_path / "run.json").read_text(encoding="utf-8"))
+        before_elapsed = before_run.get("elapsed_seconds")
+        after_elapsed = after_run.get("elapsed_seconds")
+        comparison["performance"] = {
+            "before_elapsed_seconds": before_elapsed,
+            "after_elapsed_seconds": after_elapsed,
+            "elapsed_delta_seconds": (
+                round(float(after_elapsed) - float(before_elapsed), 6)
+                if isinstance(before_elapsed, int | float)
+                and isinstance(after_elapsed, int | float)
+                else None
+            ),
+            "before_peak_process_memory_mb": before_run.get("peak_process_memory_mb"),
+            "after_peak_process_memory_mb": after_run.get("peak_process_memory_mb"),
+        }
+    typer.echo(
+        _dump(comparison)
+    )
+
+
+@debug_app.command(name="replay")
+def debug_replay(
+    run_directory: Annotated[Path, typer.Argument()],
+    lab_root: Annotated[Path, typer.Option("--lab-root")] = Path("graph-lab"),
+    keep_checkouts: Annotated[bool, typer.Option("--keep-checkouts")] = False,
+) -> None:
+    """Replay a static run at recorded commits and write its delta."""
+    replayed = GraphLabRunner(lab_root).replay(
+        run_directory,
+        cleanup=not keep_checkouts,
+    )
+    payload = json.loads((replayed / "run.json").read_text(encoding="utf-8"))
+    typer.echo(_dump({"run_directory": str(replayed), "run": payload}))
+    if payload.get("status") != "passed":
+        raise typer.Exit(code=2)
+
+
+@debug_app.command(name="prepare-repair")
+def debug_prepare_repair(
+    run_directory: Annotated[Path, typer.Argument()],
+    lab_root: Annotated[Path, typer.Option("--lab-root")] = Path("graph-lab"),
+) -> None:
+    """Создать TASK.md/failures.json; модель пока не запускается."""
+    task = prepare_repair(run_directory, lab_root)
+    typer.echo(_dump({"task_directory": str(task)}))
+
+
+@debug_app.command(name="repair")
+def debug_repair(
+    task_directory: Annotated[Path, typer.Argument()],
+    allow_write: Annotated[
+        bool,
+        typer.Option("--allow-write", help="Разрешить изменения только в отдельном worktree."),
+    ] = False,
+    command: Annotated[str, typer.Option("--command")] = "gigacode",
+    timeout_seconds: Annotated[
+        int,
+        typer.Option("--timeout", min=60, max=7200),
+    ] = 1800,
+) -> None:
+    """Дать GigaCode исправить analyzer в worktree и получить проверенный patch."""
+    if not allow_write:
+        raise ValueError("repair requires explicit --allow-write")
+    typer.echo(
+        _dump(
+            run_repair(
+                task_directory,
+                Path.cwd(),
+                command=command,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+    )
+
+
+@debug_app.command(name="apply-repair")
+def debug_apply_repair(
+    patch: Annotated[Path, typer.Argument()],
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Явно применить уже проверенный patch к текущей ветке."),
+    ] = False,
+) -> None:
+    """Проверить git apply --check и применить patch; commit/push не выполняются."""
+    if not yes:
+        raise ValueError("apply-repair requires explicit --yes")
+    apply_repair(patch, Path.cwd())
+    typer.echo(_dump({"status": "applied", "patch": str(patch.resolve())}))
 
 
 def main() -> None:

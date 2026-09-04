@@ -111,6 +111,7 @@ class GraphSnapshot(GraphModel):
     snapshot_id: str | None = None
     analysis_mode: Literal["static", "static+gigacode", "partial"] = "static"
     verification: dict[str, Any] = Field(default_factory=dict)
+    algorithm: dict[str, Any] = Field(default_factory=dict)
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     nodes: list[GraphNode] = Field(default_factory=list)
     edges: list[GraphEdge] = Field(default_factory=list)
@@ -129,6 +130,7 @@ class GraphSnapshot(GraphModel):
             "snapshot_id": self.snapshot_id,
             "analysis_mode": self.analysis_mode,
             "verification": self.verification,
+            "algorithm": self.algorithm,
             "generated_at": self.generated_at.isoformat(),
             "node_count": len(self.nodes),
             "edge_count": len(self.edges),

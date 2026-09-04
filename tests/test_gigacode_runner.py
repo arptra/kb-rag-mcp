@@ -166,17 +166,23 @@ print(json.dumps({
         "required": ["edge_updates", "analyzed_files", "warnings"],
     }
 
+    debug_directory = tmp_path / "debug"
     result = GigaCodeRunner(
         settings_factory(gigacode_command=str(executable))
     ).run_json(
         checkout=checkout,
         prompt="Verify dependency evidence.",
         schema=schema,
+        debug_directory=debug_directory,
     )
 
     assert result.session_id == "json-session"
     assert result.analyzed_files == ("Client.kt",)
     assert result.payload["edge_updates"][0]["candidate_id"] == "dep:one"
+    assert "Verify dependency evidence" in (debug_directory / "prompt.txt").read_text()
+    assert json.loads((debug_directory / "invocation.json").read_text())["read_only"] is True
+    assert (debug_directory / "stdout.jsonl").is_file()
+    assert json.loads((debug_directory / "result.json").read_text())["payload"] == result.payload
 
 
 def test_gigacode_runner_accepts_plain_markdown_result(
