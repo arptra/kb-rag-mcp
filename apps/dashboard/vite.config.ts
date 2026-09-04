@@ -39,11 +39,8 @@ const tls = tlsEnabled && existsSync(certificate) && existsSync(privateKey)
   ? { cert: readFileSync(certificate), key: readFileSync(privateKey) }
   : undefined;
 
-export default defineConfig(({ command }) => {
-  const domscribeEnabled = command === "serve"
-    && ["1", "true", "yes", "on"].includes(
-      (process.env.VITE_DOMSCRIBE_ENABLED ?? "false").toLowerCase(),
-    );
+export default defineConfig(({ command, mode }) => {
+  const domscribeEnabled = command === "serve" && mode === "domscribe";
   if (command === "serve" && tlsEnabled && tls === undefined) {
     throw new Error(
       `HTTPS certificate pair is missing: ${certificate}, ${privateKey}. `

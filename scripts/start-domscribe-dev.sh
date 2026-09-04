@@ -26,7 +26,6 @@ trap cleanup EXIT INT TERM
 cd "${project_root}"
 
 export KB_DOMSCRIBE_ENABLED=true
-export VITE_DOMSCRIBE_ENABLED=true
 export KB_MCP_TLS_ENABLED="${KB_MCP_TLS_ENABLED:-false}"
 export VITE_TLS_ENABLED="${VITE_TLS_ENABLED:-${KB_MCP_TLS_ENABLED}}"
 
@@ -36,7 +35,7 @@ echo "Backend:   http://127.0.0.1:8000"
 
 "${script_dir}/start-backend.sh" &
 backend_pid=$!
-"${script_dir}/start-frontend.sh" --host 127.0.0.1 --port 5173 --strictPort &
+"${script_dir}/start-frontend.sh" --mode domscribe --host 127.0.0.1 --port 5173 --strictPort &
 frontend_pid=$!
 
 while kill -0 "${backend_pid}" 2>/dev/null && kill -0 "${frontend_pid}" 2>/dev/null; do

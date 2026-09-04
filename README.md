@@ -192,9 +192,10 @@ DomScribe/GigaCode — отдельный development-режим. Обычные
 KB_GIGACODE_COMMAND=/opt/homebrew/bin/qwen ./scripts/start-domscribe-dev.sh
 ```
 
-Скрипт поднимает HTTP backend, Vite, локальный DomScribe relay и открывает оверлей только через
-явные `KB_DOMSCRIBE_ENABLED=true` и `VITE_DOMSCRIBE_ENABLED=true`. Выберите в панели один или
-несколько элементов, для каждого опишите изменение и отправьте.
+Скрипт поднимает HTTP backend, Vite в отдельном режиме `--mode domscribe`, локальный DomScribe
+relay и открывает оверлей. Backend-воркер включается через `KB_DOMSCRIBE_ENABLED=true`. Выберите в
+панели один или несколько элементов, для каждого опишите изменение и отправьте. Для отдельной
+отладки только frontend можно использовать `npm --prefix apps/dashboard run dev:domscribe`.
 Аннотации сохраняются в `.domscribe/` и выполняются серверным GigaCode-воркером строго по FIFO:
 первая сразу переходит в `processing`, остальные остаются `queued`, после сохранения исходников HMR
 отрисовывает изменение и воркер берёт следующий элемент. Отдельную интерактивную сессию GigaCode CLI
