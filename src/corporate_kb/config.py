@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     gigacode_timeout_seconds: int = Field(default=600, ge=30, le=7200)
     gigacode_max_session_turns: int = Field(default=30, ge=2, le=500)
     gigacode_max_tool_calls: int = Field(default=50, ge=1, le=5000)
-    domscribe_enabled: bool = True
+    domscribe_enabled: bool = False
     domscribe_workspace_root: Path = Path(".")
     domscribe_poll_interval_seconds: float = Field(default=0.5, ge=0.1, le=10.0)
     benchmark_questions_path: Path = Path("evaluation/questions.json")

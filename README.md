@@ -179,8 +179,22 @@ dependencies своей части. Подробности и production-реж�
 
 #### DomScribe + встроенный GigaCode-чат
 
-В development-режиме Vite автоматически запускает локальный DomScribe relay и открывает его
-оверлей. Выберите в панели один или несколько элементов, для каждого опишите изменение и отправьте.
+DomScribe/GigaCode — отдельный development-режим. Обычные `start-backend.sh`,
+`start-frontend.sh` и production build его не включают. Запустите весь dev-стенд одной командой:
+
+```bash
+./scripts/start-domscribe-dev.sh
+```
+
+Для временного запуска через Qwen Code вместо будущего GigaCode:
+
+```bash
+KB_GIGACODE_COMMAND=/opt/homebrew/bin/qwen ./scripts/start-domscribe-dev.sh
+```
+
+Скрипт поднимает HTTP backend, Vite, локальный DomScribe relay и открывает оверлей только через
+явные `KB_DOMSCRIBE_ENABLED=true` и `VITE_DOMSCRIBE_ENABLED=true`. Выберите в панели один или
+несколько элементов, для каждого опишите изменение и отправьте.
 Аннотации сохраняются в `.domscribe/` и выполняются серверным GigaCode-воркером строго по FIFO:
 первая сразу переходит в `processing`, остальные остаются `queued`, после сохранения исходников HMR
 отрисовывает изменение и воркер берёт следующий элемент. Отдельную интерактивную сессию GigaCode CLI
@@ -190,8 +204,8 @@ dependencies своей части. Подробности и production-реж�
 В edit-режиме GigaCode получает только read/edit/write-инструменты текущего repository: shell, web,
 Git-операции и дочерние агенты отключены. Ответ и итоговый статус возвращаются в карточку аннотации
 через DomScribe WebSocket. Индикатор `GigaCode UI` в верхней панели показывает готовность, активную
-очередь и ссылку browser-login при первой авторизации. Автообработку можно отключить через
-`KB_DOMSCRIBE_ENABLED=false`.
+очередь и ссылку browser-login при первой авторизации. Остановка dev-скрипта завершает оба сервера
+и активный headless-запуск.
 
 ### Подключение сотрудника к удалённой базе
 

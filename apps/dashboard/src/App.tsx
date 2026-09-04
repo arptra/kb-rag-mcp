@@ -563,12 +563,14 @@ export default function App() {
         <header className="topbar">
           <div><span className="breadcrumb">RAG Control Plane /</span><h1>{title}</h1></div>
           <div className="top-actions">
-            <span
-              className={`domscribe-agent-state ${domscribePending ? "busy" : domscribeAgentReady ? "ready" : "offline"}`}
-              title={domscribeAgent.last_error || domscribeAgent.gigacode.error || (domscribeAgent.relay_connected ? "DomScribe и GigaCode готовы" : "Запустите dashboard dev server, чтобы поднять DomScribe relay")}
-            >
-              <i /> GigaCode UI · {domscribePending ? `${domscribePending} в очереди` : domscribeAgentReady ? "готов" : "ожидание"}
-            </span>
+            {domscribeAgent.enabled && (
+              <span
+                className={`domscribe-agent-state ${domscribePending ? "busy" : domscribeAgentReady ? "ready" : "offline"}`}
+                title={domscribeAgent.last_error || domscribeAgent.gigacode.error || (domscribeAgent.relay_connected ? "DomScribe и GigaCode готовы" : "Запустите DomScribe dev-режим, чтобы поднять relay")}
+              >
+                <i /> GigaCode UI · {domscribePending ? `${domscribePending} в очереди` : domscribeAgentReady ? "готов" : "ожидание"}
+              </span>
+            )}
             <button className="button quiet" onClick={() => void load()} disabled={loading}>↻ Обновить</button>
           {page === "indexes" && selectedIndexId && <button className="button quiet" onClick={() => setSelectedIndexId(null)}>← Все индексы</button>}
           {page === "indexes" && !selectedIndexId && <button className="button primary" onClick={() => setRepositoryModal(true)}>＋ Подключить репозиторий</button>}

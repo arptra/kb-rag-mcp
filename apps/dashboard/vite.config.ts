@@ -40,6 +40,10 @@ const tls = tlsEnabled && existsSync(certificate) && existsSync(privateKey)
   : undefined;
 
 export default defineConfig(({ command }) => {
+  const domscribeEnabled = command === "serve"
+    && ["1", "true", "yes", "on"].includes(
+      (process.env.VITE_DOMSCRIBE_ENABLED ?? "false").toLowerCase(),
+    );
   if (command === "serve" && tlsEnabled && tls === undefined) {
     throw new Error(
       `HTTPS certificate pair is missing: ${certificate}, ${privateKey}. `
@@ -48,7 +52,10 @@ export default defineConfig(({ command }) => {
   }
   return {
     base: "/admin/",
-    plugins: [react(), domscribe(domscribeOptions), domscribeBasePath()],
+    plugins: [
+      react(),
+      ...(domscribeEnabled ? [domscribe(domscribeOptions), domscribeBasePath()] : []),
+    ],
     build: {
       outDir: "../../src/corporate_kb/mcp/admin_dist",
       emptyOutDir: true,
