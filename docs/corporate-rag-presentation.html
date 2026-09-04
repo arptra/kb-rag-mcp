@@ -1206,7 +1206,7 @@
         <p>Тема доклада — не просто поиск по документам. Речь о том, как общий контекст помогает вести разработку по спецификации в большой автоматизированной системе.</p>
         <p>Структура простая: сначала покажем проблему и её последствия, затем решение и рабочий процесс, а в конце — ограничения, выводы и живые экраны GigaCode.</p>
       </template>
-      <span class="slide-number">01 / 14</span>
+      <span class="slide-number">01 / 20</span>
     </section>
 
     <section class="slide" data-title="Как начинается доработка">
@@ -1245,7 +1245,7 @@
         <p>Начинаем с обычной задачи из бэклога: «перенести дату платежа по кредиту физлица». В ней нет ответа, где хранится график платежей, какой сервис принимает решение и какие условия уже действуют.</p>
         <p>Обычная рабочая картина: открыть первый репозиторий, написать владельцу, получить ссылку на другой сервис, потом найти правило или контракт, который меняет границы задачи. План появляется только после этого.</p>
       </template>
-      <span class="slide-number">02 / 14</span>
+      <span class="slide-number">02 / 20</span>
     </section>
 
     <section class="slide slide-scale" data-title="Цена масштаба">
@@ -1265,7 +1265,7 @@
         <p>Большая система — это не просто много репозиториев. У каждого сервиса свой владелец, свой релизный цикл и свои договорённости с соседями.</p>
         <p>Поэтому фича может начинаться в одном сервисе, но быстро упереться в чужой контракт, событие, данные или правило доступа. Если узнать об этом после оценки, работу приходится пересобирать.</p>
       </template>
-      <span class="slide-number">03 / 14</span>
+      <span class="slide-number">03 / 20</span>
     </section>
 
     <section class="slide slide-master" data-title="Почему не один репозиторий">
@@ -1288,7 +1288,7 @@
         <p>Частая первая мысль — собрать все знания в один общий репозиторий или один большой документ. Но это создаёт новую точку ожидания: любой владелец сервиса должен ещё обновить центральную копию.</p>
         <p>Нам нужен не склад копий, а единый способ прийти от задачи к актуальным источникам: коду, документу, контракту и владельцу.</p>
       </template>
-      <span class="slide-number">04 / 14</span>
+      <span class="slide-number">04 / 20</span>
     </section>
 
     <section class="slide slide-research" data-title="Что мы выяснили">
@@ -1315,7 +1315,7 @@
         <p>Мы не начинаем с предположения, что документации нет. Она есть: в коде, в Confluence, в спецификациях и у людей, которые за сервис отвечают.</p>
         <p>Проблема в маршруте. Для каждой новой задачи нужно заново угадывать, с чего начать и не пропущен ли ещё один сервис.</p>
       </template>
-      <span class="slide-number">05 / 14</span>
+      <span class="slide-number">05 / 20</span>
     </section>
 
     <section class="slide slide-master" data-title="Принцип решения">
@@ -1338,7 +1338,7 @@
         <p>Здесь нет идеи заставить все команды работать в одном репозитории или документе. У них уже есть свои рабочие места и владельцы.</p>
         <p>Мы добавляем поверх них слой навигации: RAG находит факты в источниках, граф подсказывает, по каким сервисам идти дальше.</p>
       </template>
-      <span class="slide-number">06 / 14</span>
+      <span class="slide-number">06 / 20</span>
     </section>
 
     <section class="slide" data-title="Как строится RAG">
@@ -1377,7 +1377,100 @@
         <p>RAG не переписывает знания своими словами в новую базу. Он берёт то, что уже ведут команды: спецификации, ADR, исходники и SSOT.</p>
         <p>После разбиения на фрагменты у каждого остаётся паспорт: к какому сервису относится, откуда взят и на какой revision. Поэтому человек может открыть первоисточник, а не доверять пересказу.</p>
       </template>
-      <span class="slide-number">07 / 14</span>
+      <span class="slide-number">07 / 20</span>
+    </section>
+
+    <section class="slide slide-master" data-title="Хеши в RAG">
+      <div class="slide-inner">
+        <p class="eyebrow">Что именно хешируется</p>
+        <h2>Хеши в RAG нужны <span class="accent">в двух разных местах.</span></h2>
+        <div class="audiences" aria-label="Два применения хешей в RAG">
+          <div class="audience dev">
+            <h3>Контроль изменений</h3>
+            <ul>
+              <li>У документа есть content hash.</li>
+              <li>У чанка — стабильный ID из документа, раздела и текста.</li>
+              <li>При переиндексации векторы неизменившихся чанков берутся из cache.</li>
+            </ul>
+          </div>
+          <div class="audience">
+            <h3>Быстрый поиск по терминам</h3>
+            <ul>
+              <li>Слова и символьные триграммы превращаются в признаки.</li>
+              <li>SHA-256 кладёт каждый признак в ячейку вектора со знаком.</li>
+              <li>Получается локальный нормализованный lexical vector.</li>
+            </ul>
+          </div>
+        </div>
+        <p class="routing-claim"><b>Это разные задачи:</b> один хеш экономит повторную работу при обновлении, другой создаёт вектор для автономного поиска по совпадающей терминологии.</p>
+      </div>
+      <template class="speaker-notes">
+        <p>Когда говорят «RAG построен на хешах», полезно разделить две вещи. Первая — контроль изменений. У документа есть content hash, а ID чанка считается из документа, заголовка, позиции и самого текста. При следующей индексации мы сразу видим, какие чанки остались прежними, и не пересчитываем им эмбеддинги.</p>
+        <p>Вторая вещь — штатный hash provider. Он не хранит текст как один огромный хеш. Он выделяет из текста слова и символьные триграммы, например части слова с границами. Для каждого признака берёт SHA-256, по нему выбирает ячейку и знак вектора настраиваемой размерности, затем нормализует результат.</p>
+        <p>Так получается полностью локальный lexical search: хороший для совпадающей терминологии, названий сервисов, контрактов и полей. Но он не обязан понимать смысл и синонимы так же хорошо, как semantic-модель.</p>
+      </template>
+      <span class="slide-number">08 / 20</span>
+    </section>
+
+    <section class="slide slide-master" data-title="Эмбеддинги и видеокарта">
+      <div class="slide-inner">
+        <p class="eyebrow">Два режима эмбеддингов</p>
+        <h2>Видеокарта ускоряет semantic-поиск,<br>но <span class="green">не является обязательной.</span></h2>
+        <div class="sdd-model" aria-label="Режимы эмбеддингов">
+          <div class="sdd-column">
+            <strong>Hash provider</strong>
+            <p>Режим по умолчанию: слова и триграммы → настраиваемый вектор. Нет модели, GPU и сетевого вызова.</p>
+          </div>
+          <div class="sdd-column">
+            <strong>Local semantic model</strong>
+            <p>Локальная Sentence Transformers-модель даёт поиск по смыслу и синонимам; веса модели заранее лежат на машине.</p>
+          </div>
+          <div class="sdd-column">
+            <strong>Выбор устройства</strong>
+            <p>Авто-режим выбирает CUDA, затем MPS, затем CPU. На CPU работает медленнее, но работает.</p>
+          </div>
+        </div>
+        <p class="routing-claim"><b>Данные не уходят во внешний embedding API:</b> при <code>local_files_only</code> недостающая модель даёт ошибку, а не скачивается из сети.</p>
+      </div>
+      <template class="speaker-notes">
+        <p>Если нужна не только одинаковая терминология, а смысл и синонимы, включается второй provider — локальная Sentence Transformers embedding-модель. Документ и вопрос она превращает в векторы в одном пространстве, поэтому можно сопоставить близкие по смыслу формулировки.</p>
+        <p>Здесь видеокарта — это ускоритель, а не архитектурная зависимость. Автоматический выбор устройства идёт в порядке CUDA, затем Apple MPS, затем CPU. На CPU переиндексация будет дольше, но процесс и формат индекса остаются теми же.</p>
+        <p>Модель берётся только из заранее подготовленного локального каталога. В режиме <code>local_files_only</code> при отсутствии файлов система завершает индексирование понятной ошибкой и не пытается сходить на Hugging Face или во внешний embedding API.</p>
+      </template>
+      <span class="slide-number">09 / 20</span>
+    </section>
+
+    <section class="slide" data-title="Как работает поиск RAG">
+      <div class="slide-inner">
+        <p class="eyebrow">Алгоритм поиска</p>
+        <h2>Вопрос и документ переводятся <span class="accent">одним provider'ом.</span><br>Дальше — обычная математика.</h2>
+        <div class="vector-pipeline" aria-label="Поиск в RAG">
+          <div class="vector-node">
+            <strong>Вопрос</strong>
+            <code>«Кто меняет график платежей?»</code>
+            <small>query embedding</small>
+          </div>
+          <div class="mini-arrow" aria-hidden="true">→</div>
+          <div class="vector-node">
+            <strong>Вектор вопроса</strong>
+            <code>[0.03, −0.12, …]</code>
+            <small>тот же hash или semantic provider</small>
+          </div>
+          <div class="mini-arrow" aria-hidden="true">→</div>
+          <div class="vector-node">
+            <strong>Матрица в RAM</strong>
+            <code>chunks × dimension</code>
+            <small>cosine: <code>matrix @ query_vector</code> → top-k + evidence</small>
+          </div>
+        </div>
+        <p class="routing-claim"><b>Здесь нет отдельной vector DB:</b> индекс хранит NumPy-матрицу, считает полный cosine scan в памяти и возвращает короткие выдержки со ссылками на источники.</p>
+      </div>
+      <template class="speaker-notes">
+        <p>При поиске вопрос проходит через тот же provider, что и документы. Получается query vector той же размерности. В памяти уже лежит нормализованная NumPy-матрица: одна строка на чанк.</p>
+        <p>Поскольку векторы нормализованы, cosine similarity — это простое умножение <code>matrix @ query_vector</code>. Мы выбираем top-k кандидатов, а в контекст GigaCode отдаём только короткие выдержки из разных источников. Полный чанк поднимается отдельным вызовом только когда он действительно нужен.</p>
+        <p>То есть это не отдельная vector DB, не ANN-сервис и не SQL. Диск нужен для проверяемого cache, а сам поиск работает по прогретой матрице в RAM. Это хорошо объясняет, почему обычный запрос не строит эмбеддинги заново и не вызывает внешний API.</p>
+      </template>
+      <span class="slide-number">10 / 20</span>
     </section>
 
     <section class="slide" data-title="Как строится граф системы">
@@ -1411,7 +1504,98 @@
         <p>Граф отвечает на первый практический вопрос: куда вообще смотреть. Он извлекается из исходников и объявленных контрактов: HTTP-вызовов, Kafka-топиков и конфигурации.</p>
         <p>Это не запись того, что прямо сейчас происходит в проде. Граф показывает обоснованный маршрут для анализа; точные детали добираются RAG-поиском и затем проверяются.</p>
       </template>
-      <span class="slide-number">08 / 14</span>
+      <span class="slide-number">11 / 20</span>
+    </section>
+
+    <section class="slide slide-master" data-title="Статический граф без runtime">
+      <div class="slide-inner">
+        <p class="eyebrow">Быстрый режим построения</p>
+        <h2>Базовый граф читается <span class="violet">из репозиториев.</span><br>Сервисы запускать не нужно.</h2>
+        <div class="sdd-model" aria-label="Статическое построение графа">
+          <div class="sdd-column">
+            <strong>Находим границы</strong>
+            <p>Maven/Gradle-модули, <code>spring.application.name</code>, manifest и конфигурация подсказывают, где начинается сервис.</p>
+          </div>
+          <div class="sdd-column">
+            <strong>Читаем исходники</strong>
+            <p>Tree-sitter разбирает Java и Kotlin: контроллеры, клиенты, listeners, producers и точки входа.</p>
+          </div>
+          <div class="sdd-column">
+            <strong>Публикуем snapshot</strong>
+            <p>Узлы, связи, evidence и revision сохраняются в versioned JSON для повторяемого анализа.</p>
+          </div>
+        </div>
+        <p class="routing-claim"><b>Для быстрого графа не нужно запускать сервисы, сборку или вызывать API системы:</b> достаточно исходников и конфигурации из Git.</p>
+      </div>
+      <template class="speaker-notes">
+        <p>Первый важный момент: базовая карта не требует доступа к работающим сервисам. Мы не вызываем их HTTP API, не читаем production-трафик, не запускаем Maven или Gradle и не исполняем код. Входные данные — checkout репозитория и его конфигурация.</p>
+        <p>Сначала layout-проход выделяет сервисные модули по дескрипторам сборки, manifest и <code>spring.application.name</code>. Затем Tree-sitter разбирает Java и Kotlin как текстовую структуру: он видит контроллеры, клиентов, Kafka-listener'ы и producer'ы, но ничего не выполняет.</p>
+        <p>Итог — обычный versioned JSON snapshot с узлами, связями и ссылками на строки исходников. Поэтому быстрый режим можно использовать как воспроизводимый первый проход без запуска модели.</p>
+      </template>
+      <span class="slide-number">12 / 20</span>
+    </section>
+
+    <section class="slide" data-title="Как из кода получается ребро">
+      <div class="slide-inner">
+        <p class="eyebrow">Как извлекаются связи</p>
+        <h2>Ребро появляется не «по похожему имени».<br>Его нужно <span class="accent">сопоставить с контрактом.</span></h2>
+        <div class="routing" aria-label="Сопоставление вызова с сервисным контрактом">
+          <div class="routing-step">
+            <strong>Находим<br>источник</strong>
+            <span>Feign · WebClient · RestTemplate · KafkaTemplate · listener</span>
+          </div>
+          <div class="routing-arrow" aria-hidden="true">→</div>
+          <div class="routing-step graph">
+            <strong>Нормализуем<br>значения</strong>
+            <span>разрешаем properties и простой YAML, приводим path к шаблону</span>
+          </div>
+          <div class="routing-arrow" aria-hidden="true">→</div>
+          <div class="routing-step rag">
+            <strong>Сверяем<br>контракт</strong>
+            <span>HTTP: alias/host + method/path<br>Kafka: точный topic</span>
+          </div>
+          <div class="routing-arrow" aria-hidden="true">→</div>
+          <div class="routing-step evidence">
+            <strong>Сохраняем<br>evidence</strong>
+            <span>repository · commit · file:line · snippet · extractor</span>
+          </div>
+        </div>
+        <p class="routing-claim"><b>Например, совпадение URL ещё не достаточно:</b> для HTTP нужны сервис-назначение и нормализованные method + path; для Kafka — один и тот же topic.</p>
+      </div>
+      <template class="speaker-notes">
+        <p>Второй момент — как из исходников получается именно межсервисная связь. Сканер ищет не произвольные слова, а конкретные конструкции: Feign, WebClient, RestTemplate, Spring HTTP Interface, KafkaTemplate и KafkaListener.</p>
+        <p>Затем он пытается разрешить переменные из properties и простого YAML. Для HTTP он сопоставляет alias или hostname сервиса и нормализованную пару method плюс path. Поэтому <code>/loans/{id}</code> и <code>/loans/{loanId}</code> — один шаблон, а одинаковый путь у двух сервисов не становится случайной связью.</p>
+        <p>Kafka проще и строже: producer и consumer связываются по точному имени topic. После сопоставления у ребра остаётся evidence: репозиторий, commit, файл, строка, snippet и имя extractor. В любой момент можно открыть, почему эта линия вообще появилась.</p>
+      </template>
+      <span class="slide-number">13 / 20</span>
+    </section>
+
+    <section class="slide" data-title="Неизвестное в графе">
+      <div class="slide-inner">
+        <p class="eyebrow">Границы точности</p>
+        <h2>Граф не скрывает сомнения.<br><span class="orange">Неизвестное</span> тоже становится результатом.</h2>
+        <div class="guardrails" aria-label="Уровни уверенности графа">
+          <div class="guardrail">
+            <strong>DECLARED / HIGH</strong>
+            <p>Есть декларация или сильное source evidence: связь можно использовать как маршрут анализа.</p>
+          </div>
+          <div class="guardrail">
+            <strong>MEDIUM / LOW</strong>
+            <p>Есть кандидат: похожий клиент, интерфейс или неполный контракт. Его нужно проверить.</p>
+          </div>
+          <div class="guardrail">
+            <strong>UNRESOLVED</strong>
+            <p>Динамический URL, topic или несколько целей. Граф не выбирает ответ за человека.</p>
+          </div>
+        </div>
+        <p class="routing-claim"><b>Опциональная проверка GigaCode не рисует граф заново:</b> она разбирает ограниченные пакеты кандидатов и принимает связь только с реальным source evidence и точной целью.</p>
+      </div>
+      <template class="speaker-notes">
+        <p>Статический граф не является истиной о production. Reflection, dynamic URL, profiles, gateway rewrite и внешняя конфигурация могут менять маршрут. Поэтому для нас важнее не спрятать это ограничение, а оставить его видимым.</p>
+        <p>У связи есть уровень уверенности. DECLARED и HIGH подходят, чтобы идти дальше по маршруту. MEDIUM и LOW — это гипотезы, которые должны попасть в план как пункт проверки. Если целей несколько или их нельзя вывести, связь остаётся UNRESOLVED.</p>
+        <p>Есть точный режим с GigaCode, но его роль ограничена: модель проверяет уже найденные кандидаты, может подтвердить, отклонить или переназначить цель. Она не может добавить произвольную линию без существующей строки исходника и конкретного target entrypoint. Базовый статический граф от этой опции не зависит.</p>
+      </template>
+      <span class="slide-number">14 / 20</span>
     </section>
 
     <section class="slide slide-algorithm" data-title="Алгоритм планирования фичи">
@@ -1434,7 +1618,7 @@
         <p>Здесь показываем рабочую механику. Планирование начинается не с «какой код написать», а с поиска точки входа. После неё граф сужает область, RAG поднимает детали, а сервисы получают статус подтверждённого или кандидата.</p>
         <p>Это важно для реальной работы: если данных не хватает, процесс не делает вид, что всё понял. Неизвестное остаётся в плане отдельным пунктом и превращается в задачу проверки.</p>
       </template>
-      <span class="slide-number">09 / 14</span>
+      <span class="slide-number">15 / 20</span>
     </section>
 
     <section class="slide slide-skills" data-title="Строгий формат плана">
@@ -1472,7 +1656,7 @@
         <p>До этого слайда мы объяснили, как достаём знания. Здесь показываем, во что они превращаются. Ответ планировщика теперь имеет одинаковую структуру: короткое резюме для бизнеса, затем сервисная карта, изменения, контракты, тесты, риски, evidence и Jira drafts.</p>
         <p>Verifier используется до и после планирования. Он проверяет не красоту текста, а то, не добавили ли в план несуществующий сервис, контракт или файл.</p>
       </template>
-      <span class="slide-number">10 / 14</span>
+      <span class="slide-number">16 / 20</span>
     </section>
 
     <section class="slide slide-demo" data-title="План в GigaCode">
@@ -1499,7 +1683,7 @@
         <p>Заменить заглушку реальным скриншотом GigaCode. Лучше показать верх ответа с вызванным skill и часть таблицы плана, где видны service/repository, evidence и unknowns.</p>
         <p>Во время доклада не читать весь ответ. Подсветить четыре элемента справа: маршрут, источники, конкретные изменения и честно указанные неизвестные.</p>
       </template>
-      <span class="slide-number">11 / 14</span>
+      <span class="slide-number">17 / 20</span>
     </section>
 
     <section class="slide slide-jira" data-title="Задачи в Jira">
@@ -1530,7 +1714,7 @@
         <p>Заменить заглушку реальным скриншотом GigaCode: вопрос о Jira-пространстве, выбранный проект и итоговую таблицу service → Jira key → URL.</p>
         <p>Важно честно назвать границу текущего тестового режима: все задачи создаются в одном выбранном проекте, одна Task на подтверждённый сервис, с назначением на текущего Jira-пользователя. Автоматической маршрутизации по нескольким командным проектам, эпиков и связей этот сценарий пока не обещает.</p>
       </template>
-      <span class="slide-number">12 / 14</span>
+      <span class="slide-number">18 / 20</span>
     </section>
 
     <section class="slide" data-title="Доверие и ограничения">
@@ -1557,7 +1741,7 @@
         <p>Здесь не надо спорить про магию модели. Правило очень простое: важный факт должен вести к источнику, который можно открыть и проверить.</p>
         <p>Если источника не хватает, не закрываем этот пробел красивой формулировкой. Фиксируем вопрос, владельца решения и следующий шаг проверки.</p>
       </template>
-      <span class="slide-number">13 / 14</span>
+      <span class="slide-number">19 / 20</span>
     </section>
 
     <section class="slide" data-title="Выводы">
@@ -1588,14 +1772,14 @@
         <p>Финальный тезис: это не просто более удобный поиск. Общий контекст связывает спецификацию, текущее состояние системы, план изменений и постановку задач.</p>
         <p>После вывода вернуться к реальным скриншотам или перейти в live demo: вызвать feature skill, показать сервисный план, прогнать аудит и подтвердить создание задач в выбранном Jira-проекте.</p>
       </template>
-      <span class="slide-number">14 / 14</span>
+      <span class="slide-number">20 / 20</span>
     </section>
   </main>
 
   <div class="kbd-hint" aria-hidden="true">← → / Space · F — полный экран · N — заметки</div>
   <nav class="controls" aria-label="Навигация по презентации">
     <button type="button" id="previous" aria-label="Предыдущий слайд">←</button>
-    <span class="progress" id="progress" aria-live="polite">1 / 14</span>
+    <span class="progress" id="progress" aria-live="polite">1 / 20</span>
     <button type="button" id="next" aria-label="Следующий слайд">→</button>
     <button type="button" id="toggle-notes" aria-label="Заметки докладчика" aria-pressed="false">N</button>
   </nav>
