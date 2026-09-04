@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     gigacode_timeout_seconds: int = Field(default=600, ge=30, le=7200)
     gigacode_max_session_turns: int = Field(default=30, ge=2, le=500)
     gigacode_max_tool_calls: int = Field(default=50, ge=1, le=5000)
+    domscribe_enabled: bool = True
+    domscribe_workspace_root: Path = Path(".")
+    domscribe_poll_interval_seconds: float = Field(default=0.5, ge=0.1, le=10.0)
     benchmark_questions_path: Path = Path("evaluation/questions.json")
     benchmark_password: SecretStr | None = None
     benchmark_max_questions: int = Field(default=100, ge=1, le=1000)
@@ -135,6 +138,7 @@ class Settings(BaseSettings):
                 "analysis_archive_dir": resolve(self.analysis_archive_dir),
                 "job_logs_dir": resolve(self.job_logs_dir),
                 "ssot_skill_path": resolve(self.ssot_skill_path),
+                "domscribe_workspace_root": resolve(self.domscribe_workspace_root),
                 "mcp_tls_cert_file": resolve(self.mcp_tls_cert_file),
                 "mcp_tls_key_file": resolve(self.mcp_tls_key_file),
             }

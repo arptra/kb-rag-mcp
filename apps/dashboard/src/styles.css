@@ -175,6 +175,13 @@ input, textarea, select { min-height: 38px; padding: 8px 10px; border: 1px solid
 .batch-result { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 13px; border: 1px solid #3f5835; border-radius: 8px; background: #182319; color: var(--lime); font-size: var(--text-small); }
 .batch-result-warning { border-color: #755741; background: #261c13; color: var(--amber); }
 .toast { position: fixed; z-index: 30; right: 22px; bottom: 22px; max-width: 440px; padding: 12px 16px; border: 1px solid #43513f; border-radius: 8px; background: #1a251b; color: #dce8de; box-shadow: 0 15px 40px #0008; font-size: var(--text-body); }
+.domscribe-agent-state { min-height: 32px; display: inline-flex; align-items: center; gap: 7px; padding: 6px 10px; border: 1px solid #303b33; border-radius: 999px; background: #111713; color: #7e8b81; font-size: var(--text-caption); white-space: nowrap; }
+.domscribe-agent-state i { width: 7px; height: 7px; border-radius: 50%; background: #657168; box-shadow: 0 0 0 3px #65716818; }
+.domscribe-agent-state.ready { border-color: #3d5438; color: #a8c691; }
+.domscribe-agent-state.ready i { background: var(--lime); box-shadow: 0 0 0 3px #b8f36b1f; }
+.domscribe-agent-state.busy { border-color: #775f2e; color: var(--amber); }
+.domscribe-agent-state.busy i { background: var(--amber); animation: domscribe-pulse 1.2s ease-in-out infinite; }
+@keyframes domscribe-pulse { 50% { opacity: .35; transform: scale(.75); } }
 
 .login-shell { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: radial-gradient(circle at 50% 20%, #1c2d1d 0, #090d0b 42%); }.login-shell::before { content: ""; position: fixed; inset: 0; opacity: .23; pointer-events: none; background-image: linear-gradient(#9bd95310 1px, transparent 1px), linear-gradient(90deg, #9bd95310 1px, transparent 1px); background-size: 40px 40px; mask-image: radial-gradient(circle, #000, transparent 70%); }.login-card { position: relative; width: min(420px, 100%); padding: 35px; border: 1px solid #334038; border-radius: 15px; background: #101612ec; box-shadow: 0 30px 100px #000b; }.login-card h1 { margin: 9px 0; font-size: 31px; letter-spacing: -.04em; }.login-card > p { margin: 0 0 25px; color: #849087; font-size: var(--text-body); line-height: 1.6; }.login-card label { color: #859188; font-size: var(--text-small); }.login-card input { width: 100%; margin: 7px 0 9px; }.login-card > small { display: block; margin-top: 18px; color: #59645c; font-size: var(--text-caption); text-align: center; }
 

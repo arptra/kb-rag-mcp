@@ -205,6 +205,31 @@ export interface Overview {
   catalog: Catalog;
   graph: GraphOverview;
   service_map: ServiceMapOverview;
+  domscribe_agent: {
+    enabled: boolean;
+    worker_running: boolean;
+    workspace_root: string;
+    mode: "automatic-fifo";
+    relay_connected: boolean;
+    relay_url: string | null;
+    queue: Partial<Record<"queued" | "processing" | "processed" | "failed" | "archived", number>>;
+    current_annotation_id: string | null;
+    current_intent: string | null;
+    authentication_url: string | null;
+    last_error: string | null;
+    last_progress: string | null;
+    last_completed_at: string | null;
+    completed_count: number;
+    failed_count: number;
+    gigacode: {
+      enabled: boolean;
+      available: boolean;
+      command: string;
+      executable: string | null;
+      version: string | null;
+      error: string | null;
+    };
+  };
 }
 
 export interface ServiceMapOverview {

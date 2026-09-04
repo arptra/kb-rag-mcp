@@ -19,3 +19,6 @@ graph-lab/runs/
 graph-lab/.state/
 graph-lab/tasks/*/iterations/
 .graph-debug/
+
+# Domscribe runtime manifests, annotations, relay locks, and snapshots.
+.domscribe/

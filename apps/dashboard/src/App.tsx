@@ -453,7 +453,10 @@ export default function App() {
 
   useEffect(() => void load(), [load]);
   const hasActiveJobs = Boolean(
-    overview?.catalog.jobs.some((job) => ["queued", "running", "cancelling"].includes(job.status)),
+    overview?.catalog.jobs.some((job) => ["queued", "running", "cancelling"].includes(job.status))
+      || overview?.domscribe_agent.current_annotation_id
+      || (overview?.domscribe_agent.queue.queued ?? 0) > 0
+      || (overview?.domscribe_agent.queue.processing ?? 0) > 0,
   );
   useEffect(() => {
     let disposed = false;
@@ -515,7 +518,15 @@ export default function App() {
       && job.result?.phase === "awaiting_authentication"
       && jobAuthenticationUrl(job),
   );
-  const authenticationUrl = jobAuthenticationUrl(authenticationJob);
+  const authenticationUrl = jobAuthenticationUrl(authenticationJob)
+    || overview.domscribe_agent.authentication_url;
+  const domscribeAgent = overview.domscribe_agent;
+  const domscribePending = (domscribeAgent.queue.queued ?? 0)
+    + (domscribeAgent.queue.processing ?? 0);
+  const domscribeAgentReady = domscribeAgent.enabled
+    && domscribeAgent.worker_running
+    && domscribeAgent.relay_connected
+    && domscribeAgent.gigacode.available;
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -552,6 +563,12 @@ export default function App() {
         <header className="topbar">
           <div><span className="breadcrumb">RAG Control Plane /</span><h1>{title}</h1></div>
           <div className="top-actions">
+            <span
+              className={`domscribe-agent-state ${domscribePending ? "busy" : domscribeAgentReady ? "ready" : "offline"}`}
+              title={domscribeAgent.last_error || domscribeAgent.gigacode.error || (domscribeAgent.relay_connected ? "DomScribe и GigaCode готовы" : "Запустите dashboard dev server, чтобы поднять DomScribe relay")}
+            >
+              <i /> GigaCode UI · {domscribePending ? `${domscribePending} в очереди` : domscribeAgentReady ? "готов" : "ожидание"}
+            </span>
             <button className="button quiet" onClick={() => void load()} disabled={loading}>↻ Обновить</button>
           {page === "indexes" && selectedIndexId && <button className="button quiet" onClick={() => setSelectedIndexId(null)}>← Все индексы</button>}
           {page === "indexes" && !selectedIndexId && <button className="button primary" onClick={() => setRepositoryModal(true)}>＋ Подключить репозиторий</button>}
@@ -572,7 +589,7 @@ export default function App() {
           </div>
         </header>
 
-        {authenticationJob && authenticationUrl && (
+        {authenticationUrl && (
           <section className="authentication-banner" role="alert" aria-live="assertive">
             <span className="authentication-mark">✦</span>
             <div className="grow">

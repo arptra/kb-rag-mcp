@@ -36,6 +36,8 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
             "ssot_skill_path": tmp_path / "skills" / "build-service-ssot",
             "repository_analysis_timeout_seconds": 30,
             "index_build_timeout_seconds": 30,
+            "domscribe_enabled": False,
+            "domscribe_workspace_root": tmp_path,
             "auto_index": False,
         }
         values.update(overrides)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
 import secrets
 import ssl
@@ -19,6 +20,7 @@ from starlette.types import ASGIApp
 from corporate_kb.admin import AdminController
 from corporate_kb.catalog import RagCatalog, RepositoryBatchItem
 from corporate_kb.config import Settings
+from corporate_kb.domscribe_agent import DomscribeGigaCodeAgent
 from corporate_kb.feature_context import FeatureContextPlanner
 from corporate_kb.mcp.managed_tools import ManagedToolDefinition, ManagedToolRegistry
 from corporate_kb.mcp.server import create_mcp_server
@@ -272,6 +274,9 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         )
     tools = KnowledgeTools(service, ssot_service=ssot_service, usage=usage)
     catalog = RagCatalog(settings, service, tools, usage)
+    domscribe_agent = DomscribeGigaCodeAgent(settings)
+    domscribe_agent.start()
+    atexit.register(domscribe_agent.stop)
     feature_context = FeatureContextPlanner(catalog)
     managed_tools = ManagedToolRegistry(
         settings.managed_tools_path,
@@ -379,6 +384,21 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             payload["catalog"] = catalog.payload()
             payload["graph"] = await asyncio.to_thread(catalog.graph_overview)
             payload["service_map"] = await asyncio.to_thread(catalog.service_map_overview)
+            payload["domscribe_agent"] = await asyncio.to_thread(domscribe_agent.status)
+            return JSONResponse(payload)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/domscribe/status",
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    async def admin_domscribe_status(request: Request) -> JSONResponse:
+        if not _admin_authorized(request, settings):
+            return _admin_denied(settings)
+        try:
+            payload = await asyncio.to_thread(domscribe_agent.status, refresh=True)
             return JSONResponse(payload)
         except Exception as exc:
             return _api_error(exc)

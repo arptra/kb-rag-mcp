@@ -36,6 +36,21 @@ _SSOT_RESULT_SCHEMA: dict[str, Any] = {
     "required": ["markdown", "analyzed_files", "blocking_unknowns"],
     "additionalProperties": False,
 }
+_WORKSPACE_EDIT_RESULT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["completed", "needs_input"]},
+        "message": {"type": "string", "minLength": 1},
+        "changed_files": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 100,
+        },
+        "verification": {"type": "string"},
+    },
+    "required": ["status", "message", "changed_files", "verification"],
+    "additionalProperties": False,
+}
 _URL_PATTERN: re.Pattern[str] = re.compile(r"https?://[^\s<>\"']+")
 _ANSI_PATTERN: re.Pattern[str] = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _AUTH_HINTS = ("auth", "browser", "device", "login", "sign in", "verify", "open")
@@ -86,7 +101,7 @@ class _InvocationResult:
 
 
 class GigaCodeRunner:
-    """Supervise GigaCode without granting shell or source-write tools."""
+    """Supervise bounded GigaCode JSON invocations with explicit tool policies."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -144,6 +159,7 @@ class GigaCodeRunner:
         authentication_url: Callable[[str], None] | None = None,
         authentication_complete: Callable[[], None] | None = None,
         debug_directory: Path | None = None,
+        allow_edits: bool = False,
     ) -> GigaCodeJsonResult:
         """Execute one strict JSON-contract analysis without accepting prose fallback."""
         invocation = self._run_payload(
@@ -157,6 +173,7 @@ class GigaCodeRunner:
             authentication_url=authentication_url,
             authentication_complete=authentication_complete,
             debug_directory=debug_directory,
+            allow_edits=allow_edits,
         )
         event = invocation.result_event
         analyzed_files = invocation.payload.get("analyzed_files", [])
@@ -178,6 +195,30 @@ class GigaCodeRunner:
             usage=usage if isinstance(usage, dict) else {},
         )
 
+    def run_workspace_edit(
+        self,
+        *,
+        checkout: Path,
+        prompt: str,
+        cancel: CancellationSignal | None = None,
+        progress: Callable[[str], None] | None = None,
+        authentication_url: Callable[[str], None] | None = None,
+        authentication_complete: Callable[[], None] | None = None,
+        debug_directory: Path | None = None,
+    ) -> GigaCodeJsonResult:
+        """Execute one bounded workspace edit without shell, web, or sub-agent tools."""
+        return self.run_json(
+            checkout=checkout,
+            prompt=prompt,
+            schema=_WORKSPACE_EDIT_RESULT_SCHEMA,
+            cancel=cancel,
+            progress=progress,
+            authentication_url=authentication_url,
+            authentication_complete=authentication_complete,
+            debug_directory=debug_directory,
+            allow_edits=True,
+        )
+
     def _run_payload(
         self,
         *,
@@ -191,6 +232,7 @@ class GigaCodeRunner:
         authentication_url: Callable[[str], None] | None = None,
         authentication_complete: Callable[[], None] | None = None,
         debug_directory: Path | None = None,
+        allow_edits: bool = False,
     ) -> _InvocationResult:
         """Run the shared supervised process and return its structured payload."""
         status = self.status(refresh=True)
@@ -203,12 +245,17 @@ class GigaCodeRunner:
             raise GigaCodeCancelled("GigaCode analysis was cancelled")
 
         executable = str(status["executable"])
+        excluded_tools = (
+            "shell,agent,web_fetch,web_search"
+            if allow_edits
+            else "shell,write,edit,agent,web_fetch,web_search"
+        )
         command = [
             executable,
             "--output-format",
             "stream-json",
             "--exclude-tools",
-            "shell,write,edit,agent,web_fetch,web_search",
+            excluded_tools,
             "--max-session-turns",
             str(self._settings.gigacode_max_session_turns),
         ]
@@ -227,9 +274,13 @@ class GigaCodeRunner:
                 f"auth_timeout={self._settings.gigacode_auth_timeout_seconds}s; "
                 f"max_turns={self._settings.gigacode_max_session_turns}; "
                 f"max_tools_advisory={self._settings.gigacode_max_tool_calls}; "
-                "read_only=true; schema_delivery=prompt"
+                f"read_only={str(not allow_edits).lower()}; schema_delivery=prompt"
             )
-        bounded_prompt = self._prompt_with_output_contract(prompt, schema=schema)
+        bounded_prompt = self._prompt_with_output_contract(
+            prompt,
+            schema=schema,
+            read_only=not allow_edits,
+        )
         if debug_directory is not None:
             debug_directory.mkdir(parents=True, exist_ok=True)
             (debug_directory / "prompt.txt").write_text(bounded_prompt, encoding="utf-8")
@@ -242,7 +293,7 @@ class GigaCodeRunner:
                     {
                         "command": command,
                         "cwd": str(root),
-                        "read_only": True,
+                        "read_only": not allow_edits,
                         "timeout_seconds": self._settings.gigacode_timeout_seconds,
                         "max_session_turns": self._settings.gigacode_max_session_turns,
                         "max_tool_calls_advisory": self._settings.gigacode_max_tool_calls,
@@ -519,6 +570,7 @@ class GigaCodeRunner:
         prompt: str,
         *,
         schema: dict[str, Any] | None = None,
+        read_only: bool = True,
     ) -> str:
         rendered_schema = json.dumps(schema or _SSOT_RESULT_SCHEMA, ensure_ascii=False, indent=2)
         return (
@@ -529,7 +581,7 @@ class GigaCodeRunner:
             + rendered_schema
             + "\nUse no more than "
             + str(self._settings.gigacode_max_tool_calls)
-            + " read-only tool calls."
+            + (" read-only tool calls." if read_only else " tool calls.")
         )
 
     @classmethod

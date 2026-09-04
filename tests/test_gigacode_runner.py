@@ -185,6 +185,59 @@ print(json.dumps({
     assert json.loads((debug_directory / "result.json").read_text())["payload"] == result.payload
 
 
+def test_gigacode_runner_workspace_edit_enables_edit_tools(
+    settings_factory,
+    tmp_path,
+) -> None:
+    executable = tmp_path / "gigacode-edit"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+if "--version" in sys.argv:
+    print("0.99.0-edit-test")
+    raise SystemExit(0)
+
+excluded = sys.argv[sys.argv.index("--exclude-tools") + 1]
+if "write" in excluded or "edit" in excluded:
+    raise SystemExit(9)
+prompt = sys.stdin.read()
+if '"changed_files"' not in prompt or "read-only tool calls" in prompt:
+    raise SystemExit(10)
+payload = {
+    "status": "completed",
+    "message": "Button updated",
+    "changed_files": ["src/Button.tsx"],
+    "verification": "Reviewed the edited source",
+}
+print(json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "result": json.dumps(payload),
+}))
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    checkout = tmp_path / "repository"
+    checkout.mkdir()
+    debug_directory = tmp_path / "debug-edit"
+
+    result = GigaCodeRunner(
+        settings_factory(gigacode_command=str(executable))
+    ).run_workspace_edit(
+        checkout=checkout,
+        prompt="Implement one UI annotation.",
+        debug_directory=debug_directory,
+    )
+
+    assert result.payload["status"] == "completed"
+    assert result.payload["changed_files"] == ["src/Button.tsx"]
+    assert json.loads((debug_directory / "invocation.json").read_text())["read_only"] is False
+
+
 def test_gigacode_runner_accepts_plain_markdown_result(
     settings_factory,
     tmp_path,
