@@ -8,6 +8,9 @@ dependencies = [
     "beautifulsoup4>=4.13,<5",
     "markdownify>=1.2,<2",
     "fastmcp==3.4.4",
+    "cryptography>=45,<50",
+    "httpx>=0.28,<1",
+    "uvicorn>=0.51,<0.52",
     "numpy>=2.2,<3",
     "pydantic>=2.11,<3",
     "pydantic-settings>=2.10,<3",
@@ -28,6 +31,7 @@ semantic = [
 kb = "corporate_kb.cli:main"
 kb-mcp = "corporate_kb.mcp.server:main"
 kb-mcp-http = "corporate_kb.mcp.http_server:main"
+kb-access = "corporate_kb.access.client:main"
 gigacode-graph = "gigacode_graph.cli:main"
 gigacode-graph-mcp = "gigacode_graph.mcp_server:main"
 gigacode-graph-http = "gigacode_graph.http_server:main"

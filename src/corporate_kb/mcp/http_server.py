@@ -17,6 +17,8 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.types import ASGIApp
 
+from corporate_kb.access.http import AccessControl, RegistryTokenVerifier, register_disabled_status
+from corporate_kb.access.tls import CertificateH11Protocol
 from corporate_kb.admin import AdminController
 from corporate_kb.catalog import RagCatalog, RepositoryBatchItem
 from corporate_kb.config import Settings
@@ -202,11 +204,16 @@ def _admin_authorized(request: Request, settings: Settings) -> bool:
 
 
 def _admin_denied(settings: Settings) -> JSONResponse:
+    if settings.access_enabled:
+        return _unauthorized_response()
     return JSONResponse({"error": "invalid admin password"}, status_code=403)
 
 
 def validate_http_settings(settings: Settings) -> str | None:
     """Return an optional validated token; no token means open HTTP access."""
+    # A legacy shared token must never bypass the personal registry in the new mode.
+    if settings.access_enabled:
+        return None
     secret = settings.mcp_http_bearer_token
     if secret is None:
         return None
@@ -219,7 +226,7 @@ def validate_http_settings(settings: Settings) -> str | None:
 
 
 def tls_uvicorn_config(settings: Settings) -> dict[str, object] | None:
-    """Validate the server certificate pair and return one-way TLS settings."""
+    """Validate TLS material and enable verified client-certificate enrollment if configured."""
     if not settings.mcp_tls_enabled:
         return None
     certificate = settings.mcp_tls_cert_file
@@ -233,12 +240,29 @@ def tls_uvicorn_config(settings: Settings) -> dict[str, object] | None:
         context.load_cert_chain(certfile=str(certificate), keyfile=str(private_key))
     except (OSError, ssl.SSLError) as exc:
         raise ValueError(f"Invalid TLS certificate/key pair: {exc}") from exc
-    return {
+    configuration: dict[str, object] = {
         "ssl_certfile": str(certificate),
         "ssl_keyfile": str(private_key),
-        # One-way TLS only: clients are never asked for or checked against a certificate.
         "ssl_cert_reqs": ssl.CERT_NONE,
     }
+    if settings.access_enabled:
+        authority = settings.access_client_ca_file
+        if authority is None or not authority.is_file():
+            raise ValueError("KB_ACCESS_CLIENT_CA_FILE must point to a trusted client CA bundle")
+        try:
+            context.load_verify_locations(cafile=str(authority))
+        except (OSError, ssl.SSLError) as exc:
+            raise ValueError("Invalid trusted client CA bundle") from exc
+        configuration.update({
+            "ssl_ca_certs": str(authority),
+            # No certificate is needed for admin login or subsequent Bearer requests.
+            # If presented, a client certificate MUST pass OpenSSL verification.
+            "ssl_cert_reqs": ssl.CERT_OPTIONAL,
+            "http": CertificateH11Protocol,
+            "ws": "none",
+            "proxy_headers": False,
+        })
+    return configuration
 
 
 class ConstantTimeTokenVerifier(TokenVerifier):
@@ -260,8 +284,20 @@ class ConstantTimeTokenVerifier(TokenVerifier):
 
 
 def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP:
-    """Create the shared FastMCP server; launcher defaults make it openly accessible."""
+    """Create the shared FastMCP server with optional persistent per-person access."""
     token = validate_http_settings(settings)
+    access = AccessControl(settings) if settings.access_enabled else None
+
+    async def dashboard_authorized(request: Request) -> bool:
+        if access is not None:
+            return await asyncio.to_thread(access.user, request) is not None
+        return _admin_authorized(request, settings)
+
+    async def reader_authorized(request: Request) -> bool:
+        if access is not None:
+            return await asyncio.to_thread(access.user, request) is not None
+        return _authorized(request, token)
+
     usage = UsageTracker()
     ssot_service = None
     if settings.ssot_enabled:
@@ -291,13 +327,20 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
     admin = AdminController(service, usage)
     server = create_mcp_server(
         service,
-        auth=ConstantTimeTokenVerifier(token) if token is not None else None,
+        auth=(
+            RegistryTokenVerifier(access.store) if access is not None
+            else ConstantTimeTokenVerifier(token) if token is not None else None
+        ),
         knowledge_tools=tools,
         managed_tools=managed_tools,
         feature_context=feature_context,
         catalog=catalog,
         builtin_tool_overrides=builtin_tool_overrides,
     )
+    if access is not None:
+        access.register(server)
+    else:
+        register_disabled_status(server)
 
     async def current_tool_catalog() -> dict[str, object]:
         managed = {item.name: item for item in managed_tools.list()}
@@ -340,6 +383,8 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             managed_tools=definitions,
         )
 
+    @server.custom_route("/access-admin", methods=["GET"], include_in_schema=False)
+    @server.custom_route("/access-admin/", methods=["GET"], include_in_schema=False)
     @server.custom_route("/admin", methods=["GET"], include_in_schema=False)
     async def admin_page(_request: Request) -> Response:
         index_path = _ADMIN_DIST / "index.html"
@@ -374,7 +419,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/overview", methods=["GET"], include_in_schema=False)
     async def admin_overview(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await asyncio.to_thread(admin.overview)
@@ -395,7 +440,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_domscribe_status(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await asyncio.to_thread(domscribe_agent.status, refresh=True)
@@ -405,13 +450,13 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/mcp-servers", methods=["GET"], include_in_schema=False)
     async def admin_mcp_servers(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         return JSONResponse(current_mcp_servers(request))
 
     @server.custom_route("/admin/api/mcp-servers", methods=["POST"], include_in_schema=False)
     async def admin_add_mcp_server(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -433,7 +478,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_check_mcp_server(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -454,7 +499,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_delete_mcp_server(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -470,7 +515,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/documents", methods=["POST"], include_in_schema=False)
     async def admin_upload_document(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -495,7 +540,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/index", methods=["POST"], include_in_schema=False)
     async def admin_start_index(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await asyncio.to_thread(admin.start_index)
@@ -505,13 +550,13 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/catalog", methods=["GET"], include_in_schema=False)
     async def admin_catalog(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         return JSONResponse(catalog.payload())
 
     @server.custom_route("/admin/api/indexes", methods=["POST"], include_in_schema=False)
     async def admin_create_index(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -536,7 +581,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_build_index(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -554,7 +599,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_index_documents(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             index_id = _optional_query(request, "index_id")
@@ -583,7 +628,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_index_document(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             index_id = _optional_query(request, "index_id")
@@ -605,7 +650,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_upload_index_documents(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -645,7 +690,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_add_repository(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -705,7 +750,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_add_repository_batch(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -800,7 +845,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_refresh_repository(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -818,7 +863,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_delete_repository(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -836,7 +881,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_refresh_all_services(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             job = catalog.start_all_services_ssot_refresh()
@@ -850,7 +895,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_analyze_service(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -880,7 +925,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_delete_service(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -898,7 +943,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_cancel_job(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -912,7 +957,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/jobs/status", methods=["GET"], include_in_schema=False)
     async def admin_job_status(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             job_id = _optional_query(request, "job_id")
@@ -925,7 +970,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/jobs", methods=["GET"], include_in_schema=False)
     async def admin_jobs(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             return JSONResponse(await asyncio.to_thread(catalog.jobs_payload))
@@ -934,7 +979,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/jobs/log", methods=["GET"], include_in_schema=False)
     async def admin_job_log(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             job_id = _optional_query(request, "job_id")
@@ -950,7 +995,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_clear_jobs(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             return JSONResponse(await asyncio.to_thread(catalog.clear_job_history))
@@ -963,7 +1008,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_generate_system_ssot(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             body = await request.json()
@@ -1001,7 +1046,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_create_ssot_bundle(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -1019,7 +1064,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_download_ssot_bundle(request: Request) -> Response:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             bundle_id = _optional_query(request, "bundle_id")
@@ -1041,7 +1086,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_import_ssot(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -1072,7 +1117,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_build_graph(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -1098,7 +1143,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/graph/overview", methods=["GET"], include_in_schema=False)
     async def admin_graph_overview(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             return JSONResponse(await asyncio.to_thread(catalog.graph_overview))
@@ -1111,7 +1156,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_graph_algorithms(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             return JSONResponse(await asyncio.to_thread(catalog.graph_algorithms))
@@ -1120,7 +1165,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/graph", methods=["GET"], include_in_schema=False)
     async def admin_graph(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await asyncio.to_thread(
@@ -1145,7 +1190,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_service_map_overview(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             return JSONResponse(await asyncio.to_thread(catalog.service_map_overview))
@@ -1154,7 +1199,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/service-map", methods=["GET"], include_in_schema=False)
     async def admin_service_map(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             return JSONResponse(await asyncio.to_thread(catalog.service_map))
@@ -1163,7 +1208,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/graph/evidence", methods=["GET"], include_in_schema=False)
     async def admin_graph_evidence(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             raw = request.query_params.get("ids", "")
@@ -1174,7 +1219,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/tools", methods=["POST"], include_in_schema=False)
     async def admin_save_tool(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -1195,7 +1240,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_tool_catalog(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             return JSONResponse(await current_tool_catalog())
@@ -1208,7 +1253,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def admin_save_builtin_tool(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -1237,7 +1282,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/tools/delete", methods=["POST"], include_in_schema=False)
     async def admin_delete_tool(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -1252,7 +1297,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/admin/api/tools/test", methods=["POST"], include_in_schema=False)
     async def admin_test_tool(request: Request) -> JSONResponse:
-        if not _admin_authorized(request, settings):
+        if not await dashboard_authorized(request):
             return _admin_denied(settings)
         try:
             payload = await request.json()
@@ -1282,6 +1327,8 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/health", methods=["GET"], include_in_schema=False)
     async def health_check(_request: Request) -> JSONResponse:
+        if settings.access_enabled:
+            return JSONResponse({"status": "ok"})
         stats = await asyncio.to_thread(service.stats)
         return JSONResponse(
             {
@@ -1294,7 +1341,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/api/v1/search", methods=["GET"], include_in_schema=False)
     async def api_search(request: Request) -> JSONResponse:
-        if not _authorized(request, token):
+        if not await reader_authorized(request):
             return _unauthorized_response()
         try:
             query = request.query_params.get("query", "")
@@ -1318,7 +1365,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/api/v1/ssot/context", methods=["GET"], include_in_schema=False)
     async def api_ssot_context(request: Request) -> JSONResponse:
-        if not _authorized(request, token):
+        if not await reader_authorized(request):
             return _unauthorized_response()
         try:
             question = request.query_params.get("question", "")
@@ -1336,7 +1383,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/api/v1/ssot/generate", methods=["POST"], include_in_schema=False)
     async def api_generate_system_ssot(request: Request) -> JSONResponse:
-        if not _authorized(request, token):
+        if not await reader_authorized(request):
             return _unauthorized_response()
         try:
             body = await request.json()
@@ -1370,7 +1417,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/api/v1/feature-context", methods=["POST"], include_in_schema=False)
     async def api_feature_context(request: Request) -> JSONResponse:
-        if not _authorized(request, token):
+        if not await reader_authorized(request):
             return _unauthorized_response()
         try:
             body = await request.json()
@@ -1401,7 +1448,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/api/v1/document", methods=["GET"], include_in_schema=False)
     async def api_document(request: Request) -> JSONResponse:
-        if not _authorized(request, token):
+        if not await reader_authorized(request):
             return _unauthorized_response()
         try:
             document_id = request.query_params.get("document_id", "")
@@ -1424,7 +1471,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/api/v1/chunk", methods=["GET"], include_in_schema=False)
     async def api_chunk(request: Request) -> JSONResponse:
-        if not _authorized(request, token):
+        if not await reader_authorized(request):
             return _unauthorized_response()
         try:
             chunk_id = request.query_params.get("chunk_id", "")
@@ -1451,7 +1498,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         include_in_schema=False,
     )
     async def api_context_benchmark(request: Request) -> JSONResponse:
-        if not _authorized(request, token):
+        if not await reader_authorized(request):
             return _unauthorized_response()
         try:
             password = request.headers.get("x-kb-benchmark-password", "")
@@ -1462,7 +1509,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/api/v1/documents", methods=["GET"], include_in_schema=False)
     async def api_documents(request: Request) -> JSONResponse:
-        if not _authorized(request, token):
+        if not await reader_authorized(request):
             return _unauthorized_response()
         try:
             payload = await asyncio.to_thread(
@@ -1479,7 +1526,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/api/v1/stats", methods=["GET"], include_in_schema=False)
     async def api_stats(request: Request) -> JSONResponse:
-        if not _authorized(request, token):
+        if not await reader_authorized(request):
             return _unauthorized_response()
         try:
             payload = await asyncio.to_thread(tools.stats)
@@ -1489,13 +1536,13 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
     @server.custom_route("/api/v1/tools", methods=["GET"], include_in_schema=False)
     async def api_managed_tools(request: Request) -> JSONResponse:
-        if not _authorized(request, token):
+        if not await reader_authorized(request):
             return _unauthorized_response()
         return JSONResponse(managed_tools.payload())
 
     @server.custom_route("/api/v1/tools/call", methods=["POST"], include_in_schema=False)
     async def api_call_managed_tool(request: Request) -> JSONResponse:
-        if not _authorized(request, token):
+        if not await reader_authorized(request):
             return _unauthorized_response()
         try:
             payload = await request.json()
@@ -1540,12 +1587,15 @@ def main() -> None:
     server = create_http_server(service, settings)
     logger.info(
         "Starting FastMCP %s server on %s:%d%s "
-        "(application_authentication=%s, client_certificates=disabled)",
+        "(application_authentication=%s, client_certificates=%s)",
         "HTTPS" if tls_config is not None else "HTTP",
         settings.mcp_http_host,
         settings.mcp_http_port,
         settings.mcp_http_path,
-        "enabled" if settings.mcp_http_bearer_token else "disabled",
+        "registry" if settings.access_enabled else (
+            "shared-token" if settings.mcp_http_bearer_token else "disabled"
+        ),
+        "verified-enrollment" if settings.access_enabled else "disabled",
     )
     try:
         server.run(

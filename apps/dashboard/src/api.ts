@@ -7,6 +7,19 @@ export class ApiError extends Error {
   }
 }
 
+export const DASHBOARD_ACCESS_EXPIRED = "rag-dashboard-access-expired";
+let dashboardAccessMode = false;
+
+export function setDashboardAccessMode(enabled: boolean): void {
+  dashboardAccessMode = enabled;
+}
+
+function reportDenied(status: number): void {
+  if (dashboardAccessMode && (status === 401 || status === 403)) {
+    window.dispatchEvent(new Event(DASHBOARD_ACCESS_EXPIRED));
+  }
+}
+
 export async function api<T>(
   path: string,
   password: string,
@@ -15,7 +28,7 @@ export async function api<T>(
 ): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
-  if (password) headers.set("X-KB-Admin-Password", password);
+  if (password && !dashboardAccessMode) headers.set("X-KB-Admin-Password", password);
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   let response: Response;
@@ -23,6 +36,7 @@ export async function api<T>(
     response = await fetch(path, {
       ...init,
       headers,
+      credentials: "same-origin",
       signal: init.signal || controller.signal,
     });
   } catch (error) {
@@ -43,6 +57,7 @@ export async function api<T>(
     }
   }
   if (!response.ok) {
+    reportDenied(response.status);
     const message =
       typeof payload === "object" && payload && "error" in payload
         ? String((payload as { error: unknown }).error)
@@ -58,9 +73,10 @@ export function post<T>(path: string, password: string, body: unknown, timeoutMs
 
 export async function download(path: string, password: string, filename: string): Promise<void> {
   const headers = new Headers();
-  if (password) headers.set("X-KB-Admin-Password", password);
-  const response = await fetch(path, { headers });
+  if (password && !dashboardAccessMode) headers.set("X-KB-Admin-Password", password);
+  const response = await fetch(path, { headers, credentials: "same-origin" });
   if (!response.ok) {
+    reportDenied(response.status);
     const text = await response.text();
     let message = text || response.statusText;
     try {

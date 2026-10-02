@@ -43,6 +43,22 @@ function domscribeBasePath(): Plugin {
   };
 }
 
+function accessAdminEntry(): Plugin {
+  return {
+    name: "access-admin-entry",
+    configureServer(server) {
+      // Let Vite's existing /admin/ SPA entry serve the separate UI in development.
+      server.middlewares.use((request, _response, next) => {
+        const incoming = request as typeof request & { url?: string };
+        if (/^\/access-admin\/?(?:\?.*)?$/.test(incoming.url ?? "")) {
+          incoming.url = "/admin/index.html";
+        }
+        next();
+      });
+    },
+  };
+}
+
 const tls = tlsEnabled && existsSync(certificate) && existsSync(privateKey)
   ? { cert: readFileSync(certificate), key: readFileSync(privateKey) }
   : undefined;
@@ -59,6 +75,7 @@ export default defineConfig(({ command, mode }) => {
     base: "/admin/",
     plugins: [
       react(),
+      accessAdminEntry(),
       ...(domscribeEnabled ? [domscribe(domscribeOptions), domscribeBasePath()] : []),
     ],
     build: {
@@ -69,6 +86,14 @@ export default defineConfig(({ command, mode }) => {
       https: tls,
       proxy: {
         "/admin/api": {
+          target: process.env.VITE_BACKEND_URL ?? "https://127.0.0.1:8000",
+          secure: false,
+        },
+        "/auth": {
+          target: process.env.VITE_BACKEND_URL ?? "https://127.0.0.1:8000",
+          secure: false,
+        },
+        "/access/api": {
           target: process.env.VITE_BACKEND_URL ?? "https://127.0.0.1:8000",
           secure: false,
         },

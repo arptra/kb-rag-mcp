@@ -5,6 +5,8 @@
 .cache/
 node_modules/
 .env
+# Local TLS material and personal client keys must not enter repository history.
+certs/
 __pycache__/
 *.py[cod]
 .pytest_cache/

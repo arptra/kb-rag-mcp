@@ -409,8 +409,8 @@ function Startup({ error, loading, onRetry }: { error: string; loading: boolean;
   );
 }
 
-export default function App() {
-  const [password, setPassword] = useState(() => sessionStorage.getItem("rag-admin-password") || "");
+export default function App({ secureMode = false, onSessionLogout }: { secureMode?: boolean; onSessionLogout?: () => void }) {
+  const [password, setPassword] = useState(() => secureMode ? "" : sessionStorage.getItem("rag-admin-password") || "");
   const [overview, setOverview] = useState<Overview | null>(null);
   const [page, setPage] = useState<Page>("overview");
   const [error, setError] = useState("");
@@ -437,10 +437,10 @@ export default function App() {
       setError("");
       setAccessDenied(false);
     } catch (caught) {
-      if (caught instanceof ApiError && caught.status === 403) {
+      if (caught instanceof ApiError && (caught.status === 401 || caught.status === 403)) {
         sessionStorage.removeItem("rag-admin-password");
         setOverview(null);
-        setAccessDenied(true);
+        setAccessDenied(!secureMode);
         setError(caught.message);
       } else {
         setAccessDenied(false);
@@ -449,7 +449,7 @@ export default function App() {
     } finally {
       setBooting(false);
     }
-  }, [password]);
+  }, [password, secureMode]);
 
   useEffect(() => void load(), [load]);
   const hasActiveJobs = Boolean(
@@ -545,6 +545,8 @@ export default function App() {
         </nav>
         <div className="sidebar-foot">
           <div className="server-state"><span className="pulse" /><div><b>MCP online</b><small>{overview.index.embedding_provider} embeddings</small></div></div>
+          {secureMode && <a className="access-link" href="/access-admin">Управление доступом →</a>}
+          {secureMode && <button className="logout" onClick={onSessionLogout}>Выйти из дашборда</button>}
           {password && (
             <button
               className="logout"

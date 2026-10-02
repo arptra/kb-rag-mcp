@@ -20,9 +20,7 @@ export KB_MCP_HTTP_PATH="${KB_MCP_HTTP_PATH:-/mcp}"
 export KB_MCP_TLS_ENABLED="${KB_MCP_TLS_ENABLED:-true}"
 export KB_MCP_TLS_CERT_FILE="${KB_MCP_TLS_CERT_FILE:-${project_root}/certs/server.crt}"
 export KB_MCP_TLS_KEY_FILE="${KB_MCP_TLS_KEY_FILE:-${project_root}/certs/server.key}"
-# This deployment is intentionally open: TLS encrypts traffic, but there is no Bearer/admin auth.
-export KB_MCP_HTTP_BEARER_TOKEN=""
-export KB_ADMIN_PASSWORD=""
+# Authentication is configured by KB_* / .env. Never overwrite operator credentials.
 
 case "${KB_MCP_TLS_ENABLED}" in
   1|true|TRUE|yes|YES|on|ON)

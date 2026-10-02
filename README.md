@@ -17,6 +17,8 @@
 - [evidence-backed граф Java/Spring-репозиториев для GigaCode](README.gigacode-graph.md);
 - [подключение GigaCode на клиентском компьютере](README.client.md);
 - [развёртывание базы и API на удалённом сервере](README.server.md);
+- [управление доступом по личным сертификатам и отдельная админка](README.access.md);
+- [выдача токена и автоматическая запись в настройки MCP](README.access-client.md);
 - [быстрый запуск RAG с уменьшенным контекстом](README.low-context.md);
 - [отдельный общий SSOT-индекс всех сервисов](README.ssot.md).
 
@@ -213,7 +215,12 @@ Git-операции и дочерние агенты отключены. Qwen �
 
 ### Подключение сотрудника к удалённой базе
 
-RAG, индекс и документы находятся только на сервере. На клиенте нужен только GigaCode с прямым
+Для `KB_ACCESS_ENABLED=true` используйте [подключение по личному сертификату](README.access-client.md):
+помощник получает персональный токен и сохраняет его в MCP-конфиг. Для автоматического обновления
+при запуске MCP доступен локальный stdio-посредник; сам RAG и документы остаются на сервере.
+
+Следующий URL-only пример относится к прежнему режиму без управления доступами и без общего
+Bearer-токена. На клиенте нужен только GigaCode с прямым
 Streamable HTTPS transport: без Python, `venv`, FastMCP, `npx`, `mcp-remote` и stdio-proxy.
 
 Добавьте в `~/.gigacode/settings.json`:
@@ -230,7 +237,7 @@ Streamable HTTPS transport: без Python, `venv`, FastMCP, `npx`, `mcp-remote` 
 
 Готовый settings находится в [`examples/gigacode-settings.example.json`](examples/gigacode-settings.example.json),
 полная инструкция — в [`README.client.md`](README.client.md). Сертификат сервера должен быть доверен
-клиентской ОС; дополнительных паролей, токенов и клиентских сертификатов сервер не запрашивает.
+клиентской ОС. В защищённом режиме одного URL недостаточно: требуется персональный токен.
 
 ### Установка серверной части
 
@@ -312,6 +319,9 @@ environment GigaCode-конфигурации. Все runtime wrappers вызы�
 MCP discovery.
 
 ## Подключение к GigaCode
+
+Для персонального сертификатного доступа используйте [README.access-client.md](README.access-client.md).
+Следующие примеры URL-only предназначены для прежнего открытого режима.
 
 Скопируйте `examples/gigacode-settings.example.json` в пользовательский `settings.json` GigaCode и
 замените только DNS/IP сервера. Минимальная запись:
@@ -515,7 +525,9 @@ cd /opt/corporate-kb
 ./scripts/dev.sh index-hash
 ```
 
-Сервер всегда запускается с TLS без Bearer/admin-пароля и без проверки клиентских сертификатов:
+Ниже — базовый TLS-запуск. Для персонального доступа сначала настройте `KB_ACCESS_*`
+по [инструкции управления доступом](README.access.md). Без него и без общих секретов
+MCP и API остаются открытыми:
 
 ```bash
 export KB_MCP_HTTP_HOST='127.0.0.1'
@@ -563,8 +575,9 @@ curl -G 'https://10.0.0.5:8000/api/v1/search' \
 `/api/v1/admin/context-benchmark`, `/api/v1/documents` и `/api/v1/stats`. Они используют
 тот же прогретый индекс, что и MCP tools, не строят embeddings на клиенте и не изменяют документы.
 
-Сам `/mcp` и JSON API работают без заголовка авторизации. Скрипт запуска очищает старые значения
-`KB_MCP_HTTP_BEARER_TOKEN` и `KB_ADMIN_PASSWORD`. `KB_AUTO_INDEX=false` гарантирует, что удалённый
+В режиме `KB_ACCESS_ENABLED=true` `/mcp` и JSON API требуют персональный Bearer-токен.
+Скрипт запуска сохраняет заданные `KB_MCP_HTTP_BEARER_TOKEN` и `KB_ADMIN_PASSWORD`; эти общие
+секреты используются только в прежнем режиме. `KB_AUTO_INDEX=false` гарантирует, что удалённый
 процесс не начнёт неожиданную переиндексацию.
 
 Проверяйте с клиентской машины не только `/health`, но и настоящий MCP `initialize`:
@@ -577,10 +590,14 @@ curl -i --max-time 15 \
   --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"curl-test","version":"1.0"}}}'
 ```
 
-Ожидается `HTTP/1.1 200`. `404` означает неверный путь. Ошибка TLS означает, что сертификат не
+В защищённом режиме добавьте к запросу `Authorization: Bearer <персональный токен>`;
+без него ожидается `401`. При разрешённом доступе ожидается `HTTP/1.1 200`. `404` означает неверный путь. Ошибка TLS означает, что сертификат не
 доверен клиенту или не содержит DNS/IP из URL.
 
 ### 2. Подключить GigaCode CLI
+
+Для сертификатного режима используйте [`kb-access connect`](README.access-client.md),
+а не URL-only установщик ниже.
 
 Перед раздачей впишите в корневой `install.sh` HTTPS-адрес сервера:
 
@@ -699,7 +716,7 @@ custom_field: "неизвестные поля тоже сохраняются"
 
 Тесты всегда инжектируют hash provider и не требуют интернета, Hugging Face, GPU, GigaCode, Docker
 или внешней БД. Интеграционные тесты проверяют как in-memory MCP transport, так и HTTP handshake
-через ASGI без открытия сетевого порта.
+через ASGI. Тест сертификатной выдачи также открывает временный HTTPS-порт на localhost.
 
 ## Ограничения MVP и развитие
 
@@ -710,9 +727,10 @@ custom_field: "неизвестные поля тоже сохраняются"
 - Нет reranker, hybrid/BM25 retrieval и отдельной оценки authority при ранжировании.
 - Точный token counter реальной модели не используется для предварительного chunking: интерфейс
   `TokenCounter` отделён, поэтому его можно подключить без связи chunker с SentenceTransformer.
-- Текущая deployment-модель намеренно открытая: TLS шифрует соединение, но MCP и Admin API не
-  различают пользователей. Ограничивайте сетевой доступ firewall/VPN, если сервер не должен быть
-  общедоступным.
+- Персональный контроль доступа включается отдельно через `KB_ACCESS_ENABLED=true`:
+  сертификаты, токены и отзыв описаны в [README.access.md](README.access.md). Без него и без
+  общих секретов сервис остаётся открытым. Раздельных прав на индексы/tools пока нет;
+  ограничивайте сетевой доступ firewall/VPN.
 
 Для перехода на настоящую Vector DB нужно реализовать `PostgresKnowledgeStore` или
 `QdrantKnowledgeStore` с тем же контрактом `KnowledgeStore`, выбрать реализацию при сборке

@@ -95,6 +95,14 @@ class Settings(BaseSettings):
     mcp_tls_enabled: bool = True
     mcp_tls_cert_file: Path = Path("certs/server.crt")
     mcp_tls_key_file: Path = Path("certs/server.key")
+    # Opt-in migration: legacy deployments stay usable until CA/bootstrap are configured.
+    access_enabled: bool = False
+    access_db_path: Path = Path(".cache/access/access.sqlite3")
+    access_client_ca_file: Path | None = None
+    access_bootstrap_admin_username: str = "admin"
+    access_bootstrap_admin_password: SecretStr | None = None
+    access_token_ttl_seconds: int = Field(default=2_592_000, ge=300, le=31_536_000)
+    access_admin_session_ttl_seconds: int = Field(default=28_800, ge=300, le=604_800)
 
     @field_validator("mcp_http_path")
     @classmethod
@@ -113,6 +121,15 @@ class Settings(BaseSettings):
             raise ValueError("KB_CHUNK_SIZE_TOKENS must not exceed KB_CHUNK_HARD_MAX_TOKENS")
         if self.chunk_overlap_tokens >= self.chunk_size_tokens:
             raise ValueError("KB_CHUNK_OVERLAP_TOKENS must be smaller than KB_CHUNK_SIZE_TOKENS")
+        return self
+
+    @model_validator(mode="after")
+    def validate_access_control(self) -> Settings:
+        if self.access_enabled:
+            if not self.mcp_tls_enabled:
+                raise ValueError("KB_ACCESS_ENABLED requires KB_MCP_TLS_ENABLED=true")
+            if self.access_client_ca_file is None:
+                raise ValueError("KB_ACCESS_ENABLED requires KB_ACCESS_CLIENT_CA_FILE")
         return self
 
     def resolved(self, cwd: Path | None = None) -> Settings:
@@ -143,5 +160,10 @@ class Settings(BaseSettings):
                 "domscribe_workspace_root": resolve(self.domscribe_workspace_root),
                 "mcp_tls_cert_file": resolve(self.mcp_tls_cert_file),
                 "mcp_tls_key_file": resolve(self.mcp_tls_key_file),
+                "access_db_path": resolve(self.access_db_path),
+                "access_client_ca_file": (
+                    resolve(self.access_client_ca_file)
+                    if self.access_client_ca_file is not None else None
+                ),
             }
         )
