@@ -7,6 +7,18 @@ project_root="$(cd -- "${script_dir}/.." && pwd)"
 
 cd "${project_root}"
 
+# Local access testing is an explicit isolated profile. Dispatch before the normal
+# TLS defaults and PID handling, so it cannot replace or stop a running deployment.
+if [[ "${1:-}" == "local" ]]; then
+  shift
+  if [[ ! -x "${project_root}/.venv/bin/python" ]]; then
+    echo "Local environment is not initialized. Run: ./scripts/setup-pip.sh --no-dev" >&2
+    exit 1
+  fi
+  export PYTHONPATH="${project_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
+  exec "${project_root}/.venv/bin/python" -m corporate_kb.access.local_dev "$@"
+fi
+
 export KB_ACTIVATE_QUIET=true
 source "${script_dir}/activate-venv.sh"
 unset KB_ACTIVATE_QUIET
@@ -234,7 +246,7 @@ case "${action}" in
     tail -n 100 -f "${log_file}"
     ;;
   *)
-    echo "Usage: $0 {run|start|stop|restart|status|logs}" >&2
+    echo "Usage: $0 {run|start|stop|restart|status|logs|local [--help]}" >&2
     exit 2
     ;;
 esac

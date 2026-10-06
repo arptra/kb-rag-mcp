@@ -1573,9 +1573,9 @@ def create_http_app(service: KnowledgeService, settings: Settings) -> ASGIApp:
     )
 
 
-def main() -> None:
+def main(settings: Settings | None = None) -> None:
     """Preload the index, then serve FastMCP Streamable HTTP."""
-    settings = Settings().resolved()
+    settings = (settings or Settings()).resolved()
     configure_logging(settings.log_level)
     validate_http_settings(settings)
     tls_config = tls_uvicorn_config(settings)
