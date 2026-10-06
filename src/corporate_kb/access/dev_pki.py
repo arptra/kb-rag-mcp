@@ -1,4 +1,4 @@
-"""Isolated, reusable localhost identities; never installs trust or contacts a CA.
+"""Reusable development identities for explicit hosts; never changes system trust.
 
 This is development-only PKI. The signing key exists only during initial bundle
 generation. Existing identity material is validated, never silently repaired or
@@ -7,13 +7,14 @@ rotated, so restarts cannot reset access-registry principals or credentials.
 
 from __future__ import annotations
 
-import fcntl
 import ipaddress
 import json
 import os
+import re
 import secrets
 import shutil
 import stat
+import sys
 import tempfile
 import uuid
 from collections.abc import Iterator
@@ -40,6 +41,11 @@ _FILES = {
 }
 _CREDENTIAL_FIELDS = {"schema_version", "admin_username", "admin_password", "p12_password"}
 _MAX_FILE_BYTES = 131_072
+_DEFAULT_SERVER_NAMES = ("localhost", "127.0.0.1", "::1")
+
+
+class _ServerNamesMismatch(ValueError):
+    """An existing bundle may not be silently expanded or narrowed to other hosts."""
 
 
 @dataclass(frozen=True)
@@ -58,6 +64,80 @@ class LocalIdentity:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def normalize_server_name(value: str) -> str:
+    """Return a bare canonical DNS name/IP, not a URL, wildcard or bind address.
+
+    DNS uses IDNA ASCII and lowercase; IPv6 must be unbracketed and without a
+    scoped interface suffix. This describes certificate identity, not listening
+    interfaces: unspecified and multicast addresses cannot identify a server.
+    """
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 1024
+        or any(character.isspace() or not character.isprintable() for character in value)
+        or any(character in value for character in "/\\@?#*[]%")
+    ):
+        raise ValueError("Server name must be a bare DNS name or IP, without whitespace or a URL")
+    name = value
+    if ":" not in name:
+        try:
+            name = name.encode("idna").decode("ascii").lower()
+        except UnicodeError as error:
+            raise ValueError("Invalid IDNA server name") from error
+        # IDNA also maps Unicode DNS separators to ASCII dots.
+        if name.endswith("."):
+            name = name[:-1]
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        if ":" in name:
+            raise ValueError(
+                "Server name must not include a port or malformed IPv6 address"
+            ) from None
+        labels = name.split(".")
+        if (
+            len(name) > 253
+            or not all(
+                re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels
+            )
+            or all(character.isdigit() or character == "." for character in name)
+        ):
+            raise ValueError("Invalid DNS server name or IP address") from None
+        # Validate existing A-labels too; IDNA encoding alone passes them through.
+        for label in labels:
+            if label.startswith("xn--"):
+                try:
+                    label.encode("ascii").decode("idna")
+                except UnicodeError as error:
+                    raise ValueError("Invalid IDNA server name") from error
+        return name
+    else:
+        mapped = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+        if (
+            address.is_unspecified
+            or address.is_multicast
+            or (mapped is not None and (mapped.is_unspecified or mapped.is_multicast))
+        ):
+            raise ValueError(
+                "Server certificate names cannot be unspecified or multicast addresses"
+            )
+        return str(address)
+
+
+def _server_alt_names(server_names: tuple[str, ...]) -> list[x509.GeneralName]:
+    extra = {normalize_server_name(value) for value in server_names} - set(_DEFAULT_SERVER_NAMES)
+    result: list[x509.GeneralName] = []
+    for name in (*_DEFAULT_SERVER_NAMES, *sorted(extra)):
+        try:
+            address = ipaddress.ip_address(name)
+        except ValueError:
+            result.append(x509.DNSName(name))
+        else:
+            result.append(x509.IPAddress(address))
+    return result
 
 
 def _reject_symlinks(path: Path) -> None:
@@ -148,7 +228,7 @@ def _check_leaf(
         raise ValueError("Local leaf certificate outlives its CA")
 
 
-def _load(directory: Path) -> LocalIdentity:
+def _load(directory: Path, *, server_names: tuple[str, ...] = ()) -> LocalIdentity:
     """Validate the whole bundle before returning any sensitive credential."""
     try:
         _reject_symlinks(directory)
@@ -190,13 +270,13 @@ def _load(directory: Path) -> LocalIdentity:
         if len(public_keys) != 3:
             raise ValueError("CA, server and client must have independent private keys")
         names = server.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-        if (
-            len(names) != 3
-            or names.get_values_for_type(x509.DNSName) != ["localhost"]
-            or set(names.get_values_for_type(x509.IPAddress))
-            != {ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")}
-        ):
-            raise ValueError("Local server certificate must be restricted to localhost")
+        expected_names = _server_alt_names(server_names)
+        if len(names) != len(expected_names) or set(names) != set(expected_names):
+            raise _ServerNamesMismatch(
+                "Existing server certificate names do not match the requested server names; "
+                "the identity was not changed. Reuse the original names "
+                "or choose a new state directory."
+            )
         p12_key, p12_cert, p12_chain = pkcs12.load_key_and_certificates(
             data["client_p12"], credentials["p12_password"].encode("ascii")
         )
@@ -221,6 +301,8 @@ def _load(directory: Path) -> LocalIdentity:
             admin_password=credentials["admin_password"],
             p12_password=credentials["p12_password"],
         )
+    except _ServerNamesMismatch:
+        raise
     except Exception as error:
         # Third-party decoder errors must not echo credential or key bytes.
         raise ValueError(
@@ -251,7 +333,7 @@ def _key_usage(*, ca: bool) -> x509.KeyUsage:
     )
 
 
-def _generate(directory: Path) -> None:
+def _generate(directory: Path, *, server_names: tuple[str, ...] = ()) -> None:
     now = _now()
     ca_key = ec.generate_private_key(ec.SECP256R1())
     ca_name = x509.Name(
@@ -298,13 +380,7 @@ def _generate(directory: Path) -> None:
         )
         if kind == "server":
             builder = builder.add_extension(
-                x509.SubjectAlternativeName(
-                    [
-                        x509.DNSName("localhost"),
-                        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
-                        x509.IPAddress(ipaddress.ip_address("::1")),
-                    ]
-                ),
+                x509.SubjectAlternativeName(_server_alt_names(server_names)),
                 critical=False,
             )
         certificate = builder.sign(ca_key, hashes.SHA256())
@@ -329,7 +405,8 @@ def _generate(directory: Path) -> None:
     }
     # Development-only import compatibility with macOS/Windows certificate stores.
     # PKCS#12 encryption is not a security boundary: keep the whole bundle private
-    # (0700/0600) and never distribute these keys. Production PKI is separate.
+    # (0700/0600); never distribute server keys or the raw state directory.
+    # Client identity exports are secrets. Production PKI is separate.
     encryption = (
         serialization.PrivateFormat.PKCS12.encryption_builder()
         .kdf_rounds(50_000)
@@ -354,6 +431,8 @@ def _generate(directory: Path) -> None:
 @contextmanager
 def _identity_lock(directory: Path) -> Iterator[None]:
     """Serialize cooperating launchers without deleting/replacing the lock inode."""
+    import fcntl
+
     parent = directory.parent.stat()
     if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o022:
         raise ValueError("Local identity parent must be owned by you and not writable by others")
@@ -378,25 +457,33 @@ def _identity_lock(directory: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
-def prepare_local_identity(directory: Path) -> LocalIdentity:
-    """Generate once or validate/reuse a private localhost PKI bundle.
+def prepare_local_identity(directory: Path, *, server_names: tuple[str, ...] = ()) -> LocalIdentity:
+    """Generate once or validate/reuse a private development PKI bundle.
 
     Existing directories must contain a complete valid bundle; in particular an
     empty pre-created directory is not overwritten. Concurrent creators return the
-    one winning identity. The CA is not installed in any operating-system store.
+    one winning identity. SANs always include localhost and loopback IPs, plus
+    exactly the explicitly requested hosts. Reuse requires the same normalized
+    SAN set. The CA is not installed in any operating-system store. The server
+    helper supports POSIX Linux/macOS and Windows through WSL, not native Windows.
     """
+    if sys.platform == "win32":
+        raise ValueError("Local PKI server setup requires Linux/macOS; on Windows use WSL")
+    if isinstance(server_names, str):
+        raise ValueError("server_names must be a tuple of individual host names")
+    server_names = tuple(sorted({normalize_server_name(value) for value in server_names}))
     directory = Path(directory).absolute()
     _reject_symlinks(directory)
     directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _reject_symlinks(directory.parent)
     with _identity_lock(directory):
         if directory.exists():
-            return _load(directory)
+            return _load(directory, server_names=server_names)
         temporary = Path(tempfile.mkdtemp(prefix=f".{directory.name}-", dir=directory.parent))
         try:
             os.chmod(temporary, 0o700)
-            _generate(temporary)
-            _load(temporary)
+            _generate(temporary, server_names=server_names)
+            _load(temporary, server_names=server_names)
             descriptor = os.open(temporary, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
                 os.fsync(descriptor)
@@ -405,9 +492,9 @@ def prepare_local_identity(directory: Path) -> LocalIdentity:
             # The private parent and persistent advisory lock serialize launchers.
             # Never replace an existing directory, including an incomplete bundle.
             if directory.exists() or directory.is_symlink():
-                return _load(directory)
+                return _load(directory, server_names=server_names)
             os.rename(temporary, directory)
-            return _load(directory)
+            return _load(directory, server_names=server_names)
         finally:
             if temporary.exists():
                 shutil.rmtree(temporary)

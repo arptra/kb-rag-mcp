@@ -11,12 +11,28 @@ cd "${project_root}"
 # TLS defaults and PID handling, so it cannot replace or stop a running deployment.
 if [[ "${1:-}" == "local" ]]; then
   shift
+  local_args=("-m" "corporate_kb.access.local_dev")
+  setup_local=false
+  local_help=false
+  for argument in "$@"; do
+    case "${argument}" in
+      --setup) setup_local=true ;;
+      -h|--help) local_help=true; local_args+=("${argument}") ;;
+      *) local_args+=("${argument}") ;;
+    esac
+  done
+  if [[ "${local_help}" == true ]]; then
+    echo "Launcher option: --setup prepares Python 3.12 and runtime dependencies locally."
+    echo "Servers: Debian/Linux, macOS, or Windows via WSL. Browser clients: any OS."
+  elif [[ "${setup_local}" == true ]]; then
+    bash "${script_dir}/setup-access-dev.sh"
+  fi
   if [[ ! -x "${project_root}/.venv/bin/python" ]]; then
-    echo "Local environment is not initialized. Run: ./scripts/setup-pip.sh --no-dev" >&2
+    echo "Local environment is not initialized. Run: $0 local --setup" >&2
     exit 1
   fi
   export PYTHONPATH="${project_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
-  exec "${project_root}/.venv/bin/python" -m corporate_kb.access.local_dev "$@"
+  exec "${project_root}/.venv/bin/python" "${local_args[@]}"
 fi
 
 export KB_ACTIVATE_QUIET=true

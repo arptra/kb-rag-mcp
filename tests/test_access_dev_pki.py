@@ -15,7 +15,11 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
-from corporate_kb.access.dev_pki import LocalIdentity, prepare_local_identity
+from corporate_kb.access.dev_pki import (
+    LocalIdentity,
+    normalize_server_name,
+    prepare_local_identity,
+)
 
 
 def _snapshot(directory: Path) -> dict[str, tuple[str, int]]:
@@ -267,7 +271,7 @@ def test_concurrent_creators_reuse_one_complete_bundle(tmp_path: Path) -> None:
 def test_failed_generation_does_not_publish_or_leave_partial_bundle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def fail_generation(directory: Path) -> None:
+    def fail_generation(directory: Path, *, server_names: tuple[str, ...] = ()) -> None:
         (directory / "partial").write_text("non-secret test fixture")
         raise ValueError("simulated failure")
 
@@ -276,3 +280,167 @@ def test_failed_generation_does_not_publish_or_leave_partial_bundle(
         prepare_local_identity(tmp_path / "identity")
     assert not (tmp_path / "identity").exists()
     assert {item.name for item in tmp_path.iterdir()} == {".identity.lock"}
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("Debian-BOX.Example.COM", "debian-box.example.com"),
+        ("debian-box", "debian-box"),
+        ("example.com.", "example.com"),
+        ("example\u3002com\u3002", "example.com"),
+        ("Пример.РФ", "xn--e1afmkfd.xn--p1ai"),
+        ("XN--E1AFMKFD.XN--P1AI", "xn--e1afmkfd.xn--p1ai"),
+        ("192.0.2.10", "192.0.2.10"),
+        ("192.0.2.10.", "192.0.2.10"),
+        ("2001:0DB8:0000:0000:0000:0000:0000:0010", "2001:db8::10"),
+        ("::1", "::1"),
+        ("LOCALHOST.", "localhost"),
+    ],
+)
+def test_normalize_server_names(value: str, expected: str) -> None:
+    assert normalize_server_name(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        " ",
+        "localhost ",
+        "\tlocalhost",
+        "local host",
+        "local\nhost",
+        "local\x00host",
+        "local\u200bhost",
+        "https://example.com",
+        "http://localhost",
+        "example.com:8443",
+        "example.com/path",
+        "example.com\\path",
+        "user@example.com",
+        "example.com?query",
+        "example.com#fragment",
+        "*.example.com",
+        "[::1]",
+        "[::1]:8443",
+        "fe80::1%eth0",
+        "example.com%20",
+        "_service.example.com",
+        "-example.com",
+        "example-.com",
+        "example..com",
+        ".example.com",
+        "example.com..",
+        "xn--.example",
+        "0.0.0.0",
+        "::",
+        "0:0:0:0:0:0:0:0",
+        "224.0.0.1",
+        "239.255.255.255",
+        "ff02::1",
+        "::ffff:224.0.0.1",
+        "::ffff:0.0.0.0",
+        "127.0.0.999",
+        "127.1",
+        "2130706433",
+        "127.000.000.001",
+        "2001:db8:::1",
+        "::1.",
+        "a" * 64 + ".example",
+        ".".join(["a" * 63] * 4),
+    ],
+)
+def test_invalid_server_names_are_rejected(value: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_server_name(value)
+
+
+def test_remote_names_add_dns_and_ip_sans_without_changing_client_identity(tmp_path: Path) -> None:
+    identity = prepare_local_identity(
+        tmp_path / "identity",
+        server_names=("Debian.Example.COM.", "192.0.2.10", "2001:0DB8::10", "Пример.РФ"),
+    )
+    server = x509.load_pem_x509_certificate(identity.server_cert.read_bytes())
+    sans = server.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert set(sans.get_values_for_type(x509.DNSName)) == {
+        "localhost",
+        "debian.example.com",
+        "xn--e1afmkfd.xn--p1ai",
+    }
+    assert set(sans.get_values_for_type(x509.IPAddress)) == {
+        ipaddress.ip_address("127.0.0.1"),
+        ipaddress.ip_address("::1"),
+        ipaddress.ip_address("192.0.2.10"),
+        ipaddress.ip_address("2001:db8::10"),
+    }
+    assert len(sans) == 7
+    client = x509.load_pem_x509_certificate(identity.client_cert.read_bytes())
+    with pytest.raises(x509.ExtensionNotFound):
+        client.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    assert set(client.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value) == {
+        ExtendedKeyUsageOID.CLIENT_AUTH
+    }
+
+
+def test_remote_name_reuse_normalizes_deduplicates_and_ignores_order(tmp_path: Path) -> None:
+    destination = tmp_path / "identity"
+    identity = prepare_local_identity(
+        destination,
+        server_names=("Example.COM", "192.0.2.10", "2001:db8::10"),
+    )
+    before = _snapshot(destination)
+    reused = prepare_local_identity(
+        destination,
+        server_names=(
+            "LOCALHOST.",
+            "127.0.0.1",
+            "0:0:0:0:0:0:0:1",
+            "EXAMPLE.com.",
+            "example.com",
+            "2001:0DB8::10",
+            "192.0.2.10",
+        ),
+    )
+    assert reused == identity
+    assert _snapshot(destination) == before
+
+
+@pytest.mark.parametrize("requested", [(), ("other.example.com",), ("example.com", "192.0.2.10")])
+def test_remote_name_mismatch_never_rotates_existing_bundle(
+    tmp_path: Path, requested: tuple[str, ...]
+) -> None:
+    destination = tmp_path / "identity"
+    original = prepare_local_identity(destination, server_names=("example.com",))
+    before = _snapshot(destination)
+    with pytest.raises(ValueError, match=r"server names.*not changed"):
+        prepare_local_identity(destination, server_names=requested)
+    assert _snapshot(destination) == before
+    assert prepare_local_identity(destination, server_names=("EXAMPLE.COM.",)) == original
+
+
+def test_default_bundle_cannot_silently_gain_remote_hosts(identity: LocalIdentity) -> None:
+    directory = identity.ca_cert.parent
+    before = _snapshot(directory)
+    with pytest.raises(ValueError, match=r"server names.*not changed"):
+        prepare_local_identity(directory, server_names=("debian.example.com",))
+    assert _snapshot(directory) == before
+    assert prepare_local_identity(directory) == identity
+
+
+def test_invalid_host_validation_precedes_directory_or_lock_creation(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        prepare_local_identity(tmp_path / "new-parent" / "identity", server_names=("0.0.0.0",))
+    assert not (tmp_path / "new-parent").exists()
+    with pytest.raises(ValueError, match="tuple"):
+        prepare_local_identity(tmp_path / "identity", server_names="example.com")
+    assert not list(tmp_path.iterdir())
+
+
+def test_native_windows_fails_with_wsl_guidance_before_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("corporate_kb.access.dev_pki.sys.platform", "win32")
+    with pytest.raises(ValueError, match="Windows use WSL"):
+        prepare_local_identity(tmp_path / "identity")
+    assert not list(tmp_path.iterdir())

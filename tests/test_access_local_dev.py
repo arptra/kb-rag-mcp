@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 import ssl
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -278,12 +281,136 @@ def test_open_certificate_dialogs_require_explicit_flag(
     assert identity.p12_password not in output
 
 
-def test_open_certificate_dialogs_on_nonmac_fails_before_writes(
-    local_project, tmp_path, monkeypatch
+def test_open_certificate_dialogs_on_headless_linux_prints_instructions(
+    local_project, tmp_path, monkeypatch, capsys
 ):
-    state = tmp_path / "must-not-be-created"
+    state = tmp_path / "headless-state"
     monkeypatch.setattr(local_dev.sys, "platform", "linux")
-    with pytest.raises(SystemExit) as error:
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    local_dev.main(
+        [
+            "--project-root",
+            str(local_project),
+            "--state-dir",
+            str(state),
+            "--prepare-only",
+            "--open-certificates",
+        ]
+    )
+    output = capsys.readouterr().out
+    assert "No desktop certificate opener" in output
+    assert "browser computer" in output
+    assert (state / "client-import.zip").is_file()
+
+
+def test_client_bundle_contains_only_client_material(local_project, tmp_path, capsys):
+    state = tmp_path / "client-export"
+    local_dev.main(
+        [
+            "--project-root",
+            str(local_project),
+            "--state-dir",
+            str(state),
+            "--host",
+            "0.0.0.0",
+            "--server-name",
+            "kb.example.test",
+            "--prepare-only",
+        ]
+    )
+    output = capsys.readouterr().out
+    assert "https://kb.example.test:8443/connect" in output
+    assert "NETWORK MODE" in output
+    identity = prepare_local_identity(state / "identity", server_names=("kb.example.test",))
+    bundle = state / "client-import.zip"
+    assert bundle.stat().st_mode & 0o777 == 0o600
+    with zipfile.ZipFile(bundle) as archive:
+        assert set(archive.namelist()) == {"ca.crt", "client.p12", "README.txt"}
+        assert archive.read("ca.crt") == identity.ca_cert.read_bytes()
+        assert archive.read("client.p12") == identity.client_p12.read_bytes()
+        instructions = archive.read("README.txt").decode()
+        assert "https://kb.example.test:8443/connect" in instructions
+        for text in (instructions, output):
+            assert identity.admin_password not in text
+            assert identity.p12_password not in text
+        for name in archive.namelist():
+            assert archive.read(name) != identity.server_key.read_bytes()
+
+
+def test_remote_profile_default_is_separate_from_local(local_project, capsys):
+    args = ["--project-root", str(local_project), "--prepare-only"]
+    local_dev.main(args)
+    local = prepare_local_identity(local_project / ".cache/local-access/identity")
+    local_dev.main([*args, "--host", "0.0.0.0", "--server-name", "192.0.2.10"])
+    remote = prepare_local_identity(
+        local_project / ".cache/network-access/identity", server_names=("192.0.2.10",)
+    )
+    assert remote.ca_cert.read_bytes() != local.ca_cert.read_bytes()
+    assert "https://192.0.2.10:8443/connect" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "host,name",
+    [
+        ("0.0.0.0", "localhost"),
+        ("::", "127.0.0.1"),
+        ("not-an-ip", "kb.example.test"),
+        ("0.0.0.0", "0.0.0.0"),
+        ("0.0.0.0", "https://kb.example.test:8443"),
+    ],
+)
+def test_invalid_network_options_fail_before_writes(local_project, tmp_path, host, name):
+    state = tmp_path / "not-created"
+    with pytest.raises(SystemExit):
+        local_dev.main(
+            [
+                "--project-root",
+                str(local_project),
+                "--state-dir",
+                str(state),
+                "--host",
+                host,
+                "--server-name",
+                name,
+                "--prepare-only",
+            ]
+        )
+    assert not state.exists()
+
+
+def test_ipv6_advertised_url_and_bind(local_project, tmp_path, capsys):
+    state = tmp_path / "ipv6"
+    local_dev.main(
+        [
+            "--project-root",
+            str(local_project),
+            "--state-dir",
+            str(state),
+            "--host",
+            "::",
+            "--server-name",
+            "2001:db8::1",
+            "--prepare-only",
+        ]
+    )
+    assert "https://[2001:db8::1]:8443/connect" in capsys.readouterr().out
+    settings = local_dev.prepare_local_environment(
+        local_project,
+        state,
+        host="::",
+        server_name="2001:db8::1",
+    )
+    assert settings.mcp_http_host == "::"
+
+
+def test_export_symlink_is_rejected_without_touching_target(local_project, tmp_path):
+    state = tmp_path / "state"
+    local_dev.prepare_local_environment(local_project, state)
+    outside = tmp_path / "outside.zip"
+    outside.write_bytes(b"keep")
+    (state / "client-import.zip").symlink_to(outside)
+    with pytest.raises(SystemExit):
         local_dev.main(
             [
                 "--project-root",
@@ -291,11 +418,9 @@ def test_open_certificate_dialogs_on_nonmac_fails_before_writes(
                 "--state-dir",
                 str(state),
                 "--prepare-only",
-                "--open-certificates",
             ]
         )
-    assert error.value.code != 0
-    assert not state.exists()
+    assert outside.read_bytes() == b"keep"
 
 
 @pytest.mark.parametrize("port", ["0", "65536", "-1", "invalid"])
@@ -325,7 +450,8 @@ def test_invalid_api_port_fails_before_creating_identity(local_project, tmp_path
     assert not state.exists()
 
 
-def test_launcher_dispatches_local_before_legacy_tls_defaults(tmp_path):
+@pytest.mark.parametrize("setup", [False, True])
+def test_launcher_dispatches_local_before_legacy_tls_defaults(tmp_path, setup):
     """Execute only a fake Python recorder, never a runtime or real certificate generator."""
     source_project = Path(__file__).resolve().parents[1]
     project = tmp_path / "launcher-project"
@@ -333,6 +459,7 @@ def test_launcher_dispatches_local_before_legacy_tls_defaults(tmp_path):
     scripts.mkdir(parents=True)
     shutil.copy2(source_project / "scripts/start-mcp-http.sh", scripts / "start-mcp-http.sh")
     shutil.copy2(source_project / "scripts/activate-venv.sh", scripts / "activate-venv.sh")
+    (scripts / "setup-access-dev.sh").write_text('touch "$PWD/setup-called"\n')
     python_dir = project / ".venv" / "bin"
     python_dir.mkdir(parents=True)
     python = python_dir / "python"
@@ -342,7 +469,15 @@ def test_launcher_dispatches_local_before_legacy_tls_defaults(tmp_path):
     python.chmod(0o700)
     (python_dir / "activate").write_text(f'export VIRTUAL_ENV="{project / ".venv"}"\n')
     process = subprocess.run(
-        ["bash", str(scripts / "start-mcp-http.sh"), "local", "--prepare-only", "--port", "9443"],
+        [
+            "bash",
+            str(scripts / "start-mcp-http.sh"),
+            "local",
+            "--prepare-only",
+            "--port",
+            "9443",
+            *(["--setup"] if setup else []),
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -354,6 +489,8 @@ def test_launcher_dispatches_local_before_legacy_tls_defaults(tmp_path):
     assert args[:2] == ["-m", "corporate_kb.access.local_dev"]
     assert "--prepare-only" in args
     assert args[args.index("--port") + 1] == "9443"
+    assert "--setup" not in args
+    assert (project / "setup-called").exists() is setup
     assert not (project / "certs").exists()
     assert not (project / ".cache").exists()
 
@@ -400,3 +537,56 @@ async def test_local_generated_identity_works_for_real_browser_https_flow(local_
             assert response.json()["document_count"] == stats.document_count
         assert settings.access_db_path.is_file()
     assert not (local_project / ".cache").exists()
+
+
+@pytest.mark.asyncio
+async def test_network_certificate_validates_dns_over_real_tls(local_project, tmp_path):
+    """Connect locally but send/verify the advertised remote DNS name through SNI."""
+    state = tmp_path / "network-state"
+    settings = local_dev.prepare_local_environment(
+        local_project,
+        state,
+        host="0.0.0.0",
+        server_name="kb.example.test",
+    )
+    identity = prepare_local_identity(state / "identity", server_names=("kb.example.test",))
+    service = create_service(settings)
+    service.load_read_index()
+    app = create_http_app(service, settings)
+    async with _https_server(app, settings) as origin:
+        port = urlsplit(origin).port
+        context = ssl.create_default_context(cafile=str(identity.ca_cert))
+        context.load_cert_chain(str(identity.client_cert), str(identity.client_key))
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1",
+            port,
+            ssl=context,
+            server_hostname="kb.example.test",
+        )
+        advertised = f"https://kb.example.test:{port}"
+        try:
+            writer.write(
+                (
+                    "POST /auth/mcp-config HTTP/1.1\r\n"
+                    f"Host: kb.example.test:{port}\r\nOrigin: {advertised}\r\n"
+                    "Content-Type: application/json\r\nContent-Length: 2\r\n"
+                    "Connection: close\r\n\r\n{}"
+                ).encode()
+            )
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(), timeout=5)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        headers, _, body = response.partition(b"\r\n\r\n")
+        assert headers.startswith(b"HTTP/1.1 200")
+        config = json.loads(body)["config"]["mcpServers"]["corporate-kb"]
+        assert config["httpUrl"] == advertised + "/mcp"
+        assert config["headers"]["Authorization"].startswith("Bearer ")
+        with pytest.raises(ssl.SSLCertVerificationError):
+            await asyncio.open_connection(
+                "127.0.0.1",
+                port,
+                ssl=context,
+                server_hostname="wrong.example.test",
+            )

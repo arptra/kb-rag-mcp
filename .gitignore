@@ -9,6 +9,8 @@ node_modules/
 certs/
 # Browser-exported personal MCP configuration contains a bearer credential.
 corporate-kb.mcp.json
+# Test-client export contains an encrypted personal private key, not public assets.
+client-import.zip
 __pycache__/
 *.py[cod]
 .pytest_cache/
