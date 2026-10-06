@@ -7,6 +7,8 @@ node_modules/
 .env
 # Local TLS material and personal client keys must not enter repository history.
 certs/
+# Browser-exported personal MCP configuration contains a bearer credential.
+corporate-kb.mcp.json
 __pycache__/
 *.py[cod]
 .pytest_cache/

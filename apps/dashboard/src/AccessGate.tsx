@@ -99,7 +99,7 @@ export default function AccessGate() {
         )}
         {error && <div className="form-error" role="alert">{error}</div>}
         {!busy && <button className="button secondary wide" onClick={() => void check()}>Повторить проверку</button>}
-        <a className="access-link" href="/access-admin">Управление доступом →</a>
+        <div className="connect-gate-links"><a className="access-link" href="/connect">Получить MCP-конфиг →</a><a className="access-link" href="/access-admin">Управление доступом →</a></div>
       </section>
     </main>
   );

@@ -43,14 +43,14 @@ function domscribeBasePath(): Plugin {
   };
 }
 
-function accessAdminEntry(): Plugin {
+function accessPagesEntry(): Plugin {
   return {
-    name: "access-admin-entry",
+    name: "access-pages-entry",
     configureServer(server) {
       // Let Vite's existing /admin/ SPA entry serve the separate UI in development.
       server.middlewares.use((request, _response, next) => {
         const incoming = request as typeof request & { url?: string };
-        if (/^\/access-admin\/?(?:\?.*)?$/.test(incoming.url ?? "")) {
+        if (/^\/(?:access-admin|connect)\/?(?:\?.*)?$/.test(incoming.url ?? "")) {
           incoming.url = "/admin/index.html";
         }
         next();
@@ -75,7 +75,7 @@ export default defineConfig(({ command, mode }) => {
     base: "/admin/",
     plugins: [
       react(),
-      accessAdminEntry(),
+      accessPagesEntry(),
       ...(domscribeEnabled ? [domscribe(domscribeOptions), domscribeBasePath()] : []),
     ],
     build: {

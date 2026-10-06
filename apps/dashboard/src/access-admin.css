@@ -78,12 +78,41 @@
 .access-confirm { max-width: 580px; }
 .access-confirm .modal-form > p { margin: 0; color: #b3c2b7; line-height: 1.7; overflow-wrap: anywhere; }
 
+.connect-main { max-width: 1180px; }
+.connect-gate-links { display: flex; flex-direction: column; align-items: flex-start; }
+.connect-gate-links .access-link + .access-link { margin-top: 9px; }
+.connect-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 0 0 25px; padding: 0; list-style: none; }
+.connect-steps li { display: flex; align-items: flex-start; gap: 12px; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: #111b13; }
+.connect-steps li > span { flex: 0 0 29px; height: 29px; display: grid; place-items: center; border: 1px solid #456438; border-radius: 50%; background: #22351b; color: var(--lime); font: 600 var(--text-small)/1 ui-monospace, monospace; }
+.connect-steps b { display: block; margin-bottom: 5px; font-size: var(--text-small); color: #d9e5dc; }
+.connect-steps small { color: var(--muted); line-height: 1.6; }
+.connect-panel { margin-bottom: 24px; }
+.connect-panel .access-section-head > .access-status { flex: 0 0 auto; align-self: flex-start; border: 1px solid #49613d; border-radius: 7px; padding: 6px 10px; font-size: var(--text-caption); }
+.connect-panel .access-section-head > .access-status::before { display: none; }
+.connect-access-body, .connect-config-body { padding: 0 24px 24px; }
+.connect-access-body > .access-callout:first-child { margin-top: 0; }
+.connect-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.connect-help { margin: 17px 0 0; color: var(--muted); font-size: var(--text-small); line-height: 1.65; }
+.connect-secret-warning { display: grid; gap: 7px; padding: 15px 17px; border: 1px solid #795032; border-radius: 9px; background: #291e12; color: #e4c690; font-size: var(--text-small); line-height: 1.65; }
+.connect-secret-warning b { color: #f3d4a0; font-size: var(--text-body); }
+.connect-expiry { margin: 17px 0; font-size: var(--text-small); color: var(--muted); }
+.connect-expiry time { font-weight: 600; color: #d5e3d9; }
+.connect-json-label { display: block; margin-bottom: 9px; color: #b7c8bc; font-size: var(--text-small); }
+.connect-json { width: 100%; min-height: 290px; margin-bottom: 16px; padding: 16px; border: 1px solid #374d3c; border-radius: 9px; background: #080e0b; color: #c9e2bd; font: var(--text-small)/1.65 ui-monospace, SFMono-Regular, Consolas, monospace; resize: vertical; overflow-wrap: anywhere; }
+.connect-merge-note { margin-top: 22px; padding: 15px 17px; border-left: 2px solid var(--lime); border-radius: 0 8px 8px 0; background: #172316; color: #bdcfc1; font-size: var(--text-small); line-height: 1.7; }
+.connect-merge-note > b { color: #d6e8d7; }
+.connect-merge-note p { margin: 7px 0 0; }
+.connect-merge-note code { color: #d6e8d7; overflow-wrap: anywhere; }
+.connect-dev-note { margin: 0 0 16px; color: var(--amber); font-size: var(--text-small); }
+
 @media (max-width: 850px) {
   .access-header { padding: 18px 22px; align-items: flex-start; }
   .access-header-actions > span { flex-basis: 100%; text-align: right; }
   .access-main { padding: 26px 20px; }
   .access-fields { grid-template-columns: 1fr 1fr; }
   .access-fields > button { grid-column: 1 / -1; justify-self: start; }
+  .connect-steps { grid-template-columns: 1fr; gap: 10px; }
+  .connect-panel .access-section-head { flex-wrap: wrap; }
 }
 @media (max-width: 560px) {
   .access-header { flex-direction: column; padding: 18px 16px; }
@@ -100,4 +129,7 @@
   .access-fields { grid-template-columns: 1fr; }
   .access-fields > button { justify-self: stretch; }
   .access-pagination { padding-inline: 16px; flex-wrap: wrap; }
+  .connect-access-body, .connect-config-body { padding: 0 16px 20px; }
+  .connect-actions { align-items: stretch; flex-direction: column; }
+  .connect-actions .button { width: 100%; }
 }

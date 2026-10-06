@@ -26,6 +26,7 @@ from corporate_kb.config import Settings
 logger = logging.getLogger(__name__)
 USER_COOKIE = "__Host-kb-user"
 ADMIN_COOKIE = "__Host-kb-access-admin"
+MCP_CONFIG_COOKIE = "__Host-kb-mcp-config"
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 _MAX_BODY = 16_384
 Handler = Callable[[Request], Awaitable[JSONResponse]]
@@ -272,6 +273,54 @@ class AccessControl:
         @route("/auth/browser-session", ["POST"])
         async def browser_session(request: Request) -> JSONResponse:
             return await enroll(request, browser=True)
+
+        @route("/auth/mcp-config", ["POST"])
+        async def mcp_config(request: Request) -> JSONResponse:
+            """Explicit browser export with its own token, never a dashboard session leak."""
+            await _body(request)
+            if not _same_origin(request, required=True):
+                raise AccessDenied("Same-origin request required")
+            certificate = certificate_from_scope(request.scope)
+            if certificate is None:
+                raise AccessDenied("A trusted personal client certificate is required")
+            issued = await asyncio.to_thread(
+                self.store.enroll,
+                certificate,
+                existing_token=request.cookies.get(MCP_CONFIG_COOKIE),
+                address=_address(request),
+            )
+            # Origin was checked above, and the direct TLS server ignores forwarded
+            # headers. The config must point to the same service the browser visited.
+            mcp_url = str(request.base_url).rstrip("/") + self.settings.mcp_http_path
+            response = _response(
+                {
+                    "config": {
+                        "mcpServers": {
+                            "corporate-kb": {
+                                "httpUrl": mcp_url,
+                                "headers": {"Authorization": f"Bearer {issued.token}"},
+                            }
+                        }
+                    },
+                    "expires_at": issued.expires_at,
+                    "user": issued.user,
+                }
+            )
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            # Reopening the page may reuse this export token after a fresh mTLS
+            # check. Browser logout only revokes USER_COOKIE, not a downloaded MCP
+            # configuration. Token/user revocation still takes effect in the DB.
+            response.set_cookie(
+                MCP_CONFIG_COOKIE,
+                issued.token,
+                path="/",
+                secure=True,
+                httponly=True,
+                samesite="strict",
+                max_age=max(0, issued.expires_at - int(time.time())),
+            )
+            return response
 
         @route("/auth/logout", ["POST"])
         async def logout_user(request: Request) -> JSONResponse:

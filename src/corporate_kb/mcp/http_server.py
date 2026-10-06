@@ -383,6 +383,8 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             managed_tools=definitions,
         )
 
+    @server.custom_route("/connect", methods=["GET"], include_in_schema=False)
+    @server.custom_route("/connect/", methods=["GET"], include_in_schema=False)
     @server.custom_route("/access-admin", methods=["GET"], include_in_schema=False)
     @server.custom_route("/access-admin/", methods=["GET"], include_in_schema=False)
     @server.custom_route("/admin", methods=["GET"], include_in_schema=False)
@@ -397,6 +399,8 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             index_path,
             headers={
                 "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
                 "Content-Security-Policy": (
                     "default-src 'self'; script-src 'self'; "
                     "style-src 'self' 'unsafe-inline'; "

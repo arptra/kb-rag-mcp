@@ -545,7 +545,7 @@ export default function App({ secureMode = false, onSessionLogout }: { secureMod
         </nav>
         <div className="sidebar-foot">
           <div className="server-state"><span className="pulse" /><div><b>MCP online</b><small>{overview.index.embedding_provider} embeddings</small></div></div>
-          {secureMode && <a className="access-link" href="/access-admin">Управление доступом →</a>}
+          {secureMode && <div className="connect-gate-links"><a className="access-link" href="/connect">Подключить MCP →</a><a className="access-link" href="/access-admin">Управление доступом →</a></div>}
           {secureMode && <button className="logout" onClick={onSessionLogout}>Выйти из дашборда</button>}
           {password && (
             <button
