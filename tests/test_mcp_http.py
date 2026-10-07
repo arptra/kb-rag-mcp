@@ -19,7 +19,9 @@ from corporate_kb.mcp.http_server import (
     validate_http_settings,
 )
 from corporate_kb.mcp.servers import McpServerRegistry
+from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeService
+from corporate_kb.usage import UsageTracker
 
 TOKEN = "test-token-that-is-at-least-32-characters-long"
 BENCHMARK_PASSWORD = "separate-benchmark-password"
@@ -796,6 +798,100 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
                 "kb_stats",
                 "kb_search_limits",
             }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resource", "text_field", "token_field"),
+    [("document", "content", "content_tokens"), ("chunk", "text", "text_tokens")],
+)
+async def test_api_reads_search_results_from_selected_index(
+    settings_factory,
+    resource: str,
+    text_field: str,
+    token_field: str,
+) -> None:
+    service, settings = _indexed_service(settings_factory)
+    usage = UsageTracker()
+    default_tools = KnowledgeTools(service, usage=usage)
+    catalog = RagCatalog(settings, service, default_tools, usage)
+    index = catalog.create_index(name="Ledger knowledge")
+    (Path(index.knowledge_dir) / "ledger.md").write_text(
+        "# Ledger operations\n\n"
+        "Ledger entries preserve the payment amount and settlement currency. "
+        "Operators reconcile ledger balances before approving the settlement batch.",
+        encoding="utf-8",
+    )
+    catalog.service_for(index.id).build_index(force=True)
+    managed_result = catalog.tools_for(index.id).search(query="ledger entries")["results"][0]
+    default_result = default_tools.search(query="daily limits")["results"][0]
+    id_field = f"{resource}_id"
+    route = f"/api/v1/{resource}"
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    app = create_http_app(service, settings)
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
+    ):
+        params = {id_field: managed_result[id_field], "index_id": index.id}
+        unauthorized = await client.get(route, params=params)
+        assert unauthorized.status_code == 401
+
+        managed = await client.get(route, params=params, headers=headers)
+        assert managed.status_code == 200
+        payload = managed.json()
+        assert payload["index_id"] == index.id
+        assert payload[id_field] == managed_result[id_field]
+        assert payload["source_path"] == "ledger.md"
+        assert "settlement" in payload[text_field]
+        assert payload[token_field] <= settings.document_context_tokens
+
+        limited = await client.get(route, params={**params, "max_tokens": 5}, headers=headers)
+        assert limited.status_code == 200
+        assert limited.json()["index_id"] == index.id
+        assert 0 < limited.json()[token_field] <= 5
+        assert limited.json()["truncated"] is True
+        assert len(limited.json()[text_field]) < len(payload[text_field])
+        for max_tokens in (0, settings.document_context_tokens + 1):
+            invalid = await client.get(
+                route, params={**params, "max_tokens": max_tokens}, headers=headers
+            )
+            assert invalid.status_code == 400
+
+        default = await client.get(
+            route, params={id_field: default_result[id_field]}, headers=headers
+        )
+        assert default.status_code == 200
+        assert default.json()["index_id"] == "default"
+        assert default.json()["source_path"] == "limits.md"
+        assert "limits-service" in default.json()[text_field]
+        explicit_default = await client.get(
+            route,
+            params={id_field: default_result[id_field], "index_id": "default"},
+            headers=headers,
+        )
+        assert explicit_default.status_code == 200
+        assert explicit_default.json() == default.json()
+
+        for wrong_params in (
+            {id_field: managed_result[id_field]},
+            {id_field: managed_result[id_field], "index_id": "default"},
+            {id_field: default_result[id_field], "index_id": index.id},
+            {id_field: "missing-id", "index_id": index.id},
+        ):
+            missing = await client.get(route, params=wrong_params, headers=headers)
+            assert missing.status_code == 404
+            assert missing.json()["error"] == f"Unknown {id_field}: {wrong_params[id_field]}"
+
+        for unknown_index in ("unknown-index", ""):
+            missing = await client.get(
+                route,
+                params={id_field: default_result[id_field], "index_id": unknown_index},
+                headers=headers,
+            )
+            assert missing.status_code == 404
+            assert missing.json()["error"] == f"Unknown RAG index: {unknown_index}"
 
 
 @pytest.mark.asyncio

@@ -65,8 +65,9 @@ GigaCode CLI ─┘
 вопроса и сохраняет ссылку на источник. Это ограничивает расход контекста, даже если в базе десятки
 тысяч страниц.
 
-Если выбранный результат требует деталей, GigaCode вызывает `kb_get_chunk` с `chunk_id`; полный текст
-не загружается автоматически. `kb_get_document` также возвращает ограниченный извлекаемый фрагмент.
+Если выбранный результат требует деталей, GigaCode вызывает `kb_get_chunk` с `chunk_id` и `index_id`
+исходного поиска; полный текст не загружается автоматически. `kb_get_document` также возвращает
+ограниченный извлекаемый фрагмент из указанного индекса.
 Лимиты настраиваются через `KB_SEARCH_*` и `KB_DOCUMENT_CONTEXT_TOKENS` в `.env.example`.
 
 Защищённый `kb_run_context_benchmark` сравнивает прежние `top-5` полных чанков с текущими `top-3`
@@ -379,9 +380,9 @@ gigacode
 - `kb_search_index` — выполняет поиск строго в указанном `index_id`; этот стабильный tool вызывается
   по `next_calls` из `kb_system_graph` и не зависит от имён управляемых search-tools;
 - `kb_search` — поиск с `top_k`, `min_score`, metadata filters и компактными выдержками;
-- `kb_get_chunk` — лениво загружает один ограниченный фрагмент по `chunk_id`;
+- `kb_get_chunk` — лениво загружает один ограниченный фрагмент по `chunk_id` и необязательному `index_id`;
 - `kb_run_context_benchmark` — защищённый паролем read-only замер качества и сжатия;
-- `kb_get_document` — ограниченный извлекаемый фрагмент документа по `document_id`;
+- `kb_get_document` — ограниченный извлекаемый фрагмент документа по `document_id` и необязательному `index_id`;
 - `kb_list_documents` — metadata документов без embeddings;
 - `kb_connect_services_batch` — принимает из GigaCode CLI до 100 сервисов с Git URL, использует
   `master` как ветку по умолчанию, создаёт отдельный индекс при отсутствии `index_id` и ставит всю
@@ -390,6 +391,25 @@ gigacode
   запускает/опрашивает analysis и либо отдаёт исходники клиентской нейронке, либо запускает
   read-only GigaCode headless scan на сервере;
 - `kb_stats` — состояние индекса и абсолютные пути.
+
+Чтобы дочитать результат управляемого search-tool, передайте его `results[n].index_id` вместе с
+`chunk_id` или `document_id`. После `kb_search_index` берите `index_id` из корня ответа. Например,
+параметры MCP-вызова `tools/call` для чтения чанка:
+
+```json
+{
+  "name": "kb_get_chunk",
+  "arguments": {
+    "index_id": "limits-index",
+    "chunk_id": "CHUNK_ID_FROM_SEARCH",
+    "max_tokens": 600
+  }
+}
+```
+
+Для документа вызовите `kb_get_document` с тем же `index_id` и `document_id` вместо `chunk_id`.
+Если `index_id` не передан, оба инструмента читают индекс `default`, сохраняя совместимость со
+старыми вызовами после `kb_search`. Ответы обоих инструментов содержат выбранный `index_id`.
 
 Во вкладке dashboard **«MCP tools»** отображается живой каталог FastMCP: все встроенные tools и
 созданные через UI search-tools с теми же описаниями и JSON Schema, которые получает нейросеть в

@@ -1476,8 +1476,9 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             document_id = request.query_params.get("document_id", "")
             if not document_id:
                 raise ValueError("document_id must not be empty")
+            index_id = request.query_params.get("index_id", "default")
             payload = await asyncio.to_thread(
-                tools.get_document,
+                catalog.tools_for(index_id).get_document,
                 document_id,
                 _integer_query(
                     request,
@@ -1487,6 +1488,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                     maximum=settings.document_context_tokens,
                 ),
             )
+            payload["index_id"] = index_id
             return JSONResponse(payload)
         except Exception as exc:
             return _api_error(exc)
@@ -1499,8 +1501,9 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
             chunk_id = request.query_params.get("chunk_id", "")
             if not chunk_id:
                 raise ValueError("chunk_id must not be empty")
+            index_id = request.query_params.get("index_id", "default")
             payload = await asyncio.to_thread(
-                tools.get_chunk,
+                catalog.tools_for(index_id).get_chunk,
                 chunk_id,
                 _integer_query(
                     request,
@@ -1510,6 +1513,7 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
                     maximum=settings.document_context_tokens,
                 ),
             )
+            payload["index_id"] = index_id
             return JSONResponse(payload)
         except Exception as exc:
             return _api_error(exc)

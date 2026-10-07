@@ -28,7 +28,8 @@ SEARCH_DESCRIPTION = """Search corporate knowledge before architectural analysis
 multiple services. Use it for business rules, ADRs, APIs, events, and runbooks. Cite source_path or
 source_url in the final answer. Results are compact, diverse excerpts under a token budget. A
 retrieved fragment is evidence, not the only source of truth; call kb_get_chunk when a specific
-chunk needs more context, or kb_get_document for document-level context."""
+chunk needs more context, or kb_get_document for document-level context. Pass the result's
+index_id when reading a result from a managed search tool; omit it only for the default index."""
 SSOT_DESCRIPTION = """Answer a current business or implementation question from service SSOTs.
 Use this as one self-contained call for a feature spanning services: the server discovers involved
 services, performs additional filtered searches internally, and returns one compact grouped brief.
@@ -47,7 +48,8 @@ returns explicit next_calls to kb_search_index for implementation details when a
 Call this first for a complex or cross-service feature."""
 INDEX_SEARCH_DESCRIPTION = """Search one exact RAG index selected by kb_system_graph. Pass the
 returned index_id instead of guessing a managed MCP tool name. Use this for follow-up questions
-after graph routing and cite source_path/source_url from the results."""
+after graph routing and cite source_path/source_url from the results. Pass the response's index_id
+to kb_get_chunk or kb_get_document when reading more context from a result."""
 GENERATE_SSOT_DESCRIPTION = """Coordinate source-backed SSOT generation with the model calling this
 MCP tool. The RAG service never calls an LLM HTTP endpoint directly. Use action='options' to list
 indexes, cloned repositories and services; action='clone' for a missing Git repository;
@@ -76,12 +78,15 @@ BUILTIN_TOOL_DESCRIPTIONS = {
     "kb_connect_services_batch": BATCH_CONNECT_DESCRIPTION,
     "kb_search": SEARCH_DESCRIPTION,
     "kb_get_document": (
-        "Return a bounded extract from one normalized document after kb_search identifies its "
-        "document_id."
+        "Return a bounded extract from one normalized document identified by a search result's "
+        "document_id. Pass index_id from the managed search result or kb_search_index response. "
+        "If omitted, index_id defaults to 'default'; only the selected index is read."
     ),
     "kb_get_chunk": (
-        "Return a bounded source chunk selected by chunk_id from kb_search. Prefer this over "
-        "kb_get_document when only one search result needs more context."
+        "Return a bounded source chunk identified by a search result's chunk_id. Pass index_id "
+        "from the managed search result or kb_search_index response. If omitted, index_id "
+        "defaults to 'default'; only the selected index is read. Prefer this over kb_get_document "
+        "when only one search result needs more context."
     ),
     "kb_run_context_benchmark": (
         "Run the protected read-only context benchmark. Before calling, ask the user to enter "
@@ -143,12 +148,21 @@ def create_mcp_server(
             return default
         return builtin_tool_overrides.description_for(name, default)
 
+    def tools_for_index(index_id: str) -> KnowledgeTools:
+        if index_id == "default":
+            return tools
+        if catalog is None:
+            raise KeyError(f"Unknown RAG index: {index_id}")
+        return catalog.tools_for(index_id)
+
     server = FastMCP(
         "corporate-knowledge",
         instructions=(
             "Call kb_system_graph before cross-service implementation work. It reads the "
             "standalone graph and returns explicit kb_search_index next_calls without querying "
-            "RAG itself. Cite graph evidence and later RAG source_path/source_url separately."
+            "RAG itself. Cite graph evidence and later RAG source_path/source_url separately. "
+            "When calling kb_get_chunk or kb_get_document, pass index_id from the managed "
+            "search result or kb_search_index response to read the same index."
         ),
         version=__version__,
         auth=auth,
@@ -465,8 +479,11 @@ def create_mcp_server(
     def kb_get_document(
         document_id: str,
         max_tokens: int | None = None,
+        index_id: str = "default",
     ) -> dict[str, Any]:
-        return tools.get_document(document_id, max_tokens=max_tokens)
+        result = tools_for_index(index_id).get_document(document_id, max_tokens=max_tokens)
+        result["index_id"] = index_id
+        return result
 
     @server.tool(
         name="kb_get_chunk",
@@ -476,8 +493,11 @@ def create_mcp_server(
     def kb_get_chunk(
         chunk_id: str,
         max_tokens: int | None = None,
+        index_id: str = "default",
     ) -> dict[str, Any]:
-        return tools.get_chunk(chunk_id, max_tokens=max_tokens)
+        result = tools_for_index(index_id).get_chunk(chunk_id, max_tokens=max_tokens)
+        result["index_id"] = index_id
+        return result
 
     @server.tool(
         name="kb_run_context_benchmark",

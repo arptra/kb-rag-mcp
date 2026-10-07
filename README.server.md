@@ -267,13 +267,32 @@ curl -k -G \
 | Endpoint | Назначение | Основные параметры |
 | --- | --- | --- |
 | `/api/v1/search` | Поиск релевантных фрагментов | `query`, `top_k`, filters |
-| `/api/v1/document` | Ограниченная выдержка документа | `document_id`, `max_tokens` |
-| `/api/v1/chunk` | Ограниченная выдержка найденного чанка | `chunk_id`, `max_tokens` |
+| `/api/v1/document` | Ограниченная выдержка документа | `document_id`, `index_id` (по умолчанию `default`), `max_tokens` |
+| `/api/v1/chunk` | Ограниченная выдержка найденного чанка | `chunk_id`, `index_id` (по умолчанию `default`), `max_tokens` |
 | `/api/v1/tools` | Каталог управляемых MCP schemas | нет |
 | `/api/v1/tools/call` | Выполнение управляемого search-tool | POST JSON |
 | `/api/v1/admin/context-benchmark` | Парольный замер качества и сжатия | POST + password header |
 | `/api/v1/documents` | Список metadata | filters, `limit` |
 | `/api/v1/stats` | Состояние индекса | нет |
+
+Для чтения результата из отдельного индекса передайте `index_id` из найденного результата
+управляемого search-tool (`results[n].index_id`) либо из корня ответа MCP tool `kb_search_index`:
+
+```bash
+curl -G 'https://RAG-SERVER.EXAMPLE.COM:8000/api/v1/chunk' \
+  --data-urlencode 'index_id=limits-index' \
+  --data-urlencode 'chunk_id=CHUNK_ID_FROM_SEARCH' \
+  --data-urlencode 'max_tokens=600'
+
+curl -G 'https://RAG-SERVER.EXAMPLE.COM:8000/api/v1/document' \
+  --data-urlencode 'index_id=limits-index' \
+  --data-urlencode 'document_id=DOCUMENT_ID_FROM_SEARCH' \
+  --data-urlencode 'max_tokens=600'
+```
+
+При включённой авторизации добавьте `Authorization: Bearer <токен>`. Оба endpoint возвращают
+выбранный `index_id`. Без параметра `index_id` они по-прежнему читают `default`, в том числе
+для результатов `/api/v1/search`.
 
 Client API не изменяет документы и не запускает команды. Поисковый запрос передаётся в URL и может
 попадать в access logs; ограничьте доступ к журналам сервера.

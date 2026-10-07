@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastmcp import Client
 
+from corporate_kb.catalog import RagCatalog
 from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
+from corporate_kb.mcp.managed_tools import ManagedToolDefinition, ManagedToolRegistry
 from corporate_kb.mcp.server import create_mcp_server
+from corporate_kb.mcp.tools import KnowledgeTools
 from corporate_kb.service import KnowledgeService
+from corporate_kb.usage import UsageTracker
 
 
 class _BatchJob:
@@ -177,6 +182,10 @@ limits-service owns daily limits.
             "kb_list_documents",
             "kb_stats",
         }
+        for tool in listed:
+            if tool.name in {"kb_get_document", "kb_get_chunk"}:
+                assert tool.inputSchema["properties"]["index_id"]["default"] == "default"
+                assert "index_id" not in tool.inputSchema["required"]
 
         search = await client.call_tool("kb_search", {"query": "daily limits"})
         assert search.is_error is False
@@ -190,12 +199,25 @@ limits-service owns daily limits.
         assert search.data["context_token_count"] <= settings.search_context_tokens
 
         document = await client.call_tool("kb_get_document", {"document_id": hit["document_id"]})
+        assert document.data["index_id"] == "default"
         assert document.data["title"] == "Limits Service"
         assert document.data["content_tokens"] <= settings.document_context_tokens
 
         chunk = await client.call_tool("kb_get_chunk", {"chunk_id": hit["chunk_id"]})
+        assert chunk.data["index_id"] == "default"
         assert chunk.data["document_id"] == hit["document_id"]
         assert chunk.data["text_tokens"] <= settings.document_context_tokens
+
+        for tool_name, id_key in (
+            ("kb_get_document", "document_id"),
+            ("kb_get_chunk", "chunk_id"),
+        ):
+            unknown_index = await client.call_tool(
+                tool_name,
+                {id_key: hit[id_key], "index_id": "missing-index"},
+                raise_on_error=False,
+            )
+            assert unknown_index.is_error is True
 
         denied = await client.call_tool(
             "kb_run_context_benchmark",
@@ -218,6 +240,109 @@ limits-service owns daily limits.
 
         documents = await client.call_tool("kb_list_documents", {})
         assert documents.data["document_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_reads_sources_from_exact_and_multi_index_searches(settings_factory) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    (settings.knowledge_dir / "runbook.md").write_text(
+        "# Default runbook\n\nThe default worker uses the primary queue.", encoding="utf-8"
+    )
+    service = KnowledgeService(
+        settings, provider=HashEmbeddingProvider(settings.embedding_dimension)
+    )
+    service.build_index(force=True)
+    usage = UsageTracker()
+    tools = KnowledgeTools(service, usage=usage)
+    catalog = RagCatalog(settings, service, tools, usage)
+    titles: dict[str, str] = {}
+    for name in ("Payments", "Ledger"):
+        index = catalog.create_index(name=name)
+        title = f"{name} runbook"
+        titles[index.id] = title
+        (Path(index.knowledge_dir) / "runbook.md").write_text(
+            f"# {title}\n\nThe {name} worker handles its own queue. "
+            "Check pending messages and restart the worker after investigating failures.",
+            encoding="utf-8",
+        )
+        catalog.service_for(index.id).build_index(force=True)
+
+    registry = ManagedToolRegistry(
+        settings.managed_tools_path,
+        tools,
+        index_tools=catalog.tools_for,
+        index_exists=catalog.has_index,
+    )
+    registry.upsert(
+        ManagedToolDefinition(
+            name="kb_search_workers",
+            description="Search worker runbooks across the payments and ledger indexes.",
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            index_ids=list(titles),
+        )
+    )
+    server = create_mcp_server(
+        service, knowledge_tools=tools, managed_tools=registry, catalog=catalog
+    )
+
+    async with Client(server) as client:
+        hits = []
+        for index_id in titles:
+            search = await client.call_tool(
+                "kb_search_index", {"index_id": index_id, "query": "worker runbook"}
+            )
+            assert search.data["result_count"] == 1
+            hits.append({**search.data["results"][0], "index_id": search.data["index_id"]})
+        managed = await client.call_tool("kb_search_workers", {"query": "worker runbook"})
+        assert managed.structured_content is not None
+        assert {hit["index_id"] for hit in managed.structured_content["results"]} == set(titles)
+        hits.extend(managed.structured_content["results"])
+
+        for hit in hits:
+            for tool_name, id_key, token_key in (
+                ("kb_get_document", "document_id", "content_tokens"),
+                ("kb_get_chunk", "chunk_id", "text_tokens"),
+            ):
+                result = await client.call_tool(
+                    tool_name,
+                    {id_key: hit[id_key], "index_id": hit["index_id"], "max_tokens": 8},
+                )
+                assert result.data["index_id"] == hit["index_id"]
+                assert result.data[id_key] == hit[id_key]
+                assert result.data["title"] == titles[hit["index_id"]]
+                assert result.data[token_key] <= 8
+                assert result.data["truncated"] is True
+
+        for tool_name, id_key in (
+            ("kb_get_document", "document_id"),
+            ("kb_get_chunk", "chunk_id"),
+        ):
+            hit = hits[0]
+            other_index = next(index_id for index_id in titles if index_id != hit["index_id"])
+            invalid_arguments = [
+                {id_key: hit[id_key]},
+                {id_key: hit[id_key], "index_id": other_index},
+                {id_key: hit[id_key], "index_id": "missing-index"},
+                {id_key: "missing-id", "index_id": hit["index_id"]},
+                {id_key: hit[id_key], "index_id": hit["index_id"], "max_tokens": 0},
+            ]
+            for arguments in invalid_arguments:
+                result = await client.call_tool(tool_name, arguments, raise_on_error=False)
+                assert result.is_error is True
+
+            default_search = await client.call_tool("kb_search", {"query": "default worker"})
+            default_hit = default_search.data["results"][0]
+            result = await client.call_tool(
+                tool_name, {id_key: default_hit[id_key], "index_id": "default"}
+            )
+            assert result.data["index_id"] == "default"
+            assert result.data["title"] == "Default runbook"
 
 
 @pytest.mark.asyncio
