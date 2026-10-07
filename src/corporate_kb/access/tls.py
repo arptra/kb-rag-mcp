@@ -1,10 +1,9 @@
-"""Expose certificates verified by the direct TLS transport, never by HTTP headers."""
+"""Expose TLS-authenticated certificates under the selected policy, never HTTP headers."""
 
 from __future__ import annotations
 
 import asyncio
 import ssl
-import time
 from typing import Any
 
 from cryptography import x509
@@ -18,7 +17,7 @@ _CERTIFICATE_SCOPE_KEY = "corporate_kb.verified_client_certificate"
 
 
 def identity_from_der(der: bytes) -> CertificateIdentity:
-    """Parse transport-verified DER; this function alone does not establish trust."""
+    """Parse DER; this function alone establishes neither key possession nor CA trust."""
     certificate = x509.load_der_x509_certificate(der)
     return CertificateIdentity(
         fingerprint=certificate.fingerprint(hashes.SHA256()).hex(),
@@ -36,8 +35,7 @@ def certificate_from_scope(scope: Scope) -> CertificateIdentity | None:
     identity = scope.get(_CERTIFICATE_SCOPE_KEY)
     if scope.get("scheme") != "https" or not isinstance(identity, CertificateIdentity):
         return None
-    now = time.time()
-    if not identity.not_before <= now < identity.not_after:
+    if identity.common_name is None:
         return None
     return identity
 

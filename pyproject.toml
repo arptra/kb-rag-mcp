@@ -9,6 +9,7 @@ dependencies = [
     "markdownify>=1.2,<2",
     "fastmcp==3.4.4",
     "cryptography>=45,<50",
+    "pyOpenSSL>=25.3,<27",
     "httpx>=0.28,<1",
     "uvicorn>=0.51,<0.52",
     "numpy>=2.2,<3",

@@ -226,7 +226,7 @@ def validate_http_settings(settings: Settings) -> str | None:
 
 
 def tls_uvicorn_config(settings: Settings) -> dict[str, object] | None:
-    """Validate TLS material and enable verified client-certificate enrollment if configured."""
+    """Validate server TLS material and select the explicit client-certificate policy."""
     if not settings.mcp_tls_enabled:
         return None
     certificate = settings.mcp_tls_cert_file
@@ -240,6 +240,24 @@ def tls_uvicorn_config(settings: Settings) -> dict[str, object] | None:
         context.load_cert_chain(certfile=str(certificate), keyfile=str(private_key))
     except (OSError, ssl.SSLError) as exc:
         raise ValueError(f"Invalid TLS certificate/key pair: {exc}") from exc
+    if settings.access_enabled and settings.access_client_certificate_mode == "presented":
+        try:
+            from corporate_kb.access.openssl_transport import certificate_http_protocol
+        except ModuleNotFoundError as exc:
+            if exc.name != "OpenSSL":
+                raise
+            raise ValueError(
+                "The presented certificate mode requires pyOpenSSL. Update the project's "
+                "Python environment: .venv/bin/python -m pip install -e . "
+                "(no sudo or browser certificate installation is required)."
+            ) from exc
+        # TLS terminates inside the protocol, not at a second listener or HTTP proxy.
+        # Do not pass ssl_certfile: asyncio's stdlib SSL layer rejects unknown issuers.
+        return {
+            "http": certificate_http_protocol(certificate, private_key),
+            "ws": "none",
+            "proxy_headers": False,
+        }
     configuration: dict[str, object] = {
         "ssl_certfile": str(certificate),
         "ssl_keyfile": str(private_key),
@@ -1599,8 +1617,14 @@ def main(settings: Settings | None = None) -> None:
         "registry" if settings.access_enabled else (
             "shared-token" if settings.mcp_http_bearer_token else "disabled"
         ),
-        "verified-enrollment" if settings.access_enabled else "disabled",
+        settings.access_client_certificate_mode if settings.access_enabled else "disabled",
     )
+    if settings.access_enabled and settings.access_client_certificate_mode == "presented":
+        logger.warning(
+            "CN enrollment uses the presented certificate, without issuer or validity checks. "
+            "TLS proves key possession, not employee identity. Certificates with the same CN "
+            "share an account, even with different keys. Another CN can register a new account."
+        )
     try:
         server.run(
             transport="http",

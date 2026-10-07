@@ -71,29 +71,31 @@ export default function AccessGate() {
   };
 
   if (status && (!status.enabled || status.authenticated)) {
-    return <App secureMode={status.enabled} onSessionLogout={() => void logout()} />;
+    return <App secureMode={status.enabled} accountName={status.user?.common_name || status.user?.subject || status.user?.id} onSessionLogout={() => void logout()} />;
   }
 
   return (
     <main className="login-shell access-login">
       <section className="login-card">
         <div className="brand-mark large">R</div>
-        <span className="eyebrow">Доступ по сертификату</span>
+        <span className="eyebrow">Вход по CN сертификата</span>
         <h1>RAG Control Plane</h1>
         {!status ? (
           <p>{busy ? "Проверяем доступ к сервису…" : "Не удалось проверить доступ к сервису."}</p>
         ) : (
           <>
-            <p>Войдите с личным клиентским сертификатом, чтобы работать с индексами, инструментами и дашбордом.</p>
+            <p>Выберите ваш существующий личный сертификат в браузере. Имя пользователя берётся из поля CN (Common Name); после входа персональный токен даёт доступ к индексам, инструментам и дашборду.</p>
+            {status.user && <div className="access-account-identity"><small>Учётная запись{status.user.common_name ? " · CN" : ""}</small><b>{status.user.common_name || status.user.subject || status.user.id}</b></div>}
             {!status.certificate_present && (
               <div className="access-callout">
-                Сервер не получил подтверждённый клиентский сертификат. Импортируйте выданный вашей организацией сертификат вместе с закрытым ключом в хранилище браузера или ОС, затем заново откройте HTTPS-адрес сервиса и выберите сертификат.
+                Сервер не получил клиентский сертификат с одним непустым CN. Заново откройте HTTPS-адрес сервиса и выберите уже доступный браузеру личный сертификат. Если выбора нет, уточните у администратора, какой сертификат использовать. Загружать закрытый ключ на эту страницу не нужно.
               </div>
             )}
+            {status.certificate_mode === "trusted_ca" && <p className="access-dev-note">На сервере явно включена дополнительная проверка сертификата по доверенному CA.</p>}
             <button className="button primary wide" disabled={busy || !status.certificate_present} onClick={() => void login()}>
               {busy ? "Выполняем вход…" : "Войти по сертификату"}
             </button>
-            <small>Браузер получает защищённую сессию. Пароль, закрытый ключ и токен не нужно вставлять на эту страницу. Отозванный доступ может восстановить только администратор.</small>
+            <small>Одинаковый CN означает одну учётную запись, даже если сертификат или его издатель изменился. CN не даёт роль администратора: управление доступом открывается отдельно по логину и паролю. Отозванный доступ восстанавливает администратор.</small>
             {import.meta.env.DEV && <p className="access-dev-note">Режим разработки: Vite не передаёт клиентский TLS-сертификат. Для входа по сертификату откройте собранный дашборд непосредственно на HTTPS-порту backend.</p>}
           </>
         )}

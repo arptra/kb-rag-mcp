@@ -1,5 +1,6 @@
 export interface AccessUser {
   id: string;
+  common_name: string | null;
   subject: string;
   issuer: string;
   serial_number: string;
@@ -16,6 +17,7 @@ export interface AccessUser {
 export interface AccessTokenRecord {
   id: string;
   user_id: string;
+  common_name?: string | null;
   prefix: string;
   created_at: string;
   expires_at: string;
@@ -57,5 +59,6 @@ export interface BrowserAccessStatus {
   enabled: boolean;
   authenticated: boolean;
   certificate_present: boolean;
+  certificate_mode?: "presented" | "trusted_ca";
   user: AccessUser | null;
 }

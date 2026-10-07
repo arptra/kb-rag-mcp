@@ -1,5 +1,12 @@
 .access-link { display: inline-block; margin-top: 16px; color: var(--lime); font-size: var(--text-small); text-decoration: none; }
 .access-link:hover { text-decoration: underline; }
+.access-account-identity { margin: 0 0 16px; overflow-wrap: anywhere; }
+.access-account-identity > small { display: block; margin-bottom: 4px; color: var(--muted); font-size: var(--text-caption); }
+.access-account-identity > b { display: block; color: #deebdf; font-size: var(--text-body-large); }
+.login-card .access-account-identity { margin-top: 16px; }
+.connect-certificate-details { margin: 0 0 20px; color: var(--muted); font-size: var(--text-small); overflow-wrap: anywhere; }
+.connect-certificate-details summary { color: var(--lime); cursor: pointer; }
+.connect-certificate-details p { margin: 8px 0; }
 .access-login .login-card > .form-error { margin-top: 14px; }
 .access-login .login-card form { display: grid; gap: 16px; }
 .access-login .login-card label { display: grid; gap: 7px; }
@@ -63,6 +70,7 @@
 .button.access-danger:hover:not(:disabled) { color: #ffd4cf; background: #41231d; border-color: #9e5c4f; }
 .access-inline-button { margin-top: 6px; padding: 0; border: 0; background: none; color: var(--lime); font: var(--text-caption)/1.5 ui-monospace, monospace; text-align: left; overflow-wrap: anywhere; cursor: pointer; }
 .access-inline-button:hover { text-decoration: underline; }
+.access-table td > b > .access-inline-button { margin-top: 0; font-family: inherit; font-size: var(--text-body); font-weight: 600; }
 .access-audit-table td { max-width: 280px; }
 .access-event-details { white-space: pre-wrap; overflow-wrap: anywhere; }
 .access-empty { margin: 0; padding: 54px 24px; border-block: 1px solid var(--line-soft); color: var(--muted); text-align: center; font-size: var(--text-body); }

@@ -10,7 +10,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from corporate_kb.access.dev_client_bundle import export_client_bundle
 from corporate_kb.access.dev_pki import (
@@ -67,6 +67,7 @@ def build_local_settings(
     port: int = 8443,
     host: str = "127.0.0.1",
     server_name: str = "localhost",
+    client_certificate_mode: Literal["trusted_ca", "presented"] = "presented",
 ) -> Settings:
     """Explicit defaults prevent both .env and inherited KB_* from escaping the sandbox."""
     # Supplying every field is intentional: BaseSettings otherwise reads inherited
@@ -104,6 +105,7 @@ def build_local_settings(
         values[name] = path
     values.update(
         access_enabled=True,
+        access_client_certificate_mode=client_certificate_mode,
         access_client_ca_file=identity.ca_cert,
         access_bootstrap_admin_username=identity.admin_username,
         access_bootstrap_admin_password=identity.admin_password,
@@ -129,6 +131,7 @@ def prepare_local_environment(
     port: int = 8443,
     host: str = "127.0.0.1",
     server_name: str = "localhost",
+    client_certificate_mode: Literal["trusted_ca", "presented"] = "presented",
 ) -> Settings:
     """Persist a reusable identity and create a tiny, separate sample knowledge base."""
     if not 1 <= port <= 65535:
@@ -152,6 +155,7 @@ def prepare_local_environment(
         port=port,
         host=host,
         server_name=server_name,
+        client_certificate_mode=client_certificate_mode,
     )
     _private_directory(settings.knowledge_dir)
     sample = settings.knowledge_dir / "local-access.md"
@@ -183,6 +187,7 @@ def _instructions(
     print(f"Access admin: {url}/access-admin")
     print(f"MCP:          {url}/mcp")
     print(f"Access DB:    {settings.access_db_path}")
+    print(f"Client certificate policy: {settings.access_client_certificate_mode}")
     print(f"CA to trust:  {identity.ca_cert}")
     print(f"Client ID:    {identity.client_p12}")
     print(f"Client ZIP:   {bundle} (contains a personal private key; transfer securely)")
@@ -193,8 +198,17 @@ def _instructions(
         print(f"P12 password:   {identity.p12_password}")
     else:
         print("Passwords are hidden. Use --prepare-only --show-secrets to display them locally.")
-    print("On the BROWSER computer: extract the client ZIP; trust ca.crt for SSL and import")
-    print("client.p12 with its password. Restart the browser, then open the Connect URL.")
+    if settings.access_client_certificate_mode == "presented":
+        print("Existing browser client certificates from ANY issuer provide the CN account name;")
+        print("certificate dates/EKU are metadata, not access checks. No P12 import")
+        print("is needed if your browser already has a suitable client certificate and key.")
+        print("WARNING: open enrollment, not verified employee identity. The SAME CN means the")
+        print("same account even on another certificate/key. Another CN creates a new account.")
+        print("The browser must still accept the SERVER certificate. If it already allows")
+        print("development HTTPS on localhost, no browser trust change is needed there.")
+        print("If you have no existing client identity, the optional test ZIP can be imported:")
+    print("On the BROWSER computer: extract the test ZIP; trust ca.crt for SSL if needed and")
+    print("import client.p12 with its password. Restart the browser and open the Connect URL.")
     print("macOS: Keychain Access > login; CA > Trust > Secure Sockets Layer > Always Trust.")
     print("Windows: current-user Trusted Root Certification Authorities (CA), Personal (P12).")
     print("Linux/Firefox: Settings > Privacy & Security > Certificates > View Certificates;")
@@ -261,6 +275,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--project-root", type=Path, default=Path.cwd(), help=argparse.SUPPRESS)
     parser.add_argument("--prepare-only", action="store_true", help="prepare files without serving")
     parser.add_argument(
+        "--client-certificate-mode",
+        choices=("presented", "trusted_ca"),
+        default="presented",
+        help="presented accepts existing browser certificates from any CA; trusted_ca uses test CA",
+    )
+    parser.add_argument(
         "--show-secrets", action="store_true", help="print passwords to this terminal"
     )
     parser.add_argument(
@@ -285,6 +305,7 @@ def main(argv: list[str] | None = None) -> None:
             port=args.port,
             host=host,
             server_name=server_name,
+            client_certificate_mode=args.client_certificate_mode,
         )
         identity = prepare_local_identity(
             settings.access_db_path.parent / "identity",

@@ -53,12 +53,15 @@ def test_enroll_reuse_and_public_payload(
     assert issued.created is True
     assert issued.expires_at == NOW + 600
     assert issued.user["subject"] == certificate.subject
+    assert issued.user["common_name"] == "Developer One"
     assert issued.user["created_at"].endswith("Z")
     assert issued.user["status"] == "active"
     assert "certificate_pem" not in issued.user
     assert store.verify_user_token(issued.token) == issued.user
-    assert store.verify_user_token(issued.token, fingerprint=certificate.fingerprint) == issued.user
-    assert store.verify_user_token(issued.token, fingerprint="f" * 64) is None
+    assert store.verify_user_token(issued.token, common_name=certificate.common_name) == issued.user
+    assert store.verify_user_token(issued.token, common_name="Another Person") is None
+    assert store.verify_user_token(issued.token, common_name="") is None
+    assert store.verify_user_token(issued.token, common_name="developer one") is None
     assert store.verify_user_token("unknown") is None
     assert store.verify_user_token("x" * 10000) is None
     reused = store.enroll(certificate, existing_token=issued.token)
@@ -68,30 +71,96 @@ def test_enroll_reuse_and_public_payload(
     assert store.list_users()["total"] == 1
     assert store.list_tokens()["total"] == 1
     assert store.list_tokens()["items"][0]["last_used_at"].endswith("Z")
+    assert store.list_tokens()["items"][0]["common_name"] == "Developer One"
     actions = {event["action"] for event in store.list_events()["items"]}
     assert {"user.enrolled", "user.token_issued", "user.token_reused"} <= actions
 
 
-def test_expiry_is_bounded_by_certificate(
+def test_token_expiry_is_independent_of_certificate_dates(
     store: AccessStore, certificate: CertificateIdentity, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     short_certificate = replace(certificate, not_after=NOW + 20)
     issued = store.enroll(short_certificate)
-    assert issued.expires_at == NOW + 20
+    assert issued.expires_at == NOW + 600
     monkeypatch.setattr("corporate_kb.access.store._now", lambda: NOW + 20)
+    assert store.verify_user_token(issued.token) is not None
+    assert store.list_tokens()["items"][0]["status"] == "active"
+    assert store.enroll(short_certificate, existing_token=issued.token).token == issued.token
+    monkeypatch.setattr("corporate_kb.access.store._now", lambda: NOW + 600)
     assert store.verify_user_token(issued.token) is None
     assert store.list_tokens()["items"][0]["status"] == "expired"
-    with pytest.raises(AccessDenied):
-        store.enroll(short_certificate)
 
 
 @pytest.mark.parametrize("changes", [{"not_before": NOW + 1}, {"not_after": NOW}])
-def test_invalid_certificate_dates_rejected(
+def test_certificate_dates_are_metadata_not_account_authorization(
     store: AccessStore, certificate: CertificateIdentity, changes: dict[str, int]
 ) -> None:
-    with pytest.raises(AccessDenied):
-        store.enroll(replace(certificate, **changes))
+    issued = store.enroll(replace(certificate, **changes))
+    assert issued.expires_at == NOW + 600
+    assert store.verify_user_token(issued.token) is not None
+    assert store.list_users()["total"] == 1
+
+
+@pytest.mark.parametrize("subject", ["O=Example", "CN=", "CN=One,CN=Two", "not-a-subject"])
+def test_missing_ambiguous_or_invalid_common_name_denies_enrollment(
+    store: AccessStore, certificate: CertificateIdentity, subject: str
+) -> None:
+    with pytest.raises(AccessDenied, match="Common Name"):
+        store.enroll(replace(certificate, subject=subject))
     assert store.list_users()["total"] == 0
+    assert store.list_tokens()["total"] == 0
+
+
+def test_same_common_name_reuses_account_and_token_across_certificate_and_ca_change(
+    store: AccessStore, certificate: CertificateIdentity
+) -> None:
+    first = store.enroll(certificate)
+    renewed = replace(
+        certificate,
+        fingerprint="f" * 64,
+        issuer="CN=Completely Different CA",
+        serial_number="99",
+        subject="OU=Another Company,CN=Developer One",
+        certificate_pem="new-public-certificate",
+        not_before=NOW + 50,
+        not_after=NOW + 100,
+    )
+    reused = store.enroll(renewed, existing_token=first.token)
+    assert reused.token == first.token
+    assert reused.token_id == first.token_id
+    assert reused.expires_at == first.expires_at
+    assert reused.created is False
+    assert reused.user["id"] == first.user["id"]
+    assert reused.user["created_at"] == first.user["created_at"]
+    assert reused.user["fingerprint"] == renewed.fingerprint
+    assert reused.user["subject"] == renewed.subject
+    assert reused.user["issuer"] == renewed.issuer
+    assert store.verify_user_token(first.token, common_name="Developer One") == reused.user
+    assert store.list_users()["total"] == 1
+    assert store.list_tokens()["total"] == 1
+
+
+def test_common_name_normalization_is_unicode_aware_and_case_sensitive(
+    store: AccessStore, certificate: CertificateIdentity
+) -> None:
+    first = store.enroll(replace(certificate, subject="CN=Cafe\u0301"))
+    reused = store.enroll(
+        replace(certificate, fingerprint="e" * 64, subject="CN=Café"),
+        existing_token=first.token,
+    )
+    assert first.user["common_name"] == "Café"
+    assert reused.token == first.token
+    assert store.verify_user_token(first.token, common_name="  Cafe\u0301  ") is not None
+    other = store.enroll(replace(certificate, fingerprint="d" * 64, subject="CN=café"))
+    assert other.user["id"] != first.user["id"]
+
+
+def test_cyrillic_common_name_token_verification(
+    store: AccessStore, certificate: CertificateIdentity
+) -> None:
+    issued = store.enroll(replace(certificate, subject="CN=Алексей,O=Пример"))
+    assert store.verify_user_token(issued.token, common_name="Алексей") == issued.user
+    assert store.verify_user_token(issued.token, common_name="Александр") is None
 
 
 def test_unknown_or_expired_token_can_be_replaced_only_by_enrollment(
@@ -109,7 +178,7 @@ def test_unknown_or_expired_token_can_be_replaced_only_by_enrollment(
     assert store.list_tokens()["total"] == 3
 
 
-def test_existing_token_from_other_certificate_is_never_reused(
+def test_existing_token_from_other_common_name_is_never_reused(
     store: AccessStore, certificate: CertificateIdentity
 ) -> None:
     original = store.enroll(certificate)
@@ -134,7 +203,10 @@ def test_revoked_user_cannot_reenroll_even_after_restart_or_restore_old_token(
     assert reopened.verify_user_token(second.token) is None
     for token in (None, first.token, "unknown-token-but-long-enough"):
         with pytest.raises(AccessDenied, match="revoked"):
-            reopened.enroll(certificate, existing_token=token)
+            reopened.enroll(
+                replace(certificate, fingerprint="a" * 64, issuer="CN=Renewal CA"),
+                existing_token=token,
+            )
     user = reopened.list_users()["items"][0]
     assert user["status"] == "revoked"
     assert user["revocation_reason"] == "Contract ended"
@@ -361,7 +433,16 @@ def test_concurrent_enrollment_creates_one_user(
     store: AccessStore, certificate: CertificateIdentity
 ) -> None:
     with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(lambda _: store.enroll(certificate), range(20)))
+        results = list(
+            pool.map(
+                lambda number: store.enroll(
+                    replace(
+                        certificate, fingerprint=hashlib.sha256(str(number).encode()).hexdigest()
+                    )
+                ),
+                range(20),
+            )
+        )
     assert len({result.user["id"] for result in results}) == 1
     assert len({result.token for result in results}) == 20
     assert store.list_users()["total"] == 1
@@ -382,7 +463,9 @@ def test_concurrent_revoke_and_enroll_never_resurrect_user(
             store.revoke_user(original.user["id"], actor="admin")
             return None
         try:
-            return store.enroll(certificate).token
+            return store.enroll(
+                replace(certificate, fingerprint=hashlib.sha256(str(number).encode()).hexdigest())
+            ).token
         except AccessDenied:
             return None
 

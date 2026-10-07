@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -27,22 +28,34 @@ from corporate_kb.access.models import (
     CertificateIdentity,
     IssuedAdminSession,
     IssuedToken,
+    common_name_from_certificate,
+    normalize_common_name,
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _LOGIN_FAILURE_LIMIT = 5
 _ADDRESS_FAILURE_LIMIT = 30
 _LOGIN_WINDOW_SECONDS = 900
 _MAX_TOKEN_LENGTH = 512
+_CN_INDEX = (
+    "CREATE UNIQUE INDEX users_common_name ON users(common_name) WHERE common_name IS NOT NULL"
+)
+_CN_ARCHIVE_SCHEMA = """CREATE TABLE legacy_user_identities (
+    id TEXT PRIMARY KEY, canonical_user_id TEXT NOT NULL REFERENCES users(id),
+    migrated_at INTEGER NOT NULL, original_record TEXT NOT NULL
+)"""
 _SCHEMA = (
     """CREATE TABLE users (
         id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL UNIQUE,
+        common_name TEXT,
         subject TEXT NOT NULL, issuer TEXT NOT NULL, serial_number TEXT NOT NULL,
         not_before INTEGER NOT NULL, not_after INTEGER NOT NULL,
         certificate_pem TEXT NOT NULL, created_at INTEGER NOT NULL,
         last_seen_at INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','revoked')),
         revoked_at INTEGER, revocation_reason TEXT NOT NULL DEFAULT ''
     )""",
+    _CN_INDEX,
+    _CN_ARCHIVE_SCHEMA,
     """CREATE TABLE user_tokens (
         id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
         token_hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL,
@@ -170,6 +183,7 @@ def _user_payload(row: sqlite3.Row) -> dict[str, Any]:
         key: row[key]
         for key in (
             "id",
+            "common_name",
             "subject",
             "issuer",
             "serial_number",
@@ -235,6 +249,118 @@ class AccessStore:
                 for statement in _SCHEMA:
                     connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+            elif version == 1:
+                self._migrate_common_names(connection)
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+
+    def _migrate_common_names(self, connection: sqlite3.Connection) -> None:
+        """Merge v1 certificate identities by CN in the surrounding write transaction.
+
+        Original rows from merged groups remain recoverable in an immutable archive;
+        existing audit attribution keeps its original IDs. No token or administrator
+        credential is rewritten. Rows without a usable CN remain visible but cannot
+        authenticate, even with an otherwise live historical bearer.
+        """
+        rows = connection.execute("SELECT * FROM users ORDER BY created_at, id").fetchall()
+        connection.execute("ALTER TABLE users ADD COLUMN common_name TEXT")
+        connection.execute(_CN_ARCHIVE_SCHEMA)
+        groups: dict[str, list[sqlite3.Row]] = {}
+        invalid_count = 0
+        for row in rows:
+            common_name = common_name_from_certificate(row["certificate_pem"], row["subject"])
+            if common_name is None:
+                invalid_count += 1
+            else:
+                groups.setdefault(common_name, []).append(row)
+
+        now = _now()
+        merged_count = 0
+        for common_name, members in groups.items():
+            # SQL ordering makes the canonical ID stable across machines/restarts.
+            canonical = members[0]
+            if len(members) > 1:
+                for member in members:
+                    connection.execute(
+                        "INSERT INTO legacy_user_identities VALUES (?,?,?,?)",
+                        (member["id"], canonical["id"], now, json.dumps(dict(member))),
+                    )
+                for duplicate in members[1:]:
+                    connection.execute(
+                        "UPDATE user_tokens SET user_id = ? WHERE user_id = ?",
+                        (canonical["id"], duplicate["id"]),
+                    )
+                    connection.execute("DELETE FROM users WHERE id = ?", (duplicate["id"],))
+                    self._audit(
+                        connection,
+                        actor="migration",
+                        action="user.cn_merged",
+                        target_type="user",
+                        target_id=canonical["id"],
+                        details=json.dumps({"legacy_user_id": duplicate["id"]}),
+                    )
+                    merged_count += 1
+
+            latest = max(
+                members, key=lambda row: (row["last_seen_at"], row["created_at"], row["id"])
+            )
+            revoked = [member for member in members if member["status"] == "revoked"]
+            revoked_at = None
+            reason = ""
+            if revoked:
+                first_revoked = min(
+                    revoked,
+                    key=lambda row: (
+                        row["revoked_at"] if row["revoked_at"] is not None else now,
+                        row["created_at"],
+                        row["id"],
+                    ),
+                )
+                revoked_at = (
+                    first_revoked["revoked_at"] if first_revoked["revoked_at"] is not None else now
+                )
+                reason = first_revoked["revocation_reason"]
+                # A revoked historical certificate must not be resurrected through
+                # a second previously active certificate bearing the same CN.
+                connection.execute(
+                    """UPDATE user_tokens SET revoked_at = COALESCE(revoked_at, ?)
+                    WHERE user_id = ?""",
+                    (now, canonical["id"]),
+                )
+            connection.execute(
+                """UPDATE users SET common_name = ?, fingerprint = ?, subject = ?, issuer = ?,
+                serial_number = ?, not_before = ?, not_after = ?, certificate_pem = ?,
+                last_seen_at = ?, status = ?, revoked_at = ?, revocation_reason = ? WHERE id = ?""",
+                (
+                    common_name,
+                    latest["fingerprint"],
+                    latest["subject"],
+                    latest["issuer"],
+                    latest["serial_number"],
+                    latest["not_before"],
+                    latest["not_after"],
+                    latest["certificate_pem"],
+                    latest["last_seen_at"],
+                    "revoked" if revoked else "active",
+                    revoked_at,
+                    reason,
+                    canonical["id"],
+                ),
+            )
+        connection.execute(_CN_INDEX)
+        self._audit(
+            connection,
+            actor="migration",
+            action="schema.cn_identity_migrated",
+            target_type="schema",
+            target_id="2",
+            details=json.dumps(
+                {
+                    "previous_users": len(rows),
+                    "merged_users": merged_count,
+                    "users_without_common_name": invalid_count,
+                }
+            ),
+        )
 
     @contextmanager
     def _connection(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
@@ -305,13 +431,11 @@ class AccessStore:
         existing_token: str | None = None,
         address: str = "",
     ) -> IssuedToken:
-        """Enroll a VERIFIED client certificate; explicit enrollment can replace a token."""
+        """Enroll a transport-authenticated CN; certificate properties are metadata."""
         now = _now()
         fingerprint = certificate.fingerprint.lower()
         if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
             raise ValueError("Certificate fingerprint must be a SHA-256 hexadecimal digest")
-        if certificate.not_before > now or certificate.not_after <= now:
-            raise AccessDenied("Client certificate is not currently valid")
         for value, maximum in (
             (certificate.subject, 8192),
             (certificate.issuer, 8192),
@@ -320,11 +444,16 @@ class AccessStore:
         ):
             if not isinstance(value, str) or len(value) > maximum:
                 raise ValueError("Certificate metadata exceeds the permitted size")
+        common_name = certificate.common_name
+        if common_name is None:
+            raise AccessDenied(
+                "A client certificate with exactly one valid Common Name is required"
+            )
         denied = False
         result: IssuedToken | None = None
         with self._connection(write=True) as connection:
             user = connection.execute(
-                "SELECT * FROM users WHERE fingerprint = ?", (fingerprint,)
+                "SELECT * FROM users WHERE common_name = ?", (common_name,)
             ).fetchone()
             if user is not None and user["status"] != "active":
                 self._audit(
@@ -340,11 +469,21 @@ class AccessStore:
             else:
                 user_id = user["id"] if user is not None else _new_id()
                 connection.execute(
-                    """INSERT INTO users VALUES (?,?,?,?,?,?,?,?,?,?,'active',NULL,'')
-                    ON CONFLICT(fingerprint) DO UPDATE SET last_seen_at = excluded.last_seen_at""",
+                    """INSERT INTO users (
+                        id, fingerprint, common_name, subject, issuer, serial_number,
+                        not_before, not_after, certificate_pem, created_at, last_seen_at,
+                        status, revoked_at, revocation_reason
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'active',NULL,'')
+                    ON CONFLICT(common_name) WHERE common_name IS NOT NULL DO UPDATE SET
+                        fingerprint = excluded.fingerprint, subject = excluded.subject,
+                        issuer = excluded.issuer, serial_number = excluded.serial_number,
+                        not_before = excluded.not_before, not_after = excluded.not_after,
+                        certificate_pem = excluded.certificate_pem,
+                        last_seen_at = excluded.last_seen_at""",
                     (
                         user_id,
                         fingerprint,
+                        common_name,
                         certificate.subject,
                         certificate.issuer,
                         certificate.serial_number,
@@ -395,7 +534,7 @@ class AccessStore:
                 else:
                     secret = "kb_" + secrets.token_urlsafe(32)
                     token_id = _new_id()
-                    expires_at = min(now + self.token_ttl_seconds, certificate.not_after)
+                    expires_at = now + self.token_ttl_seconds
                     connection.execute(
                         "INSERT INTO user_tokens VALUES (?,?,?,?,?,?,NULL,NULL)",
                         (token_id, user_id, _secret_hash(secret), secret[:11], now, expires_at),
@@ -421,24 +560,27 @@ class AccessStore:
         return result
 
     def verify_user_token(
-        self, token: str, *, fingerprint: str | None = None
+        self, token: str, *, common_name: str | None = None
     ) -> dict[str, Any] | None:
         if not _valid_token(token):
             return None
+        if common_name is not None:
+            try:
+                common_name = normalize_common_name(common_name)
+            except ValueError:
+                return None
         now = _now()
         with self._connection(write=True) as connection:
             row = connection.execute(
                 """SELECT u.*, t.id AS token_id FROM user_tokens t
                 JOIN users u ON u.id = t.user_id WHERE t.token_hash = ?
                 AND t.revoked_at IS NULL AND t.expires_at > ? AND u.status = 'active'
-                AND u.not_before <= ? AND u.not_after > ?""",
-                (_secret_hash(token), now, now, now),
+                AND u.common_name IS NOT NULL""",
+                (_secret_hash(token), now),
             ).fetchone()
             if row is None:
                 return None
-            if fingerprint is not None and not hmac.compare_digest(
-                row["fingerprint"], fingerprint.lower()
-            ):
+            if common_name is not None and row["common_name"] != common_name:
                 return None
             connection.execute(
                 "UPDATE user_tokens SET last_used_at = ? WHERE id = ?", (now, row["token_id"])
@@ -646,19 +788,20 @@ class AccessStore:
         self, user_id: str | None = None, limit: int = 100, offset: int = 0
     ) -> dict[str, Any]:
         limit, offset = _page(limit, offset)
-        clause = "WHERE user_id = ?" if user_id is not None else ""
+        clause = "WHERE t.user_id = ?" if user_id is not None else ""
         parameters = (user_id,) if user_id is not None else ()
         with self._connection() as connection:
             rows = connection.execute(
-                f"SELECT * FROM user_tokens {clause} ORDER BY created_at DESC, id LIMIT ? OFFSET ?",
+                f"""SELECT t.*, u.common_name FROM user_tokens t JOIN users u ON u.id = t.user_id
+                {clause} ORDER BY t.created_at DESC, t.id LIMIT ? OFFSET ?""",
                 (*parameters, limit, offset),
             ).fetchall()
             total = connection.execute(
-                f"SELECT COUNT(*) FROM user_tokens {clause}", parameters
+                f"SELECT COUNT(*) FROM user_tokens t {clause}", parameters
             ).fetchone()[0]
             items = []
             for row in rows:
-                payload = {key: row[key] for key in ("id", "user_id", "prefix")}
+                payload = {key: row[key] for key in ("id", "user_id", "common_name", "prefix")}
                 for key in ("created_at", "expires_at", "last_used_at", "revoked_at"):
                     payload[key] = _iso(row[key])
                 payload["status"] = (

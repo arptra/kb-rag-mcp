@@ -95,10 +95,11 @@ class Settings(BaseSettings):
     mcp_tls_enabled: bool = True
     mcp_tls_cert_file: Path = Path("certs/server.crt")
     mcp_tls_key_file: Path = Path("certs/server.key")
-    # Opt-in migration: legacy deployments stay usable until CA/bootstrap are configured.
+    # Access remains opt-in; CN enrollment accepts any issuer unless strict mode is explicit.
     access_enabled: bool = False
     access_db_path: Path = Path(".cache/access/access.sqlite3")
     access_client_ca_file: Path | None = None
+    access_client_certificate_mode: Literal["trusted_ca", "presented"] = "presented"
     access_bootstrap_admin_username: str = "admin"
     access_bootstrap_admin_password: SecretStr | None = None
     access_token_ttl_seconds: int = Field(default=2_592_000, ge=300, le=31_536_000)
@@ -128,7 +129,10 @@ class Settings(BaseSettings):
         if self.access_enabled:
             if not self.mcp_tls_enabled:
                 raise ValueError("KB_ACCESS_ENABLED requires KB_MCP_TLS_ENABLED=true")
-            if self.access_client_ca_file is None:
+            if (
+                self.access_client_certificate_mode == "trusted_ca"
+                and self.access_client_ca_file is None
+            ):
                 raise ValueError("KB_ACCESS_ENABLED requires KB_ACCESS_CLIENT_CA_FILE")
         return self
 

@@ -409,7 +409,7 @@ function Startup({ error, loading, onRetry }: { error: string; loading: boolean;
   );
 }
 
-export default function App({ secureMode = false, onSessionLogout }: { secureMode?: boolean; onSessionLogout?: () => void }) {
+export default function App({ secureMode = false, accountName, onSessionLogout }: { secureMode?: boolean; accountName?: string; onSessionLogout?: () => void }) {
   const [password, setPassword] = useState(() => secureMode ? "" : sessionStorage.getItem("rag-admin-password") || "");
   const [overview, setOverview] = useState<Overview | null>(null);
   const [page, setPage] = useState<Page>("overview");
@@ -544,6 +544,7 @@ export default function App({ secureMode = false, onSessionLogout }: { secureMod
           ))}
         </nav>
         <div className="sidebar-foot">
+          {secureMode && accountName && <div className="access-account-identity"><small>Учётная запись</small><b>{accountName}</b></div>}
           <div className="server-state"><span className="pulse" /><div><b>MCP online</b><small>{overview.index.embedding_provider} embeddings</small></div></div>
           {secureMode && <div className="connect-gate-links"><a className="access-link" href="/connect">Подключить MCP →</a><a className="access-link" href="/access-admin">Управление доступом →</a></div>}
           {secureMode && <button className="logout" onClick={onSessionLogout}>Выйти из дашборда</button>}

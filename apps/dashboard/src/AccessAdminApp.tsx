@@ -15,7 +15,7 @@ type Confirmation = { title: string; text: string; path: string; reason: boolean
 const EMPTY_LISTS: Lists = { users: null, tokens: null, admins: null, events: null };
 const PAGE_SIZE = 50;
 const TABS: { id: Tab; title: string; description: string }[] = [
-  { id: "users", title: "Пользователи", description: "Сертификаты, даты доступа и блокировка пользователя во всём сервисе." },
+  { id: "users", title: "Пользователи", description: "Учётные записи по CN, даты доступа и блокировка пользователя во всём сервисе." },
   { id: "tokens", title: "Токены и сессии", description: "Выданные учётные данные: сроки действия, последнее использование и отзыв." },
   { id: "admins", title: "Администраторы", description: "Отдельные учётные записи для управления доступом. Они не заменяют личный сертификат." },
   { id: "events", title: "Журнал аудита", description: "Кто, когда и какие изменения доступа выполнял." },
@@ -81,6 +81,7 @@ export default function AccessAdminApp() {
   const [lists, setLists] = useState<Lists>(EMPTY_LISTS);
   const [offsets, setOffsets] = useState<Record<Tab, number>>({ users: 0, tokens: 0, admins: 0, events: 0 });
   const [userFilter, setUserFilter] = useState("");
+  const [userFilterName, setUserFilterName] = useState("");
   const [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -98,6 +99,8 @@ export default function AccessAdminApp() {
     setLists(EMPTY_LISTS);
     setConfirmation(null);
     setNewPassword("");
+    setUserFilter("");
+    setUserFilterName("");
   }, []);
 
   const restore = useCallback(async () => {
@@ -211,8 +214,9 @@ export default function AccessAdminApp() {
     }
   };
 
-  const showTokens = (userId: string) => {
+  const showTokens = (userId: string, commonName = "") => {
     setUserFilter(userId);
+    setUserFilterName(commonName);
     setOffsets((values) => ({ ...values, tokens: 0 }));
     setTab("tokens");
   };
@@ -249,24 +253,25 @@ export default function AccessAdminApp() {
         <div className="access-header-actions"><span>Администратор: <b>{session.admin.username}</b></span><a className="button secondary" href="/admin">Дашборд ↗</a><button className="button secondary" onClick={() => void logout()} disabled={busy}>Выйти</button></div>
       </header>
       <main className="access-main">
-        <div className="access-intro"><div><span className="eyebrow">Безопасность сервиса</span><h1>Управление доступом</h1><p>Доступ к инструментам и дашборду выдаётся по подтверждённому сертификату. Права администраторов управляются отдельно.</p></div><button className="button secondary" onClick={() => setRevision((value) => value + 1)} disabled={loading || busy}>↻ Обновить</button></div>
+        <div className="access-intro"><div><span className="eyebrow">Безопасность сервиса</span><h1>Управление доступом</h1><p>Пользователь определяется по CN личного сертификата и получает персональный токен для инструментов и дашборда. Администраторы входят отдельно по логину и паролю.</p></div><button className="button secondary" onClick={() => setRevision((value) => value + 1)} disabled={loading || busy}>↻ Обновить</button></div>
         <nav className="access-tabs" aria-label="Разделы управления доступом">{TABS.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} aria-current={tab === item.id ? "page" : undefined} onClick={() => { setTab(item.id); setNotice(""); }}>{item.title}</button>)}</nav>
         <section className="access-section" aria-labelledby="access-section-title">
           <div className="access-section-head"><div><h2 id="access-section-title">{selected.title}</h2><p>{selected.description}</p></div>{loaded && !loading && <span className="access-count">{total} записей</span>}</div>
           {error && <div className="form-error" role="alert">{error}</div>}
           {notice && <div className="access-notice" role="status">{notice}</div>}
-          {tab === "tokens" && <div className="access-filter"><span>{userFilter ? <>Пользователь: <code>{userFilter}</code></> : "Все пользователи"}</span>{userFilter && <button className="button quiet" onClick={() => showTokens("")}>Сбросить фильтр ×</button>}</div>}
+          {tab === "users" && <p className="access-help">Один CN — одна учётная запись, даже если издатель или отпечаток сертификата изменился. Отзыв пользователя блокирует весь доступ по этому CN. Данные последнего сертификата показаны только для справки и не дают роль администратора.</p>}
+          {tab === "tokens" && <div className="access-filter"><span>{userFilter ? <>Пользователь{userFilterName ? " · CN" : ""}: <b>{userFilterName || userFilter}</b>{userFilterName && <> · <code>{userFilter}</code></>}</> : "Все пользователи"}</span>{userFilter && <button className="button quiet" onClick={() => showTokens("")}>Сбросить фильтр ×</button>}</div>}
           {tab === "tokens" && <p className="access-help">Здесь отображаются только идентификаторы и префиксы, не секретные значения токенов. Отзыв токена отключает только соответствующую сессию; чтобы запретить повторную выдачу, отзовите доступ пользователя.</p>}
           {loading ? <p className="access-empty" role="status">Загружаем записи…</p> : loaded && total === 0 ? <p className="access-empty">{tab === "users" ? "Пользователей пока нет. Записи появятся после первого успешного входа по сертификату." : tab === "tokens" ? "Токенов и сессий для выбранного фильтра пока нет." : tab === "events" ? "В журнале пока нет событий." : "Администраторов не найдено."}</p> : !loaded ? <p className="access-empty">Записи не загружены. Нажмите «Обновить», чтобы повторить запрос.</p> : (
             <div className="access-table-wrap">
-              {tab === "users" && <table className="access-table"><thead><tr><th>Пользователь / сертификат</th><th>Состояние</th><th>Даты доступа</th><th>Действия</th></tr></thead><tbody>{lists.users?.items.map((user) => <tr key={user.id}>
-                <td className="access-identity"><b>{user.subject || user.id}</b><small>ID: {user.id}</small><details><summary>Сведения о сертификате</summary><dl><dt>Издатель</dt><dd>{user.issuer}</dd><dt>Серийный номер</dt><dd><code>{user.serial_number}</code></dd><dt>SHA-256 fingerprint</dt><dd><code>{user.fingerprint}</code></dd><dt>Действителен</dt><dd>{date(user.not_before)} — {date(user.not_after)}</dd></dl></details></td>
+              {tab === "users" && <table className="access-table"><thead><tr><th>Пользователь · CN</th><th>Состояние</th><th>Даты доступа</th><th>Действия</th></tr></thead><tbody>{lists.users?.items.map((user) => <tr key={user.id}>
+                <td className="access-identity"><b>{user.common_name || user.subject || user.id}</b>{!user.common_name && <small>Старая запись: CN не указан</small>}<small>ID: {user.id}</small><details><summary>Последний сертификат · справочно</summary><dl><dt>Subject</dt><dd>{user.subject || "—"}</dd><dt>Издатель</dt><dd>{user.issuer || "—"}</dd><dt>Серийный номер</dt><dd><code>{user.serial_number || "—"}</code></dd><dt>SHA-256 fingerprint</dt><dd><code>{user.fingerprint || "—"}</code></dd><dt>Срок, указанный в сертификате</dt><dd>{date(user.not_before)} — {date(user.not_after)}</dd></dl></details></td>
                 <td><Status value={user.status} />{user.revoked_at && <small>Отозван: {date(user.revoked_at)}</small>}{user.revocation_reason && <small className="access-reason">{user.revocation_reason}</small>}</td>
                 <td><small>Впервые</small><span>{date(user.created_at)}</span><small>Последний доступ</small><span>{date(user.last_seen_at)}</span></td>
-                <td><div className="access-row-actions"><button className="button secondary" onClick={() => showTokens(user.id)}>Токены →</button>{user.status === "active" ? <button className="button access-danger" disabled={busy} onClick={() => confirm({ title: "Отозвать доступ пользователя?", text: `${user.subject || user.id}: все токены и браузерные сессии будут отозваны. Новый вход с этим сертификатом будет запрещён до восстановления доступа.`, path: `/access/api/users/${encodeURIComponent(user.id)}/revoke`, reason: true, destructive: true })}>Отозвать доступ</button> : <button className="button secondary" disabled={busy} onClick={() => confirm({ title: "Восстановить доступ?", text: `${user.subject || user.id} сможет снова получить токен по действительному сертификату. Старые отозванные токены не восстановятся.`, path: `/access/api/users/${encodeURIComponent(user.id)}/restore`, reason: false, destructive: false })}>Восстановить</button>}</div></td>
+                <td><div className="access-row-actions"><button className="button secondary" onClick={() => showTokens(user.id, user.common_name || "")}>Токены →</button>{user.status === "active" ? <button className="button access-danger" disabled={busy} onClick={() => confirm({ title: "Отозвать доступ пользователя?", text: `${user.common_name || user.subject || user.id}: все токены и браузерные сессии будут отозваны. ${user.common_name ? "Вход с любым сертификатом с этим CN будет запрещён" : "Вход в эту учётную запись будет запрещён"} до восстановления доступа.`, path: `/access/api/users/${encodeURIComponent(user.id)}/revoke`, reason: true, destructive: true })}>Отозвать доступ</button> : <button className="button secondary" disabled={busy} onClick={() => confirm({ title: "Восстановить доступ?", text: `${user.common_name || user.subject || user.id} сможет снова получить персональный токен. Старые отозванные токены не восстановятся.`, path: `/access/api/users/${encodeURIComponent(user.id)}/restore`, reason: false, destructive: false })}>Восстановить</button>}</div></td>
               </tr>)}</tbody></table>}
-              {tab === "tokens" && <table className="access-table"><thead><tr><th>Токен / пользователь</th><th>Состояние</th><th>Выдан / истекает</th><th>Использование</th><th>Действия</th></tr></thead><tbody>{lists.tokens?.items.map((token) => <tr key={token.id}>
-                <td><b><code>{token.prefix}…</code></b><small>ID: {token.id}</small><button className="access-inline-button" onClick={() => showTokens(token.user_id)}>{token.user_id}</button></td><td><Status value={token.status} /></td><td><small>Выдан</small><span>{date(token.created_at)}</span><small>Истекает</small><span>{date(token.expires_at)}</span></td><td><small>Последнее использование</small><span>{date(token.last_used_at)}</span>{token.revoked_at && <><small>Отозван</small><span>{date(token.revoked_at)}</span></>}</td><td><button className="button access-danger" disabled={busy || token.status !== "active"} onClick={() => confirm({ title: "Отозвать токен?", text: `Токен ${token.prefix}… перестанет давать доступ. Пользователь с активным сертификатом сможет получить новый.`, path: `/access/api/tokens/${encodeURIComponent(token.id)}/revoke`, reason: true, destructive: true })}>Отозвать</button></td>
+              {tab === "tokens" && <table className="access-table"><thead><tr><th>Пользователь · CN / токен</th><th>Состояние</th><th>Выдан / истекает</th><th>Использование</th><th>Действия</th></tr></thead><tbody>{lists.tokens?.items.map((token) => <tr key={token.id}>
+                <td><b><button className="access-inline-button" onClick={() => showTokens(token.user_id, token.common_name || "")}>{token.common_name || token.user_id}</button></b><small>Пользователь: {token.user_id}</small><code>{token.prefix}…</code><small>ID токена: {token.id}</small></td><td><Status value={token.status} /></td><td><small>Выдан</small><span>{date(token.created_at)}</span><small>Истекает</small><span>{date(token.expires_at)}</span></td><td><small>Последнее использование</small><span>{date(token.last_used_at)}</span>{token.revoked_at && <><small>Отозван</small><span>{date(token.revoked_at)}</span></>}</td><td><button className="button access-danger" disabled={busy || token.status !== "active"} onClick={() => confirm({ title: "Отозвать токен?", text: `Токен ${token.prefix}… перестанет давать доступ. Если учётная запись пользователя не заблокирована, он сможет получить новый токен по CN своего сертификата.`, path: `/access/api/tokens/${encodeURIComponent(token.id)}/revoke`, reason: true, destructive: true })}>Отозвать</button></td>
               </tr>)}</tbody></table>}
               {tab === "admins" && <table className="access-table"><thead><tr><th>Администратор</th><th>Состояние</th><th>Создан</th><th>Последний вход</th><th>Действия</th></tr></thead><tbody>{lists.admins?.items.map((admin) => <tr key={admin.id}><td><b>{admin.username}</b>{admin.id === session.admin.id && <small>Текущая учётная запись</small>}</td><td><Status value={admin.status} /></td><td>{date(admin.created_at)}</td><td>{date(admin.last_login_at)}</td><td><button className="button access-danger" disabled={busy || admin.status !== "active"} onClick={() => confirm({ title: "Отключить администратора?", text: `${admin.username} больше не сможет управлять доступом. Активные административные сессии будут завершены. Последнего активного администратора отключить нельзя.`, path: `/access/api/admins/${encodeURIComponent(admin.id)}/deactivate`, reason: false, self: admin.id === session.admin.id, destructive: true })}>Отключить</button></td></tr>)}</tbody></table>}
               {tab === "events" && <table className="access-table access-audit-table"><thead><tr><th>Когда</th><th>Кто / адрес</th><th>Действие</th><th>Объект</th><th>Подробности</th></tr></thead><tbody>{lists.events?.items.map((item) => <tr key={item.id}><td>{date(item.created_at)}</td><td><b>{item.actor || "—"}</b><small>{item.address || "—"}</small></td><td><code>{item.action}</code></td><td><span>{item.target_type || "—"}</span><small>{item.target_id || "—"}</small></td><td><span className="access-event-details">{item.details || "—"}</span></td></tr>)}</tbody></table>}

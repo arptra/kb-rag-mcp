@@ -8,7 +8,7 @@ project_root="$(cd -- "${script_dir}/.." && pwd)"
 cd "${project_root}"
 
 # Local access testing is an explicit isolated profile. Dispatch before the normal
-# TLS defaults and PID handling, so it cannot replace or stop a running deployment.
+# runtime configuration and PID handling, so it cannot replace or stop a deployment.
 if [[ "${1:-}" == "local" ]]; then
   shift
   local_args=("-m" "corporate_kb.access.local_dev")
@@ -35,41 +35,20 @@ if [[ "${1:-}" == "local" ]]; then
   exec "${project_root}/.venv/bin/python" "${local_args[@]}"
 fi
 
-export KB_ACTIVATE_QUIET=true
-source "${script_dir}/activate-venv.sh"
-unset KB_ACTIVATE_QUIET
-
-export KB_EMBEDDING_PROVIDER="${KB_EMBEDDING_PROVIDER:-hash}"
-export KB_EMBEDDING_LOCAL_FILES_ONLY="${KB_EMBEDDING_LOCAL_FILES_ONLY:-true}"
-export KB_AUTO_INDEX="${KB_AUTO_INDEX:-false}"
-export KB_MCP_HTTP_HOST="${KB_MCP_HTTP_HOST:-0.0.0.0}"
-export KB_MCP_HTTP_PORT="${KB_MCP_HTTP_PORT:-8000}"
-export KB_MCP_HTTP_PATH="${KB_MCP_HTTP_PATH:-/mcp}"
-export KB_MCP_TLS_ENABLED="${KB_MCP_TLS_ENABLED:-true}"
-export KB_MCP_TLS_CERT_FILE="${KB_MCP_TLS_CERT_FILE:-${project_root}/certs/server.crt}"
-export KB_MCP_TLS_KEY_FILE="${KB_MCP_TLS_KEY_FILE:-${project_root}/certs/server.key}"
-# Authentication is configured by KB_* / .env. Never overwrite operator credentials.
-
-case "${KB_MCP_TLS_ENABLED}" in
-  1|true|TRUE|yes|YES|on|ON)
-    if [[ ! -f "${KB_MCP_TLS_CERT_FILE}" || ! -f "${KB_MCP_TLS_KEY_FILE}" ]]; then
-      "${script_dir}/generate-dev-certs.sh"
-    fi
-    server_scheme="https"
-    ;;
-  0|false|FALSE|no|NO|off|OFF)
-    server_scheme="http"
-    ;;
-  *)
-    echo "KB_MCP_TLS_ENABLED must be a boolean value." >&2
-    exit 2
-    ;;
-esac
-
 runtime_dir="${project_root}/.cache/kb/runtime"
 pid_file="${runtime_dir}/mcp-http.pid"
 log_file="${runtime_dir}/mcp-http.log"
-server_command=("${VIRTUAL_ENV}/bin/python" -m corporate_kb.mcp.http_server)
+server_command=()
+
+prepare_runtime() {
+  # Let Python Settings load env > .env > defaults. Never source .env or export
+  # shell defaults over it. Normal deployments must provide their own TLS files;
+  # generated test certificates belong exclusively to the explicit local profile.
+  export KB_ACTIVATE_QUIET=true
+  source "${script_dir}/activate-venv.sh" || return 1
+  unset KB_ACTIVATE_QUIET
+  server_command=("${VIRTUAL_ENV}/bin/python" -m corporate_kb.mcp.http_server)
+}
 
 read_server_pid() {
   if [[ ! -f "${pid_file}" ]]; then
@@ -137,6 +116,7 @@ run_server() {
     echo "RAG/MCP server is already running (PID ${existing})." >&2
     return 1
   fi
+  prepare_runtime
   mkdir -p "${runtime_dir}"
   local child_pid=""
   cleanup_pid() {
@@ -176,6 +156,7 @@ start_server() {
     echo "RAG/MCP server is already running (PID ${existing})."
     return 0
   fi
+  prepare_runtime
   mkdir -p "${runtime_dir}"
   nohup "${BASH_SOURCE[0]}" __daemon "$@" >>"${log_file}" 2>&1 &
   local launcher_pid="$!"
@@ -196,8 +177,7 @@ start_server() {
       done
       if [[ "${stable}" == true ]]; then
         echo "RAG/MCP server started (PID ${existing})."
-        echo "Admin: ${server_scheme}://${KB_MCP_HTTP_HOST}:${KB_MCP_HTTP_PORT}/admin"
-        echo "MCP:   ${server_scheme}://${KB_MCP_HTTP_HOST}:${KB_MCP_HTTP_PORT}${KB_MCP_HTTP_PATH}"
+        "${VIRTUAL_ENV}/bin/python" -m corporate_kb.access.launcher
         echo "Log:   ${log_file}"
         return 0
       fi
@@ -258,6 +238,7 @@ case "${action}" in
     fi
     ;;
   logs)
+    mkdir -p "${runtime_dir}"
     touch "${log_file}"
     tail -n 100 -f "${log_file}"
     ;;

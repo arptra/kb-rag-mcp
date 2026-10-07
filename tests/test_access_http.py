@@ -119,6 +119,7 @@ def secured(settings_factory, pki):
     directory, certificates = pki
     settings = settings_factory(
         access_enabled=True,
+        access_client_certificate_mode="trusted_ca",
         access_db_path=directory / "access.sqlite3",
         access_client_ca_file=directory / "ca.pem",
         access_bootstrap_admin_password=PASSWORD,
@@ -139,7 +140,7 @@ def secured(settings_factory, pki):
 def test_secure_settings_fail_closed(settings_factory, pki):
     directory, _ = pki
     with pytest.raises(ValueError, match="CLIENT_CA"):
-        settings_factory(access_enabled=True)
+        settings_factory(access_enabled=True, access_client_certificate_mode="trusted_ca")
     with pytest.raises(ValueError, match="TLS_ENABLED"):
         settings_factory(
             access_enabled=True, mcp_tls_enabled=False, access_client_ca_file=directory / "ca.pem"
@@ -167,7 +168,7 @@ def test_tls_settings_use_verified_transport(secured, pki):
                 "corporate_kb.verified_client_certificate": certificates["expired"],
             }
         )
-        is None
+        == certificates["expired"]
     )
     settings.access_client_ca_file = pki[0] / "missing.pem"
     with pytest.raises(ValueError, match="CA"):

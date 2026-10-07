@@ -138,7 +138,7 @@ class RegistryTokenVerifier(TokenVerifier):
         user = await asyncio.to_thread(
             self.store.verify_user_token,
             token,
-            fingerprint=certificate.fingerprint if certificate else None,
+            common_name=certificate.common_name if certificate else None,
         )
         if user is None:
             return None
@@ -180,7 +180,7 @@ class AccessControl:
         certificate = certificate_from_scope(request.scope)
         return self.store.verify_user_token(
             token,
-            fingerprint=certificate.fingerprint if certificate else None,
+            common_name=certificate.common_name if certificate else None,
         )
 
     def administrator(self, request: Request) -> dict[str, Any] | None:
@@ -228,6 +228,7 @@ class AccessControl:
                     "enabled": True,
                     "authenticated": user is not None,
                     "certificate_present": certificate_from_scope(request.scope) is not None,
+                    "certificate_mode": self.settings.access_client_certificate_mode,
                     "user": user,
                 }
             )
@@ -236,7 +237,9 @@ class AccessControl:
             await _body(request)
             certificate = certificate_from_scope(request.scope)
             if certificate is None:
-                raise AccessDenied("A trusted personal client certificate is required")
+                raise AccessDenied(
+                    "A TLS client certificate with exactly one non-empty CN is required"
+                )
             existing = request.cookies.get(USER_COOKIE) if browser else bearer_token(request)
             issued = await asyncio.to_thread(
                 self.store.enroll,
@@ -282,7 +285,9 @@ class AccessControl:
                 raise AccessDenied("Same-origin request required")
             certificate = certificate_from_scope(request.scope)
             if certificate is None:
-                raise AccessDenied("A trusted personal client certificate is required")
+                raise AccessDenied(
+                    "A TLS client certificate with exactly one non-empty CN is required"
+                )
             issued = await asyncio.to_thread(
                 self.store.enroll,
                 certificate,
