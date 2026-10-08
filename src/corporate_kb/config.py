@@ -82,6 +82,9 @@ class Settings(BaseSettings):
     analysis_archive_dir: Path = Path(".cache/kb/analysis")
     job_logs_dir: Path = Path(".cache/kb/job-logs")
     ssot_skill_path: Path = Path("skills/build-service-ssot")
+    skills_registry_enabled: bool = True
+    skills_registry_dir: Path = Path(".cache/skills-registry")
+    skills_mcp_path: str = "/skills/mcp"
     repository_max_files: int = Field(default=10_000, ge=1, le=100_000)
     repository_git_timeout_seconds: int = Field(default=60, ge=10, le=1800)
     repository_analysis_timeout_seconds: int = Field(default=600, ge=5, le=3600)
@@ -114,6 +117,29 @@ class Settings(BaseSettings):
         if "?" in value or "#" in value or "//" in value:
             raise ValueError("KB_MCP_HTTP_PATH must be a plain absolute URL path")
         return value
+
+    @field_validator("skills_mcp_path")
+    @classmethod
+    def validate_skills_http_path(cls, value: str) -> str:
+        value = cls.validate_http_path(value)
+        prefix, _, _leaf = value.rpartition("/")
+        if (
+            not prefix
+            or value.split("/")[1] in {"admin", "auth", "access", "api"}
+            or any(segment in {".", ".."} for segment in value.split("/"))
+            or "\\" in value
+        ):
+            raise ValueError("KB_SKILLS_MCP_PATH must have a dedicated prefix, e.g. /skills/mcp")
+        return value
+
+    @model_validator(mode="after")
+    def validate_skills_routes(self) -> Settings:
+        prefix = self.skills_mcp_path.rpartition("/")[0]
+        if self.skills_registry_enabled and (
+            self.mcp_http_path == prefix or self.mcp_http_path.startswith(prefix + "/")
+        ):
+            raise ValueError("Knowledge and skills MCP endpoints must use separate route prefixes")
+        return self
 
     @model_validator(mode="after")
     def validate_chunking(self) -> Settings:
@@ -161,6 +187,7 @@ class Settings(BaseSettings):
                 "analysis_archive_dir": resolve(self.analysis_archive_dir),
                 "job_logs_dir": resolve(self.job_logs_dir),
                 "ssot_skill_path": resolve(self.ssot_skill_path),
+                "skills_registry_dir": resolve(self.skills_registry_dir),
                 "domscribe_workspace_root": resolve(self.domscribe_workspace_root),
                 "mcp_tls_cert_file": resolve(self.mcp_tls_cert_file),
                 "mcp_tls_key_file": resolve(self.mcp_tls_key_file),

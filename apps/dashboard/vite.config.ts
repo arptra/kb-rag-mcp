@@ -11,6 +11,8 @@ const tlsEnabled = !["0", "false", "no", "off"].includes(
 );
 const certificate = process.env.VITE_TLS_CERT_FILE ?? resolve(projectRoot, "certs/server.crt");
 const privateKey = process.env.VITE_TLS_KEY_FILE ?? resolve(projectRoot, "certs/server.key");
+const skillsMcpPath = process.env.VITE_SKILLS_MCP_PATH ?? process.env.KB_SKILLS_MCP_PATH ?? "/skills/mcp";
+const skillsMcpProxyPattern = `^${skillsMcpPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/?(?:\\?.*)?$`;
 type DomscribeOptions = NonNullable<Parameters<typeof domscribe>[0]> & { rootDir?: string };
 const domscribeOptions: DomscribeOptions = {
   rootDir: projectRoot,
@@ -85,6 +87,10 @@ export default defineConfig(({ command, mode }) => {
     server: {
       https: tls,
       proxy: {
+        [skillsMcpProxyPattern]: {
+          target: process.env.VITE_BACKEND_URL ?? "https://127.0.0.1:8000",
+          secure: false,
+        },
         "/admin/api": {
           target: process.env.VITE_BACKEND_URL ?? "https://127.0.0.1:8000",
           secure: false,

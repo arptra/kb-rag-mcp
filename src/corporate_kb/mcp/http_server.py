@@ -8,13 +8,18 @@ import logging
 import secrets
 import ssl
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
+import uvicorn
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, TokenVerifier
+from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from starlette.routing import Mount
 from starlette.types import ASGIApp
 
 from corporate_kb.access.http import AccessControl, RegistryTokenVerifier, register_disabled_status
@@ -43,6 +48,9 @@ from corporate_kb.service import (
     create_ssot_service,
 )
 from corporate_kb.usage import UsageTracker
+from skill_registry.http import register_skills_routes
+from skill_registry.mcp_server import create_skills_mcp_server
+from skill_registry.registry import SkillsRegistry
 
 logger = logging.getLogger(__name__)
 _READ_SCOPE = "kb:read"
@@ -301,7 +309,12 @@ class ConstantTimeTokenVerifier(TokenVerifier):
         )
 
 
-def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP:
+def create_http_server(
+    service: KnowledgeService,
+    settings: Settings,
+    *,
+    skills_registry: SkillsRegistry | None = None,
+) -> FastMCP:
     """Create the shared FastMCP server with optional persistent per-person access."""
     token = validate_http_settings(settings)
     access = AccessControl(settings) if settings.access_enabled else None
@@ -359,6 +372,29 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
         access.register(server)
     else:
         register_disabled_status(server)
+
+    if skills_registry is not None:
+        async def skills_reader_authorized(request: Request) -> bool:
+            if access is not None:
+                user = await asyncio.to_thread(access.user, request)
+                administrator = await asyncio.to_thread(access.administrator, request)
+                return user is not None or administrator is not None
+            return await skills_manager_authorized(request) or _authorized(request, token)
+
+        async def skills_manager_authorized(request: Request) -> bool:
+            if access is not None:
+                return await asyncio.to_thread(access.administrator, request) is not None
+            if settings.admin_password and settings.admin_password.get_secret_value():
+                return _admin_authorized(request, settings)
+            return _authorized(request, token)
+
+        register_skills_routes(
+            server,
+            skills_registry,
+            reader_authorized=skills_reader_authorized,
+            manager_authorized=skills_manager_authorized,
+            mcp_path=settings.skills_mcp_path,
+        )
 
     async def current_tool_catalog() -> dict[str, object]:
         managed = {item.name: item for item in managed_tools.list()}
@@ -1587,12 +1623,41 @@ def create_http_server(service: KnowledgeService, settings: Settings) -> FastMCP
 
 
 def create_http_app(service: KnowledgeService, settings: Settings) -> ASGIApp:
-    """Build the FastMCP ASGI app for tests or external ASGI servers."""
-    server = create_http_server(service, settings)
-    return server.http_app(
+    """Serve two independent MCP catalogs and the shared dashboard over one listener."""
+    registry = (
+        SkillsRegistry(
+            settings.skills_registry_dir,
+            git_timeout_seconds=settings.repository_git_timeout_seconds,
+        )
+        if settings.skills_registry_enabled else None
+    )
+    server = create_http_server(service, settings, skills_registry=registry)
+    app = server.http_app(
         path=settings.mcp_http_path,
         host_origin_protection=False,
     )
+    if registry is None:
+        return app
+
+    skills_server = create_skills_mcp_server(registry, auth=server.auth)
+    prefix, _, leaf = settings.skills_mcp_path.rpartition("/")
+    skills_app = skills_server.http_app(path=f"/{leaf}", host_origin_protection=False)
+    # ASGI mounting keeps discovery separate. FastMCP.mount() would merge the tools.
+    app.router.routes.insert(0, Mount(prefix, app=skills_app))
+    knowledge_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(application: Starlette) -> AsyncIterator[None]:
+        async with knowledge_lifespan(application), skills_app.lifespan(skills_app):
+            registry.start()
+            try:
+                yield
+            finally:
+                await asyncio.to_thread(registry.stop)
+
+    app.router.lifespan_context = lifespan
+    app.state.skills_registry = registry
+    return app
 
 
 def main(settings: Settings | None = None) -> None:
@@ -1610,7 +1675,7 @@ def main(settings: Settings | None = None) -> None:
         stats.chunk_count,
         stats.embedding_provider,
     )
-    server = create_http_server(service, settings)
+    app = create_http_app(service, settings)
     logger.info(
         "Starting FastMCP %s server on %s:%d%s "
         "(application_authentication=%s, client_certificates=%s)",
@@ -1630,15 +1695,15 @@ def main(settings: Settings | None = None) -> None:
             "share an account, even with different keys. Another CN can register a new account."
         )
     try:
-        server.run(
-            transport="http",
-            show_banner=False,
+        uvicorn_options: dict[str, Any] = dict(tls_config or {})
+        uvicorn.run(
+            app,
             host=settings.mcp_http_host,
             port=settings.mcp_http_port,
-            path=settings.mcp_http_path,
-            log_level=settings.log_level,
-            host_origin_protection=False,
-            uvicorn_config=tls_config,
+            log_level=settings.log_level.lower(),
+            lifespan="on",
+            timeout_graceful_shutdown=5,
+            **uvicorn_options,
         )
     except KeyboardInterrupt:
         return

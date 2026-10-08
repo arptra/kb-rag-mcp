@@ -34,6 +34,7 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
             "analysis_archive_dir": tmp_path / ".cache" / "kb" / "analysis",
             "job_logs_dir": tmp_path / ".cache" / "kb" / "job-logs",
             "ssot_skill_path": tmp_path / "skills" / "build-service-ssot",
+            "skills_registry_dir": tmp_path / ".cache" / "skills-registry",
             "repository_analysis_timeout_seconds": 30,
             "index_build_timeout_seconds": 30,
             "domscribe_enabled": False,

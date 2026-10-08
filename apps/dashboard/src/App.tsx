@@ -49,6 +49,7 @@ const NAV: Array<{ id: Page; label: string; mark: string }> = [
   { id: "services", label: "Сервисы", mark: "▦" },
   { id: "servers", label: "MCP servers", mark: "◉" },
   { id: "tools", label: "MCP tools", mark: "⌁" },
+  { id: "skills", label: "Скиллы", mark: "✦" },
   { id: "graph", label: "Граф системы", mark: "⌘" },
   { id: "operations", label: "Операции и логи", mark: "≡" },
 ];
@@ -65,6 +66,7 @@ const TOOL_SCHEMA = {
 
 const DOCUMENT_PAGE_SIZE = 50;
 const GraphCanvas3D = lazy(() => import("./GraphCanvas3D"));
+const SkillsApp = lazy(() => import("./SkillsApp"));
 const DOCUMENT_ACCEPT = ".md,.markdown,.txt,.html,.htm,.rst,.adoc,.log,.csv,.tsv,.json,.jsonl,.yaml,.yml,.xml,.properties";
 const SERVICE_FACET_KEYS = ["repository", "index", "build", "state", "owner", "interfaces", "submodules"] as const;
 
@@ -661,6 +663,7 @@ export default function App({ secureMode = false, accountName, onSessionLogout }
             />
           )}
           {page === "operations" && <OperationsPage data={overview} password={password} onAction={action} />}
+          {page === "skills" && <Suspense fallback={<div className="panel">Загрузка реестра скиллов…</div>}><SkillsApp password={password} secureMode={secureMode} /></Suspense>}
         </section>
       </main>
 
