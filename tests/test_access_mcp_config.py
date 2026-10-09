@@ -16,6 +16,8 @@ from test_access_proxy import _https_server
 from corporate_kb.access.http import ADMIN_COOKIE, USER_COOKIE
 from corporate_kb.access.store import AccessStore
 from corporate_kb.access.tls import _CertificateScopeApp
+from corporate_kb.mcp.http_server import create_http_app
+from corporate_kb.service import KnowledgeService
 
 pki = http_fixtures.pki
 secured = http_fixtures.secured
@@ -24,19 +26,34 @@ ORIGIN = "https://testserver"
 ENDPOINT = "/auth/mcp-config"
 
 
-def _exported_token(response: httpx.Response, origin: str = ORIGIN, path: str = "/mcp") -> str:
+def _exported_token(
+    response: httpx.Response,
+    origin: str = ORIGIN,
+    path: str = "/mcp",
+    *,
+    skills_path: str | None = "/skills/mcp",
+) -> str:
     assert response.status_code == 200, response.text
     payload = response.json()
     assert set(payload) == {"config", "expires_at", "user"}
     assert isinstance(payload["expires_at"], int)
     assert payload["expires_at"] > time.time()
-    entry = payload["config"]["mcpServers"]["corporate-kb"]
+    servers = payload["config"]["mcpServers"]
+    assert set(servers) == (
+        {"corporate-kb", "corporate-skills"} if skills_path is not None else {"corporate-kb"}
+    )
+    entry = servers["corporate-kb"]
     assert entry["httpUrl"] == origin + path
     assert set(entry) == {"httpUrl", "headers"}
     assert set(entry["headers"]) == {"Authorization"}
     scheme, token = entry["headers"]["Authorization"].split(" ", 1)
     assert scheme == "Bearer"
     assert token
+    if skills_path is not None:
+        assert servers["corporate-skills"] == {
+            "httpUrl": origin + skills_path,
+            "headers": {"Authorization": f"Bearer {token}"},
+        }
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["referrer-policy"] == "no-referrer"
@@ -192,6 +209,20 @@ async def test_exported_config_is_usable_for_mcp_and_api_without_client_certific
                 result = await session.call_tool("kb_stats", {})
                 assert not result.isError
                 assert result.structuredContent["document_count"] == 1
+            skills_entry = response.json()["config"]["mcpServers"]["corporate-skills"]
+            assert skills_entry["headers"] == headers
+            async with (
+                streamable_http_client(skills_entry["httpUrl"], http_client=mcp_client)
+                as (read, write, _),
+                ClientSession(read, write) as session,
+            ):
+                await session.initialize()
+                names = {tool.name for tool in (await session.list_tools()).tools}
+                assert names == {
+                    "skills_search", "skills_get_release", "skills_check_updates",
+                    "skills_prepare_install",
+                }
+                assert "kb_search" not in names
         assert store.verify_user_token(token) is not None
 
 
@@ -199,6 +230,7 @@ async def test_exported_config_is_usable_for_mcp_and_api_without_client_certific
 async def test_export_url_uses_configured_path_and_ignores_forwarding_headers(secured):
     app, settings, _, certificates = secured
     settings.mcp_http_path = "/custom/mcp"
+    settings.skills_mcp_path = "/custom-skills/protocol"
     base = "https://testserver:8443"
     async with (
         app.router.lifespan_context(app),
@@ -217,8 +249,59 @@ async def test_export_url_uses_configured_path_and_ignores_forwarding_headers(se
                 "forwarded": 'host="attacker.example.test";proto=http',
             },
         )
-        _exported_token(response, origin=base, path="/custom/mcp")
+        _exported_token(
+            response, origin=base, path="/custom/mcp", skills_path="/custom-skills/protocol"
+        )
         assert "attacker.example.test" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_enrollment_and_export_advertise_only_enabled_configured_skills_server(
+    secured, enabled
+):
+    _, settings, store, certificates = secured
+    settings.skills_registry_enabled = enabled
+    settings.skills_mcp_path = "/separate-skills/protocol"
+    app = create_http_app(KnowledgeService(settings), settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=_CertificateScopeApp(app, certificates["client"])),
+            base_url=ORIGIN,
+            headers={"origin": ORIGIN},
+        ) as browser,
+    ):
+        enrollment = await browser.post("/auth/token", json={})
+        assert enrollment.status_code == 200
+        assert enrollment.json()["mcp_path"] == "/mcp"
+        if enabled:
+            assert enrollment.json()["skills_mcp_path"] == "/separate-skills/protocol"
+        else:
+            assert "skills_mcp_path" not in enrollment.json()
+        exported = await browser.post(ENDPOINT, json={})
+        token = _exported_token(
+            exported, skills_path="/separate-skills/protocol" if enabled else None
+        )
+        assert store.verify_user_token(token) is not None
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url=ORIGIN,
+            headers={"Authorization": f"Bearer {token}"},
+        ) as mcp_client:
+            if enabled:
+                async with (
+                    streamable_http_client(
+                        ORIGIN + "/separate-skills/protocol", http_client=mcp_client
+                    ) as (read, write, _),
+                    ClientSession(read, write) as session,
+                ):
+                    await session.initialize()
+                    assert "skills_search" in {
+                        tool.name for tool in (await session.list_tools()).tools
+                    }
+            else:
+                absent = await mcp_client.post("/separate-skills/protocol", json={})
+                assert absent.status_code == 404
 
 
 @pytest.mark.asyncio

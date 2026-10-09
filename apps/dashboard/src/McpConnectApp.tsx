@@ -3,13 +3,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { accessApi, accessError } from "./accessApi";
 import type { AccessUser, BrowserAccessStatus } from "./accessTypes";
 
+type McpServerName = "corporate-kb" | "corporate-skills";
+
+interface McpConnection {
+  httpUrl: string;
+  headers: { Authorization: string };
+}
+
 interface PersonalMcpConfig {
   config: {
     mcpServers: {
-      "corporate-kb": {
-        httpUrl: string;
-        headers: { Authorization: string };
-      };
+      "corporate-kb": McpConnection;
+      "corporate-skills"?: McpConnection;
     };
   };
   expires_at: number;
@@ -19,6 +24,7 @@ interface PersonalMcpConfig {
 export default function McpConnectApp() {
   const [status, setStatus] = useState<BrowserAccessStatus | null>(null);
   const [result, setResult] = useState<PersonalMcpConfig | null>(null);
+  const [selectedServers, setSelectedServers] = useState<McpServerName[]>(["corporate-kb", "corporate-skills"]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -26,6 +32,11 @@ export default function McpConnectApp() {
   const pending = useRef<AbortController | null>(null);
   const configField = useRef<HTMLTextAreaElement | null>(null);
   const https = window.location.protocol === "https:";
+  const selectedConfig = result ? {
+    mcpServers: Object.fromEntries(Object.entries(result.config.mcpServers).filter(([name]) => selectedServers.includes(name as McpServerName))),
+  } : null;
+  const hasSelection = !!selectedConfig && Object.keys(selectedConfig.mcpServers).length > 0;
+  const toggleServer = (name: McpServerName) => setSelectedServers(current => current.includes(name) ? current.filter(item => item !== name) : [...current, name]);
 
   const check = useCallback(async () => {
     const request = ++generation.current;
@@ -75,7 +86,7 @@ export default function McpConnectApp() {
       const remaining = result.expires_at * 1000 - Date.now();
       if (remaining <= 0) {
         setResult(null);
-        setNotice("Срок действия токена истёк. Нажмите «Получить MCP-конфиг» и обновите запись corporate-kb в настройках клиента.");
+        setNotice("Срок действия токена истёк. Нажмите «Получить MCP-конфиг» и обновите подключённые корпоративные MCP в настройках клиента.");
       } else {
         timer = window.setTimeout(expire, Math.min(remaining, 2_147_483_647));
       }
@@ -105,6 +116,7 @@ export default function McpConnectApp() {
       if (!Number.isFinite(response.expires_at) || response.expires_at * 1000 <= Date.now()) {
         throw new Error("Сервер вернул истёкший срок токена. Повторите запрос или обратитесь к администратору.");
       }
+      setSelectedServers(response.config.mcpServers["corporate-skills"] ? ["corporate-kb", "corporate-skills"] : ["corporate-kb"]);
       setResult(response);
     } catch (caught) {
       if (request === generation.current) setError(accessError(caught));
@@ -114,13 +126,13 @@ export default function McpConnectApp() {
   };
 
   const copy = async () => {
-    if (!result || result.expires_at * 1000 <= Date.now()) return;
+    if (!result || !selectedConfig || !hasSelection || result.expires_at * 1000 <= Date.now()) return;
     const request = generation.current;
     setError("");
     try {
       if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
-      await navigator.clipboard.writeText(JSON.stringify(result.config, null, 2));
-      if (request === generation.current) setNotice("Конфиг скопирован. Вставьте только запись corporate-kb в раздел mcpServers вашего клиента; остальные подключения сохраните.");
+      await navigator.clipboard.writeText(JSON.stringify(selectedConfig, null, 2));
+      if (request === generation.current) setNotice(`Конфиг скопирован. Добавьте выбранные подключения (${Object.keys(selectedConfig.mcpServers).join(", ")}) в mcpServers вашего клиента; остальные подключения сохраните.`);
     } catch {
       if (request !== generation.current) return;
       configField.current?.focus();
@@ -130,16 +142,16 @@ export default function McpConnectApp() {
   };
 
   const download = () => {
-    if (!result || result.expires_at * 1000 <= Date.now()) return;
-    const file = new Blob([`${JSON.stringify(result.config, null, 2)}\n`], { type: "application/json;charset=utf-8" });
+    if (!result || !selectedConfig || !hasSelection || result.expires_at * 1000 <= Date.now()) return;
+    const file = new Blob([`${JSON.stringify(selectedConfig, null, 2)}\n`], { type: "application/json;charset=utf-8" });
     const url = URL.createObjectURL(file);
     const anchor = document.createElement("a");
     try {
       anchor.href = url;
-      anchor.download = "corporate-kb.mcp.json";
+      anchor.download = "corporate-mcp.json";
       document.body.appendChild(anchor);
       anchor.click();
-      setNotice("Скачивание corporate-kb.mcp.json начато. Файл содержит секрет: храните его локально и не добавляйте в Git.");
+      setNotice("Скачивание corporate-mcp.json начато. Файл содержит выбранные подключения и секрет: храните его локально и не добавляйте в Git.");
     } finally {
       anchor.remove();
       // Let the browser begin the user-requested download before releasing the URL.
@@ -148,7 +160,7 @@ export default function McpConnectApp() {
   };
 
   const canIssue = https && status?.enabled && status.certificate_present && !busy;
-  const configText = result ? JSON.stringify(result.config, null, 2) : "";
+  const configText = selectedConfig ? JSON.stringify(selectedConfig, null, 2) : "";
 
   return (
     <div className="access-shell connect-shell">
@@ -158,7 +170,7 @@ export default function McpConnectApp() {
       </header>
       <main className="access-main connect-main">
         <div className="access-intro"><div><span className="eyebrow">Персональное подключение</span><h1>Подключить MCP</h1><p>Выберите существующий личный сертификат в браузере и получите конфиг для AI-клиента. Учётная запись определяется по CN (Common Name), без Python и локальных скриптов.</p></div></div>
-        <ol className="connect-steps" aria-label="Порядок подключения"><li><span>1</span><div><b>Выберите личный сертификат</b><small>Сервис прочитает имя пользователя из CN.</small></div></li><li><span>2</span><div><b>Получите персональный конфиг</b><small>Токен появится только после нажатия кнопки.</small></div></li><li><span>3</span><div><b>Добавьте запись в MCP-клиент</b><small>Сохраните остальные подключения.</small></div></li></ol>
+        <ol className="connect-steps" aria-label="Порядок подключения"><li><span>1</span><div><b>Выберите личный сертификат</b><small>Сервис прочитает имя пользователя из CN.</small></div></li><li><span>2</span><div><b>Получите персональный конфиг</b><small>Токен появится только после нажатия кнопки.</small></div></li><li><span>3</span><div><b>Добавьте выбранные MCP</b><small>База знаний и скиллы подключаются отдельно.</small></div></li></ol>
         <section className="access-section connect-panel" aria-labelledby="connect-access-title">
           <div className="access-section-head"><div><h2 id="connect-access-title">Проверка доступа</h2><p>Вход в дашборд не заменяет личный сертификат при получении MCP-конфига.</p></div><span className={`access-status ${canIssue || result ? "active" : "expired"}`}>{busy ? "Проверяем…" : !https ? "Нужен HTTPS" : !status ? "Нет статуса" : !status.enabled ? "Отключено" : status.certificate_present ? "Сертификат с CN получен" : "Нужен сертификат с CN"}</span></div>
           <div className="connect-access-body">
@@ -169,7 +181,7 @@ export default function McpConnectApp() {
             {status?.user && <div className="access-account-identity"><small>Учётная запись{status.user.common_name ? " · CN" : ""}</small><b>{status.user.common_name || status.user.subject || status.user.id}</b></div>}
             {import.meta.env.DEV && <p className="connect-dev-note">Предпросмотр Vite не передаёт клиентский TLS-сертификат. Для получения конфига используйте собранную страницу /connect непосредственно на HTTPS-порту backend.</p>}
             <div className="connect-actions"><button className="button primary" disabled={!canIssue} onClick={() => void issue()}>{busy ? "Подождите…" : "Получить MCP-конфиг"}</button><button className="button secondary" disabled={busy} onClick={() => void check()}>Повторить проверку</button></div>
-            <p className="connect-help">Одинаковый CN означает одну учётную запись независимо от издателя и отпечатка сертификата. Токен действует до своего срока истечения или отзыва. После истечения получите конфиг снова и обновите запись в клиенте. Заблокированного пользователя может восстановить только администратор.</p>
+            <p className="connect-help">Одинаковый CN означает одну учётную запись независимо от издателя и отпечатка сертификата. Токен действует до своего срока истечения или отзыва. После истечения получите конфиг снова и обновите выбранные подключения в клиенте. Заблокированного пользователя может восстановить только администратор.</p>
           </div>
           {error && <div className="form-error" role="alert">{error}</div>}
           {notice && <div className="access-notice" role="status">{notice}</div>}
@@ -180,10 +192,37 @@ export default function McpConnectApp() {
             <details className="connect-certificate-details"><summary>Последний сертификат · справочные данные</summary><p>Subject: {result.user.subject || "—"}</p><p>Издатель: {result.user.issuer || "—"}</p><p>SHA-256: <code>{result.user.fingerprint || "—"}</code></p><small>Эти сведения не определяют учётную запись или роль администратора.</small></details>
             <div className="connect-secret-warning"><b>Внутри — секретный токен доступа.</b><span>Не отправляйте этот JSON в чат, не публикуйте его и не коммитьте в Git. Скачанный файл и содержимое буфера обмена остаются у вас даже после закрытия страницы.</span></div>
             <p className="connect-expiry">Действует до <time dateTime={new Date(result.expires_at * 1000).toISOString()}>{new Date(result.expires_at * 1000).toLocaleString("ru-RU")}</time> · время вашего устройства</p>
+            <div className="connect-merge-note connect-server-selection" role="group" aria-label="Сервисы для подключения">
+              <b>Выберите MCP-серверы</b>
+              <p>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={selectedServers.includes("corporate-kb")}
+                    onChange={() => toggleServer("corporate-kb")}
+                  />
+                  <span>База знаний — corporate-kb</span>
+                </label>
+              </p>
+              {result.config.mcpServers["corporate-skills"] && <p>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={selectedServers.includes("corporate-skills")}
+                    onChange={() => toggleServer("corporate-skills")}
+                  />
+                  <span>Скиллы — corporate-skills</span>
+                </label>
+              </p>}
+              <p>{result.config.mcpServers["corporate-skills"]
+                ? "Это два отдельных MCP с разными инструментами. Можно подключить оба или выбрать только скиллы. Авторизация уже добавлена в каждую запись."
+                : "Сервер скиллов отключён администратором; доступна база знаний."}</p>
+              {!hasSelection && <p role="status">Выберите хотя бы один сервер для копирования или скачивания.</p>}
+            </div>
             <label className="connect-json-label" htmlFor="personal-mcp-config">JSON для MCP-клиента</label>
             <textarea ref={configField} id="personal-mcp-config" className="connect-json" value={configText} readOnly spellCheck={false} autoComplete="off" aria-describedby="connect-merge-note" />
-            <div className="connect-actions"><button className="button primary" onClick={() => void copy()}>Скопировать JSON</button><button className="button secondary" onClick={download}>Скачать corporate-kb.mcp.json</button><button className="button quiet" onClick={() => { ++generation.current; setResult(null); setNotice("Конфиг скрыт. Токен остаётся действительным; для отзыва обратитесь к администратору."); }}>Скрыть конфиг</button></div>
-            <div className="connect-merge-note" id="connect-merge-note"><b>Не заменяйте весь файл настроек клиента.</b><p>Добавьте или обновите только <code>mcpServers["corporate-kb"]</code> в существующих настройках MCP. Другие серверы и настройки оставьте без изменений. Затем сохраните настройки и переподключите MCP в клиенте.</p><p>Эта страница не изменяет файлы на вашем компьютере автоматически. Формат конфигурации поддерживается клиентами с полями <code>mcpServers</code>, <code>httpUrl</code> и <code>headers</code>.</p></div>
+            <div className="connect-actions"><button className="button primary" disabled={!hasSelection} onClick={() => void copy()}>Скопировать JSON</button><button className="button secondary" disabled={!hasSelection} onClick={download}>Скачать corporate-mcp.json</button><button className="button quiet" onClick={() => { ++generation.current; setResult(null); setNotice("Конфиг скрыт. Токен остаётся действительным; для отзыва обратитесь к администратору."); }}>Скрыть конфиг</button></div>
+            <div className="connect-merge-note" id="connect-merge-note"><b>Не заменяйте весь файл настроек клиента.</b><p>Добавьте или обновите выбранные записи <code>corporate-kb</code>{result.config.mcpServers["corporate-skills"] && <> и <code>corporate-skills</code></>} внутри <code>mcpServers</code>. Другие серверы и настройки оставьте без изменений. Затем сохраните настройки и переподключите MCP в клиенте.</p><p>Эта страница не изменяет файлы на вашем компьютере автоматически. Формат конфигурации поддерживается клиентами с полями <code>mcpServers</code>, <code>httpUrl</code> и <code>headers</code>.</p></div>
             <p className="connect-help">Конфиг хранится только в памяти этой страницы и скрывается при переключении вкладки, уходе со страницы, повторной проверке или истечении токена. Скрытие и выход из дашборда не отзывают скопированный или скачанный MCP-токен. Для отзыва отдельного токена или блокировки всего доступа обратитесь к администратору.</p>
           </div>
         </section>}

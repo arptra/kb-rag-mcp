@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +73,25 @@ def first_skill(registry: SkillsRegistry) -> dict[str, Any]:
     return registry.list_skills()["skills"][0]
 
 
+def test_warning_schema_migration_preserves_existing_releases(
+    registry: SkillsRegistry, repository: Path,
+) -> None:
+    source = add_source(registry, repository)
+    registry.sync_now(source["id"])
+    skill = first_skill(registry)
+    original = registry.get_release(skill["id"])
+    with registry._connect() as connection:
+        connection.execute("ALTER TABLE sources DROP COLUMN last_warnings_json")
+    reader = SkillsRegistry(registry.root, read_only=True)
+    assert reader.list_sources()[0]["last_warnings"] == []
+    migrated = SkillsRegistry(registry.root)
+    assert migrated.list_sources()[0]["last_warnings"] == []
+    assert migrated.get_release(skill["id"]) == original
+    with migrated._connect() as connection:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(sources)")}
+    assert "last_warnings_json" in columns
+
+
 def test_content_versions_include_support_files_and_ignore_unrelated_commits(
     registry: SkillsRegistry,
     repository: Path,
@@ -118,21 +138,30 @@ def test_invalid_source_update_preserves_all_published_snapshots(
     registry: SkillsRegistry,
     repository: Path,
 ) -> None:
-    source = add_source(registry, repository)
+    source = add_source(registry, repository, interval_minutes=1)
     registry.sync_now(source["id"])
     skill = first_skill(registry)
     release = registry.get_release(skill["id"])
     last_success = registry.list_sources()[0]["last_success_at"]
     (repository / "skills/example/SKILL.md").write_text("No YAML metadata\n")
     commit(repository)
-    failed = registry.sync_now(source["id"])
-    assert failed["status"] == "failed"
-    assert "frontmatter" in failed["error"]
+    partial = registry.sync_now(source["id"])
+    assert partial["status"] == "succeeded_with_warnings"
+    assert partial["error"] is None
+    assert partial["result"]["valid"] == 0
+    assert partial["result"]["skipped"] == 1
+    assert "frontmatter" in partial["result"]["warnings"][0]["error"]
     assert registry.get_release(skill["id"]) == release
     source = registry.list_sources()[0]
     assert source["last_success_at"] == last_success
-    assert source["last_error"]
-    assert source["failure_count"] == 1
+    assert source["last_error"] is None
+    assert source["last_warnings"] == partial["result"]["warnings"]
+    assert source["failure_count"] == 0
+    scheduled_delay = (
+        datetime.fromisoformat(source["next_check_at"])
+        - datetime.fromisoformat(source["last_checked_at"])
+    ).total_seconds()
+    assert 59 <= scheduled_delay <= 61
 
 
 def test_manual_publish_candidates_rollback_and_client_update_status(
@@ -201,8 +230,9 @@ def test_symlink_cannot_escape_package_and_previous_release_remains(
     (repository / "skills/example/references/escape").symlink_to("/etc/passwd")
     commit(repository)
     job = registry.sync_now(source["id"])
-    assert job["status"] == "failed"
-    assert "Symlink" in job["error"]
+    assert job["status"] == "succeeded_with_warnings"
+    assert job["result"]["skipped"] == 1
+    assert "symlink" in job["result"]["warnings"][0]["error"].lower()
     assert registry.get_release(skill["id"]) == release
     with pytest.raises(ValueError, match="Path"):
         registry.read_file(skill["id"], release["revision"], "../SKILL.md")
@@ -420,7 +450,7 @@ def test_enabling_auto_publish_publishes_existing_candidate(
     assert registry.get_release(skill["id"])["revision"] == skill["latest_revision"]
 
 
-def test_invalid_one_of_many_packages_is_atomic(
+def test_invalid_new_package_does_not_block_a_valid_update(
     registry: SkillsRegistry,
     repository: Path,
 ) -> None:
@@ -432,9 +462,249 @@ def test_invalid_one_of_many_packages_is_atomic(
     (bad / "SKILL.md").write_text("---\nname: bad\n---\nNo description")
     commit(repository)
     job = registry.sync_now(source["id"])
-    assert job["status"] == "failed"
+    assert job["status"] == "succeeded_with_warnings"
+    assert job["result"]["valid"] == 1
+    assert job["result"]["skipped"] == 1
+    assert job["result"]["created"] == 1
     assert registry.list_skills()["total"] == 1
-    assert registry.get_release(first_skill(registry)["id"]) == original
+    latest = registry.get_release(first_skill(registry)["id"])
+    assert latest["revision"] != original["revision"]
+    assert registry.get_release(original["skill_id"], original["revision"]) == original
+
+
+def test_partial_scan_keeps_invalid_package_publication_candidate_and_client_pin(
+    registry: SkillsRegistry,
+    repository: Path,
+) -> None:
+    old_bad = write_skill(repository, "skills/old-bad")
+    commit(repository)
+    source = add_source(registry, repository)
+    assert registry.sync_now(source["id"])["status"] == "succeeded"
+    skills = {skill["path"]: skill for skill in registry.list_skills()["skills"]}
+    original = registry.get_release(skills["old-bad"]["id"])
+    healthy_original = registry.get_release(skills["example"]["id"])
+    registry.save_source({"id": source["id"], "auto_publish": False})
+    write_skill(repository, "skills/old-bad", body="Unpublished candidate")
+    commit(repository)
+    registry.sync_now(source["id"])
+    candidate = registry.skill_detail(original["skill_id"])["skill"]["latest_revision"]
+    assert candidate != original["revision"]
+    registry.save_source({"id": source["id"], "auto_publish": True})
+
+    (old_bad / "SKILL.md").write_text("Broken existing package\n")
+    new_bad = write_skill(repository, "skills/new-bad")
+    (new_bad / "SKILL.md").write_text("---\nname: new-bad\n---\nMissing description\n")
+    write_skill(repository, body="Healthy package update")
+    commit(repository)
+    job = registry.sync_now(source["id"])
+
+    assert job["status"] == "succeeded_with_warnings"
+    assert job["result"]["discovered"] == 3
+    assert job["result"]["valid"] == 1
+    assert job["result"]["skipped"] == 2
+    assert job["result"]["retired"] == 0
+    assert {warning["relative_path"] for warning in job["result"]["warnings"]} == {
+        "old-bad",
+        "new-bad",
+    }
+    assert registry.list_skills()["total"] == 2
+    preserved = registry.skill_detail(original["skill_id"])["skill"]
+    assert preserved["published_revision"] == original["revision"]
+    assert preserved["latest_revision"] == candidate
+    assert not preserved["retired"]
+    assert registry.get_release(original["skill_id"]) == original
+    assert (
+        registry.get_release(healthy_original["skill_id"])["revision"]
+        != healthy_original["revision"]
+    )
+    update = registry.check_updates(
+        [
+            {
+                "skill_id": original["skill_id"],
+                "revision": original["revision"],
+                "pinned": True,
+            }
+        ]
+    )["updates"][0]
+    assert update["status"] == "current"
+    assert not update["update_available"]
+    assert len(registry.skill_detail(original["skill_id"])["versions"]) == 2
+
+
+def test_partial_scan_can_retire_an_actually_deleted_unrelated_skill(
+    registry: SkillsRegistry,
+    repository: Path,
+) -> None:
+    write_skill(repository, "skills/broken")
+    write_skill(repository, "skills/deleted")
+    commit(repository)
+    source = add_source(registry, repository)
+    registry.sync_now(source["id"])
+    before = {skill["path"]: skill for skill in registry.list_skills()["skills"]}
+    (repository / "skills/broken/SKILL.md").write_text("Invalid metadata\n")
+    git(repository, "rm", "-r", "skills/deleted")
+    commit(repository)
+
+    job = registry.sync_now(source["id"])
+    assert job["status"] == "succeeded_with_warnings"
+    assert job["result"]["retired"] == 1
+    assert not registry.skill_detail(before["broken"]["id"])["skill"]["retired"]
+    assert registry.skill_detail(before["deleted"]["id"])["skill"]["retired"]
+    assert registry.get_release(before["deleted"]["id"], before["deleted"]["published_revision"])
+    assert registry.list_skills(published_only=True)["total"] == 2
+
+
+@pytest.mark.parametrize("invalid_parent", [".", "group"])
+def test_invalid_parent_preserves_previously_published_descendants(
+    registry: SkillsRegistry,
+    repository: Path,
+    invalid_parent: str,
+) -> None:
+    write_skill(repository, "skills/group/child")
+    commit(repository)
+    source = add_source(registry, repository)
+    registry.sync_now(source["id"])
+    original = {
+        skill["path"]: registry.get_release(skill["id"])
+        for skill in registry.list_skills()["skills"]
+    }
+    (repository / "skills" / invalid_parent / "SKILL.md").write_text("Broken parent package\n")
+    write_skill(repository, body="Healthy sibling update")
+    commit(repository)
+
+    job = registry.sync_now(source["id"])
+    assert job["status"] == "succeeded_with_warnings"
+    assert job["result"]["warnings"][0]["relative_path"] == invalid_parent
+    assert job["result"]["retired"] == 0
+    assert registry.get_release(original["group/child"]["skill_id"]) == original["group/child"]
+    healthy = registry.get_release(original["example"]["skill_id"])
+    if invalid_parent == ".":
+        assert job["result"]["valid"] == 0
+        assert healthy == original["example"]
+    else:
+        assert job["result"]["valid"] == 1
+        assert healthy["revision"] != original["example"]["revision"]
+
+
+def test_warnings_survive_restart_and_clear_after_recovery(
+    registry: SkillsRegistry,
+    repository: Path,
+) -> None:
+    source = add_source(registry, repository)
+    registry.sync_now(source["id"])
+    successful_at = registry.list_sources()[0]["last_success_at"]
+    (repository / "skills/example/SKILL.md").write_text("Missing metadata\n")
+    commit(repository)
+    partial = registry.sync_now(source["id"])
+
+    reopened = SkillsRegistry(registry.root)
+    assert reopened.get_job(partial["id"])["result"]["warnings"] == partial["result"]["warnings"]
+    assert reopened.list_sources()[0]["last_warnings"] == partial["result"]["warnings"]
+    assert reopened.list_sources()[0]["last_success_at"] == successful_at
+    write_skill(repository, body="Recovered package")
+    commit(repository)
+    recovered = reopened.sync_now(source["id"])
+    assert recovered["status"] == "succeeded"
+    assert recovered["result"]["warnings"] == []
+    assert recovered["result"]["skipped"] == 0
+    final_source = reopened.list_sources()[0]
+    assert final_source["last_warnings"] == []
+    assert final_source["last_error"] is None
+    assert final_source["last_success_at"] == final_source["last_checked_at"]
+    assert final_source["last_success_at"] != successful_at
+
+
+def test_preview_returns_valid_packages_and_warnings_without_persisting_them(
+    registry: SkillsRegistry,
+    repository: Path,
+) -> None:
+    bad = write_skill(repository, "skills/bad")
+    (bad / "SKILL.md").write_text("---\nname: bad\n---\nMissing description\n")
+    commit(repository)
+    result = registry.validate_source({"name": "Preview", "git_url": repository.as_uri()})
+    assert [skill["relative_path"] for skill in result["skills"]] == ["example"]
+    assert result["skipped"] == 1
+    assert result["discovered"] == 2
+    assert result["warnings"][0]["relative_path"] == "bad"
+    assert "description" in result["warnings"][0]["error"]
+    assert registry.list_sources() == []
+    assert registry.list_jobs() == []
+    assert registry.list_skills()["total"] == 0
+
+
+def test_pending_auto_publication_recovers_skipped_candidate_without_reverting_rollback(
+    registry: SkillsRegistry,
+    repository: Path,
+) -> None:
+    write_skill(repository, "skills/retry")
+    commit(repository)
+    source = add_source(registry, repository)
+    registry.sync_now(source["id"])
+    original = {skill["path"]: skill for skill in registry.list_skills()["skills"]}
+    registry.save_source({"id": source["id"], "auto_publish": False})
+    write_skill(repository, body="Healthy candidate")
+    write_skill(repository, "skills/retry", body="Retry candidate")
+    commit(repository)
+    registry.sync_now(source["id"])
+    candidates = {skill["path"]: skill for skill in registry.list_skills()["skills"]}
+    retry_markdown = (repository / "skills/retry/SKILL.md").read_bytes()
+    (repository / "skills/retry/SKILL.md").write_text("Temporarily invalid\n")
+    commit(repository)
+    registry.save_source({"id": source["id"], "auto_publish": True})
+    assert registry.sync_now(source["id"])["status"] == "succeeded_with_warnings"
+    assert (
+        registry.get_release(original["example"]["id"])["revision"]
+        == candidates["example"]["latest_revision"]
+    )
+    assert (
+        registry.get_release(original["retry"]["id"])["revision"]
+        == original["retry"]["published_revision"]
+    )
+
+    registry.publish(original["example"]["id"], original["example"]["published_revision"])
+    repeated = registry.sync_now(source["id"])
+    assert repeated["status"] == "succeeded_with_warnings"
+    assert repeated["result"]["published"] == 0
+    assert (
+        registry.get_release(original["example"]["id"])["revision"]
+        == original["example"]["published_revision"]
+    )
+    (repository / "skills/retry/SKILL.md").write_bytes(retry_markdown)
+    commit(repository)
+    recovered = registry.sync_now(source["id"])
+    assert recovered["status"] == "succeeded"
+    assert recovered["result"]["published"] == 1
+    assert (
+        registry.get_release(original["retry"]["id"])["revision"]
+        == candidates["retry"]["latest_revision"]
+    )
+    assert (
+        registry.get_release(original["example"]["id"])["revision"]
+        == original["example"]["published_revision"]
+    )
+    assert not registry.list_sources()[0]["publish_pending"]
+
+
+def test_enabling_auto_publish_after_existing_warnings_publishes_healthy_candidates(
+    registry: SkillsRegistry,
+    repository: Path,
+) -> None:
+    write_skill(repository, "skills/bad")
+    commit(repository)
+    source = add_source(registry, repository, auto_publish=False)
+    registry.sync_now(source["id"])
+    healthy = next(
+        skill for skill in registry.list_skills()["skills"] if skill["path"] == "example"
+    )
+    (repository / "skills/bad/SKILL.md").write_text("Broken metadata\n")
+    commit(repository)
+    assert registry.sync_now(source["id"])["status"] == "succeeded_with_warnings"
+    registry.save_source({"id": source["id"], "auto_publish": True})
+
+    result = registry.sync_now(source["id"])
+    assert result["status"] == "succeeded_with_warnings"
+    assert result["result"]["published"] == 1
+    assert registry.get_release(healthy["id"])["revision"] == healthy["latest_revision"]
 
 
 def test_binary_assets_and_executable_script_mode_are_part_of_revision(

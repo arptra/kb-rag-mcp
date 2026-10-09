@@ -1,3 +1,9 @@
+export interface SkillScanWarning {
+  relative_path: string;
+  path: string;
+  error: string;
+}
+
 export interface SkillSource {
   id: string;
   name: string;
@@ -13,9 +19,18 @@ export interface SkillSource {
   last_success_at?: string | null;
   next_check_at?: string | null;
   last_error?: string | null;
+  last_warnings?: SkillScanWarning[];
 }
 
 export type SkillSourceInput = Pick<SkillSource, "name" | "git_url" | "ref" | "skills_path" | "recursive" | "enabled" | "interval_minutes" | "auto_publish"> & { id?: string };
+
+export interface SkillSourcePreview {
+  skills: Array<{ name: string; description: string; relative_path: string }>;
+  discovered?: number;
+  skipped?: number;
+  warnings?: SkillScanWarning[];
+  errors?: unknown[];
+}
 
 export interface RegistrySkill {
   skill_id: string;
@@ -63,7 +78,15 @@ export interface SkillsJob {
   started_at?: string;
   finished_at?: string;
   error?: string | null;
-  result?: { discovered?: number; created?: number; published?: number; retired?: number };
+  result?: {
+    discovered?: number;
+    valid?: number;
+    skipped?: number;
+    warnings?: SkillScanWarning[];
+    created?: number;
+    published?: number;
+    retired?: number;
+  };
 }
 
 export interface SkillsConnection {

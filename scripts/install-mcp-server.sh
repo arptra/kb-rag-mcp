@@ -81,6 +81,7 @@ cp "${project_root}/scripts/setup-pip.sh" "${install_dir}/scripts/setup-pip.sh"
 cp "${project_root}/scripts/activate-venv.sh" "${install_dir}/scripts/activate-venv.sh"
 cp "${project_root}/scripts/dev.sh" "${install_dir}/scripts/dev.sh"
 cp "${project_root}/scripts/start-mcp.sh" "${install_dir}/scripts/start-mcp.sh"
+cp "${project_root}/scripts/start-skills-mcp.sh" "${install_dir}/scripts/start-skills-mcp.sh"
 cp "${project_root}/scripts/start-mcp-http.sh" "${install_dir}/scripts/start-mcp-http.sh"
 cp "${project_root}/scripts/rag-low-context.sh" "${install_dir}/scripts/rag-low-context.sh"
 chmod +x "${install_dir}/scripts/"*.sh
@@ -100,7 +101,8 @@ if [[ ! -x "${install_dir}/.venv/bin/python" ]]; then
   exit 0
 fi
 
-printf '\nInstallation complete. Add this entry to GigaCode settings.json:\n\n'
+printf '\nInstallation complete. Merge the needed mcpServers entries into GigaCode settings.json:\n'
+printf 'For Skills, set KB_SKILLS_REGISTRY_DIR in the installation .env to the existing dashboard registry.\n\n'
 "${install_dir}/.venv/bin/python" -c '
 import json
 import sys
@@ -130,5 +132,19 @@ entry = {
     "timeout": 120000,
     "trust": False,
 }
-print(json.dumps({"local-corporate-kb": entry}, ensure_ascii=False, indent=2))
+skills_entry = {
+    "command": f"{root}/.venv/bin/python",
+    "args": ["-m", "skill_registry.mcp_server"],
+    "cwd": root,
+    "env": {
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": f"{root}/src",
+    },
+    "timeout": 30000,
+    "trust": False,
+}
+print(json.dumps({"mcpServers": {
+    "local-corporate-kb": entry, "corporate-skills": skills_entry,
+}}, ensure_ascii=False, indent=2))
 ' "${install_dir}"

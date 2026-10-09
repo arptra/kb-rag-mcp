@@ -140,6 +140,7 @@ def _existing_entry(
     *,
     replace: bool,
     transport: str = "http",
+    service: str = "kb",
 ) -> tuple[dict[str, Any], str | None]:
     if not name.strip() or any(ord(char) < 32 or ord(char) == 127 for char in name):
         raise EnrollmentError("MCP server name must be nonempty and contain no control characters.")
@@ -153,7 +154,7 @@ def _existing_entry(
     ):
         raise EnrollmentError("Existing MCP headers must be a JSON object containing strings.")
     same_origin = False
-    managed_stdio = _is_managed_stdio(existing, server_origin, name)
+    managed_stdio = _is_managed_stdio(existing, server_origin, name, service)
     if managed_stdio and transport == "stdio":
         environment = existing.get("env", {})
         if not isinstance(environment, dict):
@@ -172,7 +173,8 @@ def _existing_entry(
     )
     if conflict and not replace:
         raise EnrollmentError(
-            "Existing MCP entry uses another origin or transport; use --replace to replace it."
+            "Existing MCP entry uses another origin, transport or service; "
+            "use --replace to replace it."
         )
     bearer = None
     if same_origin:
@@ -184,7 +186,7 @@ def _existing_entry(
     return copy.deepcopy(existing), bearer
 
 
-def _is_managed_stdio(entry: dict[str, Any], origin: str, name: str) -> bool:
+def _is_managed_stdio(entry: dict[str, Any], origin: str, name: str, service: str = "kb") -> bool:
     args = entry.get("args")
     if (
         entry.get("command") != sys.executable
@@ -196,9 +198,14 @@ def _is_managed_stdio(entry: dict[str, Any], origin: str, name: str) -> bool:
     ):
         return False
     try:
+        if args.count("--service") > 1:
+            return False
+        # Entries created before service selection always connected to the knowledge MCP.
+        saved_service = args[args.index("--service") + 1] if "--service" in args else "kb"
         return bool(
             args[args.index("--server-url") + 1] == origin
             and args[args.index("--name") + 1] == name
+            and saved_service == service
         )
     except (ValueError, IndexError):
         return False
@@ -206,6 +213,31 @@ def _is_managed_stdio(entry: dict[str, Any], origin: str, name: str) -> bool:
 
 def _valid_token(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", value))
+
+
+def _service_name(service: str, name: str | None) -> str:
+    if service not in {"kb", "skills"}:
+        raise EnrollmentError("Service must be kb or skills.")
+    return name if name is not None else f"corporate-{service}"
+
+
+def _valid_mcp_path(value: object) -> TypeGuard[str]:
+    return (
+        isinstance(value, str)
+        and bool(re.fullmatch(r"/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*/?", value))
+        and not any(segment in {".", ".."} for segment in value.split("/"))
+    )
+
+
+def _service_path(payload: dict[str, Any], service: str) -> str:
+    path = payload.get("skills_mcp_path" if service == "skills" else "mcp_path")
+    if service == "skills" and path is None:
+        raise EnrollmentError(
+            "Skills MCP is not advertised by this server; enable it or update the server first."
+        )
+    if not _valid_mcp_path(path) or (service == "skills" and path == payload.get("mcp_path")):
+        raise EnrollmentError("Server returned an invalid enrollment response.")
+    return path
 
 
 def _enroll(
@@ -255,8 +287,7 @@ def _enroll(
         or not isinstance(expiry, int)
         or isinstance(expiry, bool)
         or expiry <= time.time()
-        or not isinstance(path, str)
-        or not re.fullmatch(r"/(?:[A-Za-z0-9_-]+/?)+", path)
+        or not _valid_mcp_path(path)
     ):
         raise EnrollmentError("Server returned an invalid enrollment response.")
     return payload
@@ -300,17 +331,26 @@ def connect_client(
     key: Path,
     config: Path,
     ca: Path | None = None,
-    name: str = "corporate-kb",
+    name: str | None = None,
     replace: bool = False,
     transport: str = "http",
+    service: str = "kb",
 ) -> tuple[Path, int]:
     """Enroll over mTLS, then merge a bearer credential into one local MCP entry."""
     origin = _https_origin(server_url, base_only=True)
+    name = _service_name(service, name)
     if transport not in {"http", "stdio"}:
         raise EnrollmentError("Transport must be http or stdio.")
     snapshot = read_config(config)
-    entry, bearer = _existing_entry(snapshot, name, origin, replace=replace, transport=transport)
+    entry, bearer = _existing_entry(
+        snapshot, name, origin, replace=replace, transport=transport, service=service
+    )
     payload = _enroll(origin, cert, key, ca, bearer)
+    endpoint = origin + _service_path(payload, service)
+    if "httpUrl" in entry and not replace and entry["httpUrl"] != endpoint:
+        raise EnrollmentError(
+            "Existing MCP entry targets another endpoint or service; use --replace to replace it."
+        )
     if replace:
         for field in INCOMPATIBLE_ENTRY_FIELDS:
             entry.pop(field, None)
@@ -321,7 +361,7 @@ def connect_client(
             if key.lower() != "authorization"
         }
         headers["Authorization"] = f"Bearer {payload['access_token']}"
-        entry.update(httpUrl=origin + payload["mcp_path"], headers=headers)
+        entry.update(httpUrl=endpoint, headers=headers)
     else:
         entry.pop("httpUrl", None)
         entry.pop("headers", None)
@@ -339,6 +379,8 @@ def connect_client(
             str(snapshot.path),
             "--name",
             name,
+            "--service",
+            service,
         ]
         if ca is not None:
             args += ["--ca", str(ca.expanduser().absolute())]
@@ -389,18 +431,23 @@ def proxy_client(
     key: Path,
     config: Path,
     ca: Path | None = None,
-    name: str = "corporate-kb",
+    name: str | None = None,
+    service: str = "kb",
 ) -> None:
     """Refresh the saved credential at each stdio startup before opening remote MCP."""
     origin = _https_origin(server_url, base_only=True)
+    name = _service_name(service, name)
     snapshot = read_config(config)
-    entry, bearer = _existing_entry(snapshot, name, origin, replace=False, transport="stdio")
-    if not _is_managed_stdio(entry, origin, name):
+    entry, bearer = _existing_entry(
+        snapshot, name, origin, replace=False, transport="stdio", service=service
+    )
+    if not _is_managed_stdio(entry, origin, name, service):
         raise EnrollmentError(
             "Proxy entry is missing or changed; run connect --transport stdio first."
         )
     # Read the newest saved value, not a potentially stale inherited process environment.
     payload = _enroll(origin, cert, key, ca, bearer)
+    endpoint = origin + _service_path(payload, service)
     if bearer != payload["access_token"]:
         entry["env"][TOKEN_ENV] = payload["access_token"]
         document = copy.deepcopy(snapshot.document)
@@ -410,7 +457,7 @@ def proxy_client(
         raw, identity = _read_regular(snapshot.path)
         if raw != snapshot.raw or identity != snapshot.identity:
             raise EnrollmentError("Config changed during enrollment; reconnect the client.")
-    _run_proxy(origin + payload["mcp_path"], payload["access_token"], ca)
+    _run_proxy(endpoint, payload["access_token"], ca)
 
 
 @app.callback()
@@ -425,11 +472,14 @@ def connect(
     key: Annotated[Path, typer.Option(help="Local PEM private key; never uploaded.")],
     config: Annotated[Path, typer.Option(help="Explicit local MCP JSON settings file.")],
     ca: Annotated[Path | None, typer.Option(help="Server CA bundle, or system trust.")] = None,
-    name: Annotated[str, typer.Option(help="Entry name within mcpServers.")] = "corporate-kb",
+    name: Annotated[
+        str | None, typer.Option(help="MCP entry name; default corporate-kb or corporate-skills.")
+    ] = None,
     replace: Annotated[
         bool, typer.Option(help="Allow replacing another origin/transport.")
     ] = False,
     transport: Annotated[str, typer.Option(help="http, or stdio for startup renewal.")] = "http",
+    service: Annotated[str, typer.Option(help="MCP service: kb or skills.")] = "kb",
 ) -> None:
     """Obtain or reuse an access token and save it in the chosen MCP configuration."""
     try:
@@ -442,11 +492,15 @@ def connect(
             name=name,
             replace=replace,
             transport=transport,
+            service=service,
         )
     except EnrollmentError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from None
-    typer.echo(f"MCP entry '{name}' saved to {path}. Token expires at Unix timestamp {expiry}.")
+    typer.echo(
+        f"MCP entry '{_service_name(service, name)}' saved to {path}. "
+        f"Token expires at Unix timestamp {expiry}."
+    )
     typer.echo("Restart or reconnect the MCP client to reload its settings.")
 
 
@@ -457,11 +511,20 @@ def proxy(
     key: Annotated[Path, typer.Option()],
     config: Annotated[Path, typer.Option()],
     ca: Annotated[Path | None, typer.Option()] = None,
-    name: Annotated[str, typer.Option()] = "corporate-kb",
+    name: Annotated[str | None, typer.Option()] = None,
+    service: Annotated[str, typer.Option(help="MCP service: kb or skills.")] = "kb",
 ) -> None:
     """MCP stdio launcher with certificate-based enrollment at every process startup."""
     try:
-        proxy_client(server_url=server_url, cert=cert, key=key, config=config, ca=ca, name=name)
+        proxy_client(
+            server_url=server_url,
+            cert=cert,
+            key=key,
+            config=config,
+            ca=ca,
+            name=name,
+            service=service,
+        )
     except EnrollmentError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from None

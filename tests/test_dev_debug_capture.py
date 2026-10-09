@@ -15,6 +15,7 @@ from starlette.requests import Request
 from corporate_kb.dev_debug import capture, recording
 from skill_registry import SkillsRegistry
 from skill_registry.http import register_skills_routes
+from skill_registry.models import SkillScanResult
 
 
 @pytest.mark.parametrize("flag", [None, "0", "true"])
@@ -117,7 +118,9 @@ def test_registry_capture_reports_failure_phase_and_preserves_public_error(
         materialize=lambda *_args, **_kwargs: ([tmp_path], [SimpleNamespace(commit="abc")])
     )
     monkeypatch.setattr(registry, "_manager", lambda _path: manager)
-    monkeypatch.setattr("skill_registry.registry.scan_skills", lambda *_args: [])
+    monkeypatch.setattr(
+        "skill_registry.registry.scan_skills", lambda *_args: SkillScanResult([], [])
+    )
     if phase == "git":
         manager.materialize = fail
     elif phase == "scan":

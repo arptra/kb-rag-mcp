@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { RegistrySkill, SkillRelease, SkillSource, SkillSourceInput, SkillVersion, SkillsConnection, SkillsInstall, SkillsJob } from "./skillsTypes";
+import type { RegistrySkill, SkillRelease, SkillSource, SkillSourceInput, SkillSourcePreview, SkillVersion, SkillsConnection, SkillsInstall, SkillsJob } from "./skillsTypes";
 import "./skills.css";
 
 const BASE = "/admin/api/skills";
@@ -111,8 +111,28 @@ function bytes(value: number): string { return value < 1024 ? `${value} Б` : `$
 function Busy() { return <div className="skills-empty" role="status">Загрузка…</div>; }
 function ErrorBox({ error }: { error: string }) { return error ? <div className="form-error" role="alert">{error}</div> : null; }
 function Badge({ status, children }: { status: string; children?: React.ReactNode }) {
-  const labels: Record<string, string> = { queued: "В очереди", running: "Выполняется", succeeded: "Готово", failed: "Ошибка", published: "Опубликован", candidate: "Новая версия", retired: "Нет в источнике", draft: "Не опубликован" };
+  const labels: Record<string, string> = { queued: "В очереди", running: "Выполняется", succeeded: "Готово", succeeded_with_warnings: "С предупреждениями", failed: "Ошибка", published: "Опубликован", candidate: "Новая версия", retired: "Нет в источнике", draft: "Не опубликован" };
   return <span className={`skills-badge skills-badge-${status}`}>{children || labels[status] || status}</span>;
+}
+
+const RETAINED_VERSIONS_NOTICE = "Скиллы с ошибками пропущены. Их прежние версии сохранены в реестре; новые версии этих скиллов не опубликованы.";
+
+function SkillIssues({ issues = [], title, notice, expanded = false }: { issues?: unknown[]; title: string; notice?: string; expanded?: boolean }) {
+  if (!issues.length) return null;
+  return (
+    <details className="skills-warnings" open={expanded}>
+      <summary>{title} · {issues.length}</summary>
+      {notice && <p>{notice}</p>}
+      <ul>
+        {issues.map((issue, index) => {
+          const detail = typeof issue === "object" && issue !== null ? issue as Record<string, unknown> : null;
+          const path = typeof detail?.path === "string" ? detail.path : typeof detail?.relative_path === "string" ? detail.relative_path : "";
+          const reason = typeof issue === "string" ? issue : typeof detail?.error === "string" ? detail.error : typeof detail?.message === "string" ? detail.message : "Не удалось прочитать скилл. Проверьте его SKILL.md и файлы пакета.";
+          return <li key={`${path}:${index}`}>{path && <code>{path}</code>}<p>{reason}</p></li>;
+        })}
+      </ul>
+    </details>
+  );
 }
 
 export default function SkillsApp({ password, secureMode }: { password: string; secureMode: boolean }) {
@@ -285,10 +305,21 @@ function Sources({ api, sources, loading, error, canManage, busy, onChanged, onS
     {editing && <SourceForm key={editing.id || "new"} api={api} initial={editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); onChanged(); }} />}
     <ErrorBox error={error || deleteError} />
     {loading && !sources.length ? <Busy /> : !visibleSources.length ? <div className="skills-empty"><b>Нет подключённых источников</b><p>Укажите Git URL, ветку и каталог со скиллами. Предварительная проверка покажет найденные пакеты.</p></div> : <div className="skills-source-grid">{visibleSources.map((source) => <article className="skills-source-card" key={source.id}>
-      <header><h3>{source.name}</h3><Badge status={source.enabled && !source.archived ? "published" : "draft"}>{source.archived ? "В архиве" : source.enabled ? "Включён" : "Отключён"}</Badge></header>
+      <header>
+        <h3>{source.name}</h3>
+        <div className="skills-source-badges">
+          <Badge status={source.enabled && !source.archived ? "published" : "draft"}>{source.archived ? "В архиве" : source.enabled ? "Включён" : "Отключён"}</Badge>
+          {Boolean(source.last_warnings?.length) && <Badge status="succeeded_with_warnings" />}
+        </div>
+      </header>
       <code className="skills-source-url">{source.git_url}</code>
       <dl><div><dt>Ветка / тег / commit</dt><dd><code>{source.ref}</code></dd></div><div><dt>Каталог</dt><dd><code>{source.skills_path || "."}</code>{source.recursive && " · с подкаталогами"}</dd></div><div><dt>Проверка</dt><dd>{source.interval_minutes > 0 ? `Каждые ${source.interval_minutes} мин` : "Только вручную"}</dd></div><div><dt>Публикация</dt><dd>{source.auto_publish ? "Автоматически после проверки" : "Вручную"}</dd></div><div><dt>Последняя попытка</dt><dd>{date(source.last_checked_at)}</dd></div><div><dt>Успешная проверка</dt><dd>{date(source.last_success_at)}</dd></div><div><dt>Следующая проверка</dt><dd>{source.enabled && source.interval_minutes > 0 ? date(source.next_check_at) : "—"}</dd></div></dl>
       {source.last_error && <div className="form-error">{source.last_error}</div>}
+      <SkillIssues
+        issues={source.last_warnings}
+        title={source.last_error ? "Предупреждения предыдущей проверки" : "Пропущены при последней проверке"}
+        notice={source.last_error ? `Последняя попытка завершилась ошибкой. Эти предупреждения относятся к предыдущему обработанному состоянию источника. ${RETAINED_VERSIONS_NOTICE}` : RETAINED_VERSIONS_NOTICE}
+      />
       {canManage && <footer className="skills-actions">{!source.archived && <button className="button" disabled={busy} onClick={() => void onSync(source.id)}>Проверить сейчас</button>}<button className="button quiet" onClick={() => { setEditing({ ...source }); setDeleting(null); }}>{source.archived ? "Восстановить и настроить" : "Настроить"}</button>{!source.archived && <button className="button quiet skills-danger" disabled={deleteBusy} onClick={() => setDeleting(source.id)}>Удалить</button>}</footer>}
       {deleting === source.id && <div className="skills-delete-confirm"><p>Удалить источник «{source.name}»? Его автоматические проверки остановятся; сохранённые версии останутся в истории.</p><div className="skills-actions"><button className="button skills-danger" disabled={deleteBusy} onClick={() => void remove(source.id)}>Удалить источник</button><button className="button quiet" disabled={deleteBusy} onClick={() => setDeleting(null)}>Отмена</button></div></div>}
     </article>)}</div>}
@@ -299,7 +330,7 @@ function SourceForm({ api, initial, onClose, onSaved }: { api: SkillsApi; initia
   const [form, setForm] = useState(initial);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<"validate" | "save" | null>(null);
-  const [preview, setPreview] = useState<{ skills: Array<{ name: string; description: string; relative_path: string }>; errors?: unknown[]; warnings?: unknown[] } | null>(null);
+  const [preview, setPreview] = useState<SkillSourcePreview | null>(null);
   const controller = useRef<AbortController | null>(null);
   useEffect(() => () => controller.current?.abort(), []);
   const update = <K extends keyof SkillSourceInput>(key: K, value: SkillSourceInput[K]) => { setForm((current) => ({ ...current, [key]: value })); setPreview(null); };
@@ -330,7 +361,26 @@ function SourceForm({ api, initial, onClose, onSaved }: { api: SkillsApi; initia
       <div className="skills-checks"><label><input type="checkbox" checked={form.enabled} onChange={(event) => update("enabled", event.target.checked)} />Источник включён</label><label><input type="checkbox" checked={form.recursive} onChange={(event) => update("recursive", event.target.checked)} />Искать в подкаталогах</label><label><input type="checkbox" checked={form.auto_publish} onChange={(event) => update("auto_publish", event.target.checked)} />Публиковать прошедшие проверку версии автоматически</label></div>
     </div></fieldset>
     <ErrorBox error={error} />
-    {preview && <section className="skills-validation"><b>Найдено скиллов: {preview.skills.length}</b>{preview.skills.map((skill) => <div key={skill.relative_path}><strong>{skill.name}</strong><code>{skill.relative_path}</code><p>{skill.description}</p></div>)}{[...(preview.errors || []), ...(preview.warnings || [])].map((warning, index) => <p key={index} className="form-error">{typeof warning === "string" ? warning : JSON.stringify(warning)}</p>)}{!preview.skills.length && <p>Проверьте путь и наличие файлов SKILL.md.</p>}</section>}
+    {preview && <section className="skills-validation">
+      <header>
+        <b>Результат проверки источника</b>
+        {Boolean(preview.warnings?.length) && <Badge status="succeeded_with_warnings" />}
+      </header>
+      <div className="skills-job-results">
+        <span>Найдено <b>{preview.discovered ?? preview.skills.length}</b></span>
+        <span>Прошло проверку <b>{preview.skills.length}</b></span>
+        <span>Пропущено <b>{preview.skipped ?? preview.warnings?.length ?? 0}</b></span>
+      </div>
+      <SkillIssues
+        issues={preview.warnings}
+        title="Скиллы с ошибками"
+        notice="При синхронизации эти скиллы будут пропущены; их ранее сохранённые версии останутся в реестре."
+        expanded
+      />
+      <SkillIssues issues={preview.errors} title="Ошибки проверки" expanded />
+      {preview.skills.map((skill) => <div className="skills-validation-skill" key={skill.relative_path}><strong>{skill.name}</strong><code>{skill.relative_path}</code><p>{skill.description}</p></div>)}
+      {!preview.skills.length && <p>{preview.warnings?.length ? "Ни один скилл не прошёл проверку. Исправьте перечисленные ошибки и проверьте источник снова." : "Проверьте путь и наличие файлов SKILL.md."}</p>}
+    </section>}
     <footer className="skills-actions"><button type="button" className="button" disabled={Boolean(busy) || !form.git_url.trim()} onClick={() => void submit("validate")}>{busy === "validate" ? "Проверяем Git…" : "Проверить источник"}</button><button className="button primary" type="submit" disabled={Boolean(busy)}>{busy === "save" ? "Сохраняем…" : "Сохранить источник"}</button></footer>
   </form>;
 }
@@ -339,7 +389,24 @@ function Jobs({ jobs, sources, error, loading, onRefresh }: { jobs: SkillsJob[];
   return <>
     <div className="skills-section-head"><div><h3>Проверки и обновления</h3><p>Ручные и автоматические проверки используют общую очередь. Эта вкладка обновляется каждые 4 секунды.</p></div><button className="button" onClick={onRefresh}>Обновить журнал</button></div>
     <ErrorBox error={error} />
-    {loading ? <Busy /> : !jobs.length ? <div className="skills-empty">Проверок ещё не было. Добавьте источник и нажмите «Проверить сейчас».</div> : <div className="skills-job-list">{jobs.map((job) => <article key={job.id} className="skills-job"><header><div><b>{job.source_name || sources.find((source) => source.id === job.source_id)?.name || job.source_id}</b><small>{date(job.created_at)} · {job.started_at ? `начало ${date(job.started_at)}` : "ожидает запуска"}{job.finished_at ? ` · завершение ${date(job.finished_at)}` : ""}</small></div><Badge status={job.status} /></header>{job.result && <div className="skills-job-results"><span>Найдено <b>{job.result.discovered ?? 0}</b></span><span>Новых версий <b>{job.result.created ?? 0}</b></span><span>Опубликовано <b>{job.result.published ?? 0}</b></span><span>Исчезло из Git <b>{job.result.retired ?? 0}</b></span></div>}{job.error && <div className="form-error">{job.error}</div>}</article>)}</div>}
+    {loading ? <Busy /> : !jobs.length ? <div className="skills-empty">Проверок ещё не было. Добавьте источник и нажмите «Проверить сейчас».</div> : <div className="skills-job-list">{jobs.map((job) => <article key={job.id} className="skills-job">
+      <header>
+        <div><b>{job.source_name || sources.find((source) => source.id === job.source_id)?.name || job.source_id}</b><small>{date(job.created_at)} · {job.started_at ? `начало ${date(job.started_at)}` : "ожидает запуска"}{job.finished_at ? ` · завершение ${date(job.finished_at)}` : ""}</small></div>
+        <Badge status={job.status} />
+      </header>
+      {job.result && <>
+        <div className="skills-job-results">
+          <span>Найдено <b>{job.result.discovered ?? 0}</b></span>
+          <span>Прошло проверку <b>{job.result.valid ?? job.result.discovered ?? 0}</b></span>
+          <span>Пропущено <b>{job.result.skipped ?? job.result.warnings?.length ?? 0}</b></span>
+          <span>Новых версий <b>{job.result.created ?? 0}</b></span>
+          <span>Опубликовано <b>{job.result.published ?? 0}</b></span>
+          <span>Исчезло из Git <b>{job.result.retired ?? 0}</b></span>
+        </div>
+        <SkillIssues issues={job.result.warnings} title="Пропущенные скиллы" notice={RETAINED_VERSIONS_NOTICE} />
+      </>}
+      {job.error && <div className="form-error">{job.error}</div>}
+    </article>)}</div>}
   </>;
 }
 

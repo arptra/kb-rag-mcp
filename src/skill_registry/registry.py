@@ -18,9 +18,12 @@ from typing import Any
 from corporate_kb.dev_debug.capture import emit_failure
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.sources import RepositorySourceManager, RepositorySpec
-from skill_registry.models import SkillSnapshot, SourceConfig, safe_relative_path, scan_skills
+from skill_registry.models import SkillScanResult, SourceConfig, safe_relative_path, scan_skills
 
 _SOURCE_FIELDS = set(SourceConfig.model_fields)
+# Keep 1 compatible with existing databases: a new auto-publish request covers all packages.
+_PUBLISH_ALL = 1
+_PUBLISH_PREVIOUSLY_SKIPPED = 2
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
     id TEXT PRIMARY KEY,
@@ -33,6 +36,7 @@ CREATE TABLE IF NOT EXISTS sources (
     last_success_at TEXT,
     next_check_at TEXT,
     last_error TEXT,
+    last_warnings_json TEXT NOT NULL DEFAULT '[]',
     failure_count INTEGER NOT NULL DEFAULT 0,
     publish_pending INTEGER NOT NULL DEFAULT 0
 );
@@ -142,10 +146,25 @@ class SkillsRegistry:
     scheduled requests. Run one scheduler process per registry root.
     """
 
-    def __init__(self, root: Path, *, git_timeout_seconds: int = 60) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        git_timeout_seconds: int = 60,
+        read_only: bool = False,
+    ) -> None:
         self.root = root.resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
         self.database_path = self.root / "registry.sqlite3"
+        self.read_only = read_only
+        if read_only:
+            if not self.database_path.is_file():
+                raise FileNotFoundError(
+                    "Skills registry was not found at "
+                    f"{self.database_path}. Start the dashboard first and set "
+                    "KB_SKILLS_REGISTRY_DIR to its existing registry directory."
+                )
+        else:
+            self.root.mkdir(parents=True, exist_ok=True)
         self.git_timeout_seconds = git_timeout_seconds
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -155,6 +174,18 @@ class SkillsRegistry:
         self._source_locks_lock = threading.Lock()
         self._scheduler_lock_file: Any = None
         with self._connect() as connection:
+            if read_only:
+                tables = {
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                if not {"sources", "skills", "releases", "release_files", "jobs"} <= tables:
+                    raise sqlite3.DatabaseError(
+                        "Skills registry is not initialized; open it with the dashboard first."
+                    )
+                return
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(sources)")}
@@ -162,10 +193,23 @@ class SkillsRegistry:
                 connection.execute(
                     "ALTER TABLE sources ADD COLUMN publish_pending INTEGER NOT NULL DEFAULT 0"
                 )
+            if "last_warnings_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE sources ADD COLUMN last_warnings_json TEXT NOT NULL DEFAULT '[]'"
+                )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.database_path, timeout=30)
+        if self.read_only:
+            # mode=ro observes committed WAL changes; immutable would hide live publications.
+            connection = sqlite3.connect(
+                self.database_path.as_uri() + "?mode=ro",
+                uri=True,
+                timeout=30,
+            )
+            connection.execute("PRAGMA query_only=ON")
+        else:
+            connection = sqlite3.connect(self.database_path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
@@ -175,12 +219,17 @@ class SkillsRegistry:
         finally:
             connection.close()
 
+    def _require_writable(self) -> None:
+        if self.read_only:
+            raise RuntimeError("Read-only Skills registry cannot change data or synchronize Git")
+
     @staticmethod
     def _source(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         config = json.loads(result.pop("config_json"))
         result.update(config)
         result["archived"] = bool(result["archived"])
+        result["last_warnings"] = json.loads(result.pop("last_warnings_json", "[]"))
         return result
 
     @classmethod
@@ -198,6 +247,7 @@ class SkillsRegistry:
             ]
 
     def save_source(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._require_writable()
         unknown = set(payload) - _SOURCE_FIELDS - {"id"}
         if unknown:
             raise ValueError(f"Unknown source fields: {', '.join(sorted(unknown))}")
@@ -217,9 +267,9 @@ class SkillsRegistry:
             config_json = config.model_dump_json()
             next_check = now if config.enabled and config.interval_minutes else None
             if previous:
-                publish_pending = bool(previous["publish_pending"]) or (
-                    config.auto_publish and not previous["auto_publish"]
-                )
+                publish_pending = int(previous["publish_pending"])
+                if config.auto_publish and not previous["auto_publish"]:
+                    publish_pending = _PUBLISH_ALL
                 connection.execute(
                     """UPDATE sources SET config_json = ?, config_revision = config_revision + 1,
                     archived = 0, updated_at = ?, next_check_at = ?, publish_pending = ?
@@ -238,6 +288,7 @@ class SkillsRegistry:
         return result
 
     def delete_source(self, source_id: str) -> dict[str, Any]:
+        self._require_writable()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             source = self._require_source(connection, source_id)
@@ -271,6 +322,7 @@ class SkillsRegistry:
         )
 
     def validate_source(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._require_writable()
         # Allow an existing source's partial update without saving it.
         source_id = payload.get("id")
         values: dict[str, Any] = {}
@@ -289,12 +341,15 @@ class SkillsRegistry:
                 manager = self._manager(Path(temporary))
                 paths, records = manager.materialize([RepositorySpec(config.git_url, config.ref)])
                 phase = "scan"
-                snapshots = scan_skills(paths[0], config.skills_path, config.recursive)
+                scan = scan_skills(paths[0], config.skills_path, config.recursive)
         except Exception as exc:
             emit_failure("skills", phase, exc, source_id=source_id, operation="preview")
             raise
         return {
-            "skills": [snapshot.summary() for snapshot in snapshots],
+            "skills": [snapshot.summary() for snapshot in scan.snapshots],
+            "warnings": [issue.to_dict() for issue in scan.issues],
+            "discovered": len(scan.snapshots) + len(scan.issues),
+            "skipped": len(scan.issues),
             "commit": records[0].commit,
             "git_url": config.git_url,
             "ref": config.ref,
@@ -450,6 +505,7 @@ class SkillsRegistry:
         }
 
     def publish(self, skill_id: str, revision: str) -> dict[str, Any]:
+        self._require_writable()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             release = self._require_release(connection, skill_id, revision)
@@ -578,6 +634,7 @@ class SkillsRegistry:
             return self._job(connection, row)
 
     def queue_sync(self, source_id: str) -> dict[str, Any]:
+        self._require_writable()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             source = self._require_source(connection, source_id)
@@ -632,9 +689,14 @@ class SkillsRegistry:
                     cancel_event=self._stop,
                 )
                 phase = "scan"
-                snapshots = scan_skills(paths[0], source["skills_path"], source["recursive"])
+                scan = scan_skills(paths[0], source["skills_path"], source["recursive"])
+                for issue in scan.issues:
+                    emit_failure(
+                        "skills", phase, ValueError(issue.error), job_id=job_id,
+                        source_id=source["id"], path=issue.path,
+                    )
                 phase = "publish"
-                self._record_success(job_id, source, snapshots, records[0].commit)
+                self._record_success(job_id, source, scan, records[0].commit)
             except Exception as exc:
                 emit_failure("skills", phase, exc, job_id=job_id, source_id=source["id"])
                 self._record_failure(job_id, source, str(exc))
@@ -643,12 +705,25 @@ class SkillsRegistry:
         self,
         job_id: str,
         source: dict[str, Any],
-        snapshots: list[SkillSnapshot],
+        scan: SkillScanResult,
         commit: str | None,
     ) -> None:
         now = _now()
+        warnings = [issue.to_dict() for issue in scan.issues]
+        skipped_paths = {issue.relative_path for issue in scan.issues}
+        prior_skipped_paths = {issue["relative_path"] for issue in source["last_warnings"]}
+
+        def covered(path: str, prefixes: set[str]) -> bool:
+            return any(
+                prefix == "." or path == prefix or path.startswith(prefix + "/")
+                for prefix in prefixes
+            )
+
         result: dict[str, Any] = {
-            "discovered": len(snapshots),
+            "discovered": len(scan.snapshots) + len(scan.issues),
+            "valid": len(scan.snapshots),
+            "skipped": len(scan.issues),
+            "warnings": warnings,
             "created": 0,
             "published": 0,
             "retired": 0,
@@ -661,7 +736,7 @@ class SkillsRegistry:
             if current["archived"] or current["config_revision"] != source["config_revision"]:
                 raise ValueError("Source configuration changed during synchronization; retry")
             observed: set[str] = set()
-            for snapshot in snapshots:
+            for snapshot in scan.snapshots:
                 skill_id = f"{source['id']}:{snapshot.relative_path}"
                 observed.add(skill_id)
                 previous = connection.execute(
@@ -745,16 +820,23 @@ class SkillsRegistry:
                 # package or a restored skill advances the publication pointer automatically.
                 changed = previous is None or previous["latest_revision"] != snapshot.revision
                 restored = previous is not None and bool(previous["retired"])
-                if source["auto_publish"] and (changed or restored or source["publish_pending"]):
+                # Retry pending publication only for previously skipped packages, so a
+                # partial scan cannot repeatedly undo rollbacks of healthy packages.
+                pending = source["publish_pending"] == _PUBLISH_ALL or (
+                    source["publish_pending"] == _PUBLISH_PREVIOUSLY_SKIPPED
+                    and covered(snapshot.relative_path, prior_skipped_paths)
+                )
+                if source["auto_publish"] and (changed or restored or pending):
                     connection.execute(
                         "UPDATE skills SET published_revision = ? WHERE id = ?",
                         (snapshot.revision, skill_id),
                     )
                     result["published"] += 1
             for row in connection.execute(
-                "SELECT id FROM skills WHERE source_id = ? AND retired = 0", (source["id"],)
+                "SELECT id, relative_path FROM skills WHERE source_id = ? AND retired = 0",
+                (source["id"],),
             ).fetchall():
-                if row["id"] not in observed:
+                if row["id"] not in observed and not covered(row["relative_path"], skipped_paths):
                     connection.execute(
                         "UPDATE skills SET retired = 1, updated_at = ? WHERE id = ?",
                         (now, row["id"]),
@@ -762,14 +844,22 @@ class SkillsRegistry:
                     result["retired"] += 1
             connection.execute(
                 """UPDATE sources SET last_checked_at = ?, last_success_at = ?,
-                next_check_at = ?, last_error = NULL, failure_count = 0,
-                publish_pending = 0 WHERE id = ?""",
-                (now, now, _next_check(source), source["id"]),
+                next_check_at = ?, last_error = NULL, failure_count = 0, last_warnings_json = ?,
+                publish_pending = ? WHERE id = ?""",
+                (
+                    now, source["last_success_at"] if warnings else now, _next_check(source),
+                    json.dumps(warnings, ensure_ascii=False),
+                    _PUBLISH_PREVIOUSLY_SKIPPED if source["publish_pending"] and warnings else 0,
+                    source["id"],
+                ),
             )
             connection.execute(
-                "UPDATE jobs SET status = 'succeeded', finished_at = ?, result_json = ? "
+                "UPDATE jobs SET status = ?, finished_at = ?, result_json = ? "
                 "WHERE id = ?",
-                (now, json.dumps(result), job_id),
+                (
+                    "succeeded_with_warnings" if warnings else "succeeded",
+                    now, json.dumps(result), job_id,
+                ),
             )
 
     def _record_failure(self, job_id: str, source: dict[str, Any], error: str) -> None:
@@ -792,6 +882,7 @@ class SkillsRegistry:
             )
 
     def start(self) -> None:
+        self._require_writable()
         with self._lifecycle_lock:
             if self._thread is not None and self._thread.is_alive():
                 return

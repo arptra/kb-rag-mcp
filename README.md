@@ -304,6 +304,12 @@ Hugging Face. Если model files отсутствуют, индексиров�
 environment GigaCode-конфигурации. Все runtime wrappers вызывают Python из готовой `.venv` напрямую:
 после установки они не обращаются к package registry и не меняют окружение.
 
+Скиллы подключаются отдельной записью `corporate-skills`: основной MCP их не объявляет.
+Для HTTP выберите Skills на странице `/connect`; для локального stdio используйте
+`python -m skill_registry.mcp_server` или `scripts/start-skills-mcp.sh`.
+Конфигурация и выбор общего с dashboard каталога реестра описаны в
+[инструкции подключения скиллов](README.skills.md#подключение-gigacode).
+
 ## CLI
 
 ```bash

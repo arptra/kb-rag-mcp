@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
@@ -138,3 +139,30 @@ def create_skills_mcp_server(registry: Any, auth: AuthProvider | None = None) ->
         return bootstrap_prompt(scope=scope)
 
     return server
+
+
+def main() -> None:
+    """Serve the local dashboard's published registry over native MCP stdio."""
+    import sqlite3
+
+    from corporate_kb.config import Settings
+    from skill_registry.registry import SkillsRegistry
+
+    settings = Settings().resolved()
+    if not settings.skills_registry_enabled:
+        raise SystemExit("Skills registry is disabled (KB_SKILLS_REGISTRY_ENABLED=false).")
+    logging.basicConfig(level=settings.log_level, format="%(levelname)s %(name)s: %(message)s")
+    try:
+        registry = SkillsRegistry(
+            settings.skills_registry_dir,
+            git_timeout_seconds=settings.repository_git_timeout_seconds,
+            read_only=True,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        raise SystemExit(f"Cannot open Skills registry: {exc}") from None
+    # The dashboard owns synchronization; a client process only serves saved releases.
+    create_skills_mcp_server(registry).run(transport="stdio", show_banner=False)
+
+
+if __name__ == "__main__":
+    main()

@@ -502,3 +502,330 @@ def test_existing_world_readable_config_becomes_private(tmp_path, fake_enrollmen
     config.chmod(0o644)
     _connect(config)
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
+
+
+def test_skills_http_uses_advertised_path_and_preserves_knowledge(tmp_path, fake_enrollment):
+    config = tmp_path / "settings.json"
+    knowledge = {"httpUrl": SERVER + "/mcp", "headers": {"Authorization": f"Bearer {OLD_TOKEN}"}}
+    _write(config, {"theme": "dark", "mcpServers": {"corporate-kb": knowledge}})
+    fake_enrollment[1]["payload"]["skills_mcp_path"] = "/registry/custom-skills"
+
+    _connect(config, service="skills")
+
+    result = json.loads(config.read_text())
+    assert result["theme"] == "dark"
+    assert result["mcpServers"]["corporate-kb"] == knowledge
+    assert result["mcpServers"]["corporate-skills"] == {
+        "httpUrl": SERVER + "/registry/custom-skills",
+        "headers": {"Authorization": f"Bearer {TOKEN}"},
+    }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        None,
+        "",
+        "/mcp",
+        "//evil/mcp",
+        "https://evil/mcp",
+        "/../mcp",
+        "/./mcp",
+        "/skills/../mcp",
+        "/skills/./mcp",
+        "/skills/..",
+        "/skills/.",
+        "/skills//mcp",
+        "/skills/%2e%2e/mcp",
+        "/skills/mcp?token=x",
+        "/skills/mcp#fragment",
+        "/skills\\mcp",
+        "/skills/mcp\n",
+        4,
+    ],
+)
+def test_missing_disabled_or_unsafe_skills_endpoint_never_changes_config(
+    tmp_path,
+    fake_enrollment,
+    path,
+):
+    config = tmp_path / "settings.json"
+    original = _write(config, {"mcpServers": {"corporate-kb": {"httpUrl": SERVER + "/mcp"}}})
+    if path is not None:
+        fake_enrollment[1]["payload"]["skills_mcp_path"] = path
+    with pytest.raises(client.EnrollmentError):
+        _connect(config, service="skills")
+    assert config.read_bytes() == original
+
+
+@pytest.mark.parametrize("original_service,selected_service", [("kb", "skills"), ("skills", "kb")])
+def test_http_cannot_silently_change_services_in_one_named_entry(
+    tmp_path,
+    fake_enrollment,
+    original_service,
+    selected_service,
+):
+    config = tmp_path / "settings.json"
+    fake_enrollment[1]["payload"]["skills_mcp_path"] = "/skills/mcp"
+    _connect(config, name="chosen", service=original_service)
+    original = config.read_bytes()
+
+    with pytest.raises(client.EnrollmentError, match="another endpoint or service"):
+        _connect(config, name="chosen", service=selected_service)
+    assert config.read_bytes() == original
+
+    _connect(config, name="chosen", service=selected_service, replace=True)
+    path = "/skills/mcp" if selected_service == "skills" else "/mcp"
+    assert json.loads(config.read_text())["mcpServers"]["chosen"]["httpUrl"] == SERVER + path
+
+
+def test_skills_stdio_renews_against_selected_advertised_endpoint(
+    tmp_path,
+    fake_enrollment,
+    monkeypatch,
+):
+    config = tmp_path / "settings.json"
+    calls, state = fake_enrollment
+    state["payload"]["skills_mcp_path"] = "/skills/mcp"
+    _connect(config, transport="stdio", service="skills")
+    entry = json.loads(config.read_text())["mcpServers"]["corporate-skills"]
+    assert entry["args"][entry["args"].index("--service") + 1] == "skills"
+    assert entry["args"][entry["args"].index("--name") + 1] == "corporate-skills"
+    assert TOKEN not in " ".join(entry["args"])
+    state["payload"].update(skills_mcp_path="/registry/new-path", access_token=OLD_TOKEN)
+    calls.clear()
+    proxies = []
+    monkeypatch.setattr(client, "_run_proxy", lambda *args: proxies.append(args))
+
+    client.proxy_client(
+        server_url=SERVER,
+        cert=tmp_path / "client.crt",
+        key=tmp_path / "client.key",
+        config=config,
+        service="skills",
+    )
+
+    assert next(call["headers"] for call in calls if "url" in call) == {
+        "Authorization": f"Bearer {TOKEN}"
+    }
+    assert proxies == [(SERVER + "/registry/new-path", OLD_TOKEN, None)]
+    entry = json.loads(config.read_text())["mcpServers"]["corporate-skills"]
+    assert entry["env"][client.TOKEN_ENV] == OLD_TOKEN
+    assert entry["args"][entry["args"].index("--service") + 1] == "skills"
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_skills_stdio_disabled_at_renewal_preserves_config_and_does_not_proxy(
+    tmp_path,
+    fake_enrollment,
+    monkeypatch,
+    missing,
+):
+    config = tmp_path / "settings.json"
+    state = fake_enrollment[1]
+    state["payload"]["skills_mcp_path"] = "/skills/mcp"
+    _connect(config, service="skills", transport="stdio")
+    original = config.read_bytes()
+    state["payload"]["access_token"] = OLD_TOKEN
+    if missing:
+        del state["payload"]["skills_mcp_path"]
+    else:
+        state["payload"]["skills_mcp_path"] = None
+    proxies = []
+    monkeypatch.setattr(client, "_run_proxy", lambda *args: proxies.append(args))
+
+    with pytest.raises(client.EnrollmentError, match="not advertised"):
+        client.proxy_client(
+            server_url=SERVER,
+            cert=tmp_path / "client.crt",
+            key=tmp_path / "client.key",
+            config=config,
+            service="skills",
+        )
+    assert proxies == []
+    assert config.read_bytes() == original
+
+
+@pytest.mark.parametrize("original_service,selected_service", [("kb", "skills"), ("skills", "kb")])
+def test_stdio_service_mismatch_cannot_reuse_another_service_entry(
+    tmp_path,
+    fake_enrollment,
+    original_service,
+    selected_service,
+):
+    config = tmp_path / "settings.json"
+    fake_enrollment[1]["payload"]["skills_mcp_path"] = "/skills/mcp"
+    _connect(config, service=original_service, name="chosen", transport="stdio")
+    original = config.read_bytes()
+    fake_enrollment[0].clear()
+
+    with pytest.raises(client.EnrollmentError, match="--replace"):
+        client.proxy_client(
+            server_url=SERVER,
+            cert=tmp_path / "client.crt",
+            key=tmp_path / "client.key",
+            config=config,
+            service=selected_service,
+            name="chosen",
+        )
+    with pytest.raises(client.EnrollmentError, match="--replace"):
+        _connect(config, service=selected_service, name="chosen", transport="stdio")
+    assert fake_enrollment[0] == []
+    assert config.read_bytes() == original
+    _connect(config, service=selected_service, name="chosen", transport="stdio", replace=True)
+    entry = json.loads(config.read_text())["mcpServers"]["chosen"]
+    assert entry["args"][entry["args"].index("--service") + 1] == selected_service
+
+
+def test_legacy_stdio_without_service_stays_knowledge(tmp_path, fake_enrollment, monkeypatch):
+    config = tmp_path / "settings.json"
+    fake_enrollment[1]["payload"]["skills_mcp_path"] = "/skills/mcp"
+    _connect(config, transport="stdio")
+    document = json.loads(config.read_text())
+    args = document["mcpServers"]["corporate-kb"]["args"]
+    start = args.index("--service")
+    del args[start : start + 2]
+    _write(config, document)
+    proxies = []
+    monkeypatch.setattr(client, "_run_proxy", lambda *args: proxies.append(args))
+
+    client.proxy_client(
+        server_url=SERVER,
+        cert=tmp_path / "client.crt",
+        key=tmp_path / "client.key",
+        config=config,
+    )
+    assert proxies == [(SERVER + "/mcp", TOKEN, None)]
+    with pytest.raises(client.EnrollmentError, match="--replace"):
+        client.proxy_client(
+            server_url=SERVER,
+            cert=tmp_path / "client.crt",
+            key=tmp_path / "client.key",
+            config=config,
+            name="corporate-kb",
+            service="skills",
+        )
+
+
+@pytest.mark.parametrize(
+    "service,expected_name", [("kb", "corporate-kb"), ("skills", "corporate-skills")]
+)
+def test_cli_service_selects_default_entry_name(tmp_path, fake_enrollment, service, expected_name):
+    fake_enrollment[1]["payload"]["skills_mcp_path"] = "/skills/mcp"
+    config = tmp_path / "settings.json"
+    result = CliRunner().invoke(
+        client.app,
+        [
+            "connect",
+            "--server-url",
+            SERVER,
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--config",
+            str(config),
+            "--service",
+            service,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert f"MCP entry '{expected_name}'" in result.output
+    assert set(json.loads(config.read_text())["mcpServers"]) == {expected_name}
+    assert TOKEN not in result.output
+
+
+def test_invalid_service_is_rejected_before_enrollment(tmp_path, fake_enrollment):
+    config = tmp_path / "settings.json"
+    with pytest.raises(client.EnrollmentError, match="kb or skills"):
+        _connect(config, service="anything")
+    assert fake_enrollment[0] == []
+    assert not config.exists()
+
+
+def test_proxy_cli_preserves_service_and_keeps_stdout_for_mcp(
+    tmp_path,
+    fake_enrollment,
+    monkeypatch,
+):
+    config = tmp_path / "settings.json"
+    fake_enrollment[1]["payload"]["skills_mcp_path"] = "/registry/skills"
+    _connect(config, service="skills", transport="stdio")
+    proxies = []
+    monkeypatch.setattr(client, "_run_proxy", lambda *args: proxies.append(args))
+    result = CliRunner().invoke(
+        client.app,
+        [
+            "proxy",
+            "--server-url",
+            SERVER,
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--config",
+            str(config),
+            "--service",
+            "skills",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stdout == ""
+    assert proxies == [(SERVER + "/registry/skills", TOKEN, None)]
+
+
+@pytest.mark.parametrize(
+    "path", ["/skills.v2/mcp", "https://elsewhere/mcp", "/../bad", 3, {}, None]
+)
+def test_knowledge_ignores_unselected_optional_skills_endpoint(
+    tmp_path,
+    fake_enrollment,
+    monkeypatch,
+    path,
+):
+    config = tmp_path / "settings.json"
+    fake_enrollment[1]["payload"]["skills_mcp_path"] = path
+    _connect(config)
+    assert (
+        json.loads(config.read_text())["mcpServers"]["corporate-kb"]["httpUrl"] == SERVER + "/mcp"
+    )
+
+    _connect(config, transport="stdio", replace=True)
+    proxies = []
+    monkeypatch.setattr(client, "_run_proxy", lambda *args: proxies.append(args))
+    client.proxy_client(
+        server_url=SERVER,
+        cert=tmp_path / "client.crt",
+        key=tmp_path / "client.key",
+        config=config,
+    )
+    assert proxies == [(SERVER + "/mcp", TOKEN, None)]
+
+
+@pytest.mark.parametrize(
+    "path", ["/skills.v2/mcp", "/registry/.skills/mcp-v2.0", "/registry/skills.../mcp"]
+)
+def test_skills_accepts_safe_dotted_paths_for_http_and_stdio(
+    tmp_path,
+    fake_enrollment,
+    monkeypatch,
+    path,
+):
+    config = tmp_path / "settings.json"
+    fake_enrollment[1]["payload"]["skills_mcp_path"] = path
+    _connect(config, service="skills")
+    assert (
+        json.loads(config.read_text())["mcpServers"]["corporate-skills"]["httpUrl"] == SERVER + path
+    )
+
+    _connect(config, service="skills", transport="stdio", replace=True)
+    proxies = []
+    monkeypatch.setattr(client, "_run_proxy", lambda *args: proxies.append(args))
+    client.proxy_client(
+        server_url=SERVER,
+        cert=tmp_path / "client.crt",
+        key=tmp_path / "client.key",
+        config=config,
+        service="skills",
+    )
+    assert proxies == [(SERVER + path, TOKEN, None)]

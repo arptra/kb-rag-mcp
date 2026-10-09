@@ -111,6 +111,9 @@
 .connect-merge-note > b { color: #d6e8d7; }
 .connect-merge-note p { margin: 7px 0 0; }
 .connect-merge-note code { color: #d6e8d7; overflow-wrap: anywhere; }
+.connect-server-selection { margin-bottom: 22px; }
+.connect-server-selection label { display: flex; align-items: center; gap: 10px; min-height: 32px; cursor: pointer; }
+.connect-server-selection input[type="checkbox"] { flex: 0 0 16px; width: 16px; height: 16px; min-height: 0; margin: 0; padding: 0; accent-color: var(--lime); cursor: pointer; }
 .connect-dev-note { margin: 0 0 16px; color: var(--amber); font-size: var(--text-small); }
 
 @media (max-width: 850px) {

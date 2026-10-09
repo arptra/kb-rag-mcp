@@ -259,15 +259,16 @@ class AccessControl:
                     max_age=max(0, issued.expires_at - int(time.time())),
                 )
                 return response
-            return _response(
-                {
-                    "access_token": issued.token,
-                    "token_type": "Bearer",
-                    "expires_at": issued.expires_at,
-                    "mcp_path": self.settings.mcp_http_path,
-                    "user": issued.user,
-                }
-            )
+            payload = {
+                "access_token": issued.token,
+                "token_type": "Bearer",
+                "expires_at": issued.expires_at,
+                "mcp_path": self.settings.mcp_http_path,
+                "user": issued.user,
+            }
+            if self.settings.skills_registry_enabled:
+                payload["skills_mcp_path"] = self.settings.skills_mcp_path
+            return _response(payload)
 
         @route("/auth/token", ["POST"])
         async def issue_token(request: Request) -> JSONResponse:
@@ -296,17 +297,21 @@ class AccessControl:
             )
             # Origin was checked above, and the direct TLS server ignores forwarded
             # headers. The config must point to the same service the browser visited.
-            mcp_url = str(request.base_url).rstrip("/") + self.settings.mcp_http_path
+            origin = str(request.base_url).rstrip("/")
+            mcp_servers = {
+                "corporate-kb": {
+                    "httpUrl": origin + self.settings.mcp_http_path,
+                    "headers": {"Authorization": f"Bearer {issued.token}"},
+                }
+            }
+            if self.settings.skills_registry_enabled:
+                mcp_servers["corporate-skills"] = {
+                    "httpUrl": origin + self.settings.skills_mcp_path,
+                    "headers": {"Authorization": f"Bearer {issued.token}"},
+                }
             response = _response(
                 {
-                    "config": {
-                        "mcpServers": {
-                            "corporate-kb": {
-                                "httpUrl": mcp_url,
-                                "headers": {"Authorization": f"Bearer {issued.token}"},
-                            }
-                        }
-                    },
+                    "config": {"mcpServers": mcp_servers},
                     "expires_at": issued.expires_at,
                     "user": issued.user,
                 }

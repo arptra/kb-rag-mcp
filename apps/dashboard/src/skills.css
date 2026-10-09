@@ -34,7 +34,7 @@
 .skills-title-button:hover { color: var(--lime); }
 .skills-badge { display: inline-block; border: 1px solid #3a423c; border-radius: 5px; padding: 3px 7px; font-size: 11px; white-space: nowrap; color: #9da7a0; background: #1a211b; }
 .skills-badge-published, .skills-badge-succeeded { color: var(--lime); border-color: #3b572f; background: #1d2a19; }
-.skills-badge-candidate, .skills-badge-running, .skills-badge-queued { color: var(--amber); border-color: #65542b; background: #29220f; }
+.skills-badge-candidate, .skills-badge-running, .skills-badge-queued, .skills-badge-succeeded_with_warnings { color: var(--amber); border-color: #65542b; background: #29220f; }
 .skills-badge-failed { color: var(--red); border-color: #653b34; background: #271815; }
 .skills-badge-retired { color: #b6a8ce; border-color: #443c51; }
 .skills-pagination { display: flex; justify-content: flex-end; align-items: center; gap: 9px; margin: 15px 0; }
@@ -71,6 +71,7 @@
 .skills-archive-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 18px; color: var(--muted); font-size: var(--text-small); }
 .skills-source-card { min-width: 0; padding: 20px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
 .skills-source-card > header { display: flex; gap: 12px; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.skills-source-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .skills-source-card h3 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
 .skills-source-url { display: block; color: #86968a; font-size: 12px; overflow-wrap: anywhere; }
 .skills-source-card dl { display: grid; gap: 10px; margin: 22px 0; }
@@ -94,11 +95,19 @@
 .skills-checks input { flex: 0 0 auto; }
 .skills-source-form > footer { justify-content: flex-end; margin-top: 24px; }
 .skills-validation { max-height: 400px; overflow-y: auto; margin-top: 20px; padding: 16px; border: 1px solid #34432e; border-radius: 8px; background: #0d150e; font-size: var(--text-small); }
-.skills-validation > b { color: var(--lime); }
-.skills-validation > div { padding: 12px 0; border-bottom: 1px solid var(--line); }
-.skills-validation > div:last-child { border-bottom: 0; }
+.skills-validation > header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.skills-validation > header > b { color: var(--lime); }
+.skills-validation-skill { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.skills-validation-skill:last-child { border-bottom: 0; }
 .skills-validation code { display: block; margin-top: 4px; color: #8d9d91; font-size: 12px; }
 .skills-validation p { margin-bottom: 0; color: var(--muted); }
+.skills-warnings { margin: 16px 0; padding: 13px 15px; border: 1px solid #65542b; border-radius: 8px; background: #29220f; font-size: var(--text-small); line-height: 1.6; }
+.skills-warnings summary { cursor: pointer; color: var(--amber); overflow-wrap: anywhere; }
+.skills-warnings > p { margin: 10px 0 0; color: #c9bc9e; }
+.skills-warnings ul { display: grid; gap: 12px; padding: 0; margin: 14px 0 0; list-style: none; }
+.skills-warnings li { padding-top: 12px; border-top: 1px solid #514526; min-width: 0; }
+.skills-warnings li code { display: block; margin: 0; color: #e3cf9e; font-size: 12px; overflow-wrap: anywhere; }
+.skills-warnings li p { margin: 4px 0 0; color: #c9bc9e; white-space: pre-wrap; overflow-wrap: anywhere; }
 .skills-job-list { display: grid; gap: 10px; }
 .skills-job { padding: 18px 20px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
 .skills-job header { display: flex; justify-content: space-between; gap: 15px; align-items: flex-start; }
