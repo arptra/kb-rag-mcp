@@ -13,6 +13,7 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from corporate_kb.dev_debug.capture import emit_failure
 from skill_registry.delivery import (
     MAX_SELECTION_TOKEN,
     bootstrap_prompt,
@@ -143,6 +144,9 @@ def register_skills_routes(
                     response.headers["X-Content-Type-Options"] = "nosniff"
                     return response
                 except Exception as exc:
+                    emit_failure(
+                        "skills", "http", exc, path=request.url.path, method=request.method
+                    )
                     return _error(exc)
 
             return server.custom_route(

@@ -22,6 +22,8 @@
 - [быстрый запуск RAG с уменьшенным контекстом](README.low-context.md);
 - [отдельный общий SSOT-индекс всех сервисов](README.ssot.md).
 - [реестр скиллов, Git-синхронизация и отдельный MCP для GigaCode](README.skills.md).
+- [dev-режим: запись ошибок и исправления через GigaCode с подтверждениями](README.dev-debug.md).
+- [отдельный интерфейс Dev Console для наблюдения и исправлений](README.dev-console.md).
 
 ## Архитектура
 

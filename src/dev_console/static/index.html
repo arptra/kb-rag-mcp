@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Dev Console · Диагностика и исправления</title>
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="Dev Console"><span class="brand-mark">d<span>:</span></span><span>dev console<small>Диагностика и исправления</small></span></a>
+      <div class="local-label"><span class="dot"></span> Локальный режим</div>
+      <button class="button primary new-session" id="new-session"><span aria-hidden="true">＋</span> Новая сессия</button>
+      <div class="sidebar-heading">СЕССИИ <span id="session-count">0</span></div>
+      <nav id="sessions" aria-label="Сессии диагностики"><p class="sidebar-empty">Здесь появится история ваших тестов.</p></nav>
+      <div class="sidebar-bottom"><div id="cli-indicator" class="cli-indicator"><span class="dot muted"></span><span>Проверяем GigaCode…</span></div><p>Правки подтверждаются вами<br>в штатном терминале GigaCode.</p><div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-text">Подключение…</span></div></div>
+    </aside>
+    <main>
+      <header class="topbar"><div class="breadcrumbs">РАЗРАБОТКА <span>/</span> ТЕСТИРОВАНИЕ</div><span class="privacy-label">Передача в GigaCode — с вашим подтверждением</span></header>
+      <div id="alert" class="alert hidden" role="alert"></div>
+      <section id="empty-state" class="welcome hidden">
+        <div class="welcome-icon" aria-hidden="true">⌘</div><div class="eyebrow">ПРОВЕРЯЙТЕ. НАБЛЮДАЙТЕ. ИСПРАВЛЯЙТЕ.</div>
+        <h1>Понятный путь<br>от ошибки к исправлению</h1>
+        <p>Начните запись, воспроизведите проблему и передайте собранные данные GigaCode. План, проверки и каждое изменение остаются под вашим контролем.</p>
+        <button id="empty-create" class="button primary">Начать первую сессию <span aria-hidden="true">↗</span></button>
+        <div class="welcome-steps"><div><span>01</span><strong>Соберите контекст</strong><p>Логи, ошибки и состояние кода в одной сессии.</p></div><div><span>02</span><strong>Утвердите план</strong><p>Сначала причина и конкретные файлы, затем правки.</p></div><div><span>03</span><strong>Проверьте результат</strong><p>Автопроверки и повторение вашего сценария.</p></div></div>
+      </section>
+      <section id="workspace" class="workspace hidden">
+        <div class="page-heading"><div><div class="eyebrow">РАБОЧАЯ СЕССИЯ <span id="session-id"></span></div><h1 id="session-title">Тестирование</h1><p id="session-subtitle">Наблюдайте за тестом и подготовкой исправлений.</p></div><span id="status-badge" class="badge">Запись</span></div>
+        <div class="toolbar"><div class="recording-state"><span id="recording-dot" class="dot muted"></span><span id="recording-text">Запись остановлена</span></div><div class="toolbar-actions"><button id="recording-toggle" class="button secondary">Начать запись</button><button id="bundle-button" class="button secondary">Собрать пакет</button><button id="cancel-button" class="button danger hidden">Остановить цикл</button></div></div>
+        <ol id="timeline" class="timeline" aria-label="Этапы исправления"><li data-step="recording"><span>1</span>Запись</li><li data-step="planning"><span>2</span>Диагностика</li><li data-step="plan"><span>3</span>План</li><li data-step="editing"><span>4</span>Правки</li><li data-step="verifying"><span>5</span>Проверки</li><li data-step="resolved"><span>6</span>Результат</li></ol>
+        <div id="terminal-banner" class="terminal-banner hidden"><span class="terminal-symbol" aria-hidden="true">›_</span><div><strong id="terminal-title">GigaCode открыт в вашем терминале</strong><p id="terminal-message">Подтверждайте каждую правку там. После завершения введите /quit — управление вернётся в эту консоль.</p></div></div>
+        <section id="approval-card" class="approval-card hidden" aria-live="polite"><div class="approval-heading"><span class="approval-icon" aria-hidden="true">!</span><div><div class="eyebrow">НУЖНО ВАШЕ РЕШЕНИЕ</div><h2 id="approval-title">Подтверждение</h2></div></div><p id="approval-message"></p><pre id="approval-evidence" class="approval-evidence hidden"></pre><div class="approval-actions"><button id="approve-button" class="button primary">Подтвердить</button><button id="refuse-button" class="button secondary">Отказать и остановиться</button><span>Отказ не удаляет сохранённые правки.</span></div></section>
+        <div class="content-grid">
+          <section class="panel activity-panel"><div class="tabs" role="tablist" aria-label="Данные сессии"><button class="tab active" id="tab-events" role="tab" aria-selected="true" aria-controls="view-events" data-tab="events">Журнал <span id="event-count">0</span></button><button class="tab" id="tab-plan" role="tab" aria-selected="false" aria-controls="view-plan" data-tab="plan">План</button><button class="tab" id="tab-checks" role="tab" aria-selected="false" aria-controls="view-checks" data-tab="checks">Проверки</button><button class="tab" id="tab-artifacts" role="tab" aria-selected="false" aria-controls="view-artifacts" data-tab="artifacts">Артефакты</button></div>
+            <div id="view-events" class="tab-view" role="tabpanel" aria-labelledby="tab-events"><div class="log-tools"><label class="search"><span aria-hidden="true">⌕</span><input id="log-search" type="search" placeholder="Найти в журнале" aria-label="Найти в журнале"></label><label class="error-filter"><input id="errors-only" type="checkbox"> Только ошибки</label></div><details class="log-help"><summary>Как записать полный вывод backend?</summary><p>Обычная запись читает существующие логи. Для захвата stdout и stderr запустите backend этой командой в другом терминале. Если backend уже работает, сначала остановите его сами.</p><code id="backend-command"></code><button id="copy-backend" class="button secondary">Скопировать команду</button></details><div id="events" class="events" tabindex="0" aria-label="События сессии"></div><div class="panel-footer"><span id="updated-at">Ожидаем события</span><span>Обновление каждые 2 с</span></div></div>
+            <div id="view-plan" class="tab-view hidden" role="tabpanel" aria-labelledby="tab-plan"><div id="plan-content" class="plan-content"><div class="panel-empty"><span>◎</span><strong>Сначала разберёмся в причине</strong><p>После запуска исправления здесь появится план GigaCode: шаги, файлы и критерий готовности.</p></div></div></div>
+            <div id="view-checks" class="tab-view hidden" role="tabpanel" aria-labelledby="tab-checks"><div id="checks" class="checks"></div></div>
+            <div id="view-artifacts" class="tab-view hidden" role="tabpanel" aria-labelledby="tab-artifacts"><div id="artifacts" class="artifacts"></div><div id="artifact-viewer" class="artifact-viewer hidden"><div><strong id="artifact-name"></strong><button id="artifact-close" class="icon-button" aria-label="Закрыть просмотр">×</button></div><pre id="artifact-content"></pre></div></div>
+          </section>
+          <aside class="context-column"><section class="panel task-panel"><div class="panel-label">ЗАДАЧА ДЛЯ GIGACODE</div><h2>Что нужно исправить?</h2><p>Опишите шаги воспроизведения и ожидаемый результат.</p><label class="sr-only" for="goal">Задача для GigaCode</label><textarea id="goal" rows="5" placeholder="При добавлении Git-репозитория возникает ошибка. Ожидаю увидеть список скиллов после синхронизации."></textarea><div class="rounds-control"><label for="max-rounds">Лимит попыток</label><input id="max-rounds" type="number" min="1" max="10" value="3"></div><button id="fix-button" class="button primary full-width">Подготовить исправление <span aria-hidden="true">↗</span></button><p id="fix-unavailable" class="inline-warning hidden"></p><button id="doctor-retry" class="button secondary full-width doctor-retry hidden">Проверить GigaCode снова</button><p class="fine-print">Кнопка передаст задачу и диагностику GigaCode. Он подготовит план для вашего утверждения здесь, а каждую правку вы подтвердите в терминале.</p></section>
+            <section class="panel note-panel"><div class="panel-label">ВАШИ НАБЛЮДЕНИЯ</div><h2>Добавить контекст</h2><label class="sr-only" for="note">Наблюдение о проблеме</label><textarea id="note" rows="3" placeholder="Что произошло, на каком шаге? Не указывайте пароли и токены."></textarea><button id="note-button" class="button secondary full-width">Сохранить заметку</button><div id="notes" class="notes"></div></section>
+            <div class="scope-note"><span aria-hidden="true">◇</span><p>Сбор данных пишет только диагностические артефакты. Проверки и изменения кода требуют вашего подтверждения.</p></div>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+  <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><div><div class="eyebrow">НОВАЯ СЕССИЯ</div><h2>Начать запись тестирования</h2></div><button type="button" id="close-create" class="icon-button" aria-label="Закрыть">×</button></div><p>Соберём новые события и последние строки существующих логов. Исходники при записи не изменяются.</p><label class="field-label" for="create-label">Что вы тестируете?</label><input id="create-label" placeholder="Например, синхронизацию скиллов из Git" maxlength="500" autofocus><details><summary>Дополнительные файлы логов</summary><label class="sr-only" for="create-logs">Пути к дополнительным логам</label><textarea id="create-logs" rows="3" placeholder="Один путь на строку"></textarea><p class="fine-print">Логи сервера и операций подключаются автоматически. Относительные пути считаются от корня проекта.</p></details><div class="dialog-actions"><button type="button" id="cancel-create" class="button secondary">Отмена</button><button type="submit" id="create-submit" class="button primary">Начать запись</button></div></form></dialog>
+  <div id="toast" class="toast hidden" role="status"></div>
+</body>
+</html>

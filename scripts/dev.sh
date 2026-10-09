@@ -32,6 +32,8 @@ Commands:
   dashboard-dev Start the React/TypeScript dashboard development server
   dashboard-build
                 Type-check and build dashboard assets served at /admin
+  debug         Record development logs and run supervised GigaCode repairs
+  debug-ui      Open a standalone local developer console (port 8788)
   index-hash    Rebuild the offline hash index
   search-hash   Search with hash embeddings; accepts an optional query
   index         Rebuild using the configured provider (hash by default)
@@ -47,6 +49,12 @@ EOF
 }
 
 case "${command_name}" in
+  debug-ui)
+    exec bash "${script_dir}/dev-console.sh" "$@"
+    ;;
+  debug)
+    exec bash "${script_dir}/dev-debug.sh" "$@"
+    ;;
   install)
     exec "${script_dir}/setup-venv.sh" "$@"
     ;;

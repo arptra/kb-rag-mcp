@@ -33,6 +33,7 @@ kb = "corporate_kb.cli:main"
 kb-mcp = "corporate_kb.mcp.server:main"
 kb-mcp-http = "corporate_kb.mcp.http_server:main"
 kb-access = "corporate_kb.access.client:main"
+kb-dev-console = "dev_console.__main__:main"
 gigacode-graph = "gigacode_graph.cli:main"
 gigacode-graph-mcp = "gigacode_graph.mcp_server:main"
 gigacode-graph-http = "gigacode_graph.http_server:main"
@@ -50,7 +51,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/corporate_kb", "src/gigacode_graph", "src/service_map", "src/skill_registry"]
+packages = ["src/corporate_kb", "src/gigacode_graph", "src/service_map", "src/skill_registry", "src/dev_console"]
 
 [tool.ruff]
 target-version = "py312"
@@ -62,7 +63,7 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["corporate_kb", "gigacode_graph", "service_map", "skill_registry"]
+packages = ["corporate_kb", "gigacode_graph", "service_map", "skill_registry", "dev_console"]
 mypy_path = "src"
 plugins = ["pydantic.mypy"]
 

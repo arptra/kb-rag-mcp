@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from corporate_kb.dev_debug.capture import emit_failure
 from gigacode_graph.config import GraphSettings
 from gigacode_graph.sources import RepositorySourceManager, RepositorySpec
 from skill_registry.models import SkillSnapshot, SourceConfig, safe_relative_path, scan_skills
@@ -282,10 +283,16 @@ class SkillsRegistry:
             raise ValueError(f"Unknown source fields: {', '.join(sorted(unknown))}")
         values.update({key: value for key, value in payload.items() if key != "id"})
         config = SourceConfig.model_validate(values)
-        with tempfile.TemporaryDirectory(prefix="skill-preview-", dir=self.root) as temporary:
-            manager = self._manager(Path(temporary))
-            paths, records = manager.materialize([RepositorySpec(config.git_url, config.ref)])
-            snapshots = scan_skills(paths[0], config.skills_path, config.recursive)
+        phase = "git"
+        try:
+            with tempfile.TemporaryDirectory(prefix="skill-preview-", dir=self.root) as temporary:
+                manager = self._manager(Path(temporary))
+                paths, records = manager.materialize([RepositorySpec(config.git_url, config.ref)])
+                phase = "scan"
+                snapshots = scan_skills(paths[0], config.skills_path, config.recursive)
+        except Exception as exc:
+            emit_failure("skills", phase, exc, source_id=source_id, operation="preview")
+            raise
         return {
             "skills": [snapshot.summary() for snapshot in snapshots],
             "commit": records[0].commit,
@@ -615,6 +622,7 @@ class SkillsRegistry:
                 if claim.rowcount != 1:
                     return
                 source = self._require_source(connection, job["source_id"])
+            phase = "git"
             try:
                 if source["archived"]:
                     raise ValueError("Source was archived")
@@ -623,9 +631,12 @@ class SkillsRegistry:
                     [RepositorySpec(source["git_url"], source["ref"])],
                     cancel_event=self._stop,
                 )
+                phase = "scan"
                 snapshots = scan_skills(paths[0], source["skills_path"], source["recursive"])
+                phase = "publish"
                 self._record_success(job_id, source, snapshots, records[0].commit)
             except Exception as exc:
+                emit_failure("skills", phase, exc, job_id=job_id, source_id=source["id"])
                 self._record_failure(job_id, source, str(exc))
 
     def _record_success(
