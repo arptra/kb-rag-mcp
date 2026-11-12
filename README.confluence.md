@@ -145,6 +145,61 @@ Main endpoints:
 - `GET /admin/api/confluence/assets/{id}?source_id=...&version=...` — authenticated
   access to an attachment belonging to the requested source/version.
 
+## Connection troubleshooting
+
+Run `./scripts/start-mcp-http.sh logs` and repeat **Check access** in the dashboard.
+The connection check logs its start and outcome in `.cache/kb/runtime/mcp-http.log`;
+each API request logs a trace/request ID, endpoint (without query), attempt, response
+status and elapsed time. Retries log their reason and wait duration. Client startup
+reports the authentication mode, whether CA/proxy environment settings are present,
+timeouts and retry limit, without exposing their secret values.
+
+The synchronization journal is also mirrored to the server log with job ID and stage:
+page discovery/checks, attachment downloads/cache, image analysis/cache, normalization,
+saved checkpoints, indexing progress, publication, cancellation and completion. All of
+this uses `KB_LOG_LEVEL=INFO` (the default); DEBUG is not needed. Network failures have
+separate categories. Raw HTTPX/httpcore transport dumps are suppressed only within
+Confluence requests because they can contain signed URLs or authentication headers;
+other integrations' logs are unaffected. Document bodies and raw GigaCode output are
+not mirrored to the server log. Synchronization errors remain in the UI job journal.
+
+To collect the latest diagnostic fragment after reproducing a failure:
+
+```bash
+tail -n 300 .cache/kb/runtime/mcp-http.log
+```
+
+`Confluence network request failed` means the transport failed, not that Confluence
+rejected the token. The UI now includes a category and explanation, such as
+`tls_certificate`, `dns`, `proxy`, `connect_timeout` or `read_timeout`.
+Connection-test JSON adds `error_code` for classified failures and `upstream_status`
+for a Confluence HTTP error. The endpoint keeps HTTP 409 for upstream failures;
+HTTP 401 with `Administrator authentication required` belongs to this app's admin login.
+
+Compare curl from the **backend host/container and service environment**, using the
+same destination. A successful curl from a laptop does not establish that the backend
+has the required DNS, route, VPN or proxy. `curl -k` disables certificate verification;
+the application verifies HTTPS certificates. For a corporate certificate authority,
+obtain a trusted PEM CA bundle and export it for the backend process before restarting:
+
+```bash
+export SSL_CERT_FILE=/absolute/path/to/corporate-ca-bundle.pem
+./scripts/start-mcp-http.sh restart
+./scripts/start-mcp-http.sh logs
+```
+
+Use a bundle containing all needed trusted CAs, including public CAs if Cloud attachment
+downloads use public Atlassian media hosts. This replaces HTTPX's default CA bundle.
+For systemd, configure the variable in the service's environment and restart that service.
+The file is a **trusted CA bundle for outbound connections**, not this application's
+self-signed browser/server certificate or a private key.
+
+HTTPX also uses exported `SSL_CERT_DIR`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
+`NO_PROXY`. The launcher does not source the project `.env`: placing these non-`KB_`
+variables there alone does not export them to HTTPX. It does not read curl's `.curlrc`,
+`CURL_CA_BUNDLE` or `REQUESTS_CA_BUNDLE`. See the official
+[HTTPX environment settings](https://www.python-httpx.org/environment_variables/).
+
 Offline verification:
 
 ```bash

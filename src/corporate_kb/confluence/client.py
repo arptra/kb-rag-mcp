@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 import threading
+import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from time import monotonic
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 
 import httpx
 
+from corporate_kb.confluence.diagnostics import network_error, safe_http_logging
 from corporate_kb.confluence.models import (
     Attachment,
     ConfluenceError,
@@ -19,6 +24,8 @@ from corporate_kb.confluence.models import (
     SourceConfig,
     SyncCancelled,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ConfluenceClient:
@@ -34,6 +41,8 @@ class ConfluenceClient:
         self.config = config
         self.cancel = cancel or threading.Event()
         self.retries = retries
+        self.trace_id = uuid.uuid4().hex[:12]
+        self._request_number = 0
         parsed = urlsplit(config.base_url)
         self.origin = f"{parsed.scheme}://{parsed.netloc}"
         self.cloud = config.effective_cloud
@@ -48,22 +57,66 @@ class ConfluenceClient:
             auth = httpx.BasicAuth(config.username, token)
         else:
             headers["Authorization"] = f"Bearer {token}"
-        self.http = httpx.Client(
-            headers=headers,
-            auth=auth,
-            timeout=httpx.Timeout(30, connect=10),
-            follow_redirects=False,
-            transport=transport,
+        logger.info(
+            "Confluence client configuration: trace=%s origin=%s deployment=%s auth=%s "
+            "tls_verify=true ca=%s proxy_env=%s no_proxy_env=%s "
+            "connect_timeout=10s read_timeout=30s retries=%d",
+            self.trace_id,
+            self.origin,
+            "cloud" if self.cloud else "data_center",
+            "basic" if config.username else "bearer",
+            "SSL_CERT_FILE"
+            if os.environ.get("SSL_CERT_FILE")
+            else ("SSL_CERT_DIR" if os.environ.get("SSL_CERT_DIR") else "default"),
+            any(
+                os.environ.get(key)
+                for key in (
+                    "HTTP_PROXY",
+                    "HTTPS_PROXY",
+                    "ALL_PROXY",
+                    "http_proxy",
+                    "https_proxy",
+                    "all_proxy",
+                )
+            ),
+            bool(os.environ.get("NO_PROXY") or os.environ.get("no_proxy")),
+            retries,
         )
-        self._download_http = httpx.Client(
-            timeout=httpx.Timeout(30, connect=10),
-            follow_redirects=False,
-            transport=transport,
-        )
+        try:
+            self.http = httpx.Client(
+                headers=headers,
+                auth=auth,
+                timeout=httpx.Timeout(30, connect=10),
+                follow_redirects=False,
+                transport=transport,
+            )
+            try:
+                self._download_http = httpx.Client(
+                    timeout=httpx.Timeout(30, connect=10),
+                    follow_redirects=False,
+                    transport=transport,
+                )
+            except Exception:
+                self.http.close()
+                raise
+        except (OSError, ValueError) as exc:
+            # CA files and proxy URLs may fail before the first request. Keep
+            # private filesystem paths and proxy credentials out of the response.
+            logger.warning("Confluence HTTP client setup failed: %s", type(exc).__name__)
+            raise ConfluenceError(
+                "Confluence HTTP client configuration failed. Check the exported "
+                "SSL_CERT_FILE/SSL_CERT_DIR and HTTP_PROXY/HTTPS_PROXY/ALL_PROXY settings "
+                "of the backend process.",
+                error_code="client_configuration",
+            ) from None
 
     def close(self) -> None:
-        self.http.close()
-        self._download_http.close()
+        with safe_http_logging():
+            self.http.close()
+            self._download_http.close()
+        logger.info(
+            "Confluence client closed: trace=%s requests=%d", self.trace_id, self._request_number
+        )
 
     def _check_cancel(self) -> None:
         if self.cancel.is_set():
@@ -94,22 +147,39 @@ class ConfluenceClient:
         target = self._trusted_url(url)
         for attempt in range(self.retries + 1):
             self._check_cancel()
+            request_id, started = self._request_started(target, attempt)
             try:
-                response = self.http.get(target, params=params)
-            except httpx.HTTPError:
+                with safe_http_logging():
+                    response = self.http.get(target, params=params)
+            except httpx.HTTPError as exc:
+                failure = self._network_failure(exc, target, attempt, elapsed=monotonic() - started)
                 if attempt >= self.retries:
-                    raise ConfluenceError("Confluence network request failed") from None
-                self._wait(min(2**attempt, 15))
+                    raise failure from None
+                self._retry_wait(min(2**attempt, 15), failure.error_code or "network")
                 continue
+            self._response_received(request_id, response, started)
             if response.status_code in {429, 502, 503, 504} and attempt < self.retries:
-                self._wait(self._retry_delay(response, attempt))
+                self._retry_wait(
+                    self._retry_delay(response, attempt), f"HTTP {response.status_code}"
+                )
                 continue
             if response.is_redirect:
+                logger.warning(
+                    "Confluence API redirect rejected: trace=%s status=%d; check API URL or SSO",
+                    self.trace_id,
+                    response.status_code,
+                )
                 # Do not follow a login redirect or forward service credentials to a CDN.
                 raise ConfluenceError(
                     "Confluence redirected the API request; verify API URL and token"
                 )
             if response.is_error:
+                logger.warning(
+                    "Confluence HTTP request failed: origin=%s auth=%s status=%d",
+                    self.origin,
+                    "basic" if self.config.username else "bearer",
+                    response.status_code,
+                )
                 labels = {
                     401: "Authentication failed",
                     403: "Page access denied",
@@ -121,6 +191,76 @@ class ConfluenceClient:
                 )
             return response
         raise ConfluenceError("Confluence request exhausted retries")
+
+    def _request_started(
+        self, target: str, attempt: int, *, attachment: bool = False
+    ) -> tuple[str, float]:
+        self._request_number += 1
+        request_id = f"{self.trace_id}/{self._request_number}"
+        parsed = urlsplit(target)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        # API paths help diagnose wrong context prefixes. CDN paths/queries may
+        # themselves be signed; only their origin belongs in diagnostics.
+        endpoint = origin + (
+            parsed.path if origin == self.origin and not attachment else "/<attachment>"
+        )
+        logger.info(
+            "Confluence HTTP request started: request=%s method=GET endpoint=%s "
+            "operation=%s attempt=%d/%d",
+            request_id,
+            endpoint,
+            "attachment" if attachment else "api",
+            attempt + 1,
+            self.retries + 1,
+        )
+        return request_id, monotonic()
+
+    @staticmethod
+    def _response_received(request_id: str, response: httpx.Response, started: float) -> None:
+        logger.info(
+            "Confluence HTTP response received: request=%s status=%d elapsed=%.3fs",
+            request_id,
+            response.status_code,
+            monotonic() - started,
+        )
+
+    def _retry_wait(self, seconds: float, reason: str) -> None:
+        logger.info(
+            "Confluence retry scheduled: trace=%s reason=%s wait=%.1fs",
+            self.trace_id,
+            reason,
+            seconds,
+        )
+        self._wait(seconds)
+
+    def _network_failure(
+        self,
+        exc: httpx.HTTPError,
+        target: str,
+        attempt: int,
+        *,
+        attachment: bool = False,
+        elapsed: float = 0,
+    ) -> ConfluenceError:
+        failure = network_error(exc, attachment=attachment)
+        parsed = urlsplit(target)
+        # No path/query: attachment redirects can contain signed credentials.
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        auth = ("basic" if self.config.username else "bearer") if origin == self.origin else "none"
+        logger.warning(
+            "Confluence request failed: trace=%s operation=%s origin=%s auth=%s attempt=%d/%d "
+            "code=%s elapsed=%.3fs; %s",
+            self.trace_id,
+            "attachment" if attachment else "api",
+            origin,
+            auth,
+            attempt + 1,
+            self.retries + 1,
+            failure.error_code,
+            elapsed,
+            failure,
+        )
+        return failure
 
     @staticmethod
     def _retry_delay(response: httpx.Response, attempt: int) -> float:
@@ -364,6 +504,10 @@ class ConfluenceClient:
             raise
 
     def download(self, attachment: Attachment) -> bytes:
+        with safe_http_logging():
+            return self._download(attachment)
+
+    def _download(self, attachment: Attachment) -> bytes:
         if attachment.size is not None and attachment.size > self.config.max_attachment_bytes:
             raise ConfluenceError("Attachment exceeds configured size limit")
         target = self._trusted_url(attachment.download_url)
@@ -374,8 +518,10 @@ class ConfluenceClient:
         attempt = 0
         while True:
             self._check_cancel()
+            request_id, started = self._request_started(target, attempt, attachment=True)
             try:
                 with client.stream("GET", target, headers={"Accept": "*/*"}) as response:
+                    self._response_received(request_id, response, started)
                     if response.is_redirect:
                         redirects += 1
                         if redirects > 3:
@@ -399,9 +545,19 @@ class ConfluenceClient:
                             target, client = destination, self._download_http
                         else:
                             raise ConfluenceError("Attachment redirected to an untrusted origin")
+                        logger.info(
+                            "Confluence attachment redirect accepted: trace=%s hop=%d auth=%s",
+                            self.trace_id,
+                            redirects,
+                            ("basic" if self.config.username else "bearer")
+                            if client is self.http
+                            else "none",
+                        )
                         continue
                     if response.status_code in {429, 502, 503, 504} and attempt < self.retries:
-                        self._wait(self._retry_delay(response, attempt))
+                        self._retry_wait(
+                            self._retry_delay(response, attempt), f"HTTP {response.status_code}"
+                        )
                         attempt += 1
                         continue
                     if response.is_error:
@@ -416,9 +572,19 @@ class ConfluenceClient:
                         if size > self.config.max_attachment_bytes:
                             raise ConfluenceError("Attachment exceeds configured size limit")
                         chunks.append(chunk)
+                    logger.info(
+                        "Confluence attachment download completed: request=%s bytes=%d "
+                        "elapsed=%.3fs",
+                        request_id,
+                        size,
+                        monotonic() - started,
+                    )
                     return b"".join(chunks)
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
+                failure = self._network_failure(
+                    exc, target, attempt, attachment=True, elapsed=monotonic() - started
+                )
                 if attempt >= self.retries:
-                    raise ConfluenceError("Attachment network request failed") from None
-                self._wait(min(2**attempt, 15))
+                    raise failure from None
+                self._retry_wait(min(2**attempt, 15), failure.error_code or "network")
                 attempt += 1

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from datetime import UTC, datetime
@@ -130,6 +131,82 @@ def test_registry_binding_secrets_noop_history_and_attachment_updates(tmp_path):
     assert fourth["result"]["archived_versions"] == 2
     assert any(doc.metadata["page_version"] == 2 for _, doc in archived)
     assert len({doc.metadata["revision_id"] for _, doc in archived}) == len(archived)
+
+
+def test_sync_journal_is_mirrored_to_server_without_document_content(tmp_path, caplog):
+    instance, _, _, _, _ = registry(tmp_path)
+    source = instance.upsert_source(config().model_dump(), "pat-never-log")
+    with caplog.at_level(logging.INFO):
+        job = instance.queue_sync(source["id"])
+        completed = instance.run_job(job["id"])
+    assert completed["status"] == "completed"
+    assert f"job={job['id']}" in caplog.text
+    assert "Confluence synchronization queued" in caplog.text
+    assert "Confluence synchronization started" in caplog.text
+    for stage in (
+        "discovery",
+        "fetch",
+        "attachments",
+        "normalization",
+        "checkpoint",
+        "indexing",
+        "publication",
+        "complete",
+    ):
+        assert f"stage={stage}" in caplog.text
+    assert '"pages_done": 2' in caplog.text
+    assert "pat-never-log" not in caplog.text
+    assert "<p>revision" not in caplog.text
+    assert "unsafe.png" not in caplog.text
+
+
+def test_server_log_omits_external_extractor_and_indexer_payloads(tmp_path, caplog):
+    instance, _, _, _, _ = registry(tmp_path)
+    source = instance.upsert_source(config().model_dump(), "pat-never-log")
+    job = instance.queue_sync(source["id"])
+    with caplog.at_level(logging.INFO):
+        instance._log(
+            job["id"],
+            "images",
+            "GigaCode stdout (non-JSON) | confidential-image-text",
+            attachment_id="asset-1",
+            extracted_text="confidential-image-text",
+        )
+        instance._log(
+            job["id"],
+            "images",
+            "GigaCode waits for browser authentication: https://auth.example/?token=secret-link",
+        )
+        instance._index_progress(
+            job["id"],
+            {
+                "stage": "embedding",
+                "message": "confidential-page-text",
+                "completed": 10,
+                "total": 20,
+                "content": "confidential-page-text",
+            },
+        )
+    assert "stage=images" in caplog.text and "stage=indexing" in caplog.text
+    assert '"completed": 10' in caplog.text
+    assert "confidential" not in caplog.text
+    assert "secret-link" not in caplog.text
+
+
+def test_raw_validation_failure_is_not_copied_to_server_log(tmp_path, caplog):
+    instance, client, _, _, _ = registry(tmp_path)
+
+    def malformed_page(_root):
+        raise ValueError("input_value=confidential-page-body pat-never-log")
+
+    client.page_ids = malformed_page
+    source = instance.upsert_source(config().model_dump(), "pat-never-log")
+    with caplog.at_level(logging.INFO):
+        failed = instance.run_job(instance.queue_sync(source["id"])["id"])
+    assert failed["status"] == "failed"
+    assert "Synchronization failed (ValueError)" in caplog.text
+    assert "confidential-page-body" not in caplog.text
+    assert "pat-never-log" not in caplog.text
 
 
 def test_discovery_failure_does_not_remove_pages_and_403_quarantines(tmp_path):

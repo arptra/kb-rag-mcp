@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -14,7 +15,9 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import frontmatter
 from bs4 import BeautifulSoup
@@ -31,6 +34,8 @@ from corporate_kb.confluence.models import (
 from corporate_kb.loaders.base import make_document
 from corporate_kb.loaders.normalizer import DocumentNormalizer
 from corporate_kb.models import Document
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -244,10 +249,23 @@ class ConfluenceRegistry:
             raise ValueError("Select an existing RAG index")
         if not token:
             raise ValueError("Confluence token is required")
-        client = self.client_factory(parsed, token)
+        client = None
+        started = monotonic()
+        logger.info(
+            "Confluence connection check started: host=%s deployment=%s auth=%s",
+            urlsplit(parsed.base_url).hostname,
+            "cloud" if parsed.effective_cloud else "data_center",
+            "basic" if parsed.username else "bearer",
+        )
         try:
+            client = self.client_factory(parsed, token)
             root_id = client.root_id()
             page = client.page(root_id, body=False)
+            logger.info(
+                "Confluence connection check succeeded: host=%s elapsed=%.2fs",
+                urlsplit(parsed.base_url).hostname,
+                monotonic() - started,
+            )
             return {
                 "status": "connected",
                 "root_page_id": root_id,
@@ -256,12 +274,22 @@ class ConfluenceRegistry:
                 "index_id": parsed.index_id,
                 "deployment": "cloud" if getattr(client, "cloud", False) else "data_center",
             }
-        except ConfluenceError:
+        except ConfluenceError as exc:
+            logger.warning(
+                "Confluence connection check failed: host=%s code=%s upstream_status=%s "
+                "elapsed=%.2fs",
+                urlsplit(parsed.base_url).hostname,
+                exc.error_code or "confluence",
+                exc.status_code,
+                monotonic() - started,
+            )
             raise
         except Exception:
+            logger.warning("Confluence connection check failed: unexpected client error")
             raise ConfluenceError("Confluence connection check failed") from None
         finally:
-            client.close()
+            if client is not None:
+                client.close()
 
     def upsert_source(
         self,
@@ -391,6 +419,7 @@ class ConfluenceRegistry:
                     ),
                     (job_id, source_id, config.index_id, _now()),
                 )
+        logger.info("Confluence synchronization queued: job=%s source=%s", job_id, source_id)
         self._wake.set()
         return self.job_status(job_id)
 
@@ -447,7 +476,14 @@ class ConfluenceRegistry:
         }
 
     def _log(
-        self, job_id: str, stage: str, message: str, *, level: str = "info", **details: Any
+        self,
+        job_id: str,
+        stage: str,
+        message: str,
+        *,
+        level: str = "info",
+        server_message: str | None = None,
+        **details: Any,
     ) -> None:
         with self._state_lock:
             for token in self._active_tokens:
@@ -473,6 +509,52 @@ class ConfluenceRegistry:
                 "UPDATE jobs SET phase=?,message=?,progress_json=? WHERE id=?",
                 (stage, message[:500], _json(progress), job_id),
             )
+        # Mirror the durable operation journal to the normal server log, keeping
+        # only progress metadata. Extractor stdout/auth URLs can contain secrets
+        # or document text; report their event type, never their raw payload.
+        server_message = server_message if server_message is not None else message
+        if server_message.startswith("GigaCode"):
+            server_message = re.split(r"[:|;]", server_message, maxsplit=1)[0]
+            if server_message.startswith("GigaCode waits for browser authentication"):
+                server_message = "GigaCode requires browser authentication; see operation journal"
+        progress_keys = {
+            "page_id",
+            "attachment_id",
+            "index_id",
+            "version",
+            "pages_done",
+            "pages_total",
+            "attachments_total",
+            "bytes",
+            "changed",
+            "unchanged",
+            "archived_versions",
+            "discovered",
+            "assets",
+            "completed",
+            "total",
+            "processed",
+            "processed_chunks",
+            "total_chunks",
+            "computed",
+            "reused",
+            "published",
+            "index_stage",
+            "phase",
+        }
+        summary = _json({key: value for key, value in details.items() if key in progress_keys})
+        with self._state_lock:
+            for token in self._active_tokens:
+                summary = summary.replace(token, "[REDACTED]")
+                server_message = server_message.replace(token, "[REDACTED]")
+        logger.log(
+            {"error": logging.ERROR, "warning": logging.WARNING}.get(level, logging.INFO),
+            "Confluence job=%s stage=%s %s progress=%s",
+            job_id,
+            stage,
+            server_message[:1000].replace("\n", "\\n").replace("\r", "\\r"),
+            summary,
+        )
 
     def _index_progress(self, job_id: str, event: Any) -> None:
         if isinstance(event, dict):
@@ -484,12 +566,14 @@ class ConfluenceRegistry:
                 job_id,
                 "indexing",
                 str(event.get("message", event.get("stage", "Indexing"))),
+                server_message="Indexing progress",
                 **details,
             )
         else:
-            self._log(job_id, "indexing", str(event))
+            self._log(job_id, "indexing", str(event), server_message="Indexing progress")
 
     def cancel_job(self, job_id: str) -> dict[str, Any]:
+        logger.info("Confluence cancellation requested: job=%s", job_id)
         with self._state_lock:
             self._cancel.setdefault(job_id, threading.Event()).set()
         with self._db() as connection:
@@ -655,6 +739,13 @@ class ConfluenceRegistry:
             if not self.index_exists(config.index_id):
                 raise ValueError("Bound index no longer exists")
             client = self.client_factory(config, token)
+            logger.info(
+                "Confluence synchronization started: job=%s source=%s index=%s trace=%s",
+                job_id,
+                source["id"],
+                config.index_id,
+                getattr(client, "trace_id", "unknown"),
+            )
             if hasattr(client, "cancel"):
                 client.cancel = cancel
             with self._guard(config.index_id, cancel):
@@ -679,6 +770,16 @@ class ConfluenceRegistry:
                         job_id,
                     ),
                 )
+            self._log(
+                job_id,
+                "complete",
+                "Synchronization completed" if result["changed"] else "No changes",
+                discovered=result["discovered"],
+                changed=result["changed"],
+                unchanged=result["unchanged"],
+                assets=result["assets"],
+                archived_versions=result["archived_versions"],
+            )
         except SyncCancelled:
             self._log(
                 job_id, "cancelled", "Saved checkpoints retained for the next synchronization"
@@ -709,7 +810,15 @@ class ConfluenceRegistry:
                 if isinstance(exc, (ConfluenceError, ValueError))
                 else f"Synchronization failed ({type(exc).__name__})"
             )
-            self._log(job_id, "failed", message, level="error")
+            self._log(
+                job_id,
+                "failed",
+                message,
+                level="error",
+                server_message=message
+                if isinstance(exc, ConfluenceError)
+                else f"Synchronization failed ({type(exc).__name__})",
+            )
             with self._db() as connection:
                 failures = int(source["failure_count"]) + 1
                 connection.execute(
@@ -895,7 +1004,10 @@ class ConfluenceRegistry:
                         except SyncCancelled:
                             raise
                         except Exception as exc:
-                            warning = f"Attachment {attachment.id}: {type(exc).__name__}"
+                            reason = (
+                                str(exc) if isinstance(exc, ConfluenceError) else type(exc).__name__
+                            )
+                            warning = f"Attachment {attachment.id}: {reason}"
                             result["warnings"].append(warning)
                             self._log(
                                 job_id, "attachments", warning, level="warning", page_id=page_id
@@ -1226,6 +1338,13 @@ class ConfluenceRegistry:
             )
         else:
             inline_svg = attachment.extra.get("inline_svg")
+            self._log(
+                job_id,
+                "attachments",
+                "Reading inline SVG" if isinstance(inline_svg, str) else "Downloading attachment",
+                attachment_id=attachment.id,
+                version=attachment.version,
+            )
             data = (
                 inline_svg.encode() if isinstance(inline_svg, str) else client.download(attachment)
             )
@@ -1304,6 +1423,9 @@ class ConfluenceRegistry:
             if cached_extraction.get("extractor") == identity:
                 text = cached_extraction["markdown"]
                 row["extraction_status"] = cached_extraction.get("result", {}).get("status", "ok")
+                self._log(
+                    job_id, "images", "Image extraction cache hit", attachment_id=attachment.id
+                )
             elif self.image_extractor:
                 self._log(
                     job_id, "images", "Analyzing image with GigaCode", attachment_id=attachment.id
@@ -1318,6 +1440,12 @@ class ConfluenceRegistry:
                     )
                     text = output.markdown()
                     row["extraction_status"] = output.status
+                    self._log(
+                        job_id,
+                        "images",
+                        f"Image analysis completed: {output.status}",
+                        attachment_id=attachment.id,
+                    )
                     encoded = _json(
                         {
                             "markdown": text,

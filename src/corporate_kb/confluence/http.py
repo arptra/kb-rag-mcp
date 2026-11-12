@@ -12,6 +12,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 
 from corporate_kb.a2a.http import body
+from corporate_kb.confluence.models import ConfluenceError
 from corporate_kb.confluence.registry import ConfluenceRegistry
 from corporate_kb.gigacode_runner import GigaCodeRunner
 
@@ -57,6 +58,16 @@ def register_confluence_routes(
                     return JSONResponse({"error": str(exc)}, status_code=401)
                 except (ValueError, TypeError) as exc:
                     return JSONResponse({"error": str(exc)}, status_code=400)
+                except ConfluenceError as exc:
+                    details: dict[str, Any] = {"error": str(exc)}
+                    if exc.error_code is not None:
+                        details["error_code"] = exc.error_code
+                    if exc.status_code is not None:
+                        details["upstream_status"] = exc.status_code
+                    # Keep our admin-session 401 distinct from upstream failures.
+                    return JSONResponse(
+                        details, status_code=409, headers={"Cache-Control": "no-store"}
+                    )
                 except RuntimeError as exc:
                     return JSONResponse({"error": str(exc)}, status_code=409)
 
