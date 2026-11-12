@@ -7,6 +7,8 @@ import math
 import numpy as np
 from numpy.typing import NDArray
 
+from corporate_kb.embeddings.base import matrix_is_finite
+from corporate_kb.history import utc_datetime, version_fields
 from corporate_kb.models import Chunk, Document, SearchFilters, SearchResult
 
 
@@ -38,7 +40,7 @@ class InMemoryKnowledgeStore:
         matrix = np.asarray(embeddings, dtype=np.float32)
         if matrix.ndim != 2 or matrix.shape[0] != len(chunks):
             raise ValueError(f"Embeddings shape {matrix.shape} does not match {len(chunks)} chunks")
-        if not np.isfinite(matrix).all():
+        if not matrix_is_finite(matrix):
             raise ValueError("Embeddings contain NaN or infinite values")
         if len({document.document_id for document in documents}) != len(documents):
             raise ValueError("Duplicate document_id in replacement index")
@@ -79,7 +81,13 @@ class InMemoryKnowledgeStore:
             return []
 
         active_filters = filters.active()
-        if active_filters:
+        if (
+            active_filters
+            or filters.page_id
+            or filters.updated_from
+            or filters.updated_to
+            or filters.version_scope == "latest"
+        ):
             candidate_indices = np.asarray(
                 [
                     index
@@ -101,9 +109,7 @@ class InMemoryKnowledgeStore:
             return []
 
         if eligible_positions.size > top_k:
-            top_positions = np.argpartition(
-                -scores[eligible_positions], top_k - 1
-            )[:top_k]
+            top_positions = np.argpartition(-scores[eligible_positions], top_k - 1)[:top_k]
             eligible_positions = eligible_positions[top_positions]
 
         ranked = [
@@ -132,6 +138,7 @@ class InMemoryKnowledgeStore:
                     source_path=chunk.source_path,
                     source_url=chunk.source_url,
                     metadata=dict(chunk.metadata),
+                    **version_fields(chunk),
                 )
             )
         return results
@@ -189,6 +196,8 @@ class InMemoryKnowledgeStore:
 
     @classmethod
     def _matches(cls, chunk: Chunk, filters: SearchFilters) -> bool:
+        if not cls._matches_version(chunk, filters):
+            return False
         return all(
             cls._value_matches(
                 chunk.source_path.rsplit(".", 1)[-1]
@@ -203,10 +212,29 @@ class InMemoryKnowledgeStore:
 
     @classmethod
     def _matches_document(cls, document: Document, filters: SearchFilters) -> bool:
+        if not cls._matches_version(document, filters):
+            return False
         return all(
             cls._value_matches(
                 document.source_type if key == "source_type" else document.metadata.get(key),
                 expected,
             )
             for key, expected in filters.active().items()
+        )
+
+    @staticmethod
+    def _matches_version(item: Chunk | Document, filters: SearchFilters) -> bool:
+        if item.page_id in filters.excluded_page_ids:
+            return False
+        if filters.version_scope == "latest" and not item.is_latest:
+            return False
+        if filters.page_id and item.page_id != filters.page_id:
+            return False
+        updated = utc_datetime(item.source_updated_at)
+        if filters.updated_from and (
+            updated is None or updated < utc_datetime(filters.updated_from)
+        ):
+            return False
+        return not (
+            filters.updated_to and (updated is None or updated > utc_datetime(filters.updated_to))
         )

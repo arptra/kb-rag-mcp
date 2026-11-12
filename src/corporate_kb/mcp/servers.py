@@ -44,6 +44,10 @@ BUILTIN_TOOLS: tuple[dict[str, str], ...] = (
         "description": "Connect and analyze many service repositories in one queued call.",
     },
     {"name": "kb_search", "description": "Search indexed corporate knowledge."},
+    {
+        "name": "kb_search_versions",
+        "description": "Search latest or historical document revisions.",
+    },
     {"name": "kb_get_document", "description": "Read a bounded document extract."},
     {"name": "kb_get_chunk", "description": "Read context around one search chunk."},
     {"name": "kb_run_context_benchmark", "description": "Run the context quality benchmark."},
@@ -122,8 +126,7 @@ class McpServerRegistry:
     def list(self) -> list[McpServerDefinition]:
         with self._lock:
             return [
-                self._definitions[key].model_copy(deep=True)
-                for key in sorted(self._definitions)
+                self._definitions[key].model_copy(deep=True) for key in sorted(self._definitions)
             ]
 
     def add(self, definition: McpServerDefinition) -> McpServerDefinition:
@@ -218,8 +221,7 @@ class McpServerRegistry:
     def _save_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = [
-            self._definitions[key].model_dump(mode="json")
-            for key in sorted(self._definitions)
+            self._definitions[key].model_dump(mode="json") for key in sorted(self._definitions)
         ]
         descriptor, temporary = tempfile.mkstemp(
             prefix=f".{self._path.name}.",

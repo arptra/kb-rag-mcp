@@ -15,7 +15,7 @@ from typing import Any
 
 from fastmcp.tools import Tool, ToolResult
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationInfo, field_validator
 
 from corporate_kb.mcp.tool_overrides import BUILTIN_TOOL_NAMES
 from corporate_kb.mcp.tools import KnowledgeTools
@@ -32,8 +32,14 @@ _ALLOWED_ARGUMENTS = {
     "status",
     "authority",
     "source_type",
+    "version_scope",
+    "page_id",
+    "as_of",
+    "updated_from",
+    "updated_to",
 }
 _RESERVED_NAMES = BUILTIN_TOOL_NAMES
+_NEW_BUILTIN_NAMES = frozenset({"kb_search_versions"})
 _OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -64,6 +70,18 @@ class ManagedToolDefaults(BaseModel):
     status: str | None = "current"
     authority: str | None = None
     source_type: str | None = None
+    version_scope: str = "latest"
+    page_id: str | None = None
+    as_of: str | None = None
+    updated_from: str | None = None
+    updated_to: str | None = None
+
+    @field_validator("version_scope")
+    @classmethod
+    def validate_version_scope(cls, value: str) -> str:
+        if value not in {"latest", "history", "as_of"}:
+            raise ValueError("version_scope must be latest, history or as_of")
+        return value
 
 
 class ManagedToolDefinition(BaseModel):
@@ -79,12 +97,17 @@ class ManagedToolDefinition(BaseModel):
 
     @field_validator("name")
     @classmethod
-    def validate_name(cls, value: str) -> str:
+    def validate_name(cls, value: str, info: ValidationInfo) -> str:
         if not _TOOL_NAME.fullmatch(value):
             raise ValueError("Tool name must contain only A-Z, a-z, 0-9, _, . or -")
         if not value.startswith("kb_"):
             raise ValueError("Managed tool name must start with kb_")
-        if value in _RESERVED_NAMES:
+        legacy_name = (
+            value in _NEW_BUILTIN_NAMES
+            and isinstance(info.context, dict)
+            and info.context.get("loading_persisted_definition") is True
+        )
+        if value in _RESERVED_NAMES and not legacy_name:
             raise ValueError("Tool name is reserved by the built-in MCP server")
         return value
 
@@ -112,6 +135,11 @@ class ManagedToolDefinition(BaseModel):
             "status": "string",
             "authority": "string",
             "source_type": "string",
+            "version_scope": "string",
+            "page_id": "string",
+            "as_of": "string",
+            "updated_from": "string",
+            "updated_to": "string",
         }
         for name, property_schema in properties.items():
             if not isinstance(property_schema, dict):
@@ -184,6 +212,7 @@ class ManagedToolRegistry:
         self._index_exists = index_exists or (lambda index_id: index_id == "default")
         self._lock = Lock()
         self._definitions = self._load()
+        self._runtime_builtin_names: set[str] = set()
 
     def list(self) -> list[ManagedToolDefinition]:
         with self._lock:
@@ -199,6 +228,13 @@ class ManagedToolRegistry:
     def create_tool(self, definition: ManagedToolDefinition) -> ManagedSearchTool:
         return ManagedSearchTool(definition, self.execute)
 
+    def reserve_builtin_name(self, name: str) -> None:
+        """Keep a compatibility alias from being overwritten by a later UI edit."""
+        with self._lock:
+            if name in self._definitions:
+                raise ValueError("Built-in alias conflicts with an existing managed tool")
+            self._runtime_builtin_names.add(name)
+
     def upsert(self, definition: ManagedToolDefinition) -> ManagedToolDefinition:
         unknown = [
             index_id for index_id in definition.index_ids if not self._index_exists(index_id)
@@ -206,6 +242,8 @@ class ManagedToolRegistry:
         if unknown:
             raise ValueError(f"Unknown RAG indexes: {', '.join(unknown)}")
         with self._lock:
+            if definition.name in self._runtime_builtin_names:
+                raise ValueError("Tool name is reserved by the running MCP server")
             if definition.name not in self._definitions and len(self._definitions) >= 50:
                 raise ValueError("Managed tool limit reached (50)")
             self._definitions[definition.name] = definition
@@ -234,7 +272,7 @@ class ManagedToolRegistry:
             payloads.append(
                 (
                     index_id,
-                    self._index_tools(index_id).search(
+                    self._index_tools(index_id).search_versions(
                         query=values["query"],
                         top_k=top_k,
                         min_score=values.get("min_score", defaults.min_score),
@@ -244,6 +282,11 @@ class ManagedToolRegistry:
                         status=values.get("status", defaults.status),
                         authority=values.get("authority", defaults.authority),
                         source_type=values.get("source_type", defaults.source_type),
+                        version_scope=values.get("version_scope", defaults.version_scope),
+                        page_id=values.get("page_id", defaults.page_id),
+                        as_of=values.get("as_of", defaults.as_of),
+                        updated_from=values.get("updated_from", defaults.updated_from),
+                        updated_to=values.get("updated_to", defaults.updated_to),
                     ),
                 )
             )
@@ -270,7 +313,13 @@ class ManagedToolRegistry:
                 item = dict(raw)
                 item["index_id"] = index_id
                 results.append(item)
-        results.sort(key=lambda item: (-float(item.get("score", 0.0)), str(item.get("chunk_id"))))
+        results.sort(
+            key=lambda item: (
+                not item.get("is_latest", True),
+                -float(item.get("score", 0.0)),
+                str(item.get("chunk_id")),
+            )
+        )
         selected = results[:top_k]
         for rank, item in enumerate(selected, start=1):
             item["rank"] = rank
@@ -317,7 +366,12 @@ class ManagedToolRegistry:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
             if not isinstance(raw, list):
                 raise ValueError("managed_tools.json must contain an array")
-            definitions = [ManagedToolDefinition.model_validate(item) for item in raw]
+            definitions = [
+                ManagedToolDefinition.model_validate(
+                    item, context={"loading_persisted_definition": True}
+                )
+                for item in raw
+            ]
             return {definition.name: definition for definition in definitions}
         except Exception as exc:
             logger.warning("Managed MCP tools could not be loaded: %s", exc)

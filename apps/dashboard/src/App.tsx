@@ -10,6 +10,10 @@ import {
   useState,
 } from "react";
 import { ApiError, api, download, post } from "./api";
+import A2AApp from "./A2AApp";
+import ConfluenceApp from "./ConfluenceApp";
+import DocumentHistoryViewer from "./DocumentHistoryViewer";
+import { integrationDate } from "./managementApi";
 import {
   CONFIDENCE_INFO,
   CONFIDENCE_ORDER,
@@ -32,7 +36,6 @@ import type {
   GraphOverview,
   GraphPayload,
   IndexDocument,
-  IndexDocumentDetail,
   IndexDocumentsPage,
   ManagedTool,
   McpServer,
@@ -49,6 +52,7 @@ const NAV: Array<{ id: Page; label: string; mark: string }> = [
   { id: "services", label: "Сервисы", mark: "▦" },
   { id: "servers", label: "MCP servers", mark: "◉" },
   { id: "tools", label: "MCP tools", mark: "⌁" },
+  { id: "a2a", label: "A2A · агенты", mark: "⇄" },
   { id: "skills", label: "Скиллы", mark: "✦" },
   { id: "graph", label: "Граф системы", mark: "⌘" },
   { id: "operations", label: "Операции и логи", mark: "≡" },
@@ -629,6 +633,7 @@ export default function App({ secureMode = false, accountName, onSessionLogout }
               onCreate={() => setIndexModal(true)}
               onRepository={() => setRepositoryModal(true)}
               onOpen={setSelectedIndexId}
+              onRefresh={() => void load()}
               onAction={action}
             />
           )}
@@ -664,6 +669,7 @@ export default function App({ secureMode = false, accountName, onSessionLogout }
           )}
           {page === "operations" && <OperationsPage data={overview} password={password} onAction={action} />}
           {page === "skills" && <Suspense fallback={<div className="panel">Загрузка реестра скиллов…</div>}><SkillsApp password={password} secureMode={secureMode} /></Suspense>}
+          {page === "a2a" && <A2AApp password={password} indexes={overview.catalog.indexes} />}
         </section>
       </main>
 
@@ -837,22 +843,33 @@ function JobList({ jobs, password, onCancel }: { jobs: CatalogJob[]; password: s
   const [expanded, setExpanded] = useState<string | null>(null);
   const [logs, setLogs] = useState<Record<string, string>>({});
   const [logError, setLogError] = useState("");
-  const loadLog = useCallback(async (jobId: string) => {
+  const logCursors = useRef<Record<string, number>>({});
+  const loadLog = useCallback(async (jobId: string, signal: AbortSignal) => {
     try {
-      const payload = await api<{ log: string }>(`/admin/api/jobs/log?job_id=${encodeURIComponent(jobId)}`, password);
-      setLogs((current) => ({ ...current, [jobId]: payload.log || "Журнал пока пуст" }));
+      const cursor = logCursors.current[jobId] ?? 0;
+      const params = new URLSearchParams({ job_id: jobId, cursor: String(cursor), limit: "65536" });
+      const payload = await api<{ log: string; next_cursor?: number; has_more?: boolean }>(`/admin/api/jobs/log?${params}`, password, { signal });
+      if (signal.aborted) return false;
+      const next = payload.next_cursor;
+      setLogs((current) => ({ ...current, [jobId]: (next === undefined || next < cursor ? payload.log : (current[jobId] || "") + payload.log).slice(-200_000) }));
+      if (next !== undefined) logCursors.current[jobId] = next;
       setLogError("");
+      return Boolean(payload.has_more);
     } catch (caught) {
-      setLogError(caught instanceof Error ? caught.message : "Не удалось загрузить журнал");
+      if (!signal.aborted) setLogError(caught instanceof Error ? caught.message : "Не удалось загрузить журнал");
+      return false;
     }
   }, [password]);
   const expandedStatus = jobs.find((job) => job.id === expanded)?.status;
   useEffect(() => {
     if (!expanded) return;
-    void loadLog(expanded);
-    if (!expandedStatus || !["queued", "running", "cancelling"].includes(expandedStatus)) return;
-    const timer = window.setInterval(() => void loadLog(expanded), 1000);
-    return () => window.clearInterval(timer);
+    const controller = new AbortController(); let timer = 0;
+    const poll = async () => {
+      const more = await loadLog(expanded, controller.signal);
+      if (!controller.signal.aborted && (more || (expandedStatus && ["queued", "running", "cancelling"].includes(expandedStatus)))) timer = window.setTimeout(poll, more ? 100 : 1000);
+    };
+    void poll();
+    return () => { controller.abort(); window.clearTimeout(timer); };
   }, [expanded, expandedStatus, loadLog]);
   const toggleLog = (job: CatalogJob) => {
     if (expanded === job.id) {
@@ -871,12 +888,12 @@ function JobList({ jobs, password, onCancel }: { jobs: CatalogJob[]; password: s
         <div className="grow"><b>{job.message}</b><small>{job.error || `${job.type} · ${relativeDate(job.completed_at || job.started_at)}`}</small></div>
         <Status value={job.status} />
         {job.log_path
-          ? <button className="job-log-button" onClick={() => toggleLog(job)}>{expanded === job.id ? "Скрыть лог" : "Полный лог"}</button>
+          ? <button className="job-log-button" onClick={() => toggleLog(job)}>{expanded === job.id ? "Скрыть лог" : "Журнал"}</button>
           : <span className="job-log-missing" title="Эта задача была создана до появления постоянных job-логов">Лог не сохранён</span>}
         {authenticationUrl && job.status === "running" && <a className="job-log-button" href={authenticationUrl} target="_blank" rel="noreferrer">Войти в GigaCode ↗</a>}
         {onCancel && ["queued", "running", "cancelling"].includes(job.status) && <button className="job-cancel" disabled={job.status === "cancelling"} onClick={() => onCancel(job)}>{job.status === "cancelling" ? "Отменяем…" : "Отменить"}</button>}
       </div>
-      {expanded === job.id && <div className="job-log"><div className="job-log-meta"><code>{job.id}</code><span>{job.log_path}</span></div><pre>{logError || logs[job.id] || "Загружаем журнал…"}</pre></div>}
+      {expanded === job.id && <div className="job-log"><div className="job-log-meta"><code>{job.id}</code><span>Последние 200 000 символов · загрузка частями</span></div><pre>{logError || logs[job.id] || "Журнал пока пуст"}</pre></div>}
     </div>;
   })}</div>;
 }
@@ -951,12 +968,13 @@ function OperationsPage({ data, password, onAction }: {
   );
 }
 
-function IndexesPage({ data, password, onCreate, onRepository, onOpen, onAction }: {
+function IndexesPage({ data, password, onCreate, onRepository, onOpen, onAction, onRefresh }: {
   data: Overview;
   password: string;
   onCreate: () => void;
   onRepository: () => void;
   onOpen: (indexId: string) => void;
+  onRefresh: () => void;
   onAction: (run: () => Promise<unknown>, message: string) => Promise<void>;
 }) {
   const nameById = useMemo(() => Object.fromEntries(data.catalog.indexes.map((item) => [item.id, item.name])), [data]);
@@ -978,7 +996,7 @@ function IndexesPage({ data, password, onCreate, onRepository, onOpen, onAction 
           >
             <header><div className="index-glyph big">{index.kind === "default" ? "◆" : "◇"}</div><Status value={index.status} /></header>
             <h3>{index.name}</h3><p>{index.description || "Отдельный контур корпоративных знаний"}</p>
-            <div className="index-numbers"><span><b>{number(index.document_count)}</b> документов</span><span><b>{number(index.chunk_count)}</b> чанков</span><span><b>{index.source_count}</b> Git</span></div>
+            <div className="index-numbers"><span><b>{number(index.document_count)}</b> документов</span><span><b>{number(index.chunk_count)}</b> чанков</span><span><b>{index.source_count}</b> источников</span></div>
             {index.error && <div className="inline-error">{index.error}</div>}
             <footer><small>Обновлён {relativeDate(index.updated_at)} · открыть →</small><button onClick={(event) => { event.stopPropagation(); void onAction(() => post("/admin/api/indexes/build", password, { index_id: index.id }), "Переиндексация запущена"); }}>↻ Пересобрать</button></footer>
           </article>
@@ -992,6 +1010,7 @@ function IndexesPage({ data, password, onCreate, onRepository, onOpen, onAction 
           </tbody></table></div>
         ) : <div className="empty-state"><div>↗</div><h3>Подключите первый репозиторий</h3><p>Сервис проанализирует исходники, найдёт openspec при наличии, обновит индекс и карту.</p><button className="button primary" onClick={onRepository}>Подключить Git</button></div>}
       </section>
+      <ConfluenceApp password={password} indexes={data.catalog.indexes} onChanged={onRefresh} />
       {data.catalog.jobs.length > 0 && <section className="panel"><PanelHeader title="Очередь операций" kicker="Фоновые задачи" /><JobList password={password} jobs={data.catalog.jobs} onCancel={(job) => void onAction(() => post("/admin/api/jobs/cancel", password, { job_id: job.id }), "Отмена запрошена")} /></section>}
     </>
   );
@@ -1089,6 +1108,7 @@ function IndexDetailPage({ index, repositories, password, onBack, onChanged, onA
     upload: "Загружен вручную",
     ssot: "SSOT",
     local: "Локальный источник",
+    confluence: "Confluence",
   };
   const totalSelectedBytes = files.reduce((sum, file) => sum + file.size, 0);
 
@@ -1109,6 +1129,7 @@ function IndexDetailPage({ index, repositories, password, onBack, onChanged, onA
         </div>
       </div>
 
+      <ConfluenceApp password={password} indexes={[index]} indexId={index.id} onChanged={() => onChanged("Источники обновлены")} />
       <section className="panel index-upload-panel">
         <PanelHeader title="Догрузить текстовые файлы" kicker="Файлы сохранятся только в этом индексе" />
         <div className="upload-layout">
@@ -1140,7 +1161,7 @@ function IndexDetailPage({ index, repositories, password, onBack, onChanged, onA
           <form onSubmit={(event) => { event.preventDefault(); setOffset(0); setQuery(queryInput.trim()); }}><input value={queryInput} onChange={(event) => setQueryInput(event.target.value)} placeholder="Название или путь документа" /><button className="button secondary">Найти</button>{query && <button type="button" className="button quiet" onClick={() => { setQueryInput(""); setQuery(""); setOffset(0); }}>Сбросить</button>}</form>
         </div>
         {loadingDocuments && !documents ? <div className="empty-state"><div>◌</div><h3>Читаем индекс</h3></div> : documents?.documents.length ? (
-          <div className="table-wrap"><table className="documents-table"><thead><tr><th>Документ</th><th>Источник</th><th>Тип</th><th>Загружен</th></tr></thead><tbody>{documents.documents.map((document) => <tr key={document.document_id}><td><button className="document-open" onClick={() => setSelectedDocument(document)}><b>{document.title}</b><small title={document.source_path}>{document.source_path}</small><em>Открыть →</em></button></td><td><span className={`tag origin-${document.origin}`}>{origins[document.origin] || document.origin}</span></td><td><code>{document.source_type}</code></td><td>{relativeDate(document.loaded_at)}</td></tr>)}</tbody></table></div>
+          <div className="table-wrap"><table className="documents-table"><thead><tr><th>Документ</th><th>Источник</th><th>Версия</th><th>Изменён в источнике</th><th>Получен нами</th></tr></thead><tbody>{documents.documents.map((document) => <tr key={document.document_id}><td><button className="document-open" onClick={() => setSelectedDocument(document)}><b>{document.title}</b><small title={document.source_path}>{document.source_path}</small><em>Открыть →</em></button></td><td><span className={`tag origin-${document.origin}`}>{origins[document.origin] || document.origin}</span></td><td><code>{document.source_version || document.source_type}</code>{document.is_latest === false && <small>Историческая</small>}</td><td>{integrationDate(document.source_updated_at)}</td><td>{integrationDate(document.fetched_at || document.loaded_at)}</td></tr>)}</tbody></table></div>
         ) : <div className="empty-state"><div>◇</div><h3>{query ? "Ничего не найдено" : "Индекс пока пуст"}</h3><p>{query ? "Измените поисковый запрос." : "Загрузите текстовые файлы или подключите Git/OpenSpec."}</p></div>}
         {documents && documents.total > DOCUMENT_PAGE_SIZE && <div className="documents-pagination"><button className="button quiet" disabled={offset === 0 || loadingDocuments} onClick={() => setOffset(Math.max(0, offset - DOCUMENT_PAGE_SIZE))}>← Назад</button><span>{number(offset + 1)}–{number(Math.min(offset + documents.documents.length, documents.total))} из {number(documents.total)}</span><button className="button quiet" disabled={!documents.has_more || loadingDocuments} onClick={() => setOffset(offset + DOCUMENT_PAGE_SIZE)}>Дальше →</button></div>}
       </section>
@@ -1150,49 +1171,9 @@ function IndexDetailPage({ index, repositories, password, onBack, onChanged, onA
 }
 
 function DocumentViewer({ indexId, document, password, onClose }: {
-  indexId: string;
-  document: IndexDocument;
-  password: string;
-  onClose: () => void;
+  indexId: string; document: IndexDocument; password: string; onClose: () => void;
 }) {
-  const [detail, setDetail] = useState<IndexDocumentDetail | null>(null);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let disposed = false;
-    const params = new URLSearchParams({ index_id: indexId, document_id: document.document_id });
-    api<IndexDocumentDetail>(`/admin/api/indexes/document?${params}`, password, {}, 30_000)
-      .then((payload) => { if (!disposed) { setDetail(payload); setError(""); } })
-      .catch((caught) => { if (!disposed) setError(caught instanceof Error ? caught.message : "Не удалось открыть документ"); });
-    return () => { disposed = true; };
-  }, [document.document_id, indexId, password]);
-
-  const origins: Record<string, string> = {
-    repository: "Git / OpenSpec",
-    upload: "Загружен вручную",
-    ssot: "SSOT",
-    local: "Локальный источник",
-  };
-
-  return (
-    <Modal title={document.title} onClose={onClose} className="document-modal">
-      {error ? <div className="form-error document-view-error">{error}</div> : !detail ? (
-        <div className="document-loading"><span>◌</span><b>Загружаем документ из индекса…</b></div>
-      ) : (
-        <div className="document-viewer">
-          <div className="document-facts">
-            <span><small>Индекс</small><b>{detail.index.name}</b></span>
-            <span><small>Источник</small><b>{origins[detail.origin] || detail.origin}</b></span>
-            <span><small>Тип</small><b>{detail.source_type}</b></span>
-            <span><small>Размер</small><b>{number(detail.content_chars)} символов · {(detail.content_bytes / 1024).toFixed(1)} KB</b></span>
-          </div>
-          <div className="document-source-line"><code>{detail.source_path}</code>{detail.source_url && <a href={detail.source_url} target="_blank" rel="noreferrer">Открыть источник ↗</a>}</div>
-          <section className="document-content"><div><span className="eyebrow">Normalized serving content</span><b>Содержимое документа</b></div><pre>{detail.content}</pre></section>
-          <details className="document-metadata"><summary>Метаданные и идентификаторы</summary><pre>{JSON.stringify({ document_id: detail.document_id, source_id: detail.source_id, loaded_at: detail.loaded_at, metadata: detail.metadata }, null, 2)}</pre></details>
-        </div>
-      )}
-    </Modal>
-  );
+  return <DocumentHistoryViewer indexId={indexId} document={document} password={password} onClose={onClose} />;
 }
 
 function ServicesPage({ data, password, onGraph, onSsot, onAction }: {
@@ -1728,6 +1709,7 @@ function schemaType(property: Record<string, unknown>): string {
 }
 
 function initialPlaygroundValues(tool: ToolCatalogItem): Record<string, PlaygroundValue> {
+  const required = new Set(Array.isArray(tool.input_schema.required) ? tool.input_schema.required.map(String) : []);
   const samples: Record<string, string> = {
     feature: "Добавить резервирование товара при создании заказа",
     question: "Как устроено текущее состояние системы?",
@@ -1735,10 +1717,20 @@ function initialPlaygroundValues(tool: ToolCatalogItem): Record<string, Playgrou
   };
   return Object.fromEntries(
     Object.entries(schemaProperties(tool.input_schema)).map(([name, property]) => {
-      const value = property.default ?? samples[name] ?? (schemaType(property) === "boolean" ? false : "");
+      const value = property.default ?? samples[name] ?? (required.has(name) ? schemaEnum(property)[0] : undefined) ?? (schemaType(property) === "boolean" ? false : "");
       return [name, typeof value === "boolean" ? value : String(value ?? "")];
     }),
   );
+}
+
+function schemaEnum(property: Record<string, unknown>): unknown[] {
+  if (Array.isArray(property.enum)) return property.enum;
+  if (Array.isArray(property.anyOf)) {
+    for (const item of property.anyOf) {
+      if (item && typeof item === "object" && "enum" in item && Array.isArray(item.enum)) return item.enum;
+    }
+  }
+  return [];
 }
 
 function ToolPlayground({ tool, password }: { tool: ToolCatalogItem; password: string }) {
@@ -1793,7 +1785,12 @@ function ToolPlayground({ tool, password }: { tool: ToolCatalogItem; password: s
         return (
           <label className="playground-field" key={name}>
             <span><code>{name}</code>{required.has(name) && <i>обязательно</i>}</span>
-            {type === "boolean" ? (
+            {schemaEnum(property).length > 0 ? (
+              <select value={String(values[name] ?? "")} onChange={(event) => setValues((current) => ({ ...current, [name]: event.target.value }))}>
+                {!required.has(name) && <option value="">По умолчанию</option>}
+                {schemaEnum(property).map((value) => <option key={String(value)} value={String(value)}>{String(value)}</option>)}
+              </select>
+            ) : type === "boolean" ? (
               <input type="checkbox" checked={Boolean(values[name])} onChange={(event) => setValues((current) => ({ ...current, [name]: event.target.checked }))} />
             ) : isLongText ? (
               <textarea value={String(values[name] ?? "")} onChange={(event) => setValues((current) => ({ ...current, [name]: event.target.value }))} />

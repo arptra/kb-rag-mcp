@@ -176,6 +176,56 @@ def test_tls_settings_use_verified_transport(secured, pki):
 
 
 @pytest.mark.asyncio
+async def test_a2a_without_certificate_admin_issuance_and_token_isolation(secured):
+    app, _settings, _store, _certificates = secured
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="https://testserver"
+        ) as client,
+    ):
+        login = await client.post(
+            "/access/api/login", json={"username": "admin", "password": PASSWORD}
+        )
+        assert login.status_code == 200
+        denied = await client.post(
+            "/admin/api/a2a/agents", json={"name": "A2A Agent", "index_ids": ["default"]}
+        )
+        assert denied.status_code == 401  # Admin cookie also requires CSRF on writes.
+        issued = await client.post(
+            "/admin/api/a2a/agents",
+            headers={"x-csrf-token": login.json()["csrf_token"], "origin": "https://testserver"},
+            json={"name": "A2A Agent", "index_ids": ["default"]},
+        )
+        assert issued.status_code == 201, issued.text
+        token = issued.json()["token"]
+        client.cookies.clear()
+        headers = {"authorization": "Bearer " + token, "A2A-Version": "1.0"}
+        result = await client.post(
+            "/a2a",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": "1",
+                "method": "SendMessage",
+                "params": {
+                    "message": {
+                        "messageId": "test-message",
+                        "role": "ROLE_USER",
+                        "parts": [{"text": "limits"}],
+                    }
+                },
+            },
+        )
+        assert result.json()["result"]["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+        assert (await client.get("/api/v1/stats", headers=headers)).status_code == 401
+        assert (await client.post("/mcp", headers=headers, json={})).status_code == 401
+        assert (
+            await client.post("/admin/api/a2a/agents", headers=headers, json={})
+        ).status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_every_operational_route_requires_personal_auth(secured):
     app, _, _, _ = secured
     async with (

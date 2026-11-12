@@ -66,7 +66,11 @@ def make_document(
     metadata["source_type"] = source_type
 
     normalized = content.strip()
-    content_hash_payload = f"{normalized}\n{stable_json(metadata)}"
+    identity_metadata = {
+        key: value for key, value in metadata.items()
+        if key not in {"fetched_at", "indexed_at", "is_latest", "is_current", "last_checked_at"}
+    }
+    content_hash_payload = f"{normalized}\n{stable_json(identity_metadata)}"
     content_hash = hashlib.sha256(content_hash_payload.encode("utf-8")).hexdigest()
     document_id_input = f"{relative_path}\0{source_id}\0{content_hash}"
     document_id = hashlib.sha256(document_id_input.encode("utf-8")).hexdigest()

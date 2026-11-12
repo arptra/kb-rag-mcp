@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from corporate_kb.loaders.base import DocumentLoader
@@ -47,7 +48,9 @@ class FileSystemDocumentLoader:
             **{suffix: text for suffix in PLAIN_TEXT_SUFFIXES},
         }
 
-    def load_directory(self, knowledge_root: Path) -> list[Document]:
+    def load_directory(
+        self, knowledge_root: Path, *, progress: Callable[[str, int], None] | None = None
+    ) -> list[Document]:
         root = knowledge_root.resolve()
         if not root.exists():
             raise FileNotFoundError(f"Knowledge directory does not exist: {root}")
@@ -79,9 +82,7 @@ class FileSystemDocumentLoader:
             for name in file_names:
                 path = current / name
                 relative = path.relative_to(root)
-                if any(
-                    part.startswith(".") or part in _IGNORED_PARTS for part in relative.parts
-                ):
+                if any(part.startswith(".") or part in _IGNORED_PARTS for part in relative.parts):
                     continue
                 if (
                     path.is_symlink()
@@ -98,6 +99,8 @@ class FileSystemDocumentLoader:
                     logger.warning("Skipping file outside knowledge directory: %s", path)
                     continue
                 paths.append(path)
+            if progress is not None:
+                progress("discovering", len(paths))
 
         ordered_paths = sorted(paths, key=lambda item: item.relative_to(root).as_posix())
         logger.info("Discovered %d knowledge files under %s", len(ordered_paths), root)
@@ -105,7 +108,8 @@ class FileSystemDocumentLoader:
         progress_step = max(100, len(ordered_paths) // 20 or 1)
         for position, path in enumerate(ordered_paths, start=1):
             try:
-                raw_prefix = path.read_bytes()[:8192]
+                with path.open("rb") as handle:
+                    raw_prefix = handle.read(8192)
                 if b"\x00" in raw_prefix:
                     logger.warning("Skipping binary-looking file: %s", path)
                     continue
@@ -120,6 +124,8 @@ class FileSystemDocumentLoader:
                     exc,
                 )
             if position == 1 or position % progress_step == 0 or position == len(ordered_paths):
+                if progress is not None:
+                    progress("loading", position)
                 logger.info(
                     "Loaded knowledge files: %d/%d (documents=%d)",
                     position,

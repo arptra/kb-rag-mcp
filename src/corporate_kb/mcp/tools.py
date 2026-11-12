@@ -11,6 +11,7 @@ from typing import Any
 
 from corporate_kb.context import ContextCompressor, ContextExcerpt
 from corporate_kb.evaluation.evaluator import load_evaluation_questions
+from corporate_kb.history import utc_datetime, version_fields
 from corporate_kb.models import Document, SearchFilters, SearchResult
 from corporate_kb.service import KnowledgeService
 from corporate_kb.ssot import SsotContextBuilder
@@ -104,10 +105,22 @@ class KnowledgeTools:
 
     def get_document(
         self,
-        document_id: str,
+        document_id: str | None = None,
         max_tokens: int | None = None,
+        *,
+        page_id: str | None = None,
+        source_version: str | None = None,
+        as_of: str | None = None,
     ) -> dict[str, Any]:
-        document = self._service.get_document(document_id)
+        if bool(document_id) == bool(page_id):
+            raise ValueError("Provide exactly one of document_id or page_id")
+        if document_id and (source_version is not None or as_of is not None):
+            raise ValueError("Version selectors require page_id")
+        document = (
+            self._service.get_document(document_id)
+            if document_id
+            else self._service.read_page(str(page_id), source_version=source_version, as_of=as_of)
+        )
         if self._is_legacy_graph_item(document):
             raise KeyError(f"Unknown document: {document_id}")
         excerpt = self._excerpt(
@@ -123,6 +136,7 @@ class KnowledgeTools:
             "truncated": excerpt.truncated,
             "source_path": document.source_path,
             "source_url": document.source_url,
+            **document.model_dump(mode="json", include=set(version_fields(document))),
         }
         self.usage.record("kb_get_document")
         return payload
@@ -150,8 +164,89 @@ class KnowledgeTools:
             "source_path": chunk.source_path,
             "source_url": chunk.source_url,
             "citation": f"{chunk.title}{section} ({location})",
+            **chunk.model_dump(mode="json", include=set(version_fields(chunk))),
         }
         self.usage.record("kb_get_chunk")
+        return payload
+
+    def search_versions(
+        self,
+        *,
+        query: str,
+        version_scope: str = "latest",
+        page_id: str | None = None,
+        as_of: str | None = None,
+        updated_from: str | None = None,
+        updated_to: str | None = None,
+        top_k: int = 3,
+        min_score: float | None = None,
+        service: str | None = None,
+        domain: str | None = None,
+        document_type: str | None = None,
+        status: str | None = None,
+        authority: str | None = None,
+        source_type: str | None = None,
+    ) -> dict[str, Any]:
+        if version_scope not in {"latest", "history", "as_of"}:
+            raise ValueError("version_scope must be latest, history or as_of")
+        if (version_scope == "as_of") != (as_of is not None):
+            raise ValueError("as_of is required only for version_scope=as_of")
+        if not 1 <= top_k <= 20:
+            raise ValueError("top_k must be between 1 and 20")
+        start, end = utc_datetime(updated_from), utc_datetime(updated_to)
+        if start and end and start > end:
+            raise ValueError("updated_from must not exceed updated_to")
+        filters = SearchFilters(
+            page_id=page_id,
+            version_scope=version_scope,
+            as_of=utc_datetime(as_of),
+            updated_from=start,
+            updated_to=end,
+            service=service,
+            domain=domain,
+            document_type=document_type,
+            status=status,
+            authority=authority,
+            source_type=source_type,
+        )
+        results = self._service.search_versions(
+            query,
+            filters=filters,
+            top_k=min(20, max(top_k, self._service.settings.search_candidate_k)),
+            min_score=min_score,
+        )
+        results = [item for item in results if not self._is_legacy_graph_item(item)]
+        if version_scope == "history":
+            results.sort(key=lambda item: (not item.is_latest, -item.score, item.chunk_id))
+        packed, token_count = self._pack_search_results(
+            query=query, results=results, requested_top_k=top_k
+        )
+        current_references = (
+            self._service.history.latest_references(
+                [item["page_id"] for item in packed if item.get("page_id")]
+            )
+            if version_scope != "latest"
+            else {}
+        )
+        for rank, item in enumerate(packed, 1):
+            item["rank"] = rank
+            if version_scope != "latest" and not item["is_latest"]:
+                item["latest_revision"] = current_references.get(item["page_id"])
+        payload = {
+            "query": query,
+            "version_scope": version_scope,
+            "as_of": as_of,
+            "result_count": len(packed),
+            "retrieved_candidate_count": len(results),
+            "context_token_count": token_count,
+            "results": packed,
+            "coverage": self._service.history.coverage(
+                page_id, identity=self._service.provider.cache_identity
+            ),
+        }
+        self.usage.record(
+            "kb_search_versions", context_tokens=token_count, result_count=len(packed)
+        )
         return payload
 
     def list_documents(
@@ -172,9 +267,7 @@ class KnowledgeTools:
             ),
             limit=limit,
         )
-        documents = [
-            document for document in documents if not self._is_legacy_graph_item(document)
-        ]
+        documents = [document for document in documents if not self._is_legacy_graph_item(document)]
         payload = {
             "document_count": len(documents),
             "documents": [self._document_metadata(document) for document in documents],
@@ -405,8 +498,7 @@ class KnowledgeTools:
         limit = self._service.settings.document_context_tokens if max_tokens is None else max_tokens
         if not 1 <= limit <= self._service.settings.document_context_tokens:
             raise ValueError(
-                "max_tokens must be between 1 and "
-                f"{self._service.settings.document_context_tokens}"
+                f"max_tokens must be between 1 and {self._service.settings.document_context_tokens}"
             )
         return self._compressor.excerpt(query=query, text=text, max_tokens=limit)
 
@@ -432,6 +524,7 @@ class KnowledgeTools:
             "source_path": result.source_path,
             "source_url": result.source_url,
             "citation": f"{result.title}{section} ({location})",
+            **result.model_dump(mode="json", include=set(version_fields(result))),
         }
 
     @staticmethod
@@ -446,4 +539,5 @@ class KnowledgeTools:
             "content_hash": document.content_hash,
             "metadata": document.metadata,
             "loaded_at": document.loaded_at.isoformat(),
+            **document.model_dump(mode="json", include=set(version_fields(document))),
         }

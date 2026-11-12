@@ -77,10 +77,19 @@ BUILTIN_TOOL_DESCRIPTIONS = {
     "kb_generate_system_ssot": GENERATE_SSOT_DESCRIPTION,
     "kb_connect_services_batch": BATCH_CONNECT_DESCRIPTION,
     "kb_search": SEARCH_DESCRIPTION,
+    "kb_search_versions": (
+        "Search versioned documentation in one selected index. Default version_scope='latest' "
+        "returns current pages only. Use 'history' explicitly for captured older revisions or "
+        "'as_of' with an ISO date for the latest known revision on that date. Results include "
+        "page_id, exact document_id, source version/update date and coverage limitations. "
+        "Do not present historical evidence as current. Read exact hits with kb_get_document."
+    ),
     "kb_get_document": (
         "Return a bounded extract from one normalized document identified by a search result's "
-        "document_id. Pass index_id from the managed search result or kb_search_index response. "
-        "If omitted, index_id defaults to 'default'; only the selected index is read."
+        "exact document_id, including archived revisions. Alternatively provide page_id to read "
+        "the latest page, optionally source_version or an ISO as_of timestamp. Provide exactly "
+        "one of document_id/page_id. Pass index_id from the search result; omitted index_id "
+        "defaults to 'default'. Version fields distinguish historical evidence."
     ),
     "kb_get_chunk": (
         "Return a bounded source chunk identified by a search result's chunk_id. Pass index_id "
@@ -141,6 +150,21 @@ def create_mcp_server(
     kb_service = service or create_service()
     tools = knowledge_tools or KnowledgeTools(kb_service)
     registry = managed_tools or ManagedToolRegistry(kb_service.settings.managed_tools_path, tools)
+    managed_names = {definition.name for definition in registry.list()}
+    version_search_name = "kb_search_versions"
+    if version_search_name in managed_names:
+        base = "kb_search_versions_builtin"
+        version_search_name = base
+        suffix = 2
+        while version_search_name in managed_names:
+            version_search_name = f"{base}_{suffix}"
+            suffix += 1
+        logger.warning(
+            "Preserving existing managed tool kb_search_versions; the built-in historical "
+            "search is available as %s",
+            version_search_name,
+        )
+    registry.reserve_builtin_name(version_search_name)
 
     def description(name: str) -> str:
         default = BUILTIN_TOOL_DESCRIPTIONS[name]
@@ -162,7 +186,9 @@ def create_mcp_server(
             "standalone graph and returns explicit kb_search_index next_calls without querying "
             "RAG itself. Cite graph evidence and later RAG source_path/source_url separately. "
             "When calling kb_get_chunk or kb_get_document, pass index_id from the managed "
-            "search result or kb_search_index response to read the same index."
+            "search result or kb_search_index response to read the same index. "
+            f"Use {version_search_name} to search latest or historical document revisions; "
+            "the default version_scope is latest."
         ),
         version=__version__,
         auth=auth,
@@ -219,9 +245,7 @@ def create_mcp_server(
             start_service: str | None = None,
             max_hops: int = 2,
             direction: Literal["incoming", "outgoing", "both"] = "both",
-            min_confidence: Literal[
-                "DECLARED", "HIGH", "MEDIUM", "LOW", "UNRESOLVED"
-            ] = "LOW",
+            min_confidence: Literal["DECLARED", "HIGH", "MEDIUM", "LOW", "UNRESOLVED"] = "LOW",
             include_unresolved: bool = True,
         ) -> dict[str, Any]:
             return feature_context.graph_route(
@@ -244,9 +268,7 @@ def create_mcp_server(
             max_hops: int = 2,
             top_k_per_service: int = 2,
             direction: Literal["incoming", "outgoing", "both"] = "both",
-            min_confidence: Literal[
-                "DECLARED", "HIGH", "MEDIUM", "LOW", "UNRESOLVED"
-            ] = "LOW",
+            min_confidence: Literal["DECLARED", "HIGH", "MEDIUM", "LOW", "UNRESOLVED"] = "LOW",
             include_unresolved: bool = True,
         ) -> dict[str, Any]:
             return feature_context.build(
@@ -477,12 +499,64 @@ def create_mcp_server(
         annotations={"readOnlyHint": True, "openWorldHint": False},
     )
     def kb_get_document(
-        document_id: str,
+        document_id: str | None = None,
         max_tokens: int | None = None,
         index_id: str = "default",
+        page_id: str | None = None,
+        source_version: str | None = None,
+        as_of: str | None = None,
     ) -> dict[str, Any]:
-        result = tools_for_index(index_id).get_document(document_id, max_tokens=max_tokens)
+        result = tools_for_index(index_id).get_document(
+            document_id,
+            max_tokens=max_tokens,
+            page_id=page_id,
+            source_version=source_version,
+            as_of=as_of,
+        )
         result["index_id"] = index_id
+        return result
+
+    @server.tool(
+        name=version_search_name,
+        description=description("kb_search_versions"),
+        annotations={"readOnlyHint": True, "openWorldHint": False},
+    )
+    def kb_search_versions(
+        query: str,
+        index_id: str = "default",
+        top_k: int = 3,
+        version_scope: Literal["latest", "history", "as_of"] = "latest",
+        page_id: str | None = None,
+        as_of: str | None = None,
+        updated_from: str | None = None,
+        updated_to: str | None = None,
+        min_score: float | None = None,
+        service: str | None = None,
+        domain: str | None = None,
+        document_type: str | None = None,
+        status: str | None = None,
+        authority: str | None = None,
+        source_type: str | None = None,
+    ) -> dict[str, Any]:
+        result = tools_for_index(index_id).search_versions(
+            query=query,
+            top_k=top_k,
+            version_scope=version_scope,
+            page_id=page_id,
+            as_of=as_of,
+            updated_from=updated_from,
+            updated_to=updated_to,
+            min_score=min_score,
+            service=service,
+            domain=domain,
+            document_type=document_type,
+            status=status,
+            authority=authority,
+            source_type=source_type,
+        )
+        result["index_id"] = index_id
+        for item in result["results"]:
+            item["index_id"] = index_id
         return result
 
     @server.tool(
@@ -572,9 +646,7 @@ def main() -> None:
             index_tools=catalog.tools_for,
             index_exists=catalog.has_index,
         )
-        builtin_tool_overrides = BuiltinToolOverrideRegistry(
-            settings.builtin_tool_overrides_path
-        )
+        builtin_tool_overrides = BuiltinToolOverrideRegistry(settings.builtin_tool_overrides_path)
         create_mcp_server(
             service,
             knowledge_tools=tools,

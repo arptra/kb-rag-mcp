@@ -257,9 +257,7 @@ def test_managed_checkouts_are_removed_but_documents_and_graph_are_retained(
         )
         finished = _wait_for_job(catalog, job.id)
         assert finished["status"] == "completed"
-        imported = next(
-            item for item in catalog.payload()["repositories"] if item["name"] == name
-        )
+        imported = next(item for item in catalog.payload()["repositories"] if item["name"] == name)
         imported_names.append(name)
         repository_ids.append(str(imported["id"]))
         assert imported["checkout_state"] == "removed"
@@ -272,9 +270,7 @@ def test_managed_checkouts_are_removed_but_documents_and_graph_are_retained(
         result = catalog.tools_for(index.id).search(query=f"{name} contract", top_k=1)
         assert result["results"]
 
-    assert {item["label"] for item in catalog.graph_overview()["services"]} == set(
-        imported_names
-    )
+    assert {item["label"] for item in catalog.graph_overview()["services"]} == set(imported_names)
     refreshed = _wait_for_job(
         catalog,
         catalog.start_repository_refresh(repository_ids[0]).id,
@@ -283,9 +279,7 @@ def test_managed_checkouts_are_removed_but_documents_and_graph_are_retained(
     refreshed_repository = catalog._repository(repository_ids[0])
     assert refreshed_repository.checkout_state == "removed"
     assert not Path(refreshed_repository.checkout_path).exists()
-    assert {item["label"] for item in catalog.graph_overview()["services"]} == set(
-        imported_names
-    )
+    assert {item["label"] for item in catalog.graph_overview()["services"]} == set(imported_names)
 
     static_job = catalog.start_graph_build()
     static = _wait_for_job(catalog, static_job.id)
@@ -307,9 +301,7 @@ def test_managed_checkouts_are_removed_but_documents_and_graph_are_retained(
     assert exact["result"]["generation_mode"] == "gigacode"
     exact_log = catalog.job_log(exact_job.id)["log"]
     assert exact_log.count("Temporarily restoring checkout for analysis") == 2
-    assert {item["label"] for item in catalog.graph_overview()["services"]} == set(
-        imported_names
-    )
+    assert {item["label"] for item in catalog.graph_overview()["services"]} == set(imported_names)
     for repository_id in repository_ids:
         restored = catalog._repository(repository_id)
         assert restored.checkout_state == "removed"
@@ -490,13 +482,7 @@ def test_system_ssot_session_serves_sources_and_accepts_client_generated_documen
         "spring.application.name=primary-lifecycle-service\n",
     )
     _write(
-        repository
-        / "primary"
-        / "src"
-        / "main"
-        / "java"
-        / "example"
-        / "LifecycleController.java",
+        repository / "primary" / "src" / "main" / "java" / "example" / "LifecycleController.java",
         """
 package example;
 @RestController
@@ -512,13 +498,7 @@ public class LifecycleController {
         "spring.application.name=fallback-lifecycle-service\n",
     )
     _write(
-        repository
-        / "fallback"
-        / "src"
-        / "main"
-        / "java"
-        / "example"
-        / "FallbackController.java",
+        repository / "fallback" / "src" / "main" / "java" / "example" / "FallbackController.java",
         """
 package example;
 @RestController
@@ -779,9 +759,7 @@ public class GigaCodeController {
     waiting: dict[str, object] | None = None
     for _ in range(100):
         current = next(
-            item
-            for item in catalog.payload()["jobs"]
-            if item["id"] == queued["job"]["id"]
+            item for item in catalog.payload()["jobs"] if item["id"] == queued["job"]["id"]
         )
         result = current.get("result")
         if isinstance(result, dict) and result.get("phase") == "awaiting_authentication":
@@ -790,9 +768,7 @@ public class GigaCodeController {
         time.sleep(0.01)
     assert waiting is not None
     assert waiting["message"] == "GigaCode ожидает вход через браузер"
-    assert waiting["result"]["authentication_url"] == (
-        "https://auth.example/gigacode/device"
-    )
+    assert waiting["result"]["authentication_url"] == ("https://auth.example/gigacode/device")
     completed = _wait_for_job(catalog, queued["job"]["id"])
 
     assert completed["status"] == "completed"
@@ -896,9 +872,7 @@ public class FallbackController {
     assert completed["result"]["gigacode_failure_count"] == 1
     assert completed["result"]["fallback_used"] is True
     assert completed["result"]["gigacode_runs"][0]["status"] == "failed"
-    assert completed["result"]["gigacode_runs"][0]["fallback"] == (
-        "static-analysis-ssot"
-    )
+    assert completed["result"]["gigacode_runs"][0]["fallback"] == ("static-analysis-ssot")
     generated = Path(index.knowledge_dir) / completed["result"]["files"][0]
     content = generated.read_text(encoding="utf-8")
     assert 'generated_by: "kb_generate_system_ssot/gigacode-fallback"' in content
@@ -1096,9 +1070,7 @@ def test_catalog_cancels_running_graph_job_without_blocking_api(
     )
     entered = threading.Event()
 
-    def cancellable_build(
-        self, repositories, *, cancel=None, progress=None, checkpoint=None
-    ):
+    def cancellable_build(self, repositories, *, cancel=None, progress=None, checkpoint=None):
         del self, repositories, progress, checkpoint
         assert cancel is not None
         entered.set()
@@ -1142,9 +1114,11 @@ def test_catalog_cancels_running_index_process(
     )
     entered = threading.Event()
 
-    def cancellable_build(self, *, cancel=None):
+    def cancellable_build(self, *, cancel=None, progress=None):
         del self
         assert cancel is not None
+        assert callable(progress)
+        progress({"stage": "embedding", "completed": 1, "total": 2})
         entered.set()
         while not cancel.is_set():
             time.sleep(0.01)
@@ -1254,9 +1228,7 @@ public class LifecycleController {
     assert catalog.service_map_overview()["service_count"] == 0
 
     repository_record = catalog.payload()["repositories"][0]
-    documents = (
-        Path(index.knowledge_dir) / "repositories" / repository_record["id"]
-    )
+    documents = Path(index.knowledge_dir) / "repositories" / repository_record["id"]
     assert documents.is_dir()
     repository_delete = catalog.start_repository_delete(repository_record["id"])
     assert _wait_for_job(catalog, repository_delete.id)["status"] == "completed"

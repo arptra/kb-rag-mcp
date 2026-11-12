@@ -183,6 +183,7 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
             listed = await session.list_tools()
             assert {
                 "kb_search",
+                "kb_search_versions",
                 "kb_feature_context",
                 "kb_system_graph",
                 "kb_generate_system_ssot",
@@ -641,7 +642,7 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
         assert server_metrics["peak_rss_mb"] > 0
 
         runtime_catalog = admin_overview.json()["tool_catalog"]
-        assert runtime_catalog["built_in_count"] == 12
+        assert runtime_catalog["built_in_count"] == 13
         assert {
             "ssot_context",
             "kb_feature_context",
@@ -791,6 +792,7 @@ async def test_http_mcp_rejects_missing_token_and_serves_tools_with_valid_token(
                 "kb_generate_system_ssot",
                 "kb_connect_services_batch",
                 "kb_search",
+                "kb_search_versions",
                 "kb_get_document",
                 "kb_get_chunk",
                 "kb_run_context_benchmark",

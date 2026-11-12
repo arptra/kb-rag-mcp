@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { accessApi, accessError } from "./accessApi";
 import type { AccessUser, BrowserAccessStatus } from "./accessTypes";
+import A2AApp from "./A2AApp";
 
 type McpServerName = "corporate-kb" | "corporate-skills";
 
@@ -22,6 +23,7 @@ interface PersonalMcpConfig {
 }
 
 export default function McpConnectApp() {
+  const [protocol, setProtocol] = useState<"mcp" | "a2a">(() => new URLSearchParams(window.location.search).get("protocol") === "a2a" ? "a2a" : "mcp");
   const [status, setStatus] = useState<BrowserAccessStatus | null>(null);
   const [result, setResult] = useState<PersonalMcpConfig | null>(null);
   const [selectedServers, setSelectedServers] = useState<McpServerName[]>(["corporate-kb", "corporate-skills"]);
@@ -59,6 +61,7 @@ export default function McpConnectApp() {
   }, []);
 
   useEffect(() => {
+    if (protocol !== "mcp") { setResult(null); return; }
     void check();
     const hide = () => {
       ++generation.current;
@@ -77,7 +80,7 @@ export default function McpConnectApp() {
       document.removeEventListener("visibilitychange", visibility);
       window.removeEventListener("pagehide", hide);
     };
-  }, [check]);
+  }, [check, protocol]);
 
   useEffect(() => {
     if (!result) return;
@@ -165,10 +168,12 @@ export default function McpConnectApp() {
   return (
     <div className="access-shell connect-shell">
       <header className="access-header">
-        <a className="access-brand" href="/admin"><span className="brand-mark">R</span><span><b>RAG</b><small>ПОДКЛЮЧЕНИЕ MCP</small></span></a>
+        <a className="access-brand" href="/admin"><span className="brand-mark">R</span><span><b>RAG</b><small>ПОДКЛЮЧЕНИЕ</small></span></a>
         <div className="access-header-actions"><a className="button secondary" href="/admin">Дашборд ↗</a><a className="button secondary" href="/access-admin">Управление доступом</a></div>
       </header>
       <main className="access-main connect-main">
+        <nav className="integration-tabs connect-protocol-tabs" aria-label="Протокол подключения"><button className={`button ${protocol === "mcp" ? "primary" : "secondary"}`} aria-pressed={protocol === "mcp"} onClick={() => setProtocol("mcp")}>MCP · инструменты</button><button className={`button ${protocol === "a2a" ? "primary" : "secondary"}`} aria-pressed={protocol === "a2a"} onClick={() => setProtocol("a2a")}>A2A · агенты</button></nav>
+        {protocol === "a2a" ? <A2AApp connectionMode /> : <>
         <div className="access-intro"><div><span className="eyebrow">Персональное подключение</span><h1>Подключить MCP</h1><p>Выберите существующий личный сертификат в браузере и получите конфиг для AI-клиента. Учётная запись определяется по CN (Common Name), без Python и локальных скриптов.</p></div></div>
         <ol className="connect-steps" aria-label="Порядок подключения"><li><span>1</span><div><b>Выберите личный сертификат</b><small>Сервис прочитает имя пользователя из CN.</small></div></li><li><span>2</span><div><b>Получите персональный конфиг</b><small>Токен появится только после нажатия кнопки.</small></div></li><li><span>3</span><div><b>Добавьте выбранные MCP</b><small>База знаний и скиллы подключаются отдельно.</small></div></li></ol>
         <section className="access-section connect-panel" aria-labelledby="connect-access-title">
@@ -226,6 +231,7 @@ export default function McpConnectApp() {
             <p className="connect-help">Конфиг хранится только в памяти этой страницы и скрывается при переключении вкладки, уходе со страницы, повторной проверке или истечении токена. Скрытие и выход из дашборда не отзывают скопированный или скачанный MCP-токен. Для отзыва отдельного токена или блокировки всего доступа обратитесь к администратору.</p>
           </div>
         </section>}
+        </>}
       </main>
     </div>
   );

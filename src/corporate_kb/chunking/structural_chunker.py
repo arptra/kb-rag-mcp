@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from typing import Protocol
 
 from corporate_kb.chunking.blocks import Block, parse_markdown_blocks
+from corporate_kb.history import version_fields
 from corporate_kb.models import Chunk, Document
 
 _TOKEN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
@@ -85,6 +86,7 @@ class StructuralChunker:
                     source_path=document.source_path,
                     source_url=document.source_url,
                     metadata=dict(document.metadata),
+                    **version_fields(document),
                 )
             )
         return chunks

@@ -516,6 +516,44 @@ async def test_local_generated_identity_works_for_real_browser_https_flow(local_
             status = await anonymous.get("/auth/status")
             assert status.json()["enabled"] is True
             assert status.json()["certificate_present"] is False
+            # A2A uses an independent agent token over the same TLS listener, no mTLS.
+            login = await anonymous.post(
+                "/access/api/login",
+                json={
+                    "username": identity.admin_username,
+                    "password": identity.admin_password,
+                },
+            )
+            assert login.status_code == 200
+            issued = await anonymous.post(
+                "/admin/api/a2a/agents",
+                json={
+                    "name": "TLS A2A Agent",
+                    "index_ids": ["default"],
+                },
+                headers={"origin": origin, "x-csrf-token": login.json()["csrf_token"]},
+            )
+            assert issued.status_code == 201, issued.text
+            answer = await anonymous.post(
+                "/a2a",
+                headers={
+                    "Authorization": "Bearer " + issued.json()["token"],
+                    "A2A-Version": "1.0",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "SendMessage",
+                    "params": {
+                        "message": {
+                            "messageId": "tls-test",
+                            "role": "ROLE_USER",
+                            "parts": [{"text": "documentation"}],
+                        }
+                    },
+                },
+            )
+            assert answer.json()["result"]["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
 
         context = ssl.create_default_context(cafile=str(identity.ca_cert))
         context.load_cert_chain(str(identity.client_cert), str(identity.client_key))

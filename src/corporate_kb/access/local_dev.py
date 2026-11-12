@@ -80,6 +80,10 @@ def build_local_settings(
     paths = {
         "knowledge_dir": "knowledge",
         "cache_dir": "kb",
+        "history_dir": "history",
+        "confluence_state_dir": "confluence",
+        "a2a_state_dir": "a2a",
+        "skills_registry_dir": "skills-registry",
         "ssot_knowledge_dir": "ssot",
         "ssot_cache_dir": "ssot-cache",
         "benchmark_questions_path": "evaluation/questions.json",

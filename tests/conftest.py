@@ -14,6 +14,9 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
         values: dict[str, object] = {
             "knowledge_dir": tmp_path / "knowledge",
             "cache_dir": tmp_path / ".cache" / "kb",
+            "history_dir": tmp_path / "var" / "history",
+            "confluence_state_dir": tmp_path / "var" / "confluence",
+            "a2a_state_dir": tmp_path / "var" / "a2a",
             "embedding_provider": "hash",
             "embedding_dimension": 64,
             "chunk_size_tokens": 40,

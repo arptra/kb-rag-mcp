@@ -13,7 +13,7 @@ import tempfile
 import threading
 import traceback
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
@@ -348,9 +348,7 @@ class RagCatalog:
         with self._lock:
             existing = self._repository_for_source_key_locked(source_key)
             if existing is not None:
-                raise ValueError(
-                    f"Git-репозиторий уже подключён: {existing.name}"
-                )
+                raise ValueError(f"Git-репозиторий уже подключён: {existing.name}")
             if source_key in self._repository_import_reservations:
                 raise ValueError("Этот Git-репозиторий уже подключается")
             self._repository_import_reservations.add(source_key)
@@ -500,8 +498,7 @@ class RagCatalog:
                     job.id,
                     status="completed",
                     message=(
-                        f"All {requested_count} repositories skipped; "
-                        "nothing was cloned or scanned"
+                        f"All {requested_count} repositories skipped; nothing was cloned or scanned"
                     ),
                     completed_at=_now(),
                     result=initial_result,
@@ -525,9 +522,7 @@ class RagCatalog:
             return self.job_status(job.id)
         except Exception:
             with self._lock:
-                self._repository_import_reservations.difference_update(
-                    reserved_source_keys
-                )
+                self._repository_import_reservations.difference_update(reserved_source_keys)
             raise
 
     def gigacode_status(self, *, refresh: bool = False) -> dict[str, Any]:
@@ -937,16 +932,44 @@ class RagCatalog:
             raise KeyError(f"Unknown job: {job_id}")
         return job.model_copy(deep=True)
 
-    def job_log(self, job_id: str) -> dict[str, str]:
+    def job_log(
+        self, job_id: str, *, cursor: int | None = None, limit: int = 65536
+    ) -> dict[str, Any]:
         with self._lock:
             job = self._jobs.get(job_id)
         if job is None:
             raise KeyError(f"Unknown job: {job_id}")
         path = self._job_log_path(job_id)
+        if cursor is not None and (cursor < 0 or not 1 <= limit <= 1048576):
+            raise ValueError("Invalid log cursor or limit")
+        if cursor is None:
+            content = path.read_text(encoding="utf-8") if path.is_file() else ""
+            return {"job_id": job_id, "status": job.status, "log": content}
+        data = b""
+        size = path.stat().st_size if path.is_file() else 0
+        cursor = min(cursor, size)
+        if size:
+            with path.open("rb") as handle:
+                handle.seek(cursor)
+                data = handle.read(limit)
+                # Do not split a multibyte character between polls.
+                while data and len(data) < limit + 4:
+                    try:
+                        data.decode("utf-8")
+                        break
+                    except UnicodeDecodeError as exc:
+                        if exc.reason != "unexpected end of data":
+                            break
+                        more = handle.read(1)
+                        if not more:
+                            break
+                        data += more
         return {
             "job_id": job_id,
             "status": job.status,
-            "log": path.read_text(encoding="utf-8") if path.is_file() else "",
+            "log": data.decode("utf-8", errors="replace"),
+            "next_cursor": cursor + len(data),
+            "has_more": cursor + len(data) < size,
         }
 
     def jobs_payload(self) -> dict[str, Any]:
@@ -1418,6 +1441,19 @@ class RagCatalog:
                     "origin": self._document_origin(document.source_path),
                     "loaded_at": document.loaded_at.isoformat(),
                     "metadata": document.metadata,
+                    **document.model_dump(
+                        mode="json",
+                        include={
+                            "page_id",
+                            "revision_id",
+                            "source_version",
+                            "source_updated_at",
+                            "revision_updated_at",
+                            "fetched_at",
+                            "is_latest",
+                            "history_baseline",
+                        },
+                    ),
                 }
             )
         return {
@@ -1454,6 +1490,19 @@ class RagCatalog:
             "content": document.content,
             "content_chars": len(document.content),
             "content_bytes": len(encoded),
+            **document.model_dump(
+                mode="json",
+                include={
+                    "page_id",
+                    "revision_id",
+                    "source_version",
+                    "source_updated_at",
+                    "revision_updated_at",
+                    "fetched_at",
+                    "is_latest",
+                    "history_baseline",
+                },
+            ),
         }
 
     def upload_documents(
@@ -1651,8 +1700,9 @@ class RagCatalog:
         service = self.service_for(index_id)
         IndexBuildProcessRunner(
             service.settings,
-            timeout_seconds=self.settings.index_build_timeout_seconds,
-        ).build(cancel=cancel_event)
+            no_progress_timeout_seconds=self.settings.index_build_no_progress_timeout_seconds,
+            overall_timeout_seconds=self.settings.index_build_overall_timeout_seconds,
+        ).build(cancel=cancel_event, progress=lambda event: self._index_progress(job_id, event))
         stats = service.reload_cached_index()
         self._update_index(
             index_id,
@@ -1747,8 +1797,7 @@ class RagCatalog:
                     job_id,
                     status="running",
                     message=(
-                        f"Preparing {len(repositories)} repositories with "
-                        f"{worker_count} workers"
+                        f"Preparing {len(repositories)} repositories with {worker_count} workers"
                     ),
                     started_at=_now(),
                 )
@@ -1847,12 +1896,8 @@ class RagCatalog:
                         f"All {len(repositories)} repositories failed during preparation"
                     )
 
-                successful_repository_ids = {
-                    str(item["repository_id"]) for item in completed_items
-                }
-                successful_index_ids = sorted(
-                    {str(item["index_id"]) for item in completed_items}
-                )
+                successful_repository_ids = {str(item["repository_id"]) for item in completed_items}
+                successful_index_ids = sorted({str(item["index_id"]) for item in completed_items})
                 self._update_job(
                     job_id,
                     message=(
@@ -2036,9 +2081,7 @@ class RagCatalog:
             item.index_id,
         )
         documentation = (
-            Path(self._record(item.index_id).knowledge_dir)
-            / "repositories"
-            / repository_id
+            Path(self._record(item.index_id).knowledge_dir) / "repositories" / repository_id
         ).resolve()
         try:
             previous = self._repository(repository_id)
@@ -2064,9 +2107,7 @@ class RagCatalog:
                 ref=item.ref,
                 index_id=item.index_id,
                 checkout_path=str(checkout),
-                checkout_state=(
-                    "external" if ingestion.source_type == "local" else "available"
-                ),
+                checkout_state=("external" if ingestion.source_type == "local" else "available"),
                 documentation_path=str(documentation),
                 commit=ingestion.commit,
             )
@@ -2089,8 +2130,7 @@ class RagCatalog:
         )
         self._upsert_repository(repository)
         paths_summary = (
-            ",".join(path.relative_to(checkout).as_posix() for path in openspecs)
-            or "none"
+            ",".join(path.relative_to(checkout).as_posix() for path in openspecs) or "none"
         )
         self._append_job_log(
             job_id,
@@ -2198,8 +2238,11 @@ class RagCatalog:
                 service = self.service_for(index_id)
                 IndexBuildProcessRunner(
                     service.settings,
-                    timeout_seconds=self.settings.index_build_timeout_seconds,
-                ).build(cancel=cancel_event)
+                    no_progress_timeout_seconds=self.settings.index_build_no_progress_timeout_seconds,
+                    overall_timeout_seconds=self.settings.index_build_overall_timeout_seconds,
+                ).build(
+                    cancel=cancel_event, progress=lambda event: self._index_progress(job_id, event)
+                )
                 stats = service.reload_cached_index()
                 self._update_index(
                     index_id,
@@ -3062,8 +3105,9 @@ class RagCatalog:
             self._update_index(index.id, status="indexing", error=None)
             IndexBuildProcessRunner(
                 self.service_for(index.id).settings,
-                timeout_seconds=self.settings.index_build_timeout_seconds,
-            ).build(cancel=cancel_event)
+                no_progress_timeout_seconds=self.settings.index_build_no_progress_timeout_seconds,
+                overall_timeout_seconds=self.settings.index_build_overall_timeout_seconds,
+            ).build(cancel=cancel_event, progress=lambda event: self._index_progress(job_id, event))
             stats = self.service_for(index.id).reload_cached_index()
             self._update_index(
                 index.id,
@@ -3415,8 +3459,11 @@ class RagCatalog:
                 self._update_index(index_id, status="indexing", error=None)
                 IndexBuildProcessRunner(
                     self.service_for(index_id).settings,
-                    timeout_seconds=self.settings.index_build_timeout_seconds,
-                ).build(cancel=cancel_event)
+                    no_progress_timeout_seconds=self.settings.index_build_no_progress_timeout_seconds,
+                    overall_timeout_seconds=self.settings.index_build_overall_timeout_seconds,
+                ).build(
+                    cancel=cancel_event, progress=lambda event: self._index_progress(job_id, event)
+                )
                 stats = self.service_for(index_id).reload_cached_index()
                 self._update_index(
                     index_id,
@@ -3925,17 +3972,26 @@ class RagCatalog:
             owners.update(service.id for service, root in matches if len(root.parts) == deepest)
         return owners
 
+    def _index_progress(self, job_id: str, event: dict[str, object]) -> None:
+        stage = str(event.get("stage", "indexing"))
+        completed, total = event.get("completed"), event.get("total")
+        amount = f" {completed}/{total}" if total is not None else ""
+        message = str(event.get("message") or stage) + amount
+        self._update_job(job_id, message=message)
+
     def _rebuild_index(
         self,
         index_id: str,
         cancel_event: threading.Event | None,
+        progress: Callable[[dict[str, object]], None] | None = None,
     ) -> Any:
         self._update_index(index_id, status="indexing", error=None)
         service = self.service_for(index_id)
         IndexBuildProcessRunner(
             service.settings,
-            timeout_seconds=self.settings.index_build_timeout_seconds,
-        ).build(cancel=cancel_event)
+            no_progress_timeout_seconds=self.settings.index_build_no_progress_timeout_seconds,
+            overall_timeout_seconds=self.settings.index_build_overall_timeout_seconds,
+        ).build(cancel=cancel_event, progress=progress)
         stats = service.reload_cached_index()
         self._update_index(
             index_id,
@@ -4096,6 +4152,7 @@ class RagCatalog:
             update={
                 "knowledge_dir": Path(record.knowledge_dir),
                 "cache_dir": Path(record.cache_dir),
+                "history_index_id": record.id,
                 "auto_index": False,
             }
         )
@@ -4504,9 +4561,7 @@ class RagCatalog:
 
     def _release_repository_import_reservation(self, git_url: str) -> None:
         with self._lock:
-            self._repository_import_reservations.discard(
-                self._repository_source_key(git_url)
-            )
+            self._repository_import_reservations.discard(self._repository_source_key(git_url))
 
     @staticmethod
     def _repository_id(name: str, git_url: str, ref: str | None, index_id: str) -> str:

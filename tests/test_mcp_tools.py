@@ -176,6 +176,7 @@ limits-service owns daily limits.
         assert {tool.name for tool in listed} == {
             "ssot_context",
             "kb_search",
+            "kb_search_versions",
             "kb_get_document",
             "kb_get_chunk",
             "kb_run_context_benchmark",
@@ -185,7 +186,7 @@ limits-service owns daily limits.
         for tool in listed:
             if tool.name in {"kb_get_document", "kb_get_chunk"}:
                 assert tool.inputSchema["properties"]["index_id"]["default"] == "default"
-                assert "index_id" not in tool.inputSchema["required"]
+                assert "index_id" not in tool.inputSchema.get("required", [])
 
         search = await client.call_tool("kb_search", {"query": "daily limits"})
         assert search.is_error is False

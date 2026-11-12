@@ -89,6 +89,17 @@ class Settings(BaseSettings):
     repository_git_timeout_seconds: int = Field(default=60, ge=10, le=1800)
     repository_analysis_timeout_seconds: int = Field(default=600, ge=5, le=3600)
     index_build_timeout_seconds: int = Field(default=600, ge=10, le=7200)
+    history_dir: Path = Path("var/history")
+    history_index_id: str | None = None
+    embedding_checkpoint_batch_size: int = Field(default=32, ge=1, le=4096)
+    index_build_no_progress_timeout_seconds: int = Field(default=600, ge=1, le=86400)
+    index_build_overall_timeout_seconds: int | None = Field(default=None, ge=1)
+    confluence_enabled: bool = True
+    confluence_state_dir: Path = Path("var/confluence")
+    a2a_enabled: bool = True
+    a2a_state_dir: Path = Path("var/a2a")
+    a2a_path: str = "/a2a"
+    a2a_max_request_bytes: int = Field(default=65536, ge=1024, le=1048576)
     auto_index: bool = False
     log_level: str = "INFO"
     mcp_http_host: str = "127.0.0.1"
@@ -132,6 +143,16 @@ class Settings(BaseSettings):
             raise ValueError("KB_SKILLS_MCP_PATH must have a dedicated prefix, e.g. /skills/mcp")
         return value
 
+    @field_validator("a2a_path")
+    @classmethod
+    def validate_a2a_path(cls, value: str) -> str:
+        value = cls.validate_http_path(value)
+        if value.split("/")[1] in {"admin", "auth", "access", "api", ".well-known"}:
+            raise ValueError("KB_A2A_PATH must use a dedicated route, e.g. /a2a")
+        if any(segment in {".", ".."} for segment in value.split("/")) or "\\" in value:
+            raise ValueError("KB_A2A_PATH must be a plain route")
+        return value
+
     @model_validator(mode="after")
     def validate_skills_routes(self) -> Settings:
         prefix = self.skills_mcp_path.rpartition("/")[0]
@@ -139,6 +160,12 @@ class Settings(BaseSettings):
             self.mcp_http_path == prefix or self.mcp_http_path.startswith(prefix + "/")
         ):
             raise ValueError("Knowledge and skills MCP endpoints must use separate route prefixes")
+        if self.a2a_enabled and (
+            self.a2a_path == self.mcp_http_path
+            or self.a2a_path == prefix
+            or self.a2a_path.startswith(prefix + "/")
+        ):
+            raise ValueError("A2A and MCP endpoints must use separate routes")
         return self
 
     @model_validator(mode="after")
@@ -173,6 +200,9 @@ class Settings(BaseSettings):
             update={
                 "knowledge_dir": resolve(self.knowledge_dir),
                 "cache_dir": resolve(self.cache_dir),
+                "history_dir": resolve(self.history_dir),
+                "confluence_state_dir": resolve(self.confluence_state_dir),
+                "a2a_state_dir": resolve(self.a2a_state_dir),
                 "ssot_knowledge_dir": resolve(self.ssot_knowledge_dir),
                 "ssot_cache_dir": resolve(self.ssot_cache_dir),
                 "benchmark_questions_path": resolve(self.benchmark_questions_path),
@@ -194,7 +224,8 @@ class Settings(BaseSettings):
                 "access_db_path": resolve(self.access_db_path),
                 "access_client_ca_file": (
                     resolve(self.access_client_ca_file)
-                    if self.access_client_ca_file is not None else None
+                    if self.access_client_ca_file is not None
+                    else None
                 ),
             }
         )

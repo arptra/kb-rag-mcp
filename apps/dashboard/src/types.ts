@@ -1,4 +1,4 @@
-export type Page = "overview" | "indexes" | "services" | "servers" | "tools" | "skills" | "graph" | "operations";
+export type Page = "overview" | "indexes" | "services" | "servers" | "tools" | "skills" | "graph" | "operations" | "a2a";
 
 export interface RagIndex {
   id: string;
@@ -21,8 +21,16 @@ export interface IndexDocument {
   source_path: string;
   source_type: string;
   source_url: string | null;
-  origin: "repository" | "upload" | "ssot" | "local";
+  origin: "repository" | "upload" | "ssot" | "local" | "confluence";
   loaded_at: string;
+  page_id?: string | null;
+  revision_id?: string | null;
+  source_version?: string | null;
+  source_updated_at?: string | null;
+  revision_updated_at?: string | null;
+  fetched_at?: string | null;
+  is_latest?: boolean;
+  history_baseline?: boolean;
   metadata: Record<string, unknown>;
 }
 

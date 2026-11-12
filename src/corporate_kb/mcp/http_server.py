@@ -9,7 +9,7 @@ import secrets
 import ssl
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
@@ -22,13 +22,20 @@ from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Respon
 from starlette.routing import Mount
 from starlette.types import ASGIApp
 
+from corporate_kb.a2a.http import register_a2a_routes
+from corporate_kb.a2a.service import A2AService
+from corporate_kb.a2a.store import A2AStore
 from corporate_kb.access.http import AccessControl, RegistryTokenVerifier, register_disabled_status
 from corporate_kb.access.tls import CertificateH11Protocol
 from corporate_kb.admin import AdminController
 from corporate_kb.catalog import RagCatalog, RepositoryBatchItem
 from corporate_kb.config import Settings
+from corporate_kb.confluence.http import register_confluence_routes
+from corporate_kb.confluence.images import GigaCodeImageExtractor
+from corporate_kb.confluence.registry import ConfluenceRegistry
 from corporate_kb.domscribe_agent import DomscribeGigaCodeAgent
 from corporate_kb.feature_context import FeatureContextPlanner
+from corporate_kb.gigacode_runner import GigaCodeRunner
 from corporate_kb.mcp.managed_tools import ManagedToolDefinition, ManagedToolRegistry
 from corporate_kb.mcp.server import create_mcp_server
 from corporate_kb.mcp.servers import (
@@ -62,9 +69,7 @@ def _authorized(request: Request, token: str | None) -> bool:
         return True
     scheme, separator, supplied = request.headers.get("authorization", "").partition(" ")
     return (
-        bool(separator)
-        and scheme.lower() == "bearer"
-        and secrets.compare_digest(supplied, token)
+        bool(separator) and scheme.lower() == "bearer" and secrets.compare_digest(supplied, token)
     )
 
 
@@ -279,15 +284,17 @@ def tls_uvicorn_config(settings: Settings) -> dict[str, object] | None:
             context.load_verify_locations(cafile=str(authority))
         except (OSError, ssl.SSLError) as exc:
             raise ValueError("Invalid trusted client CA bundle") from exc
-        configuration.update({
-            "ssl_ca_certs": str(authority),
-            # No certificate is needed for admin login or subsequent Bearer requests.
-            # If presented, a client certificate MUST pass OpenSSL verification.
-            "ssl_cert_reqs": ssl.CERT_OPTIONAL,
-            "http": CertificateH11Protocol,
-            "ws": "none",
-            "proxy_headers": False,
-        })
+        configuration.update(
+            {
+                "ssl_ca_certs": str(authority),
+                # No certificate is needed for admin login or subsequent Bearer requests.
+                # If presented, a client certificate MUST pass OpenSSL verification.
+                "ssl_cert_reqs": ssl.CERT_OPTIONAL,
+                "http": CertificateH11Protocol,
+                "ws": "none",
+                "proxy_headers": False,
+            }
+        )
     return configuration
 
 
@@ -314,6 +321,7 @@ def create_http_server(
     settings: Settings,
     *,
     skills_registry: SkillsRegistry | None = None,
+    runtimes: list[Any] | None = None,
 ) -> FastMCP:
     """Create the shared FastMCP server with optional persistent per-person access."""
     token = validate_http_settings(settings)
@@ -328,6 +336,23 @@ def create_http_server(
         if access is not None:
             return await asyncio.to_thread(access.user, request) is not None
         return _authorized(request, token)
+
+    async def integration_manager_authorized(request: Request) -> bool:
+        if access is not None:
+            return await asyncio.to_thread(access.administrator, request) is not None
+        if settings.admin_password and settings.admin_password.get_secret_value():
+            return _admin_authorized(request, settings)
+        return _authorized(request, token)
+
+    async def integration_reader_authorized(request: Request) -> bool:
+        if await integration_manager_authorized(request):
+            return True
+        if access is not None:
+            return await asyncio.to_thread(access.user, request) is not None
+        if token is not None:
+            return _authorized(request, token)
+        # An administrative password alone must still protect queries and source URLs.
+        return not (settings.admin_password and settings.admin_password.get_secret_value())
 
     usage = UsageTracker()
     ssot_service = None
@@ -351,16 +376,17 @@ def create_http_server(
         index_tools=catalog.tools_for,
         index_exists=catalog.has_index,
     )
-    builtin_tool_overrides = BuiltinToolOverrideRegistry(
-        settings.builtin_tool_overrides_path
-    )
+    builtin_tool_overrides = BuiltinToolOverrideRegistry(settings.builtin_tool_overrides_path)
     mcp_servers = McpServerRegistry(settings.mcp_servers_path)
     admin = AdminController(service, usage)
     server = create_mcp_server(
         service,
         auth=(
-            RegistryTokenVerifier(access.store) if access is not None
-            else ConstantTimeTokenVerifier(token) if token is not None else None
+            RegistryTokenVerifier(access.store)
+            if access is not None
+            else ConstantTimeTokenVerifier(token)
+            if token is not None
+            else None
         ),
         knowledge_tools=tools,
         managed_tools=managed_tools,
@@ -373,7 +399,90 @@ def create_http_server(
     else:
         register_disabled_status(server)
 
+    def integration_indexes() -> list[dict[str, Any]]:
+        return [{"id": item["id"], "name": item["name"]} for item in catalog.payload()["indexes"]]
+
+    if settings.a2a_enabled:
+        a2a = A2AService(A2AStore(settings.a2a_state_dir), catalog)
+        register_a2a_routes(
+            server,
+            a2a,
+            settings,
+            reader_authorized=integration_reader_authorized,
+            manager_authorized=integration_manager_authorized,
+            indexes=integration_indexes,
+        )
+        if runtimes is not None:
+            runtimes.append(a2a)
+    else:
+
+        @server.custom_route("/auth/a2a/status", methods=["GET"], include_in_schema=False)
+        async def a2a_disabled_status(_request: Request) -> JSONResponse:
+            return JSONResponse(
+                {
+                    "enabled": False,
+                    "can_manage": False,
+                    "protocol_version": "1.0",
+                    "endpoint": "",
+                    "agent_card_url": "",
+                }
+            )
+
+    if settings.confluence_enabled:
+        gigacode = GigaCodeRunner(settings)
+        confluence = ConfluenceRegistry(
+            settings.confluence_state_dir,
+            index_exists=catalog.has_index,
+            knowledge_root=lambda index_id: catalog.service_for(index_id).settings.knowledge_dir,
+            publish=lambda index_id, **kwargs: catalog._rebuild_index(
+                index_id, kwargs.get("cancel"), progress=kwargs.get("progress")
+            ),
+            archive_document=lambda index_id, document: catalog.service_for(
+                index_id
+            ).archive_document(document, make_current=False),
+            page_visibility=lambda index_id, page_id, visible: catalog.service_for(
+                index_id
+            ).set_page_visibility(page_id, visible),
+            index_guard=catalog._index_work_lock,
+            image_extractor=GigaCodeImageExtractor(
+                gigacode, settings.confluence_state_dir / "image-cache"
+            ),
+        )
+        register_confluence_routes(
+            server,
+            confluence,
+            reader_authorized=integration_reader_authorized,
+            manager_authorized=integration_manager_authorized,
+            indexes=integration_indexes,
+            gigacode=gigacode,
+        )
+        if runtimes is not None:
+            runtimes.append(confluence)
+    else:
+
+        @server.custom_route("/admin/api/confluence", methods=["GET"], include_in_schema=False)
+        async def confluence_disabled_status(request: Request) -> JSONResponse:
+            if not await integration_reader_authorized(request):
+                return _unauthorized_response()
+            return JSONResponse(
+                {
+                    "enabled": False,
+                    "sources": [],
+                    "jobs": [],
+                    "can_manage": False,
+                    "indexes": [],
+                    "gigacode": {"available": False},
+                }
+            )
+
+        @server.custom_route("/admin/api/confluence/jobs", methods=["GET"], include_in_schema=False)
+        async def confluence_disabled_jobs(request: Request) -> JSONResponse:
+            if not await integration_reader_authorized(request):
+                return _unauthorized_response()
+            return JSONResponse({"jobs": []})
+
     if skills_registry is not None:
+
         async def skills_reader_authorized(request: Request) -> bool:
             if access is not None:
                 user = await asyncio.to_thread(access.user, request)
@@ -691,14 +800,60 @@ def create_http_server(
         try:
             index_id = _optional_query(request, "index_id")
             document_id = _optional_query(request, "document_id")
-            if not index_id or not document_id:
-                raise ValueError("index_id and document_id query parameters are required")
+            if not index_id:
+                raise ValueError("index_id query parameter is required")
+            if not document_id:
+                page_id = _optional_query(request, "page_id")
+                if not page_id:
+                    raise ValueError("document_id or page_id query parameter is required")
+                document = await asyncio.to_thread(
+                    catalog.service_for(index_id).read_page,
+                    page_id,
+                    source_version=_optional_query(request, "source_version"),
+                    as_of=_optional_query(request, "as_of"),
+                )
+                document_id = document.document_id
             payload = await asyncio.to_thread(
                 catalog.index_document,
                 index_id,
                 document_id,
             )
             return JSONResponse(payload)
+        except Exception as exc:
+            return _api_error(exc)
+
+    @server.custom_route(
+        "/admin/api/indexes/document/versions", methods=["GET"], include_in_schema=False
+    )
+    async def admin_document_versions(request: Request) -> JSONResponse:
+        if not await dashboard_authorized(request):
+            return _admin_denied(settings)
+        try:
+            index_id, page_id = (
+                _optional_query(request, "index_id"),
+                _optional_query(request, "page_id"),
+            )
+            if not index_id or not page_id:
+                raise ValueError("index_id and page_id are required")
+            offset = _integer_query(request, "offset", 0, minimum=0, maximum=10000000)
+            limit = _integer_query(request, "limit", 50, minimum=1, maximum=100)
+            versions = await asyncio.to_thread(
+                catalog.service_for(index_id).history.list_versions,
+                page_id,
+                limit=limit,
+                offset=offset,
+            )
+            return JSONResponse(
+                {
+                    "page_id": page_id,
+                    "offset": offset,
+                    "limit": limit,
+                    "versions": [
+                        doc.model_dump(mode="json", exclude={"content", "metadata"})
+                        for doc in versions
+                    ],
+                }
+            )
         except Exception as exc:
             return _api_error(exc)
 
@@ -841,9 +996,7 @@ def create_http_server(
                 ref = raw.get("ref")
                 index_id = raw.get("index_id")
                 if not isinstance(name, str) or not isinstance(git_url, str):
-                    raise ValueError(
-                        f"repositories[{position}] name and git_url must be strings"
-                    )
+                    raise ValueError(f"repositories[{position}] name and git_url must be strings")
                 if ref is not None and not isinstance(ref, str):
                     raise ValueError(f"repositories[{position}] ref must be a string or null")
                 if not isinstance(index_id, str) or not index_id:
@@ -961,17 +1114,13 @@ def create_http_server(
             if not isinstance(service_id, str) or not service_id:
                 raise ValueError("service_id must be a non-empty string")
             generation_mode = (
-                payload.get("generation_mode", "static")
-                if isinstance(payload, dict)
-                else "static"
+                payload.get("generation_mode", "static") if isinstance(payload, dict) else "static"
             )
             if generation_mode not in {"static", "gigacode"}:
                 raise ValueError("generation_mode must be static or gigacode")
             job = catalog.start_service_analysis(
                 service_id,
-                generation_mode=(
-                    "gigacode" if generation_mode == "gigacode" else "static"
-                ),
+                generation_mode=("gigacode" if generation_mode == "gigacode" else "static"),
             )
             return JSONResponse(job.model_dump(mode="json"), status_code=202)
         except Exception as exc:
@@ -1043,7 +1192,19 @@ def create_http_server(
             job_id = _optional_query(request, "job_id")
             if not job_id:
                 raise ValueError("job_id query parameter is required")
-            return JSONResponse(await asyncio.to_thread(catalog.job_log, job_id))
+            cursor = (
+                _integer_query(request, "cursor", 0, minimum=0, maximum=1000000000000)
+                if "cursor" in request.query_params
+                else None
+            )
+            return JSONResponse(
+                await asyncio.to_thread(
+                    catalog.job_log,
+                    job_id,
+                    cursor=cursor,
+                    limit=_integer_query(request, "limit", 65536, minimum=1, maximum=1048576),
+                )
+            )
         except Exception as exc:
             return _api_error(exc)
 
@@ -1281,9 +1442,15 @@ def create_http_server(
             return _admin_denied(settings)
         try:
             payload = await request.json()
-            definition = ManagedToolDefinition.model_validate(payload)
-            replacement = managed_tools.create_tool(definition)
             existing = {item.name for item in managed_tools.list()}
+            definition = ManagedToolDefinition.model_validate(
+                payload,
+                context={
+                    "loading_persisted_definition": isinstance(payload, dict)
+                    and payload.get("name") in existing
+                },
+            )
+            replacement = managed_tools.create_tool(definition)
             managed_tools.upsert(definition)
             if definition.name in existing:
                 server.local_provider.remove_tool(definition.name)
@@ -1629,34 +1796,39 @@ def create_http_app(service: KnowledgeService, settings: Settings) -> ASGIApp:
             settings.skills_registry_dir,
             git_timeout_seconds=settings.repository_git_timeout_seconds,
         )
-        if settings.skills_registry_enabled else None
+        if settings.skills_registry_enabled
+        else None
     )
-    server = create_http_server(service, settings, skills_registry=registry)
+    runtimes: list[Any] = []
+    server = create_http_server(service, settings, skills_registry=registry, runtimes=runtimes)
     app = server.http_app(
         path=settings.mcp_http_path,
         host_origin_protection=False,
     )
-    if registry is None:
-        return app
-
-    skills_server = create_skills_mcp_server(registry, auth=server.auth)
-    prefix, _, leaf = settings.skills_mcp_path.rpartition("/")
-    skills_app = skills_server.http_app(path=f"/{leaf}", host_origin_protection=False)
-    # ASGI mounting keeps discovery separate. FastMCP.mount() would merge the tools.
-    app.router.routes.insert(0, Mount(prefix, app=skills_app))
+    skills_app = None
+    if registry is not None:
+        skills_server = create_skills_mcp_server(registry, auth=server.auth)
+        prefix, _, leaf = settings.skills_mcp_path.rpartition("/")
+        skills_app = skills_server.http_app(path=f"/{leaf}", host_origin_protection=False)
+        # ASGI mounting keeps discovery separate. FastMCP.mount() would merge the tools.
+        app.router.routes.insert(0, Mount(prefix, app=skills_app))
+        runtimes.append(registry)
     knowledge_lifespan = app.router.lifespan_context
 
     @asynccontextmanager
     async def lifespan(application: Starlette) -> AsyncIterator[None]:
-        async with knowledge_lifespan(application), skills_app.lifespan(skills_app):
-            registry.start()
-            try:
-                yield
-            finally:
-                await asyncio.to_thread(registry.stop)
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(knowledge_lifespan(application))
+            if skills_app is not None:
+                await stack.enter_async_context(skills_app.lifespan(skills_app))
+            for runtime in runtimes:
+                await asyncio.to_thread(runtime.start)
+                stack.push_async_callback(asyncio.to_thread, runtime.stop)
+            yield
 
     app.router.lifespan_context = lifespan
     app.state.skills_registry = registry
+    app.state.integrations = runtimes
     return app
 
 
@@ -1683,9 +1855,9 @@ def main(settings: Settings | None = None) -> None:
         settings.mcp_http_host,
         settings.mcp_http_port,
         settings.mcp_http_path,
-        "registry" if settings.access_enabled else (
-            "shared-token" if settings.mcp_http_bearer_token else "disabled"
-        ),
+        "registry"
+        if settings.access_enabled
+        else ("shared-token" if settings.mcp_http_bearer_token else "disabled"),
         settings.access_client_certificate_mode if settings.access_enabled else "disabled",
     )
     if settings.access_enabled and settings.access_client_certificate_mode == "presented":

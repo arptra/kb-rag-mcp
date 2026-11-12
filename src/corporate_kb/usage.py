@@ -40,7 +40,9 @@ class UsageTracker:
             recent_cutoff = time.monotonic() - 60
             while self._recent_calls and self._recent_calls[0] < recent_cutoff:
                 self._recent_calls.popleft()
-            search_count = self._calls.get("kb_search", 0)
+            search_count = sum(
+                self._calls.get(name, 0) for name in ("kb_search", "kb_search_versions")
+            )
             return {
                 "started_at": self._started_at.isoformat(),
                 "last_used_at": (
