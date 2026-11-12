@@ -50,7 +50,7 @@ def normal_project(tmp_path):
     python = bin_dir / "python"
     python.write_text(
         f"#!{sys.executable}\n"
-        "import json, os, sys\n"
+        "import json, os, sys, time\n"
         "from pathlib import Path\n"
         "Path('python-called').touch()\n"
         "from corporate_kb.config import Settings\n"
@@ -76,6 +76,8 @@ def normal_project(tmp_path):
         "    'auto_index': settings.auto_index,\n"
         f"    'environment': {{key: os.environ.get(key) for key in {TRACKED_SETTINGS!r}}},\n"
         "}))\n"
+        "if os.environ.get('TEST_STAY_ALIVE') == '1':\n"
+        "    time.sleep(30)\n"
     )
     python.chmod(0o700)
     (bin_dir / "activate").write_text(f'export VIRTUAL_ENV="{project / ".venv"}"\n')
@@ -239,8 +241,32 @@ def test_already_running_start_does_not_load_configuration(normal_project):
     )
     assert process.returncode == 0, process.stderr
     assert "already running (PID 12345)" in process.stdout
+    assert "No reload was performed" in process.stdout
+    assert "start-mcp-http.sh restart" in process.stdout
+    assert "HTTP readiness has not been checked" in process.stdout
     assert (runtime / "mcp-http.pid").read_text() == "12345\n"
     assert not (normal_project / "python-called").exists()
+
+
+def test_background_start_and_status_do_not_claim_http_readiness(normal_project):
+    # A long-lived process with no HTTP listener must only be reported as launched.
+    try:
+        process = run_launcher(
+            normal_project, "start", environment={"TEST_STAY_ALIVE": "1"}
+        )
+        assert process.returncode == 0, process.stderr
+        assert "server process launched (PID " in process.stdout
+        assert "Initialization continues in the background" in process.stdout
+        assert "HTTP readiness has not been checked" in process.stdout
+        assert "start-mcp-http.sh logs" in process.stdout
+        status = run_launcher(normal_project, "status")
+        assert status.returncode == 0, status.stderr
+        assert "server process is running (PID " in status.stdout
+        assert "HTTP readiness has not been checked" in status.stdout
+    finally:
+        stopped = run_launcher(normal_project, "stop")
+        assert stopped.returncode == 0, stopped.stderr
+    assert not (normal_project / ".cache/kb/runtime/mcp-http.pid").exists()
 
 
 @pytest.mark.parametrize(

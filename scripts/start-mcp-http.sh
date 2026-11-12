@@ -114,6 +114,7 @@ run_server() {
   local existing
   if existing="$(read_server_pid)"; then
     echo "RAG/MCP server is already running (PID ${existing})." >&2
+    echo "No reload was performed. To apply updated files or .env: $0 restart" >&2
     return 1
   fi
   prepare_runtime
@@ -154,6 +155,8 @@ start_server() {
   local existing
   if existing="$(read_server_pid)"; then
     echo "RAG/MCP server is already running (PID ${existing})."
+    echo "No reload was performed. To apply updated files or .env: $0 restart"
+    echo "HTTP readiness has not been checked. Follow startup: $0 logs"
     return 0
   fi
   prepare_runtime
@@ -176,9 +179,11 @@ start_server() {
         fi
       done
       if [[ "${stable}" == true ]]; then
-        echo "RAG/MCP server started (PID ${existing})."
+        echo "RAG/MCP server process launched (PID ${existing})."
+        echo "Initialization continues in the background; HTTP readiness has not been checked."
         "${VIRTUAL_ENV}/bin/python" -m corporate_kb.access.launcher
         echo "Log:   ${log_file}"
+        echo "Follow startup: $0 logs (wait for Application startup complete)."
         return 0
       fi
       break
@@ -231,7 +236,8 @@ case "${action}" in
     ;;
   status)
     if pid="$(read_server_pid)"; then
-      echo "RAG/MCP server is running (PID ${pid})."
+      echo "RAG/MCP server process is running (PID ${pid}). HTTP readiness has not been checked."
+      echo "Follow startup: $0 logs"
     else
       echo "RAG/MCP server is not running."
       exit 1

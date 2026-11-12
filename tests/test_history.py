@@ -244,7 +244,7 @@ def test_existing_cache_is_archived_before_changed_model_rebuild(settings_factor
     assert changed.history.coverage(identity=changed.provider.cache_identity)["pending_chunks"] == 0
 
 
-def test_loading_pre_history_cache_migrates_without_reembedding(settings_factory):
+def test_loading_pre_history_cache_migrates_without_reembedding(settings_factory, caplog):
     settings = settings_factory(auto_index=False)
     write_page(settings.knowledge_dir, 1, "Original policy cached before migration.")
     first = KnowledgeService(settings, provider=HashEmbeddingProvider(64))
@@ -252,7 +252,21 @@ def test_loading_pre_history_cache_migrates_without_reembedding(settings_factory
     shutil.rmtree(settings.history_dir)
     provider = InterruptedProvider(fail_call=1)
     loaded = KnowledgeService(settings, provider=provider)
-    loaded.load_cached_index()
+    with caplog.at_level("INFO", logger="corporate_kb.service"):
+        loaded.load_cached_index()
     assert len(loaded.history.list_versions("confluence:team:123")) == 1
     assert loaded.history.coverage(identity=provider.cache_identity)["pending_chunks"] == 0
+    assert provider.calls == 0
+    assert "History migration: documents 1/1" in caplog.text
+    assert "History migration: chunks" in caplog.text
+    assert "Reusing cached vectors without model inference" in caplog.text
+    assert "Activating current document revisions" in caplog.text
+
+    # A following process must use the completed archive without a second import.
+    restarted = KnowledgeService(settings, provider=provider)
+    caplog.clear()
+    with caplog.at_level("INFO", logger="corporate_kb.service"):
+        restarted.load_cached_index()
+    assert "import skipped" in caplog.text
+    assert "Importing cached snapshot" not in caplog.text
     assert provider.calls == 0

@@ -9,10 +9,12 @@ from __future__ import annotations
 import hashlib
 import heapq
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
+from time import monotonic, sleep
 from typing import Any, overload
 
 import numpy as np
@@ -84,15 +86,44 @@ class HistoryStore:
         # Hash the key rather than trusting a caller-provided filesystem component.
         self.root = root.resolve() / hashlib.sha256(index_key.encode()).hexdigest()[:32]
         self.path = self.root / "history.sqlite3"
+        self._schema_ready = False
+        self._schema_lock = Lock()
 
     @contextmanager
     def _db(self) -> Iterator[sqlite3.Connection]:
         self.root.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path, timeout=60)
         try:
-            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA foreign_keys=ON")
-            connection.executescript("""
+            self._initialize_schema(connection)
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _initialize_schema(self, connection: sqlite3.Connection) -> None:
+        # Every normal lookup uses its own connection, but schema checks and DDL
+        # only belong to the first connection opened by this store. The write
+        # transaction also serializes migrations across different processes.
+        with self._schema_lock:
+            if self._schema_ready:
+                return
+            # SQLite's busy timeout is not always honored when concurrent first
+            # connections switch a brand-new database from DELETE to WAL mode.
+            deadline = monotonic() + 60
+            while True:
+                try:
+                    connection.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if (
+                        exc.sqlite_errorcode not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+                        or monotonic() >= deadline
+                    ):
+                        raise
+                    sleep(0.05)
+            connection.execute("BEGIN IMMEDIATE")
+            schema = """
                 CREATE TABLE IF NOT EXISTS revisions (
                     document_id TEXT PRIMARY KEY, page_id TEXT NOT NULL,
                     source_version TEXT, source_updated_at TEXT, fetched_at TEXT NOT NULL,
@@ -117,50 +148,19 @@ class HistoryStore:
                     embedding_key TEXT NOT NULL REFERENCES embeddings(key),
                     PRIMARY KEY(chunk_id, identity)
                 );
-            """)
+            """
+            for statement in schema.split(";"):
+                if statement.strip():
+                    connection.execute(statement)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(revisions)")}
             if "revision_updated_at" not in columns:
                 connection.execute("ALTER TABLE revisions ADD COLUMN revision_updated_at TEXT")
-            yield connection
             connection.commit()
-        finally:
-            connection.close()
+            self._schema_ready = True
 
     def archive_document(self, document: Document, *, make_current: bool = False) -> Document:
-        normalized = normalize_document(document)
         with self._db() as db:
-            existing = db.execute(
-                "SELECT payload FROM revisions WHERE document_id=?", (normalized.document_id,)
-            ).fetchone()
-            if existing:
-                saved = Document.model_validate_json(existing[0])
-                if (
-                    saved.content_hash != normalized.content_hash
-                    or saved.page_id != normalized.page_id
-                ):
-                    raise ValueError(
-                        "A document revision ID cannot be reused for different content"
-                    )
-                normalized = saved
-            else:
-                db.execute(
-                    "INSERT INTO revisions "
-                    "(document_id,page_id,source_version,source_updated_at,fetched_at,"
-                    "payload,is_latest,revision_updated_at) VALUES (?,?,?,?,?,?,0,?)",
-                    (
-                        normalized.document_id,
-                        normalized.page_id,
-                        normalized.source_version,
-                        normalized.source_updated_at.isoformat()
-                        if normalized.source_updated_at
-                        else None,
-                        (normalized.fetched_at or normalized.loaded_at).isoformat(),
-                        normalized.model_dump_json(),
-                        normalized.revision_updated_at.isoformat()
-                        if normalized.revision_updated_at
-                        else None,
-                    ),
-                )
+            normalized = self._archive_document(db, document)
             if make_current:
                 db.execute(
                     "UPDATE revisions SET is_latest=0 WHERE page_id=?", (normalized.page_id,)
@@ -170,6 +170,147 @@ class HistoryStore:
                     (normalized.document_id,),
                 )
         return normalized
+
+    @staticmethod
+    def _archive_document(db: sqlite3.Connection, document: Document) -> Document:
+        normalized = normalize_document(document)
+        existing = db.execute(
+            "SELECT payload FROM revisions WHERE document_id=?", (normalized.document_id,)
+        ).fetchone()
+        if existing:
+            saved = Document.model_validate_json(existing[0])
+            if saved.content_hash != normalized.content_hash or saved.page_id != normalized.page_id:
+                raise ValueError("A document revision ID cannot be reused for different content")
+            return saved
+        db.execute(
+            "INSERT INTO revisions "
+            "(document_id,page_id,source_version,source_updated_at,fetched_at,"
+            "payload,is_latest,revision_updated_at) VALUES (?,?,?,?,?,?,0,?)",
+            (
+                normalized.document_id,
+                normalized.page_id,
+                normalized.source_version,
+                normalized.source_updated_at.isoformat() if normalized.source_updated_at else None,
+                (normalized.fetched_at or normalized.loaded_at).isoformat(),
+                normalized.model_dump_json(),
+                normalized.revision_updated_at.isoformat()
+                if normalized.revision_updated_at
+                else None,
+            ),
+        )
+        return normalized
+
+    def import_snapshot(
+        self,
+        documents: Sequence[Document],
+        chunks: Sequence[Chunk],
+        matrix: NDArray[np.float32],
+        identity: str,
+        *,
+        batch_size: int = 512,
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> None:
+        """Archive a serving cache using bounded, resumable transactions.
+
+        The supplied matrix may be a read-only memory map. No model is invoked
+        and no full matrix copy is made. Each chunk and its existing vector are
+        committed together; a restart fills missing batches without replacing
+        immutable archive records or changing the active revision pointers.
+        """
+        if batch_size < 1:
+            raise ValueError("Import batch_size must be positive")
+        if matrix.ndim != 2 or matrix.shape[0] != len(chunks):
+            raise ValueError("Invalid embedding checkpoint")
+        # Stay below SQLite's parameter limit even on older installations.
+        batch_size = min(batch_size, 500)
+        with self._db() as db:
+            if progress:
+                progress("documents", 0, len(documents))
+            for offset in range(0, len(documents), batch_size):
+                db.execute("BEGIN IMMEDIATE")
+                for document in documents[offset : offset + batch_size]:
+                    self._archive_document(db, document)
+                db.commit()
+                if progress:
+                    progress("documents", min(offset + batch_size, len(documents)), len(documents))
+            if progress:
+                progress("chunks", 0, len(chunks))
+            for offset in range(0, len(chunks), batch_size):
+                batch = chunks[offset : offset + batch_size]
+                vectors = matrix[offset : offset + len(batch)]
+                if not np.isfinite(vectors).all():
+                    raise ValueError("Invalid embedding checkpoint")
+                db.execute("BEGIN IMMEDIATE")
+                self._import_chunk_batch(db, batch, vectors, identity)
+                db.commit()
+                if progress:
+                    progress("chunks", offset + len(batch), len(chunks))
+
+    @staticmethod
+    def _import_chunk_batch(
+        db: sqlite3.Connection,
+        chunks: Sequence[Chunk],
+        matrix: NDArray[np.float32],
+        identity: str,
+    ) -> None:
+        placeholders = ",".join("?" for _ in chunks)
+        chunk_ids = [chunk.chunk_id for chunk in chunks]
+        existing_chunks = {
+            row[0]: Chunk.model_validate_json(row[1])
+            for row in db.execute(
+                f"SELECT chunk_id,payload FROM chunks WHERE chunk_id IN ({placeholders})",
+                chunk_ids,
+            )
+        }
+        existing_links = dict(
+            db.execute(
+                "SELECT chunk_id,embedding_key FROM chunk_embeddings WHERE identity=? "
+                f"AND chunk_id IN ({placeholders})",
+                [identity, *chunk_ids],
+            )
+        )
+        keys = [embedding_key(identity, chunk.embedding_text) for chunk in chunks]
+        existing_dimensions = dict(
+            db.execute(
+                f"SELECT key,dimension FROM embeddings WHERE key IN ({placeholders})", keys
+            )
+        )
+        dimension = matrix.shape[1]
+        for chunk, key, vector in zip(chunks, keys, matrix, strict=True):
+            saved = existing_chunks.get(chunk.chunk_id)
+            if saved is not None:
+                if (
+                    saved.document_id != chunk.document_id
+                    or saved.chunk_index != chunk.chunk_index
+                    or saved.text != chunk.text
+                    or saved.embedding_text != chunk.embedding_text
+                ):
+                    raise ValueError("A chunk ID cannot be reused for different content")
+            else:
+                db.execute(
+                    "INSERT INTO chunks VALUES (?,?,?)",
+                    (chunk.chunk_id, chunk.document_id, chunk.model_dump_json()),
+                )
+                existing_chunks[chunk.chunk_id] = chunk
+            if key in existing_dimensions and existing_dimensions[key] != dimension:
+                raise ValueError(
+                    "An embedding identity cannot be reused with a different dimension"
+                )
+            previous_key = existing_links.get(chunk.chunk_id)
+            if previous_key is not None:
+                if previous_key != key:
+                    raise ValueError("A chunk embedding cannot be replaced with different content")
+                continue
+            if key not in existing_dimensions:
+                db.execute(
+                    "INSERT INTO embeddings VALUES (?,?,?,?)",
+                    (key, identity, dimension, np.asarray(vector, dtype=np.float32).tobytes()),
+                )
+                existing_dimensions[key] = dimension
+            db.execute(
+                "INSERT INTO chunk_embeddings VALUES (?,?,?)", (chunk.chunk_id, identity, key)
+            )
+            existing_links[chunk.chunk_id] = key
 
     def activate(self, documents: list[Document]) -> None:
         with self._db() as db:

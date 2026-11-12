@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -111,10 +112,7 @@ class KnowledgeService:
                 if cached is not None and not self.history.has_pending_chunks(
                     self.provider.cache_identity
                 ):
-                    self.store.replace_index(cached.documents, cached.chunks, cached.embeddings)
-                    self._archive_cached_snapshot(cached)
-                    self.history.activate(cached.documents)
-                    self._stats = self._stats_from_cache(cached.manifest)
+                    self._stats = self._restore_cached_snapshot(cached)
                     logger.info(
                         "Loaded compatible knowledge index: documents=%d chunks=%d in %.3f seconds",
                         self._stats.document_count,
@@ -144,10 +142,7 @@ class KnowledgeService:
                 chunking=self.chunker.identity,
             )
             if cached is not None:
-                self.store.replace_index(cached.documents, cached.chunks, cached.embeddings)
-                self._archive_cached_snapshot(cached)
-                self.history.activate(cached.documents)
-                self._stats = self._stats_from_cache(cached.manifest)
+                self._stats = self._restore_cached_snapshot(cached)
                 logger.info(
                     "Loaded compatible knowledge index: documents=%d chunks=%d in %.3f seconds",
                     self._stats.document_count,
@@ -191,10 +186,7 @@ class KnowledgeService:
                     "Prepared knowledge index is missing or incompatible.\n"
                     "Run: ./scripts/dev.sh index"
                 )
-            self.store.replace_index(cached.documents, cached.chunks, cached.embeddings)
-            self._archive_cached_snapshot(cached)
-            self.history.activate(cached.documents)
-            self._stats = self._stats_from_cache(cached.manifest)
+            self._stats = self._restore_cached_snapshot(cached)
             logger.info(
                 "Loaded prepared knowledge index: documents=%d chunks=%d in %.3f seconds",
                 self._stats.document_count,
@@ -549,25 +541,70 @@ class KnowledgeService:
                     if mapping is not None:
                         mapping.close()
 
+    def _restore_cached_snapshot(self, cached: CachedIndex) -> IndexStats:
+        logger.info(
+            "Preparing cached serving snapshot: documents=%d chunks=%d",
+            len(cached.documents),
+            len(cached.chunks),
+        )
+        self.store.replace_index(cached.documents, cached.chunks, cached.embeddings)
+        self._archive_cached_snapshot(cached)
+        logger.info("Activating current document revisions: documents=%d", len(cached.documents))
+        self.history.activate(cached.documents)
+        return self._stats_from_cache(cached.manifest)
+
     def _archive_cached_snapshot(self, cached: CachedIndex) -> None:
+        logger.info("Checking cached snapshot in document history: %s", self.history.path)
         if self.history.contains_documents(
             [item.document_id for item in cached.documents]
         ) and self.history.contains_chunk_embeddings(
             [item.chunk_id for item in cached.chunks], cached.manifest.embedding_cache_identity
         ):
+            logger.info("Document history already contains this cached snapshot; import skipped")
             return
-        for position, document in enumerate(cached.documents, 1):
-            self.history.archive_document(document)
-            if position % 100 == 0:
-                self._report("migration", total=len(cached.documents), completed=position)
-        self.history.archive_chunks(cached.chunks)
-        for offset in range(0, len(cached.chunks), 32):
-            self.history.save_embeddings(
+        started = time.perf_counter()
+        last_logged = started
+        logger.info(
+            "Importing cached snapshot into history: documents=%d chunks=%d. "
+            "Reusing cached vectors without model inference; committed batches survive restart.",
+            len(cached.documents),
+            len(cached.chunks),
+        )
+
+        def progress(phase: str, completed: int, total: int) -> None:
+            nonlocal last_logged
+            now = time.perf_counter()
+            if completed in {0, total} or now - last_logged >= 2:
+                logger.info(
+                    "History migration: %s %d/%d (%.1f%%), elapsed %.1fs",
+                    phase,
+                    completed,
+                    total,
+                    100 * completed / total if total else 100,
+                    now - started,
+                )
+                last_logged = now
+            self._report("migration", phase=phase, completed=completed, total=total)
+
+        try:
+            self.history.import_snapshot(
+                cached.documents,
+                cached.chunks,
+                cached.embeddings,
                 cached.manifest.embedding_cache_identity,
-                cached.chunks[offset : offset + 32],
-                cached.embeddings[offset : offset + 32],
+                progress=progress,
             )
-            self._report("migration", chunks=min(offset + 32, len(cached.chunks)))
+        except (OSError, sqlite3.OperationalError):
+            logger.exception(
+                "History migration could not write to %s; "
+                "check free space and service permissions. "
+                "The original knowledge cache has not been removed.",
+                self.history.path,
+            )
+            raise
+        logger.info(
+            "Cached snapshot imported into history in %.3f seconds", time.perf_counter() - started
+        )
 
     @staticmethod
     def _revision_order(document: Document) -> tuple[datetime, int, str]:
