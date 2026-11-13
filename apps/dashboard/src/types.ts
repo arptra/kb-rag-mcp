@@ -196,6 +196,14 @@ export interface Overview {
     calls_last_minute: number;
     total_context_tokens: number;
   };
+  a2a_usage?: {
+    enabled: boolean;
+    total_calls: number;
+    successful_calls: number;
+    failed_calls: number;
+    calls_last_minute: number;
+    active_agents: number;
+  };
   server_metrics: {
     uptime_seconds: number;
     peak_rss_mb: number;

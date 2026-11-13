@@ -402,6 +402,7 @@ def create_http_server(
     def integration_indexes() -> list[dict[str, Any]]:
         return [{"id": item["id"], "name": item["name"]} for item in catalog.payload()["indexes"]]
 
+    a2a: A2AService | None = None
     if settings.a2a_enabled:
         a2a = A2AService(A2AStore(settings.a2a_state_dir), catalog)
         register_a2a_routes(
@@ -590,6 +591,18 @@ def create_http_server(
             return _admin_denied(settings)
         try:
             payload = await asyncio.to_thread(admin.overview)
+            payload["a2a_usage"] = (
+                {"enabled": True, **await asyncio.to_thread(a2a.store.stats)}
+                if a2a is not None
+                else {
+                    "enabled": False,
+                    "total_calls": 0,
+                    "successful_calls": 0,
+                    "failed_calls": 0,
+                    "active_agents": 0,
+                    "calls_last_minute": 0,
+                }
+            )
             payload["managed_tools"] = managed_tools.payload()
             payload["tool_catalog"] = await current_tool_catalog()
             payload["mcp_servers"] = current_mcp_servers(request)

@@ -145,6 +145,77 @@ async def test_a2a_protocol_scopes_history_identity_and_mcp_counter(settings_fac
 
 
 @pytest.mark.asyncio
+async def test_dashboard_a2a_calls_are_separate_and_survive_restart(settings_factory):
+    service, settings = indexed(settings_factory)
+    app = create_http_app(service, settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client,
+    ):
+        initial = await client.get("/admin/api/overview")
+        assert initial.status_code == 200
+        assert initial.json()["a2a_usage"]["enabled"] is True
+        assert initial.json()["a2a_usage"]["total_calls"] == 0
+        issued = (
+            await client.post(
+                "/admin/api/a2a/agents", json={"name": "Dashboard Agent", "index_ids": ["default"]}
+            )
+        ).json()
+        headers = {"Authorization": "Bearer " + issued["token"], "A2A-Version": "1.0"}
+        # Existing REST/tool usage remains in its own process-local counter.
+        assert (await client.get("/api/v1/stats")).status_code == 200
+        assert (await client.post("/a2a", json=message())).status_code == 401
+        sent = (await client.post("/a2a", headers=headers, json=message())).json()
+        task_id = sent["result"]["task"]["id"]
+        failed = await client.post(
+            "/a2a", headers={"Authorization": headers["Authorization"]}, json=message()
+        )
+        assert failed.json()["error"]["code"] == -32009
+        polled = await client.post(
+            "/a2a",
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": 2, "method": "GetTask", "params": {"id": task_id}},
+        )
+        assert polled.json()["result"]["id"] == task_id
+        # Refreshing either dashboard only reads counters, including errors and task polling.
+        for _ in range(2):
+            overview = (await client.get("/admin/api/overview")).json()
+            a2a_stats = (await client.get("/admin/api/a2a")).json()["stats"]
+            assert overview["a2a_usage"] == {"enabled": True, **a2a_stats}
+            assert overview["a2a_usage"] == {
+                "enabled": True,
+                "total_calls": 3,
+                "successful_calls": 2,
+                "failed_calls": 1,
+                "active_agents": 1,
+                "calls_last_minute": 3,
+            }
+            assert overview["usage"]["total_calls"] == 1
+            assert overview["usage"]["calls_by_tool"] == {"kb_stats": 1}
+
+    restarted_service = KnowledgeService(
+        settings, provider=HashEmbeddingProvider(settings.embedding_dimension)
+    )
+    restarted_service.load_cached_index()
+    restarted_app = create_http_app(restarted_service, settings)
+    async with (
+        restarted_app.router.lifespan_context(restarted_app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=restarted_app), base_url="http://testserver"
+        ) as client,
+    ):
+        overview = (await client.get("/admin/api/overview")).json()
+        a2a_stats = (await client.get("/admin/api/a2a")).json()["stats"]
+        assert overview["a2a_usage"] == {"enabled": True, **a2a_stats}
+        assert overview["a2a_usage"]["total_calls"] == 3
+        assert overview["a2a_usage"]["successful_calls"] == 2
+        assert overview["a2a_usage"]["failed_calls"] == 1
+        assert overview["usage"]["total_calls"] == 0
+
+
+@pytest.mark.asyncio
 async def test_a2a_management_requires_admin_but_agent_needs_only_token(settings_factory):
     service, settings = indexed(
         settings_factory,
@@ -277,3 +348,13 @@ async def test_disabled_integrations_have_explicit_status_and_no_wire_endpoint(s
         assert (await client.get("/auth/a2a/status")).json()["enabled"] is False
         assert (await client.get("/admin/api/confluence")).json()["enabled"] is False
         assert (await client.post("/a2a", json=message())).status_code == 404
+        overview = await client.get("/admin/api/overview")
+        assert overview.status_code == 200
+        assert overview.json()["a2a_usage"] == {
+            "enabled": False,
+            "total_calls": 0,
+            "successful_calls": 0,
+            "failed_calls": 0,
+            "active_agents": 0,
+            "calls_last_minute": 0,
+        }

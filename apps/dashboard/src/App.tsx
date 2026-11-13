@@ -792,6 +792,12 @@ function OverviewPage({ data, password, onNavigate, onAction }: { data: Overview
         <Metric label="MCP tools" value={number(localToolCount(data))} note={`${data.managed_tools.tool_count} управляемых`} tone="violet" />
         <Metric label="Git-источники" value={number(data.catalog.repository_count)} note={`${data.catalog.index_count} индексов`} tone="blue" />
         <Metric label="Вызовы" value={number(data.usage.total_calls)} note={`${data.usage.calls_last_minute} за минуту`} tone="amber" />
+        <Metric
+          label="Вызовы A2A"
+          value={data.a2a_usage?.enabled ? number(data.a2a_usage.total_calls) : "—"}
+          note={data.a2a_usage?.enabled ? `${number(data.a2a_usage.calls_last_minute)} за минуту` : data.a2a_usage ? "A2A отключён" : "Статистика недоступна"}
+          tone="blue"
+        />
       </div>
       <div className="dashboard-grid">
         <section className="panel span-2">

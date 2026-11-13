@@ -86,7 +86,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .hero-orbit span:nth-child(1) { top: 8px; left: 28px; }.hero-orbit span:nth-child(2) { bottom: -20px; right: 55px; }.hero-orbit span:nth-child(3) { right: -17px; top: 62px; }
 .hero-orbit b { font-size: 38px; line-height: 1; }.hero-orbit small { margin-top: 6px; color: #7d8c80; font-size: var(--text-small); text-transform: uppercase; }
 
-.metric-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 11px; margin: 13px 0; }
+.metric-row { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 11px; margin: 13px 0; }
 .metric-card { position: relative; overflow: hidden; min-height: 127px; padding: 18px 19px; border: 1px solid var(--line-soft); border-radius: 12px; background: var(--panel); }
 .metric-card > span, .metric-card small { display: block; color: #707c73; font-size: var(--text-small); }.metric-card strong { display: block; margin: 8px 0 4px; font-size: 30px; letter-spacing: -.04em; }.metric-card i { position: absolute; width: 54px; height: 54px; right: -14px; bottom: -16px; border: 10px solid currentColor; border-radius: 50%; opacity: .09; }
 .metric-card.lime strong, .metric-card.lime i { color: var(--lime); }.metric-card.violet strong, .metric-card.violet i { color: var(--violet); }.metric-card.blue strong, .metric-card.blue i { color: var(--blue); }.metric-card.amber strong, .metric-card.amber i { color: var(--amber); }
@@ -188,6 +188,7 @@ input, textarea, select { min-height: 38px; padding: 8px 10px; border: 1px solid
 @media (max-width: 1120px) {
   .app-shell { grid-template-columns: 210px minmax(0, 1fr); }
   .metric-row { grid-template-columns: 1fr 1fr; }
+  .metric-row > :first-child { grid-column: 1 / -1; }
   .index-card-grid { grid-template-columns: 1fr 1fr; }
   .service-grid { grid-template-columns: 1fr 1fr; }
   .graph-layout { grid-template-columns: 175px minmax(0, 1fr) 225px; }
