@@ -108,7 +108,7 @@ function SourceForm({ source, indexes, initialIndex, request, gigacodeAvailable,
   useEffect(() => {
     ++connectionRevision.current; setCheck(null); setError("");
   }, [base, root, deployment, username, token, index]);
-  const payload = () => ({ name: name.trim() || `Confluence · ${new URL(base).hostname}`.slice(0, 120), index_id: index, base_url: base.trim(), root_page_url: root.trim(), deployment, username: username.trim() || null, ...(token ? { token } : {}), schedule, include_history: history, analyze_images: images, enabled: source?.enabled ?? true });
+  const payload = () => ({ name: name.trim() || `Confluence · ${new URL(base).hostname}`.slice(0, 120), index_id: index, base_url: base.trim(), root_page_url: root.trim(), deployment, username: deployment === "data_center" ? null : username.trim() || null, ...(token ? { token } : {}), schedule, include_history: history, analyze_images: images, enabled: source?.enabled ?? true });
   const test = async () => {
     if (!formRef.current?.reportValidity()) return;
     const testedRevision = connectionRevision.current;

@@ -53,8 +53,8 @@ class ConfluenceClient:
         self.api = self.base + ("/api/v2" if self.cloud else "/rest/api")
         headers = {"Accept": "application/json"}
         auth = None
-        if config.username:
-            auth = httpx.BasicAuth(config.username, token)
+        if config.auth_mode == "basic":
+            auth = httpx.BasicAuth(config.username or "", token)
         else:
             headers["Authorization"] = f"Bearer {token}"
         logger.info(
@@ -64,7 +64,7 @@ class ConfluenceClient:
             self.trace_id,
             self.origin,
             "cloud" if self.cloud else "data_center",
-            "basic" if config.username else "bearer",
+            config.auth_mode,
             "SSL_CERT_FILE"
             if os.environ.get("SSL_CERT_FILE")
             else ("SSL_CERT_DIR" if os.environ.get("SSL_CERT_DIR") else "default"),
@@ -177,11 +177,27 @@ class ConfluenceClient:
                 logger.warning(
                     "Confluence HTTP request failed: origin=%s auth=%s status=%d",
                     self.origin,
-                    "basic" if self.config.username else "bearer",
+                    self.config.auth_mode,
                     response.status_code,
                 )
+                if response.status_code == 401:
+                    hint = (
+                        "Check the Confluence personal access token (PAT), its expiry and "
+                        "whether the gateway forwards Bearer authentication. Enter only the "
+                        "token value, without the Bearer prefix."
+                        if self.config.auth_mode == "bearer"
+                        else "Check the account email/username and token. For a Data Center "
+                        "personal access token select Data Center to use Bearer authentication."
+                    )
+                    raise ConfluenceError(
+                        "Authentication failed: HTTP 401 from Confluence or its gateway "
+                        f"(auth={self.config.auth_mode}, "
+                        f"deployment={'cloud' if self.cloud else 'data_center'}, "
+                        f"request={request_id}). {hint}",
+                        status_code=401,
+                        error_code="authentication",
+                    )
                 labels = {
-                    401: "Authentication failed",
                     403: "Page access denied",
                     404: "Page unavailable",
                 }
@@ -246,7 +262,7 @@ class ConfluenceClient:
         parsed = urlsplit(target)
         # No path/query: attachment redirects can contain signed credentials.
         origin = f"{parsed.scheme}://{parsed.netloc}"
-        auth = ("basic" if self.config.username else "bearer") if origin == self.origin else "none"
+        auth = self.config.auth_mode if origin == self.origin else "none"
         logger.warning(
             "Confluence request failed: trace=%s operation=%s origin=%s auth=%s attempt=%d/%d "
             "code=%s elapsed=%.3fs; %s",
@@ -549,9 +565,7 @@ class ConfluenceClient:
                             "Confluence attachment redirect accepted: trace=%s hop=%d auth=%s",
                             self.trace_id,
                             redirects,
-                            ("basic" if self.config.username else "bearer")
-                            if client is self.http
-                            else "none",
+                            self.config.auth_mode if client is self.http else "none",
                         )
                         continue
                     if response.status_code in {429, 502, 503, 504} and attempt < self.retries:

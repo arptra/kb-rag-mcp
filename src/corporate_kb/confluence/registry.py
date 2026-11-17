@@ -255,7 +255,7 @@ class ConfluenceRegistry:
             "Confluence connection check started: host=%s deployment=%s auth=%s",
             urlsplit(parsed.base_url).hostname,
             "cloud" if parsed.effective_cloud else "data_center",
-            "basic" if parsed.username else "bearer",
+            parsed.auth_mode,
         )
         try:
             client = self.client_factory(parsed, token)

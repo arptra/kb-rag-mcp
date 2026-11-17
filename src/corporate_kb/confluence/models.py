@@ -77,6 +77,12 @@ class SourceConfig(BaseModel):
             and (urlsplit(self.base_url).hostname or "").lower().endswith(".atlassian.net")
         )
 
+    @property
+    def auth_mode(self) -> Literal["basic", "bearer"]:
+        # Explicit Data Center means PAT, even if an old Cloud email was saved.
+        # Keep existing auto + username connections compatible with Basic auth.
+        return "basic" if self.deployment != "data_center" and self.username else "bearer"
+
     @field_validator("base_url")
     @classmethod
     def validate_base(cls, value: str) -> str:

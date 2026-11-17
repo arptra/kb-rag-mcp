@@ -21,6 +21,10 @@ The adapter detects `*.atlassian.net` as Cloud; choose `deployment=cloud` or
 `/pages/<id>`, `pageId=<id>`, numeric IDs and legacy `/display/SPACE/Title` are supported.
 Cloud email is required even when the deployment is detected automatically; a Cloud
 API token is never silently treated as a Data Center Bearer token.
+Explicit `deployment=data_center` always sends Bearer authentication, including for
+older saved sources that still contain a Cloud email. The dashboard omits that email
+in Data Center requests. Existing `auto` connections with a username retain Basic
+authentication for compatibility; choose Data Center explicitly when using a PAT.
 
 The connection test reads root metadata without saving settings or content. Creating a
 source through the dashboard/API immediately queues its first synchronization. This
@@ -175,6 +179,11 @@ rejected the token. The UI now includes a category and explanation, such as
 Connection-test JSON adds `error_code` for classified failures and `upstream_status`
 for a Confluence HTTP error. The endpoint keeps HTTP 409 for upstream failures;
 HTTP 401 with `Administrator authentication required` belongs to this app's admin login.
+An upstream `Authentication failed` now includes HTTP 401, the actual `auth=basic`
+or `auth=bearer` mode, deployment and request ID, plus a mode-specific troubleshooting
+hint. Its `error_code` is `authentication`. A 401 can originate from Confluence or a
+gateway; it does not prove the token itself is invalid. The response body and raw
+authentication headers are never copied into diagnostics.
 
 Compare curl from the **backend host/container and service environment**, using the
 same destination. A successful curl from a laptop does not establish that the backend

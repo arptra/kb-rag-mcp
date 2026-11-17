@@ -185,7 +185,7 @@ def test_http_401_remains_an_authentication_failure_without_transport_retries(mo
         with pytest.raises(ConfluenceError, match="Authentication failed") as caught:
             client.page("1", body=False)
         assert caught.value.status_code == 401
-        assert caught.value.error_code is None
+        assert caught.value.error_code == "authentication"
         assert len(calls) == 1 and waits == []
         assert_no_secrets(str(caught.value))
     finally:
