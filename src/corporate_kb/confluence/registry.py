@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 from typing import Any, cast
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import frontmatter
 from bs4 import BeautifulSoup
@@ -78,6 +78,19 @@ CREATE TABLE IF NOT EXISTS events (
  message TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS events_job ON events(job_id,id);
+CREATE TABLE IF NOT EXISTS sync_items (
+ job_id TEXT NOT NULL REFERENCES jobs(id), task_kind TEXT NOT NULL,
+ page_id TEXT NOT NULL, content_kind TEXT NOT NULL DEFAULT 'page',
+ status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+ stage TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+ error_type TEXT NOT NULL DEFAULT '', status_code INTEGER,
+ title TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '', changed INTEGER NOT NULL DEFAULT 0,
+ unchanged INTEGER NOT NULL DEFAULT 0, assets INTEGER NOT NULL DEFAULT 0,
+ archived_versions INTEGER NOT NULL DEFAULT 0, had_failure INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(job_id,task_kind,page_id)
+);
+CREATE INDEX IF NOT EXISTS sync_items_pending
+ ON sync_items(job_id,task_kind,status,attempts,page_id);
 """
 
 
@@ -104,8 +117,19 @@ def _atomic_write(path: Path, data: bytes) -> None:
     os.replace(staged, path)
 
 
+class PageSyncError(Exception):
+    """Carry the failed stage without treating optional API failures as page deletion."""
+
+    def __init__(self, error: Exception, stage: str, *, current_page: bool = False) -> None:
+        super().__init__(type(error).__name__)
+        self.error, self.stage, self.current_page = error, stage, current_page
+
+
 class ConfluenceRegistry:
     """Source configuration never exposes credentials; scheduler never starts in __init__."""
+
+    RETRY_ROUNDS = 2
+    RETRY_DELAY_SECONDS = 2
 
     def __init__(
         self,
@@ -319,7 +343,8 @@ class ConfluenceRegistry:
             if (
                 previous
                 and connection.execute(
-                    "SELECT 1 FROM jobs WHERE source_id=? AND status='running'", (source_id,)
+                    "SELECT 1 FROM jobs WHERE source_id=? AND status IN ('queued','running')",
+                    (source_id,),
                 ).fetchone()
             ):
                 raise ValueError(
@@ -475,6 +500,48 @@ class ConfluenceRegistry:
             "has_more": len(rows) > limit,
         }
 
+    def job_failures(self, job_id: str, *, offset: int = 0, limit: int = 50) -> dict[str, Any]:
+        if offset < 0 or not 1 <= limit <= 200:
+            raise ValueError("Invalid failure pagination")
+        self.job_status(job_id)
+        with self._db() as connection:
+            total = connection.execute(
+                "SELECT COUNT(*) FROM sync_items WHERE job_id=? AND status IN ('retry','failed')",
+                (job_id,),
+            ).fetchone()[0]
+            rows = connection.execute(
+                "SELECT page_id,title,url,task_kind,stage,attempts,error,error_type,"
+                "status_code,status "
+                "FROM sync_items WHERE job_id=? AND status IN ('retry','failed') "
+                "ORDER BY task_kind,page_id LIMIT ? OFFSET ?",
+                (job_id, limit, offset),
+            ).fetchall()
+        items = [dict(row) for row in rows]
+        return {
+            "items": items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "has_more": offset + len(items) < total,
+        }
+
+    def _error_summary(self, exc: Exception) -> str:
+        if isinstance(exc, ConfluenceError):
+            message = str(exc)
+        else:
+            frames = []
+            frame = exc.__traceback__
+            while frame is not None:
+                code = frame.tb_frame.f_code
+                frames.append(f"{Path(code.co_filename).name}:{frame.tb_lineno} ({code.co_name})")
+                frame = frame.tb_next
+            # Exception text and source lines can contain page bodies or credentials.
+            message = type(exc).__name__ + (": " + " -> ".join(frames[-5:]) if frames else "")
+        with self._state_lock:
+            for token in self._active_tokens:
+                message = message.replace(token, "[REDACTED]")
+        return re.sub(r"(?i)(authorization\s*[:=]\s*)([^\n]+)", r"\1[REDACTED]", message)[:1000]
+
     def _log(
         self,
         job_id: str,
@@ -541,6 +608,18 @@ class ConfluenceRegistry:
             "published",
             "index_stage",
             "phase",
+            "attempts",
+            "error_type",
+            "status_code",
+            "retry_round",
+            "wait_seconds",
+            "retry_pending",
+            "failed_pages",
+            "failed_branches",
+            "failed_items",
+            "recovered_pages",
+            "discovery_complete",
+            "completed_branches",
         }
         summary = _json({key: value for key, value in details.items() if key in progress_keys})
         with self._state_lock:
@@ -751,6 +830,13 @@ class ConfluenceRegistry:
             with self._guard(config.index_id, cancel):
                 result = self._synchronize(job_id, source["id"], config, client, cancel)
             now = _now()
+            message = (
+                f"Synchronization completed with {result['failed_items']} unresolved item(s)"
+                if result["failed_items"]
+                else "Synchronization completed"
+                if result["changed"]
+                else "No changes"
+            )
             with self._db() as connection:
                 connection.execute(
                     (
@@ -766,19 +852,23 @@ class ConfluenceRegistry:
                         "completed_with_warnings" if result["warnings"] else "completed",
                         now,
                         _json(result),
-                        "Synchronization completed" if result["changed"] else "No changes",
+                        message,
                         job_id,
                     ),
                 )
             self._log(
                 job_id,
                 "complete",
-                "Synchronization completed" if result["changed"] else "No changes",
+                message,
                 discovered=result["discovered"],
                 changed=result["changed"],
                 unchanged=result["unchanged"],
                 assets=result["assets"],
                 archived_versions=result["archived_versions"],
+                failed_pages=result["failed_pages"],
+                failed_branches=result["failed_branches"],
+                recovered_pages=result["recovered_pages"],
+                retry_pending=result["retry_pending"],
             )
         except SyncCancelled:
             self._log(
@@ -805,19 +895,12 @@ class ConfluenceRegistry:
                         ),
                     )
                 return self.job_status(job_id)
-            message = (
-                str(exc)
-                if isinstance(exc, (ConfluenceError, ValueError))
-                else f"Synchronization failed ({type(exc).__name__})"
-            )
+            message = self._error_summary(exc)
             self._log(
                 job_id,
                 "failed",
                 message,
                 level="error",
-                server_message=message
-                if isinstance(exc, ConfluenceError)
-                else f"Synchronization failed ({type(exc).__name__})",
             )
             with self._db() as connection:
                 failures = int(source["failure_count"]) + 1
@@ -841,7 +924,14 @@ class ConfluenceRegistry:
                 )
         finally:
             if client is not None:
-                client.close()
+                try:
+                    client.close()
+                except Exception as exc:
+                    logger.warning(
+                        "Confluence client close failed: job=%s %s",
+                        job_id,
+                        self._error_summary(exc),
+                    )
             with self._state_lock:
                 self._active_tokens.discard(token)
                 self._cancel.pop(job_id, None)
@@ -877,6 +967,274 @@ class ConfluenceRegistry:
             raise ValueError("Unsafe Confluence materialization path")
         return path
 
+    def _enqueue_item(
+        self,
+        job_id: str,
+        task_kind: str,
+        page_id: str,
+        content_kind: str = "page",
+        *,
+        url: str = "",
+    ) -> None:
+        with self._db() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO sync_items(job_id,task_kind,page_id,content_kind,url) "
+                "VALUES(?,?,?,?,?)",
+                (job_id, task_kind, page_id, content_kind, url),
+            )
+
+    @staticmethod
+    def _report_url(config: SourceConfig, page_id: str) -> str:
+        # Keep report links tied to this job's connection even if the source is
+        # edited later. Match the client's implicit /wiki context for Cloud.
+        base = config.base_url
+        if config.effective_cloud and not urlsplit(base).path.rstrip("/"):
+            base += "/wiki"
+        target = page_id if page_id.isdigit() else config.root_page_url
+        if target.isdigit():
+            return f"{base}/pages/viewpage.action?pageId={quote(target, safe='')}"
+        return target
+
+    def _next_item(self, job_id: str, task_kind: str, retry_round: int) -> dict[str, Any] | None:
+        with self._db() as connection:
+            # Newly discovered work always gets its first attempt before another retry.
+            row = connection.execute(
+                "SELECT * FROM sync_items WHERE job_id=? AND task_kind=? AND status='pending' "
+                "ORDER BY attempts,page_id LIMIT 1",
+                (job_id, task_kind),
+            ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    "SELECT * FROM sync_items WHERE job_id=? AND task_kind=? AND status='retry' "
+                    "AND attempts<=? ORDER BY attempts,page_id LIMIT 1",
+                    (job_id, task_kind, retry_round),
+                ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _begin_item(self, item: dict[str, Any]) -> None:
+        # Commit the attempt only with its outcome. An interrupted attempt remains
+        # eligible after a process crash, including the final deferred attempt.
+        item["attempts"] += 1
+
+    def _complete_item(self, item: dict[str, Any]) -> None:
+        with self._db() as connection:
+            connection.execute(
+                "UPDATE sync_items SET status='done',error='',error_type='',"
+                "status_code=NULL,attempts=? "
+                "WHERE job_id=? AND task_kind=? AND page_id=?",
+                (item["attempts"], item["job_id"], item["task_kind"], item["page_id"]),
+            )
+
+    def _fail_item(self, item: dict[str, Any], exc: Exception, stage: str) -> None:
+        status = "retry" if item["attempts"] <= self.RETRY_ROUNDS else "failed"
+        message = self._error_summary(exc)
+        status_code = exc.status_code if isinstance(exc, ConfluenceError) else None
+        with self._db() as connection:
+            connection.execute(
+                "UPDATE sync_items SET status=?,stage=?,error=?,error_type=?,status_code=?,"
+                "attempts=?,had_failure=1 "
+                "WHERE job_id=? AND task_kind=? AND page_id=?",
+                (
+                    status,
+                    stage,
+                    message,
+                    type(exc).__name__,
+                    status_code,
+                    item["attempts"],
+                    item["job_id"],
+                    item["task_kind"],
+                    item["page_id"],
+                ),
+            )
+        self._log(
+            item["job_id"],
+            stage,
+            f"Page {item['page_id']}: {message}; "
+            + ("queued for a later retry" if status == "retry" else "retry limit reached"),
+            level="warning",
+            page_id=item["page_id"],
+            attempts=item["attempts"],
+            error_type=type(exc).__name__,
+            status_code=status_code,
+        )
+
+    def _retry_pause(self, job_id: str, cancel: threading.Event, retry_round: int) -> None:
+        seconds = min(self.RETRY_DELAY_SECONDS * 2 ** (retry_round - 1), 120)
+        self._log(
+            job_id,
+            "retry_wait",
+            "Waiting before retrying unsuccessful pages",
+            retry_round=retry_round,
+            wait_seconds=seconds,
+        )
+        if cancel.wait(seconds):
+            raise SyncCancelled("Synchronization cancelled during retry wait")
+
+    def _queue_counts(self, job_id: str) -> dict[str, Any]:
+        with self._db() as connection:
+            rows = connection.execute(
+                "SELECT task_kind,status,COUNT(*) AS n FROM sync_items WHERE job_id=? "
+                "GROUP BY task_kind,status",
+                (job_id,),
+            ).fetchall()
+            metrics = connection.execute(
+                "SELECT COALESCE(SUM(changed),0),COALESCE(SUM(CASE WHEN changed=0 THEN unchanged "
+                "ELSE 0 END),0),COALESCE(SUM(assets),0),COALESCE(SUM(archived_versions),0),"
+                "COALESCE(SUM(CASE WHEN status='done' AND had_failure=1 THEN 1 ELSE 0 END),0) "
+                "FROM sync_items WHERE job_id=? AND task_kind='page'",
+                (job_id,),
+            ).fetchone()
+        counts = {(row["task_kind"], row["status"]): row["n"] for row in rows}
+        failed_pages = sum(counts.get(("page", status), 0) for status in ("retry", "failed"))
+        failed_branches = sum(
+            counts.get(("discovery", status), 0) for status in ("retry", "failed")
+        )
+        return {
+            "discovered": sum(n for (kind, _), n in counts.items() if kind == "page"),
+            "pages_done": counts.get(("page", "done"), 0) + counts.get(("page", "failed"), 0),
+            "failed_pages": failed_pages,
+            "failed_branches": failed_branches,
+            "failed_items": failed_pages + failed_branches,
+            "retry_pending": sum(n for (_, status), n in counts.items() if status == "retry"),
+            "discovery_complete": not failed_branches and not counts.get(("discovery", "pending")),
+            "changed": metrics[0],
+            "unchanged": metrics[1],
+            "assets": metrics[2],
+            "archived_versions": metrics[3],
+            "recovered_pages": metrics[4],
+        }
+
+    def _save_sync_result(self, job_id: str, result: dict[str, Any]) -> None:
+        with self._db() as connection:
+            connection.execute("UPDATE jobs SET result_json=? WHERE id=?", (_json(result), job_id))
+
+    def _update_page_result(self, item: dict[str, Any], result: dict[str, Any]) -> None:
+        # Update counters from just this checkpoint; scanning the whole queue after
+        # every page makes large imports quadratic. Reconstruct totals once on resume.
+        with self._db() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_items WHERE job_id=? AND task_kind='page' AND page_id=?",
+                (item["job_id"], item["page_id"]),
+            ).fetchone()
+        assert row is not None
+        for value, sign in ((item, -1), (dict(row), 1)):
+            failed = int(value["status"] in {"retry", "failed"})
+            contributions = {
+                "changed": value["changed"],
+                "unchanged": value["unchanged"] if not value["changed"] else 0,
+                "assets": value["assets"],
+                "archived_versions": value["archived_versions"],
+                "pages_done": int(value["status"] in {"done", "failed"}),
+                "failed_pages": failed,
+                "failed_items": failed,
+                "retry_pending": int(value["status"] == "retry"),
+                "recovered_pages": int(value["status"] == "done" and value["had_failure"]),
+            }
+            for key, amount in contributions.items():
+                result[key] += sign * amount
+
+    def _discover_pages(
+        self, job_id: str, config: SourceConfig, client: Any, cancel: threading.Event
+    ) -> None:
+        self._enqueue_item(
+            job_id, "discovery", "@root", "root", url=self._report_url(config, "@root")
+        )
+        with self._db() as connection:
+            known = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT page_id FROM sync_items WHERE job_id=? AND task_kind='discovery' "
+                    "AND page_id!='@root'",
+                    (job_id,),
+                )
+            }
+            discovered_pages = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT page_id FROM sync_items WHERE job_id=? AND task_kind='page'",
+                    (job_id,),
+                )
+            }
+
+        def discover(page_id: str, kind: str, *, traverse: bool) -> None:
+            if page_id not in known:
+                if len(known) >= config.max_pages:
+                    raise ConfluenceError(
+                        "Page limit exceeded; tree discovery is incomplete", error_code="page_limit"
+                    )
+                self._enqueue_item(
+                    job_id,
+                    "discovery",
+                    page_id,
+                    kind if traverse else "leaf",
+                    url=self._report_url(config, page_id),
+                )
+                known.add(page_id)
+            if kind == "page":
+                self._enqueue_item(job_id, "page", page_id, url=self._report_url(config, page_id))
+                discovered_pages.add(page_id)
+
+        counts = self._queue_counts(job_id)
+        self._log(job_id, "discovery", "Resolving root and discovering page tree")
+        for retry_round in range(self.RETRY_ROUNDS + 1):
+            if retry_round and self._next_item(job_id, "discovery", retry_round):
+                self._retry_pause(job_id, cancel, retry_round)
+            while (item := self._next_item(job_id, "discovery", retry_round)) is not None:
+                self._check_cancel(cancel)
+                self._begin_item(item)
+                next_status = "done"
+                try:
+                    kind, page_id = item["content_kind"], item["page_id"]
+                    if kind == "root":
+                        root_id = client.root_id()
+                        if hasattr(client, "children"):
+                            discover(root_id, "page", traverse=True)
+                        else:
+                            # Compatibility with external adapters exposing only page_ids.
+                            # Keep yielded pages even if a later pagination request fails.
+                            for found_id in client.page_ids(root_id):
+                                self._check_cancel(cancel)
+                                discover(found_id, "page", traverse=False)
+                    elif kind != "leaf":
+                        for child_id, child_kind in client.children(page_id, kind=kind):
+                            self._check_cancel(cancel)
+                            discover(child_id, child_kind, traverse=True)
+                    self._complete_item(item)
+                except SyncCancelled:
+                    raise
+                except Exception as exc:
+                    self._check_cancel(cancel)
+                    self._fail_item(item, exc, "discovery")
+                    next_status = "retry" if item["attempts"] <= self.RETRY_ROUNDS else "failed"
+                failure_delta = int(next_status in {"retry", "failed"}) - int(
+                    item["status"] in {"retry", "failed"}
+                )
+                counts["failed_branches"] += failure_delta
+                counts["failed_items"] += failure_delta
+                counts["retry_pending"] += int(next_status == "retry") - int(
+                    item["status"] == "retry"
+                )
+                self._log(
+                    job_id,
+                    "discovery_retry" if retry_round else "discovery",
+                    "Page tree discovery progress",
+                    retry_round=retry_round,
+                    discovered=len(discovered_pages),
+                    failed_branches=counts["failed_branches"],
+                    failed_items=counts["failed_items"],
+                    retry_pending=counts["retry_pending"],
+                )
+        counts = self._queue_counts(job_id)
+        self._log(
+            job_id,
+            "discovery",
+            "Page tree discovery completed"
+            if counts["discovery_complete"]
+            else "Page tree is incomplete; existing pages will be retained",
+            pages_total=counts["discovered"],
+            **counts,
+        )
+
     def _synchronize(
         self,
         job_id: str,
@@ -885,237 +1243,86 @@ class ConfluenceRegistry:
         client: Any,
         cancel: threading.Event,
     ) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "discovered": 0,
-            "changed": 0,
-            "unchanged": 0,
-            "archived_versions": 0,
-            "assets": 0,
-            "warnings": [],
-            "index_id": config.index_id,
-        }
-        self._log(job_id, "discovery", "Resolving root and discovering page tree")
-        root_id = client.root_id()
-        # Discovery must complete before interpreting absences as removals.
-        page_ids = list(dict.fromkeys(client.page_ids(root_id)))
-        result["discovered"] = len(page_ids)
-        self._log(job_id, "discovery", "Page tree discovery completed", pages_total=len(page_ids))
-        for position, page_id in enumerate(page_ids, 1):
-            self._check_cancel(cancel)
-            self._log(
-                job_id,
-                "fetch",
-                "Checking page and attachment versions",
-                page_id=page_id,
-                pages_done=position - 1,
-                pages_total=len(page_ids),
-            )
-            try:
-                summary = client.page(page_id, body=False)
-                attachments = client.attachments(page_id)
-                fingerprint = hashlib.sha256(
-                    _json(
-                        {
-                            "version": summary.version,
-                            "title": summary.title,
-                            "parent_id": summary.parent_id,
-                            "updated_at": summary.updated_at,
-                            "assets": sorted((a.id, a.version) for a in attachments),
-                            "images": config.analyze_images,
-                            "extractor": getattr(self.image_extractor, "identity", "none"),
-                        }
-                    ).encode()
-                ).hexdigest()
-                with self._db() as connection:
-                    previous = connection.execute(
-                        "SELECT * FROM pages WHERE source_id=? AND page_id=?", (source_id, page_id)
-                    ).fetchone()
-                current_path = self._current_path(config.index_id, source_id, page_id)
-                changed = (
-                    previous is None
-                    or previous["fingerprint"] != fingerprint
-                    or previous["state"] != "current"
-                    or not current_path.is_file()
+        result: dict[str, Any] = {"warnings": [], "index_id": config.index_id}
+        self._discover_pages(job_id, config, client, cancel)
+        result.update(self._queue_counts(job_id))
+        self._save_sync_result(job_id, result)
+        for retry_round in range(self.RETRY_ROUNDS + 1):
+            if retry_round and self._next_item(job_id, "page", retry_round):
+                self._retry_pause(job_id, cancel, retry_round)
+            while (item := self._next_item(job_id, "page", retry_round)) is not None:
+                self._check_cancel(cancel)
+                self._begin_item(item)
+                self._log(
+                    job_id,
+                    "retry" if retry_round else "fetch",
+                    "Retrying page" if retry_round else "Checking page and attachment versions",
+                    page_id=item["page_id"],
+                    retry_round=retry_round,
+                    pages_total=result["discovered"],
+                    **result,
                 )
-                if changed:
-                    page = client.page(page_id, body=True)
-                    if page.version != summary.version:
-                        raise ConfluenceError(
-                            "Page changed during synchronization; retry will fetch a "
-                            "consistent version"
-                        )
-                    self._archive_source(source_id, page)
-                    # Inline SVG diagrams do not appear in the attachment API.
-                    for svg in BeautifulSoup(page.body, "html.parser").find_all("svg"):
-                        svg_text = str(svg)
-                        svg_hash = hashlib.sha256(svg_text.encode()).hexdigest()
-                        attachments.append(
-                            Attachment(
-                                id=f"inline-svg-{svg_hash}",
-                                title=f"inline-diagram-{svg_hash[:12]}.svg",
-                                version=page.version,
-                                media_type="image/svg+xml",
-                                download_url=page.url,
-                                updated_at=page.updated_at,
-                                extra={"inline_svg": svg_text},
-                            )
-                        )
-                    self._log(
-                        job_id,
-                        "attachments",
-                        "Processing page attachments",
-                        page_id=page_id,
-                        attachments_total=len(attachments),
-                    )
-                    image_blocks = []
-                    asset_metadata = []
-                    attachment_warning_count = len(result["warnings"])
-                    for attachment in attachments:
-                        self._check_cancel(cancel)
-                        try:
-                            asset, block = self._asset(
-                                job_id, source_id, page_id, attachment, config, client, cancel
-                            )
-                            result["assets"] += 1
-                            asset_metadata.append(
-                                {
-                                    "id": asset["id"],
-                                    "filename": asset["title"],
-                                    "mime_type": asset["media_type"],
-                                    "source_id": source_id,
-                                    "version": asset["version"],
-                                    "updated_at": attachment.updated_at or asset["created_at"],
-                                    "status": asset.get("extraction_status", "archived"),
-                                    "extracted_text": block,
-                                    "description": "",
-                                }
-                            )
-                            if block:
-                                image_blocks.append(block)
-                            if asset.get("extraction_status") in {
-                                "partial",
-                                "unreadable",
-                                "unsupported",
-                                "error",
-                            }:
-                                warning = f"Image {attachment.id}: {asset['extraction_status']}"
-                                result["warnings"].append(warning)
-                                self._log(job_id, "images", warning, level="warning")
-                        except SyncCancelled:
-                            raise
-                        except Exception as exc:
-                            reason = (
-                                str(exc) if isinstance(exc, ConfluenceError) else type(exc).__name__
-                            )
-                            warning = f"Attachment {attachment.id}: {reason}"
-                            result["warnings"].append(warning)
-                            self._log(
-                                job_id, "attachments", warning, level="warning", page_id=page_id
-                            )
-                    self._log(
-                        job_id,
-                        "normalization",
-                        "Normalizing page text and image evidence",
-                        page_id=page_id,
-                    )
-                    document = self._document(
-                        config, source_id, page, fingerprint, image_blocks, asset_metadata
-                    )
-                    document = self._archive(
-                        config.index_id, source_id, page_id, document, page.version, page.updated_at
-                    )
-                    _atomic_write(
-                        current_path,
-                        frontmatter.dumps(
-                            frontmatter.Post(document.content, **document.metadata)
-                        ).encode(),
-                    )
-                    revision_id = str(document.metadata["revision_id"])
-                    with self._db() as connection:
-                        stored_fingerprint = (
-                            fingerprint
-                            if len(result["warnings"]) == attachment_warning_count
-                            else ""
-                        )
-                        connection.execute(
-                            (
-                                "INSERT INTO "
-                                "pages(source_id,page_id,title,parent_id,version,source_updated_at,"
-                                "url,fingerprint,revision_id,state,last_seen_job) "
-                                "VALUES(?,?,?,?,?,?,?,?,?,'current',?) "
-                                "ON CONFLICT(source_id,page_id) DO UPDATE SET "
-                                "title=excluded.title,parent_id=excluded.parent_id,"
-                                "version=excluded.version,source_updated_at=excluded.source_updated_at,"
-                                "url=excluded.url,fingerprint=excluded.fingerprint,"
-                                "revision_id=excluded.revision_id,state='current',"
-                                "last_seen_job=excluded.last_seen_job"
-                            ),
-                            (
-                                source_id,
-                                page_id,
-                                page.title,
-                                page.parent_id,
-                                page.version,
-                                page.updated_at,
-                                page.url,
-                                stored_fingerprint,
-                                revision_id,
-                                job_id,
-                            ),
-                        )
-                        connection.execute(
-                            "UPDATE sources SET publish_pending=1 WHERE id=?", (source_id,)
-                        )
-                    result["changed"] += 1
-                    if self.page_visibility:
-                        self.page_visibility(
-                            config.index_id, f"confluence:{source_id}:{page_id}", True
-                        )
-                else:
-                    result["unchanged"] += 1
-                    with self._db() as connection:
-                        connection.execute(
-                            "UPDATE pages SET last_seen_job=? WHERE source_id=? AND page_id=?",
-                            (job_id, source_id, page_id),
-                        )
-                if config.include_history:
-                    result["archived_versions"] += self._history(
-                        job_id, source_id, config, client, page_id, summary.version, cancel
-                    )
-            except ConfluenceError as exc:
-                if exc.status_code not in {403, 404}:
+                try:
+                    self._sync_page(job_id, source_id, config, client, cancel, item["page_id"])
+                    self._complete_item(item)
+                except SyncCancelled:
                     raise
-                state = "access_lost" if exc.status_code == 403 else "unavailable"
-                self._hide_page(config.index_id, source_id, page_id, state, job_id)
-                warning = f"Page {page_id} unavailable (HTTP {exc.status_code}); archive retained"
-                result["warnings"].append(warning)
-                result["changed"] += 1
-                self._log(job_id, "fetch", warning, level="warning")
-            self._log(
-                job_id,
-                "checkpoint",
-                "Page checkpoint saved",
-                page_id=page_id,
-                pages_done=position,
-                pages_total=len(page_ids),
-                changed=result["changed"],
-                unchanged=result["unchanged"],
-            )
+                except PageSyncError as failure:
+                    self._check_cancel(cancel)
+                    exc = failure.error
+                    if (
+                        failure.current_page
+                        and isinstance(exc, ConfluenceError)
+                        and exc.status_code in {403, 404}
+                    ):
+                        state = "access_lost" if exc.status_code == 403 else "unavailable"
+                        self._hide_page(config.index_id, source_id, item["page_id"], state, job_id)
+                        with self._db() as connection:
+                            connection.execute(
+                                "UPDATE sync_items SET changed=1 WHERE job_id=? "
+                                "AND task_kind='page' AND page_id=?",
+                                (job_id, item["page_id"]),
+                            )
+                    self._fail_item(item, exc, failure.stage)
+                self._update_page_result(item, result)
+                self._save_sync_result(job_id, result)
+                self._log(
+                    job_id,
+                    "checkpoint",
+                    "Page checkpoint saved",
+                    page_id=item["page_id"],
+                    pages_total=result["discovered"],
+                    **result,
+                )
         self._check_cancel(cancel)
+        self._save_sync_result(job_id, result)
+        if result["discovery_complete"]:
+            # Only complete discovery proves absence. Failed reads of discovered pages
+            # must never be mistaken for deletion from the tree.
+            with self._db() as connection:
+                missing = connection.execute(
+                    "SELECT p.page_id FROM pages p WHERE p.source_id=? AND p.state='current' "
+                    "AND NOT EXISTS(SELECT 1 FROM sync_items i WHERE i.job_id=? "
+                    "AND i.task_kind='page' AND i.page_id=p.page_id)",
+                    (source_id, job_id),
+                ).fetchall()
+            for row in missing:
+                self._hide_page(
+                    config.index_id, source_id, row["page_id"], "removed_from_tree", job_id
+                )
+            result["changed"] += len(missing)
+        else:
+            result["warnings"].append("Tree discovery incomplete; previously saved pages retained")
+        if result["failed_items"]:
+            result["warnings"].append(
+                f"{result['failed_pages']} page(s) and {result['failed_branches']} tree branch(es) "
+                "remain incomplete after retries; see the failed-page report"
+            )
         with self._db() as connection:
-            missing = connection.execute(
-                (
-                    "SELECT page_id FROM pages WHERE source_id=? AND state='current' "
-                    "AND (last_seen_job IS NULL OR last_seen_job!=?)"
-                ),
-                (source_id, job_id),
-            ).fetchall()
-        for row in missing:
-            self._hide_page(config.index_id, source_id, row["page_id"], "removed_from_tree", job_id)
-            result["changed"] += 1
-        with self._db() as connection:
+            connection.execute("UPDATE jobs SET result_json=? WHERE id=?", (_json(result), job_id))
             dirty = connection.execute(
-                "SELECT publish_pending FROM sources WHERE id=?", (source_id,)
+                "SELECT publish_pending FROM sources WHERE id=?",
+                (source_id,),
             ).fetchone()[0]
         if dirty or result["archived_versions"]:
             self._log(
@@ -1124,12 +1331,23 @@ class ConfluenceRegistry:
                 "Publishing changes to the selected index",
                 index_id=config.index_id,
             )
-            self._check_cancel(cancel)
-            publication = self.publish(
-                config.index_id,
-                cancel=cancel,
-                progress=lambda event: self._index_progress(job_id, event),
-            )
+            for retry_round in range(self.RETRY_ROUNDS + 1):
+                self._check_cancel(cancel)
+                try:
+                    publication = self.publish(
+                        config.index_id,
+                        cancel=cancel,
+                        progress=lambda event: self._index_progress(job_id, event),
+                    )
+                    break
+                except SyncCancelled:
+                    raise
+                except Exception as exc:
+                    self._check_cancel(cancel)
+                    if retry_round == self.RETRY_ROUNDS:
+                        raise
+                    self._log(job_id, "indexing", self._error_summary(exc), level="warning")
+                    self._retry_pause(job_id, cancel, retry_round + 1)
             result["index_build"] = (
                 publication if isinstance(publication, dict) else {"status": "completed"}
             )
@@ -1155,6 +1373,230 @@ class ConfluenceRegistry:
             result["publication_status"] = "unchanged"
             self._log(job_id, "publication", "No changes; index build is unnecessary")
         return result
+
+    def _sync_page(
+        self,
+        job_id: str,
+        source_id: str,
+        config: SourceConfig,
+        client: Any,
+        cancel: threading.Event,
+        page_id: str,
+    ) -> None:
+        result: dict[str, Any] = {
+            "changed": 0,
+            "unchanged": 0,
+            "assets": 0,
+            "warnings": [],
+        }
+        stage, current_page = "fetch", False
+        attachment_error: Exception | None = None
+        try:
+            current_page = True
+            summary = client.page(page_id, body=False)
+            current_page = False
+            with self._db() as connection:
+                connection.execute(
+                    "UPDATE sync_items SET title=? WHERE job_id=? "
+                    "AND task_kind='page' AND page_id=?",
+                    (summary.title, job_id, page_id),
+                )
+            stage = "attachments"
+            attachments = client.attachments(page_id)
+            stage = "normalization"
+            fingerprint = hashlib.sha256(
+                _json(
+                    {
+                        "version": summary.version,
+                        "title": summary.title,
+                        "parent_id": summary.parent_id,
+                        "updated_at": summary.updated_at,
+                        "assets": sorted((a.id, a.version) for a in attachments),
+                        "images": config.analyze_images,
+                        "extractor": getattr(self.image_extractor, "identity", "none"),
+                    }
+                ).encode()
+            ).hexdigest()
+            with self._db() as connection:
+                previous = connection.execute(
+                    "SELECT * FROM pages WHERE source_id=? AND page_id=?", (source_id, page_id)
+                ).fetchone()
+            current_path = self._current_path(config.index_id, source_id, page_id)
+            changed = (
+                previous is None
+                or previous["fingerprint"] != fingerprint
+                or previous["state"] != "current"
+                or not current_path.is_file()
+            )
+            if changed:
+                stage, current_page = "fetch", True
+                page = client.page(page_id, body=True)
+                current_page = False
+                stage = "normalization"
+                if page.version != summary.version:
+                    raise ConfluenceError(
+                        "Page changed during synchronization; retry will fetch a consistent version"
+                    )
+                self._archive_source(source_id, page)
+                # Inline SVG diagrams do not appear in the attachment API.
+                for svg in BeautifulSoup(page.body, "html.parser").find_all("svg"):
+                    svg_text = str(svg)
+                    svg_hash = hashlib.sha256(svg_text.encode()).hexdigest()
+                    attachments.append(
+                        Attachment(
+                            id=f"inline-svg-{svg_hash}",
+                            title=f"inline-diagram-{svg_hash[:12]}.svg",
+                            version=page.version,
+                            media_type="image/svg+xml",
+                            download_url=page.url,
+                            updated_at=page.updated_at,
+                            extra={"inline_svg": svg_text},
+                        )
+                    )
+                self._log(
+                    job_id,
+                    "attachments",
+                    "Processing page attachments",
+                    page_id=page_id,
+                    attachments_total=len(attachments),
+                )
+                stage = "attachments"
+                image_blocks = []
+                asset_metadata = []
+                attachment_warning_count = len(result["warnings"])
+                for attachment in attachments:
+                    self._check_cancel(cancel)
+                    try:
+                        asset, block = self._asset(
+                            job_id, source_id, page_id, attachment, config, client, cancel
+                        )
+                        result["assets"] += 1
+                        asset_metadata.append(
+                            {
+                                "id": asset["id"],
+                                "filename": asset["title"],
+                                "mime_type": asset["media_type"],
+                                "source_id": source_id,
+                                "version": asset["version"],
+                                "updated_at": attachment.updated_at or asset["created_at"],
+                                "status": asset.get("extraction_status", "archived"),
+                                "extracted_text": block,
+                                "description": "",
+                            }
+                        )
+                        if block:
+                            image_blocks.append(block)
+                        if asset.get("extraction_status") in {
+                            "partial",
+                            "unreadable",
+                            "unsupported",
+                            "error",
+                        }:
+                            warning = f"Image {attachment.id}: {asset['extraction_status']}"
+                            result["warnings"].append(warning)
+                            self._log(job_id, "images", warning, level="warning")
+                    except SyncCancelled:
+                        raise
+                    except Exception as exc:
+                        attachment_error = exc
+                        reason = self._error_summary(exc)
+                        warning = f"Attachment {attachment.id}: {reason}"
+                        result["warnings"].append(warning)
+                        self._log(job_id, "attachments", warning, level="warning", page_id=page_id)
+                self._log(
+                    job_id,
+                    "normalization",
+                    "Normalizing page text and image evidence",
+                    page_id=page_id,
+                )
+                stage = "normalization"
+                document = self._document(
+                    config, source_id, page, fingerprint, image_blocks, asset_metadata
+                )
+                stage = "archive"
+                document = self._archive(
+                    config.index_id, source_id, page_id, document, page.version, page.updated_at
+                )
+                _atomic_write(
+                    current_path,
+                    frontmatter.dumps(
+                        frontmatter.Post(document.content, **document.metadata)
+                    ).encode(),
+                )
+                revision_id = str(document.metadata["revision_id"])
+                with self._db() as connection:
+                    stored_fingerprint = (
+                        fingerprint if len(result["warnings"]) == attachment_warning_count else ""
+                    )
+                    connection.execute(
+                        (
+                            "INSERT INTO "
+                            "pages(source_id,page_id,title,parent_id,version,source_updated_at,"
+                            "url,fingerprint,revision_id,state,last_seen_job) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,'current',?) "
+                            "ON CONFLICT(source_id,page_id) DO UPDATE SET "
+                            "title=excluded.title,parent_id=excluded.parent_id,"
+                            "version=excluded.version,source_updated_at=excluded.source_updated_at,"
+                            "url=excluded.url,fingerprint=excluded.fingerprint,"
+                            "revision_id=excluded.revision_id,state='current',"
+                            "last_seen_job=excluded.last_seen_job"
+                        ),
+                        (
+                            source_id,
+                            page_id,
+                            page.title,
+                            page.parent_id,
+                            page.version,
+                            page.updated_at,
+                            page.url,
+                            stored_fingerprint,
+                            revision_id,
+                            job_id,
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE sources SET publish_pending=1 WHERE id=?", (source_id,)
+                    )
+                result["changed"] += 1
+                if self.page_visibility:
+                    self.page_visibility(config.index_id, f"confluence:{source_id}:{page_id}", True)
+            else:
+                result["unchanged"] += 1
+                with self._db() as connection:
+                    connection.execute(
+                        "UPDATE pages SET last_seen_job=? WHERE source_id=? AND page_id=?",
+                        (job_id, source_id, page_id),
+                    )
+            if config.include_history:
+                stage = "history"
+                self._history(job_id, source_id, config, client, page_id, summary.version, cancel)
+            if result["warnings"]:
+                stage = "attachments"
+                if attachment_error is not None:
+                    raise attachment_error
+                raise ConfluenceError(
+                    "Page text saved; one or more attachments or images "
+                    "could not be fully processed",
+                    error_code="incomplete_attachments",
+                )
+        except SyncCancelled:
+            raise
+        except Exception as exc:
+            raise PageSyncError(exc, stage, current_page=current_page) from None
+        finally:
+            with self._db() as connection:
+                connection.execute(
+                    "UPDATE sync_items SET changed=MAX(changed,?),unchanged=MAX(unchanged,?),"
+                    "assets=MAX(assets,?) "
+                    "WHERE job_id=? AND task_kind='page' AND page_id=?",
+                    (
+                        result["changed"],
+                        result["unchanged"],
+                        result["assets"],
+                        job_id,
+                        page_id,
+                    ),
+                )
 
     def _hide_page(
         self, index_id: str, source_id: str, page_id: str, state: str, job_id: str
@@ -1264,6 +1706,9 @@ class ConfluenceRegistry:
                     archive.relative_to(self.root).as_posix(),
                 ),
             )
+            # Keep the publication obligation in the same transaction as the
+            # revision checkpoint, including an interrupted historical import.
+            connection.execute("UPDATE sources SET publish_pending=1 WHERE id=?", (source_id,))
         return document
 
     def _archive_source(self, source_id: str, page: Page) -> None:
@@ -1309,6 +1754,14 @@ class ConfluenceRegistry:
                 ["Историческая версия: вложения текущей страницы к ней не подставляются."],
             )
             self._archive(config.index_id, source_id, page_id, doc, version, page.updated_at)
+            # Each archived version is durable even if a later history request fails.
+            with self._db() as connection:
+                connection.execute("UPDATE sources SET publish_pending=1 WHERE id=?", (source_id,))
+                connection.execute(
+                    "UPDATE sync_items SET archived_versions=archived_versions+1 "
+                    "WHERE job_id=? AND task_kind='page' AND page_id=?",
+                    (job_id, page_id),
+                )
             count += 1
         return count
 
@@ -1418,11 +1871,24 @@ class ConfluenceRegistry:
         text = ""
         path = self.root / row["path"]
         if config.analyze_images and attachment.media_type.startswith("image/"):
-            cached_extraction = json.loads(row["extraction_json"]) if row["extraction_json"] else {}
+            try:
+                cached_extraction = (
+                    json.loads(row["extraction_json"]) if row["extraction_json"] else {}
+                )
+            except (TypeError, ValueError):
+                cached_extraction = {}
+            if not isinstance(cached_extraction, dict):
+                cached_extraction = {}
+            cached_result = cached_extraction.get("result")
             identity = getattr(self.image_extractor, "identity", "unknown")
-            if cached_extraction.get("extractor") == identity:
+            if (
+                cached_extraction.get("extractor") == identity
+                and isinstance(cached_result, dict)
+                and isinstance(cached_extraction.get("markdown"), str)
+                and cached_result.get("status") == "ok"
+            ):
                 text = cached_extraction["markdown"]
-                row["extraction_status"] = cached_extraction.get("result", {}).get("status", "ok")
+                row["extraction_status"] = cached_result["status"]
                 self._log(
                     job_id, "images", "Image extraction cache hit", attachment_id=attachment.id
                 )
@@ -1461,6 +1927,15 @@ class ConfluenceRegistry:
                 except Exception as exc:
                     self._check_cancel(cancel)
                     row["extraction_status"] = "error"
+                    row["extraction_error"] = self._error_summary(exc)
+                    self._log(
+                        job_id,
+                        "images",
+                        row["extraction_error"],
+                        level="warning",
+                        page_id=page_id,
+                        attachment_id=attachment.id,
+                    )
                     text = (
                         f"Image extraction unavailable ({type(exc).__name__}); original retained."
                     )

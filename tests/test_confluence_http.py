@@ -264,3 +264,122 @@ async def test_confluence_http_to_history_and_published_index(settings_factory):
         logs = (await client.get(f"/admin/api/confluence/jobs/{second['id']}/log")).json()
         assert any(item["stage"] == "indexing" for item in logs["items"])
         assert all("secret-do-not-return" not in str(item) for item in logs["items"])
+
+
+@pytest.mark.asyncio
+async def test_job_failures_are_protected_paginated_and_sanitized(settings_factory, monkeypatch):
+    monkeypatch.setattr(ConfluenceRegistry, "RETRY_DELAY_SECONDS", 0)
+    password = "long-admin-failures-password"
+    app, registry = connection_app(settings_factory, admin_password=password)
+
+    class FailedSource(Source):
+        def page(self, page_id, *, body=True, version=None):
+            raise AttributeError("confidential-content confluence-pat-never-return-or-log")
+
+    registry.client_factory = lambda config, token: FailedSource()
+    payload = connection_payload()
+    token = payload.pop("token")
+    source = registry.upsert_source(payload, token)
+    job = await asyncio.to_thread(registry.run_job, registry.queue_sync(source["id"])["id"])
+    assert job["status"] == "completed_with_warnings"
+    path = f"/admin/api/confluence/jobs/{job['id']}/failures"
+    headers = {"X-KB-Admin-Password": password}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        denied = await client.get(path)
+        assert denied.status_code == 401
+        assert (
+            await client.get(path, headers={"X-KB-Admin-Password": "wrong-password"})
+        ).status_code == 401
+        first = await client.get(path, headers=headers, params={"limit": 1})
+        assert first.status_code == 200
+        assert first.headers["Cache-Control"] == "no-store"
+        assert first.json()["total"] == 2 and first.json()["has_more"]
+        assert first.json()["offset"] == 0 and first.json()["limit"] == 1
+        assert first.json()["items"][0]["attempts"] == 3
+        assert first.json()["items"][0]["error_type"] == "AttributeError"
+        second = await client.get(path, headers=headers, params={"offset": 1, "limit": 1})
+        assert second.status_code == 200 and not second.json()["has_more"]
+        assert second.json()["total"] == 2
+        assert first.json()["items"][0]["page_id"] != second.json()["items"][0]["page_id"]
+        empty = await client.get(path, headers=headers, params={"offset": 2, "limit": 1})
+        assert empty.status_code == 200 and empty.json()["items"] == []
+        for params in (
+            {"offset": -1},
+            {"offset": "invalid"},
+            {"limit": 0},
+            {"limit": 201},
+            {"limit": "invalid"},
+        ):
+            assert (await client.get(path, headers=headers, params=params)).status_code == 400
+        assert (
+            await client.get("/admin/api/confluence/jobs/missing/failures", headers=headers)
+        ).status_code == 404
+    for response in (denied, first, second, empty):
+        assert token not in response.text and "confidential-content" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_job_failure_report_is_available_to_authenticated_readers(settings_factory):
+    token = "confluence-read-access-token-at-least-32-characters"
+    app, registry = connection_app(
+        settings_factory,
+        admin_password="separate-admin-failures-password",
+        mcp_http_bearer_token=token,
+    )
+    payload = connection_payload()
+    credential = payload.pop("token")
+    source = registry.upsert_source(payload, credential)
+    job = registry.queue_sync(source["id"])
+    path = f"/admin/api/confluence/jobs/{job['id']}/failures"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        assert (await client.get(path)).status_code == 401
+        report = await client.get(path, headers={"Authorization": f"Bearer {token}"})
+        assert report.status_code == 200
+        assert report.json()["items"] == [] and report.json()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_source_configuration_cannot_change_during_queued_job(settings_factory):
+    app, registry = connection_app(settings_factory)
+    payload = connection_payload()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        created = await client.post("/admin/api/confluence/sources", json=payload)
+        assert created.status_code == 200
+        source, job = created.json()["source"], created.json()["job"]
+        path = f"/admin/api/confluence/sources/{source['id']}"
+        updates = {
+            "root_page_url": "https://confluence.example/pages/999",
+            "name": "Different source tree",
+            "token": "replacement-token-that-must-not-be-saved",
+        }
+
+        blocked = await client.patch(path, json=updates)
+
+        assert blocked.status_code == 400
+        assert "cancel" in blocked.json()["error"].lower()
+        assert registry.get_source(source["id"])["root_page_url"] == payload["root_page_url"]
+        assert registry.get_source(source["id"])["name"] == payload["name"]
+        assert registry.job_status(job["id"])["status"] == "queued"
+        observed_tokens = []
+
+        def factory(config, token):
+            observed_tokens.append(token)
+            return Source()
+
+        registry.client_factory = factory
+        checked = await client.post("/admin/api/confluence/test", json={"source_id": source["id"]})
+        assert checked.status_code == 200 and observed_tokens == [payload["token"]]
+        assert (
+            await client.post(f"/admin/api/confluence/jobs/{job['id']}/cancel")
+        ).status_code == 200
+        updated = await client.patch(path, json=updates)
+        assert updated.status_code == 200
+        assert updated.json()["source"]["root_page_url"] == updates["root_page_url"]

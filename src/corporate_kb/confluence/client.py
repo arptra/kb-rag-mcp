@@ -27,6 +27,14 @@ from corporate_kb.confluence.models import (
 
 logger = logging.getLogger(__name__)
 
+_CLOUD_COLLECTIONS = {
+    "page": "pages",
+    "folder": "folders",
+    "database": "databases",
+    "whiteboard": "whiteboards",
+    "embed": "embeds",
+}
+
 
 class ConfluenceClient:
     def __init__(
@@ -132,11 +140,18 @@ class ConfluenceClient:
             and url != context
         ):
             url = context + url
-        resolved = urljoin(self.base + "/", url)
-        parsed, original = urlsplit(resolved), urlsplit(self.origin)
+        try:
+            resolved = urljoin(self.base + "/", url)
+            parsed, original = urlsplit(resolved), urlsplit(self.origin)
+            trusted_origin = (parsed.scheme, parsed.hostname, parsed.port) == (
+                original.scheme,
+                original.hostname,
+                original.port,
+            )
+        except ValueError:
+            raise self._invalid_response("URL", "link") from None
         if (
-            (parsed.scheme, parsed.hostname, parsed.port)
-            != (original.scheme, original.hostname, original.port)
+            not trusted_origin
             or parsed.username
             or parsed.password
         ):
@@ -294,14 +309,66 @@ class ConfluenceClient:
         if self.cancel.wait(seconds):
             raise SyncCancelled("Confluence synchronization cancelled")
 
-    def _json(self, url: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _invalid_response(self, category: str, field: str) -> ConfluenceError:
+        # Never interpolate API values here: malformed fields can contain document
+        # content, signed URLs, or secrets returned by a gateway instead of JSON.
+        logger.warning(
+            "Confluence invalid API response: trace=%s category=%s field=%s",
+            self.trace_id,
+            category,
+            field,
+        )
+        return ConfluenceError(
+            f"Confluence returned invalid {category} response ({field}); "
+            "this item could not be read safely",
+            error_code="invalid_response",
+        )
+
+    def _mapping(self, value: Any, category: str, field: str) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise self._invalid_response(category, field)
+        return value
+
+    def _integer(self, value: Any, category: str, field: str, *, minimum: int = 1) -> int:
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise self._invalid_response(category, field)
+        try:
+            result = int(value)
+        except ValueError:
+            raise self._invalid_response(category, field) from None
+        if result < minimum:
+            raise self._invalid_response(category, field)
+        return result
+
+    def _content_id(self, value: Any, category: str, field: str = "id") -> str:
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise self._invalid_response(category, field)
+        result = str(value)
+        if not re.fullmatch(r"[0-9]+", result) or not result.lstrip("0"):
+            raise self._invalid_response(category, field)
+        return result
+
+    def _optional_text(self, value: Any, category: str, field: str) -> str | None:
+        if value is not None and not isinstance(value, str):
+            raise self._invalid_response(category, field)
+        return value
+
+    def _json(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        category: str = "JSON",
+    ) -> dict[str, Any]:
         response = self._request(url, params=params)
         try:
             result = response.json()
         except ValueError:
-            raise ConfluenceError("Confluence returned invalid JSON") from None
+            raise self._invalid_response(category, "JSON") from None
         if not isinstance(result, dict):
-            raise ConfluenceError("Confluence returned an unexpected response")
+            raise self._invalid_response(category, "object")
         return result
 
     def _paginate(
@@ -309,6 +376,7 @@ class ConfluenceClient:
         url: str,
         *,
         params: dict[str, Any] | None = None,
+        category: str = "pagination",
     ) -> Iterator[dict[str, Any]]:
         seen: set[str] = set()
         while url:
@@ -320,29 +388,43 @@ class ConfluenceClient:
             response = self._request(url, params=params)
             try:
                 payload = response.json()
-                rows = payload["results"]
-                if not isinstance(rows, list):
-                    raise ValueError
-            except (ValueError, KeyError, TypeError):
-                raise ConfluenceError("Confluence returned invalid pagination data") from None
+            except ValueError:
+                raise self._invalid_response(category, "JSON") from None
+            if not isinstance(payload, dict):
+                raise self._invalid_response(category, "object")
+            rows = payload.get("results")
+            if not isinstance(rows, list):
+                raise self._invalid_response(category, "results")
             for row in rows:
-                if isinstance(row, dict):
-                    yield row
-            next_url = (payload.get("_links") or {}).get("next")
+                if not isinstance(row, dict):
+                    raise self._invalid_response(category, "results entry")
+                yield row
+            links = self._mapping(payload.get("_links"), category, "_links")
+            next_url = self._optional_text(links.get("next"), category, "_links.next")
             if not next_url:
                 next_url = response.links.get("next", {}).get("url")
             # DC may omit next but provide start/limit/size; never guess on Cloud cursor APIs.
-            if not next_url and not self.cloud and len(rows) == int(payload.get("limit", 100)):
-                start = int(payload.get("start", (params or {}).get("start", 0)))
-                params = {**(params or {}), "start": start + len(rows)}
-                continue
+            if not next_url and not self.cloud:
+                limit = self._integer(payload.get("limit", 100), category, "limit")
+                if len(rows) == limit:
+                    start = self._integer(
+                        payload.get("start", (params or {}).get("start", 0)),
+                        category,
+                        "start",
+                        minimum=0,
+                    )
+                    params = {**(params or {}), "start": start + len(rows)}
+                    continue
             if next_url:
                 next_text = str(next_url)
-                url = self._trusted_url(
-                    next_text
-                    if next_text.startswith("/")
-                    else urljoin(str(response.url), next_text)
-                )
+                try:
+                    url = self._trusted_url(
+                        next_text
+                        if next_text.startswith("/")
+                        else urljoin(str(response.url), next_text)
+                    )
+                except ValueError:
+                    raise self._invalid_response(category, "_links.next") from None
                 params = None
             else:
                 url = ""
@@ -365,62 +447,54 @@ class ConfluenceClient:
                 "title": unquote(match.group(2)).replace("+", " "),
                 "limit": 2,
             }
-            result = self._json(self.base + "/rest/api/content", params=params).get("results", [])
+            result = self._json(
+                self.base + "/rest/api/content", params=params, category="root lookup"
+            ).get("results", [])
+            if not isinstance(result, list) or any(not isinstance(row, dict) for row in result):
+                raise self._invalid_response("root lookup", "results")
             if len(result) == 1:
-                return str(result[0]["id"])
+                return self._content_id(result[0].get("id"), "root lookup")
         raise ConfluenceError("Use a root page URL containing /pages/<id> or pageId=<id>")
 
+    def children(self, content_id: str, *, kind: str = "page") -> Iterator[tuple[str, str]]:
+        """Read one branch so failed branches can be retried independently."""
+        content_id = self._content_id(content_id, "children", "parent id")
+        if (
+            not isinstance(kind, str)
+            or kind not in _CLOUD_COLLECTIONS
+            or (not self.cloud and kind != "page")
+        ):
+            raise self._invalid_response("children", "unsupported parent content type")
+        endpoint = (
+            f"{self.api}/{_CLOUD_COLLECTIONS[kind]}/{content_id}/direct-children"
+            if self.cloud
+            else f"{self.api}/content/{content_id}/child/page"
+        )
+        for item in self._paginate(endpoint, params={"limit": 100}, category="children"):
+            child_kind = item.get("type", "page") if self.cloud else "page"
+            if not isinstance(child_kind, str) or child_kind not in _CLOUD_COLLECTIONS:
+                raise self._invalid_response("children", "unsupported content type")
+            yield self._content_id(item.get("id"), "children"), child_kind
+
     def page_ids(self, root_id: str) -> Iterator[str]:
+        root_id = self._content_id(root_id, "children", "root id")
         yield root_id
         seen = {root_id}
-        if self.cloud:
-            # The descendants API defaults to depth=2 and caps depth at 10. Walk
-            # direct children instead, including containers that can contain pages.
-            collections = {
-                "page": "pages",
-                "folder": "folders",
-                "database": "databases",
-                "whiteboard": "whiteboards",
-                "embed": "embeds",
-            }
-            pending_cloud = [("page", root_id)]
-            while pending_cloud:
-                kind, parent = pending_cloud.pop()
-                for item in self._paginate(
-                    f"{self.api}/{collections[kind]}/{parent}/direct-children",
-                    params={"limit": 100},
-                ):
-                    child_kind = item.get("type", "page")
-                    if child_kind not in collections:
-                        raise ConfluenceError(
-                            "Confluence returned an unsupported content type; "
-                            "tree discovery is incomplete"
-                        )
-                    child_id = str(item["id"])
-                    if child_id in seen:
-                        continue
-                    seen.add(child_id)
-                    # Bound the whole traversal, including non-page containers.
-                    if len(seen) > self.config.max_pages:
-                        raise ConfluenceError("Page limit exceeded; tree discovery is incomplete")
-                    pending_cloud.append((child_kind, child_id))
-                    if child_kind == "page":
-                        yield child_id
-        else:
-            pending = [root_id]
-            while pending:
-                parent = pending.pop()
-                for item in self._paginate(
-                    f"{self.api}/content/{parent}/child/page", params={"limit": 100}
-                ):
-                    page_id = str(item["id"])
-                    if page_id in seen:
-                        continue
-                    seen.add(page_id)
-                    if len(seen) > self.config.max_pages:
-                        raise ConfluenceError("Page limit exceeded; tree discovery is incomplete")
-                    pending.append(page_id)
-                    yield page_id
+        # The Cloud descendants API has a depth cap. Direct children also permit
+        # walking through folders, databases, whiteboards and embeds without it.
+        pending = [(root_id, "page")]
+        while pending:
+            parent, kind = pending.pop()
+            for child_id, child_kind in self.children(parent, kind=kind):
+                if child_id in seen:
+                    continue
+                seen.add(child_id)
+                # Bound the whole traversal, including non-page containers.
+                if len(seen) > self.config.max_pages:
+                    raise ConfluenceError("Page limit exceeded; tree discovery is incomplete")
+                pending.append((child_id, child_kind))
+                if child_kind == "page":
+                    yield child_id
 
     def page(self, page_id: str, *, body: bool = True, version: int | None = None) -> Page:
         params: dict[str, Any] = {}
@@ -435,22 +509,37 @@ class ConfluenceClient:
                 params["status"] = "historical"
         if version is not None:
             params["version"] = version
-        item = self._json(endpoint, params=params)
-        version_data = item.get("version") or {}
-        ancestors = item.get("ancestors") or []
-        links = item.get("_links") or {}
-        body_data = item.get("body") or {}
-        storage = body_data.get("storage") or {}
+        item = self._json(endpoint, params=params, category="page")
+        version_data = self._mapping(item.get("version"), "page", "version")
+        ancestors = item.get("ancestors")
+        if ancestors is None:
+            ancestors = []
+        if not isinstance(ancestors, list) or any(not isinstance(row, dict) for row in ancestors):
+            raise self._invalid_response("page", "ancestors")
+        links = self._mapping(item.get("_links"), "page", "_links")
+        body_data = self._mapping(item.get("body"), "page", "body")
+        storage = self._mapping(body_data.get("storage"), "page", "body.storage")
+        parent = item.get("parentId")
+        parent_id = (
+            self._content_id(parent, "page", "parentId")
+            if parent is not None
+            else self._content_id(ancestors[-1].get("id"), "page", "ancestors.id")
+            if ancestors
+            else None
+        )
+        webui = self._optional_text(links.get("webui"), "page", "_links.webui")
         return Page(
-            id=str(item["id"]),
-            title=str(item.get("title", page_id)),
-            version=int(version_data.get("number", version or 1)),
-            updated_at=version_data.get("createdAt") or version_data.get("when"),
-            parent_id=str(item["parentId"])
-            if item.get("parentId")
-            else (str(ancestors[-1]["id"]) if ancestors else None),
-            url=self._trusted_url(links.get("webui", f"pages/viewpage.action?pageId={page_id}")),
-            body=str(storage.get("value", "")),
+            id=self._content_id(item.get("id"), "page"),
+            title=self._optional_text(item.get("title"), "page", "title") or page_id,
+            version=self._integer(
+                version_data.get("number", version or 1), "page", "version.number"
+            ),
+            updated_at=self._optional_text(
+                version_data.get("createdAt") or version_data.get("when"), "page", "version date"
+            ),
+            parent_id=parent_id,
+            url=self._trusted_url(webui or f"pages/viewpage.action?pageId={page_id}"),
+            body=self._optional_text(storage.get("value"), "page", "body.storage.value") or "",
         )
 
     def attachments(self, page_id: str) -> list[Attachment]:
@@ -463,37 +552,53 @@ class ConfluenceClient:
         params: dict[str, Any] = {"limit": 100}
         if not self.cloud:
             params["expand"] = "version"
-        for item in self._paginate(endpoint, params=params):
-            extension = item.get("extensions") or {}
-            links = item.get("_links") or {}
-            version_data = item.get("version") or {}
-            version = int(version_data.get("number", 1))
+        for item in self._paginate(endpoint, params=params, category="attachments"):
+            extension = self._mapping(item.get("extensions"), "attachments", "extensions")
+            links = self._mapping(item.get("_links"), "attachments", "_links")
+            version_data = self._mapping(item.get("version"), "attachments", "version")
+            version = self._integer(version_data.get("number", 1), "attachments", "version.number")
+            raw_id = item.get("id")
+            if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)) or not str(raw_id):
+                raise self._invalid_response("attachments", "id")
+            attachment_id = str(raw_id)
             download: str | None
             if self.cloud:
                 # downloadLink may point to a retired browser download route.
                 # The supported REST endpoint supplies the signed media redirect.
-                attachment_id = quote(str(item["id"]), safe="")
                 download = (
                     f"{self.base}/rest/api/content/{quote(page_id, safe='')}/child/attachment/"
-                    f"{attachment_id}/download?version={version}"
+                    f"{quote(attachment_id, safe='')}/download?version={version}"
                 )
             else:
-                download = item.get("downloadLink") or links.get("download")
+                download = self._optional_text(
+                    item.get("downloadLink") or links.get("download"), "attachments", "download"
+                )
             if not download:
                 continue
+            size = item.get("fileSize")
+            if size is None:
+                size = extension.get("fileSize")
             result.append(
                 Attachment(
-                    id=str(item["id"]),
-                    title=str(item.get("title", item["id"])),
+                    id=attachment_id,
+                    title=self._optional_text(item.get("title"), "attachments", "title")
+                    or attachment_id,
                     version=version,
-                    media_type=str(
-                        item.get("mediaType")
-                        or extension.get("mediaType")
-                        or "application/octet-stream"
+                    media_type=self._optional_text(
+                        item.get("mediaType") or extension.get("mediaType"),
+                        "attachments",
+                        "mediaType",
+                    )
+                    or "application/octet-stream",
+                    size=self._integer(size, "attachments", "fileSize", minimum=0)
+                    if size is not None
+                    else None,
+                    updated_at=self._optional_text(
+                        version_data.get("createdAt") or version_data.get("when"),
+                        "attachments",
+                        "version date",
                     ),
-                    size=item.get("fileSize") or extension.get("fileSize"),
-                    updated_at=version_data.get("createdAt") or version_data.get("when"),
-                    download_url=self._trusted_url(str(download)),
+                    download_url=self._trusted_url(download),
                 )
             )
         return result
@@ -506,7 +611,12 @@ class ConfluenceClient:
         )
         try:
             return sorted(
-                {int(item["number"]) for item in self._paginate(endpoint, params={"limit": 100})},
+                {
+                    self._integer(item.get("number"), "versions", "number")
+                    for item in self._paginate(
+                        endpoint, params={"limit": 100}, category="versions"
+                    )
+                },
                 reverse=True,
             )
         except ConfluenceError as exc:

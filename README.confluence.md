@@ -78,6 +78,31 @@ checkpoints. Canceling a job retains completed checkpoints. The scheduler and em
 worker propagate cancellation while waiting for an index lock, downloading, extracting
 images and indexing.
 
+Failures loading an individual page or discovering its children do not stop the rest
+of the synchronization. Failed items enter a durable retry queue. After each initial
+discovery or page-loading pass, the worker makes up to two additional passes over
+failed items with a delay between passes; HTTP-level retries and rate-limit waits
+still apply within each attempt.
+The queue and attempt counts survive a backend restart. Canceling a job remains
+available while waiting or retrying.
+
+The dashboard shows the retry round, pending items and recovered pages. Its
+**Ошибки загрузки** report lists the remaining page IDs, titles, links, failed stage,
+attempt count and sanitized error, 50 items at a time. A discovery failure is shown
+as an unreadable branch: its descendants may not have been discovered yet. The report
+refreshes while the selected job runs and remains available after completion. A job
+that still has failed pages or branches finishes with warnings and publishes the
+successfully loaded pages. Previous saved snapshots are retained on transient errors;
+confirmed access denial retains the existing access-loss behavior. Incomplete discovery
+never treats unseen pages as deleted. Run **Проверить** on the source to start another
+synchronization after resolving a persistent error.
+
+Global failures, such as an unavailable state database or index publication failure,
+still fail the job rather than presenting an incomplete publication as successful.
+These errors appear in the job status and journal, separately from page failures.
+Index publication also receives up to two additional attempts. Unexpected exceptions
+include their type and code locations, without exception payloads, page text or tokens.
+
 An index lock coordinates source materialization and manual builds. Successful
 synchronization runs a build before reporting publication complete. A publish failure
 keeps the source dirty so the next run retries publication without downloading unchanged
@@ -145,6 +170,11 @@ Main endpoints:
   and `has_more` (maximum page size 200).
 - `GET /admin/api/confluence/jobs/{id}` — job status.
 - `GET /admin/api/confluence/jobs/{id}/log?cursor=0&limit=200` — incremental journal.
+- `GET /admin/api/confluence/jobs/{id}/failures?offset=0&limit=50` — paginated durable
+  retry/failure report with reader authorization; returns `items`, `total`, `offset`,
+  `limit` and `has_more` (maximum page size 200). Each item includes `page_id`, `title`,
+  `url`, `stage`, `task_kind` (`page` or `discovery`), `attempts`, `error`, `error_type`,
+  `status_code` and `status` (`retry` or `failed`). Recovered items leave this report.
 - `POST /admin/api/confluence/jobs/{id}/cancel` — cancel while retaining checkpoints.
 - `GET /admin/api/confluence/assets/{id}?source_id=...&version=...` — authenticated
   access to an attachment belonging to the requested source/version.

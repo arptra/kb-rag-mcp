@@ -190,6 +190,16 @@ def register_confluence_routes(
             int(request.query_params.get("limit", "200")),
         )
 
+    @route("/jobs/{job_id}/failures", ["GET"])
+    async def failures(request: Request) -> dict[str, Any]:
+        offset = int(request.query_params.get("offset", "0"))
+        limit = int(request.query_params.get("limit", "50"))
+        if offset < 0 or not 1 <= limit <= 200:
+            raise ValueError("offset must be non-negative and limit must be between 1 and 200")
+        return await asyncio.to_thread(
+            registry.job_failures, request.path_params["job_id"], offset=offset, limit=limit
+        )
+
     @route("/jobs/{job_id}/cancel", ["POST"], manage=True)
     async def cancel(request: Request) -> dict[str, Any]:
         return {"job": await asyncio.to_thread(registry.cancel_job, request.path_params["job_id"])}

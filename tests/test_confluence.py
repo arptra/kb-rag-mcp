@@ -203,8 +203,10 @@ def test_raw_validation_failure_is_not_copied_to_server_log(tmp_path, caplog):
     source = instance.upsert_source(config().model_dump(), "pat-never-log")
     with caplog.at_level(logging.INFO):
         failed = instance.run_job(instance.queue_sync(source["id"])["id"])
-    assert failed["status"] == "failed"
-    assert "Synchronization failed (ValueError)" in caplog.text
+    assert failed["status"] == "completed_with_warnings"
+    assert failed["result"]["failed_branches"] == 1
+    assert "ValueError:" in caplog.text
+    assert "malformed_page" in caplog.text
     assert "confidential-page-body" not in caplog.text
     assert "pat-never-log" not in caplog.text
 
@@ -215,7 +217,8 @@ def test_discovery_failure_does_not_remove_pages_and_403_quarantines(tmp_path):
     instance.run_job(instance.queue_sync(source["id"])["id"])
     client.discovery_error = True
     failed = instance.run_job(instance.queue_sync(source["id"])["id"])
-    assert failed["status"] == "failed"
+    assert failed["status"] == "completed_with_warnings"
+    assert failed["result"]["discovery_complete"] is False
     assert all(page["state"] == "current" for page in instance.source_pages(source["id"]))
     client.discovery_error, client.denied = False, True
     partial = instance.run_job(instance.queue_sync(source["id"])["id"])
@@ -502,7 +505,9 @@ def test_image_failure_retains_original_and_retries_then_model_change_invalidate
     instance, _, _, _, _ = registry(tmp_path, image_extractor=extractor)
     source = instance.upsert_source(config(analyze_images=True).model_dump(), "secret")
     first = instance.run_job(instance.queue_sync(source["id"])["id"])
-    assert first["status"] == "completed_with_warnings"
+    assert first["status"] == "completed"
+    assert first["result"]["recovered_pages"] == 1
+    assert first["result"]["failed_pages"] == 0
     assert instance.get_source(source["id"])["asset_count"] == 2
     assert instance.run_job(instance.queue_sync(source["id"])["id"])["status"] == "completed"
     assert len(calls) == 3

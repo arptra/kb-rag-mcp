@@ -22,9 +22,49 @@ interface LogItem { cursor: string | number; timestamp: string; stage: string; l
 interface LogPage { items: LogItem[]; next_cursor: string | number | null; has_more: boolean }
 interface SourcePage { page_id: string; title: string; parent_id: string | null; version: string | number; source_updated_at: string | null; url: string; state: string; revision_id: string | null }
 interface SourcePageList { pages: SourcePage[]; total: number; offset: number; limit: number; has_more: boolean }
+interface FailedPage { page_id: string; title: string; url: string; stage: string; task_kind: "page" | "discovery"; attempts: number; error: string; error_type: string; status_code: number | null; status: "retry" | "failed" }
+interface FailurePage { items: FailedPage[]; total: number; offset: number; limit: number; has_more: boolean }
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 const active = (status: string) => ["queued", "running", "cancelling"].includes(status);
 const labels: Record<string, string> = { idle: "Готов", queued: "В очереди", running: "Выполняется", paused: "Приостановлен", error: "Ошибка", failed: "Ошибка", completed: "Завершено", completed_with_warnings: "С предупреждениями", cancelled: "Отменено", cancelling: "Отменяется" };
+const stageLabels: Record<string, string> = { discovery: "Поиск дочерних страниц", discovery_retry: "Повторный поиск дочерних страниц", fetch: "Загрузка страницы", attachments: "Загрузка вложений", images: "Обработка изображений", normalization: "Обработка текста", archive: "Сохранение версии", history: "Загрузка истории", checkpoint: "Сохранение страницы", indexing: "Индексация", publication: "Публикация", retry_wait: "Ожидание повторной попытки", retry: "Повторная загрузка" };
+
+function ConfluenceFailures({ job, request }: { job: ConfluenceJob; request: Request }) {
+  const [offset, setOffset] = useState(0);
+  const [data, setData] = useState<FailurePage | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController(); let timer = 0;
+    setData(null); setLoading(true); setError("");
+    const poll = async () => {
+      try {
+        const params = new URLSearchParams({ offset: String(offset), limit: "50" });
+        const page = await request<FailurePage>(`/admin/api/confluence/jobs/${encodeURIComponent(job.id)}/failures?${params}`, { signal: controller.signal });
+        if (controller.signal.aborted) return;
+        if (offset > 0 && !page.items.length) { setOffset(Math.max(0, Math.ceil(page.total / 50) - 1) * 50); return; }
+        setData(page); setError("");
+      } catch (caught) { if (!controller.signal.aborted) setError(accessError(caught)); }
+      finally { if (!controller.signal.aborted) setLoading(false); }
+      if (!controller.signal.aborted && active(job.status)) timer = window.setTimeout(poll, 4000);
+    };
+    void poll(); return () => { controller.abort(); window.clearTimeout(timer); };
+  }, [job.id, job.status, request, offset, revision]);
+  return <section className="confluence-failures" aria-label="Ошибки загрузки">
+    <div className="integration-job-head"><h4>Ошибки загрузки</h4><button className="button quiet" disabled={loading} onClick={() => setRevision(value => value + 1)}>Обновить список</button></div>
+    <p className="integration-muted">{active(job.status) ? "Остальные страницы продолжают загружаться. Для ошибок предусмотрены ещё два прохода в конце; список обновляется по мере повторных попыток." : "Здесь остаются страницы и ветки, которые не удалось загрузить. Для новой попытки запустите «Проверить» у источника."}</p>
+    {error && <div className="form-error" role="alert">{error}</div>}
+    {loading ? <p className="integration-muted">Загружаем список…</p> : data && <>
+      {data.items.length > 0 ? <div className="table-wrap"><table><thead><tr><th>Страница / ветка</th><th>Этап и ошибка</th><th>Попытки</th><th>Состояние</th></tr></thead><tbody>{data.items.map(item => <tr key={`${item.task_kind}:${item.page_id}`}>
+        <td>{/^https?:\/\//i.test(item.url) ? <a href={item.url} target="_blank" rel="noreferrer">{item.title || item.page_id} ↗</a> : item.title || item.page_id}<small>ID: {item.page_id}</small>{item.task_kind === "discovery" && <small>Не удалось прочитать ветку. Часть дочерних страниц может быть не обнаружена.</small>}</td>
+        <td><b>{stageLabels[item.stage] || item.stage}</b><div className="confluence-failure-message">{item.error}</div><small>{[item.error_type, item.status_code != null ? `HTTP ${item.status_code}` : null].filter(Boolean).join(" · ")}</small></td>
+        <td>{item.attempts}</td><td><span className="tag">{item.status === "retry" && active(job.status) ? "В очереди повтора" : "Не загружена"}</span></td>
+      </tr>)}</tbody></table></div> : <div className="empty-state compact">Ошибок загрузки не осталось</div>}
+      <div className="integration-actions"><button className="button secondary" disabled={offset === 0} onClick={() => setOffset(current => Math.max(0, current - 50))}>Назад</button><small className="integration-muted">{data.total ? `${offset + 1}–${offset + data.items.length} из ${data.total}` : "0 ошибок"}</small><button className="button secondary" disabled={!data.has_more} onClick={() => setOffset(current => current + 50)}>Далее</button></div>
+    </>}
+  </section>;
+}
 
 function SourcePages({ source, request, onClose }: { source: ConfluenceSource; request: Request; onClose: () => void }) {
   const [draft, setDraft] = useState("");
@@ -158,6 +198,7 @@ export default function ConfluenceApp({ password, indexes, indexId, onChanged }:
   const [jobs, setJobs] = useState<ConfluenceJob[]>([]);
   const [editing, setEditing] = useState<ConfluenceSource | "new" | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [failuresJobId, setFailuresJobId] = useState<string | null>(null);
   const [sourceFilter, setSourceFilter] = useState("");
   const [pagesSourceId, setPagesSourceId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -198,13 +239,19 @@ export default function ConfluenceApp({ password, indexes, indexId, onChanged }:
     {catalog && !catalog.can_manage && <ManagementLogin onLogin={login} />}
     {jobs.length > 0 && <section className="panel integration-panel"><div className="integration-job-head"><h3>Синхронизация и индексация</h3><label>Источник<select value={sourceFilter} onChange={event => setSourceFilter(event.target.value)}><option value="">Все источники</option>{sources.map(source => <option key={source.id} value={source.id}>{source.name}</option>)}</select></label></div>{jobs.map(job => {
       const progress = job.progress || {}; const count = (key: string) => typeof progress[key] === "number" ? Number(progress[key]) : null;
+      const outcome = (key: string) => typeof job.result?.[key] === "number" ? Number(job.result[key]) : count(key);
+      const failedItems = outcome("failed_items") ?? 0;
+      const retryRound = count("retry_round") ?? 0;
       const processedChunks = count("completed") ?? count("processed") ?? count("processed_chunks");
       const processed = processedChunks ?? count("pages_done");
       const total = processedChunks !== null ? count("total") ?? count("total_chunks") : count("pages_total");
-      return <article className="integration-job-row" key={job.id}><div className="integration-job-head"><div><b>{job.message || job.phase || "Синхронизация Confluence"}</b><small className="integration-muted"> · {labels[job.status] || job.status}</small><div className="integration-muted">{sources.find(source => source.id === job.source_id)?.name || job.source_id} · {indexes.find(index => index.id === job.index_id)?.name || job.index_id} · {integrationDate(job.completed_at || job.started_at || job.created_at)}</div></div><div className="integration-actions"><button className="button quiet" onClick={() => setExpanded(expanded === job.id ? null : job.id)}>{expanded === job.id ? "Скрыть журнал" : "Журнал"}</button>{catalog?.can_manage && active(job.status) && <button className="button quiet" disabled={busy || job.status === "cancelling"} onClick={() => void mutate(`/admin/api/confluence/jobs/${encodeURIComponent(job.id)}/cancel`, {}, "Отмена запрошена")}>Отменить</button>}</div></div>
+      return <article className="integration-job-row" key={job.id}><div className="integration-job-head"><div><b>{stageLabels[job.phase] && ["retry_wait", "retry", "discovery_retry"].includes(job.phase) ? stageLabels[job.phase] : job.message || stageLabels[job.phase] || job.phase || "Синхронизация Confluence"}</b><small className="integration-muted"> · {labels[job.status] || job.status}</small><div className="integration-muted">{sources.find(source => source.id === job.source_id)?.name || job.source_id} · {indexes.find(index => index.id === job.index_id)?.name || job.index_id} · {integrationDate(job.completed_at || job.started_at || job.created_at)}</div></div><div className="integration-actions">{(failedItems > 0 || failuresJobId === job.id) && <button className="button secondary" aria-expanded={failuresJobId === job.id} onClick={() => setFailuresJobId(failuresJobId === job.id ? null : job.id)}>{failuresJobId === job.id ? "Скрыть ошибки" : `Ошибки загрузки (${failedItems})`}</button>}<button className="button quiet" onClick={() => setExpanded(expanded === job.id ? null : job.id)}>{expanded === job.id ? "Скрыть журнал" : "Журнал"}</button>{catalog?.can_manage && active(job.status) && <button className="button quiet" disabled={busy || job.status === "cancelling"} onClick={() => void mutate(`/admin/api/confluence/jobs/${encodeURIComponent(job.id)}/cancel`, {}, "Отмена запрошена")}>Отменить</button>}</div></div>
         {total !== null && total > 0 && processed !== null && <progress className="integration-progress" value={processed} max={total} aria-label={processedChunks !== null ? "Обработанные фрагменты" : "Проверенные страницы"} />}
         <div className="integration-facts">{[[processedChunks !== null ? "Обработано фрагментов" : "Проверено страниц", processed !== null ? `${processed}${total !== null ? ` / ${total}` : ""}` : null], ["Из кэша", count("reused") ?? count("reused_chunks")], ["Рассчитано", count("computed") ?? count("computed_chunks")], ["Опубликовано", count("published") ?? count("published_chunks")]].map(([label, value]) => value !== null ? <span key={String(label)}>{label}<b>{value}</b></span> : null)}</div>
-        {job.error && <div className="integration-error">{job.error}</div>}{expanded === job.id && <ConfluenceLog job={job} request={request} />}
+        <div className="integration-facts">{[["Повторный проход", active(job.status) && retryRound > 0 ? `${retryRound} / 2` : null], ["Ожидают повтора", active(job.status) && (count("retry_pending") ?? 0) > 0 ? count("retry_pending") : null], ["Восстановлено после ошибок", (outcome("recovered_pages") ?? 0) > 0 ? outcome("recovered_pages") : null], ["Страниц с ошибками", failedItems > 0 ? outcome("failed_pages") : null], ["Не прочитано веток", failedItems > 0 ? outcome("failed_branches") : null]].map(([label, value]) => value !== null ? <span key={String(label)}>{label}<b>{value}</b></span> : null)}</div>
+        {job.result?.discovery_complete === false && <p className="confluence-partial-warning">Обход дерева не завершён: часть страниц могла остаться необнаруженной. Отсутствующие страницы не считаются удалёнными.</p>}
+        {!active(job.status) && failedItems > 0 && <p className="confluence-partial-warning">Загрузка завершена не полностью. Успешно загруженные страницы сохранены; оставшиеся ошибки доступны в списке.</p>}
+        {job.error && <div className="integration-error">{job.error}</div>}{failuresJobId === job.id && <ConfluenceFailures key={job.id} job={job} request={request} />}{expanded === job.id && <ConfluenceLog job={job} request={request} />}
       </article>;
     })}<p className="integration-muted">Задачи выполняются на сервере. Закрытие вкладки не прерывает обработку; журнал и сохранённый прогресс доступны после возвращения.</p></section>}
     {editing && <SourceForm source={editing === "new" ? null : editing} indexes={indexes} initialIndex={indexId} request={request} gigacodeAvailable={catalog?.gigacode?.available} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); setNotice("Источник сохранён"); void load(); onChanged?.(); }} />}
