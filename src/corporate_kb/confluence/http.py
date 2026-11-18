@@ -17,6 +17,18 @@ from corporate_kb.confluence.registry import ConfluenceRegistry
 from corporate_kb.gigacode_runner import GigaCodeRunner
 
 
+def _without_authentication_urls(value: Any) -> Any:
+    """A server-side CLI login action belongs to source administrators only."""
+    if isinstance(value, dict):
+        return {
+            key: None if key == "authentication_url" else _without_authentication_urls(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_without_authentication_urls(item) for item in value]
+    return value
+
+
 def register_confluence_routes(
     server: FastMCP,
     registry: ConfluenceRegistry,
@@ -51,6 +63,8 @@ def register_confluence_routes(
                     result = await handler(request)
                     if isinstance(result, Response):
                         return result
+                    if not await manager_authorized(request):
+                        result = _without_authentication_urls(result)
                     return JSONResponse(result, headers={"Cache-Control": "no-store"})
                 except KeyError as exc:
                     return JSONResponse({"error": str(exc.args[0])}, status_code=404)

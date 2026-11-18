@@ -102,6 +102,8 @@ class GigaCodeImageExtractor:
         *,
         cancel: threading.Event | None = None,
         progress: Callable[[str], None] | None = None,
+        authentication_url: Callable[[str], None] | None = None,
+        authentication_complete: Callable[[], None] | None = None,
     ) -> ImageExtraction:
         cancel = cancel or threading.Event()
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -144,6 +146,8 @@ class GigaCodeImageExtractor:
                     schema=ImageExtraction.model_json_schema(by_alias=True),
                     cancel=cancel,
                     progress=progress,
+                    authentication_url=authentication_url,
+                    authentication_complete=authentication_complete,
                     allow_edits=False,
                 )
                 result = ImageExtraction.model_validate(response.payload)

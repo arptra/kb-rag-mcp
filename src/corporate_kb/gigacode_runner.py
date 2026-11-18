@@ -15,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TextIO
+from urllib.parse import urlsplit
 
 from corporate_kb.config import Settings
 
@@ -51,9 +52,41 @@ _WORKSPACE_EDIT_RESULT_SCHEMA: dict[str, Any] = {
     "required": ["status", "message", "changed_files", "verification"],
     "additionalProperties": False,
 }
-_URL_PATTERN: re.Pattern[str] = re.compile(r"https?://[^\s<>\"']+")
+_URL_PATTERN: re.Pattern[str] = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _ANSI_PATTERN: re.Pattern[str] = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_AUTH_HINTS = ("auth", "browser", "device", "login", "sign in", "verify", "open")
+_AUTH_HINT_PATTERN: re.Pattern[str] = re.compile(
+    r"\b(?:auth(?:entication|orization|enticate)?|browser|device|log[ -]?in|"
+    r"sign[ -]?in|verify|verification|open)\b",
+    re.IGNORECASE,
+)
+
+
+def browser_authentication_url(value: str) -> str | None:
+    """Validate a complete browser login URL without changing its signed query."""
+    if not value or any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in value
+    ):
+        return None
+    if any(character in value for character in "\\<>\"'"):
+        return None
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return None
+        # Accessing port also rejects malformed and out-of-range port numbers.
+        _ = parsed.port
+        hostname = parsed.hostname.encode("idna").decode("ascii")
+    except (ValueError, UnicodeError):
+        return None
+    if not re.fullmatch(r"[a-zA-Z0-9.:-]+", hostname):
+        return None
+    return value
 
 
 class CancellationSignal(Protocol):
@@ -806,21 +839,93 @@ class GigaCodeRunner:
     @staticmethod
     def _authentication_url(line: str) -> str | None:
         clean_line = _ANSI_PATTERN.sub("", line)
-        lowered = clean_line.lower()
-        matches = _URL_PATTERN.findall(clean_line)
+        allow_url_only = True
+        authentication_context = False
+        try:
+            structured = json.loads(clean_line)
+        except json.JSONDecodeError:
+            structured = None
+        if isinstance(structured, dict):
+            if "type" not in structured:
+                # A bare login object must identify its URL explicitly. Accept only
+                # top-level auth URL fields, never arbitrary untyped payload text.
+                for key in (
+                    "verification_uri_complete",
+                    "authentication_url",
+                    "authorization_url",
+                    "auth_url",
+                    "verification_uri",
+                    "login_url",
+                ):
+                    value = structured.get(key)
+                    if isinstance(value, str):
+                        validated = browser_authentication_url(value)
+                        if validated is not None:
+                            return validated
+                return None
+            kind = str(structured.get("type", "")).lower().replace("-", "_")
+            authentication_context = kind in {"auth", "authentication", "authorization", "login"}
+            authentication_context = authentication_context or kind.startswith(
+                ("auth_", "authentication_", "authorization_", "login_")
+            )
+            if kind != "system" and not authentication_context:
+                # Model output and tool results may describe arbitrary URLs, including
+                # authentication endpoints in the document being analyzed.
+                return None
+
+            def text_values(value: object) -> list[str]:
+                if isinstance(value, str):
+                    return [value]
+                if isinstance(value, dict):
+                    return [
+                        text
+                        for key, item in value.items()
+                        for text in [str(key).replace("_", " "), *text_values(item)]
+                    ]
+                if isinstance(value, list):
+                    return [text for item in value for text in text_values(item)]
+                return []
+
+            # Decode JSON strings first: escaped slashes/newlines must not become
+            # part of the browser link.
+            clean_line = " ".join(text_values(structured))
+            allow_url_only = False
+        elif isinstance(structured, str):
+            clean_line = structured
+        elif structured is not None:
+            return None
+        matches = list(_URL_PATTERN.finditer(clean_line))
         if not matches:
             return None
-        stripped = clean_line.strip()
-        if not any(hint in lowered for hint in _AUTH_HINTS) and not stripped.startswith(
-            ("http://", "https://")
+        context = _URL_PATTERN.sub("", clean_line)
+        if not (
+            authentication_context
+            or _AUTH_HINT_PATTERN.search(context)
+            or (
+                allow_url_only
+                and clean_line.strip().lower().startswith(("http://", "https://"))
+            )
         ):
             return None
-        return str(matches[0]).rstrip(".,;:)]}")
+        for match in matches:
+            candidate = match.group()
+            # Remove a matching surrounding prose/Markdown bracket only; trimming
+            # arbitrary punctuation can corrupt a signed URL's query parameter.
+            opening = clean_line[match.start() - 1] if match.start() else ""
+            closing = {"(": ")", "[": "]", "{": "}"}.get(opening)
+            if closing and candidate.endswith(closing):
+                candidate = candidate[:-1]
+            validated = browser_authentication_url(candidate)
+            if validated is not None:
+                return validated
+        return None
 
     @staticmethod
     def _signals_analysis_activity(event: dict[str, Any]) -> bool:
         kind = event.get("type")
-        if kind in {"assistant", "user", "result"}:
+        if kind == "result":
+            return not bool(event.get("is_error"))
+        if kind in {"assistant", "user"}:
             return True
         if kind != "stream_event":
             return False

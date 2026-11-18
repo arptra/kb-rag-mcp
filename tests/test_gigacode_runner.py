@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from corporate_kb.gigacode_runner import GigaCodeRunner
+from corporate_kb.gigacode_runner import GigaCodeRunner, browser_authentication_url
 
 
 def _fake_gigacode(path: Path) -> Path:
@@ -377,3 +377,178 @@ raise SystemExit(1)
         )
 
     assert any("No auth type is selected" in line for line in progress)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://auth.example/device?state=a%2Fb&code=abc==&redirect_uri=https%3A%2F%2Flocalhost",
+        "http://localhost:8080/login?code=a.b;:)",
+        "https://[::1]:8080/login",
+        "HTTPS://auth.example/login?state=A%2B%2Fa%3D",
+    ],
+)
+def test_browser_authentication_url_preserves_complete_url(url: str) -> None:
+    assert browser_authentication_url(url) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "javascript:alert(1)",
+        "//auth.example/login",
+        "https:///login",
+        "https://",
+        "https://user:secret@auth.example/login",
+        "https://user@auth.example/login",
+        "https://auth.example/login\n",
+        "https://auth.example/\x1blogin",
+        "https://auth.example/\x7flogin",
+        "https://auth.example/a b",
+        "https://auth.example\\@other.example/login",
+        "https://auth.example:invalid/login",
+        "https://auth.example:99999/login",
+        "https://[broken/login",
+        "https://%65xample.com/login",
+    ],
+)
+def test_browser_authentication_url_rejects_invalid_browser_links(url: str) -> None:
+    assert browser_authentication_url(url) is None
+
+
+@pytest.mark.parametrize("kind", ["assistant", "result", "stream_event", "user", "tool"])
+def test_gigacode_authentication_ignores_model_and_tool_urls(kind: str) -> None:
+    line = json.dumps(
+        {
+            "type": kind,
+            "auth_url": "https://auth.example/device?code=example",
+            "message": {
+                "content": "Open browser to authenticate: https://auth.example/device?code=example"
+            },
+        }
+    )
+
+    assert GigaCodeRunner._authentication_url(line) is None
+
+
+@pytest.mark.parametrize("kind", ["system", "auth", "authentication_required"])
+def test_gigacode_authentication_decodes_structured_instructions(kind: str) -> None:
+    url = "https://auth.example/device?code=a%2Fb==&state=abc."
+    line = json.dumps(
+        {"type": kind, "message": "Open browser to authenticate", "url": url}
+    ).replace("/", "\\/").replace("&", "\\u0026")
+
+    assert GigaCodeRunner._authentication_url(line) == url
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "auth_url", "authentication_url", "authorization_url",
+        "verification_uri", "verification_uri_complete", "login_url",
+    ],
+)
+def test_gigacode_authentication_accepts_explicit_url_without_event_type(field: str) -> None:
+    url = "https://auth.example/device?code=a%2Fb==&state=abc."
+    line = json.dumps({field: url}).replace("/", "\\/").replace("&", "\\u0026")
+
+    assert GigaCodeRunner._authentication_url(line) == url
+
+
+def test_gigacode_authentication_rejects_arbitrary_untyped_payload() -> None:
+    assert GigaCodeRunner._authentication_url(
+        json.dumps({"message": "Open browser: https://auth.example/device"})
+    ) is None
+    assert GigaCodeRunner._authentication_url(
+        json.dumps({"payload": {"auth_url": "https://auth.example/device"}})
+    ) is None
+    assert GigaCodeRunner._authentication_url(
+        json.dumps({"auth_url": "https://user:password@auth.example/device"})
+    ) is None
+
+
+def test_gigacode_authentication_does_not_match_hints_inside_url() -> None:
+    assert GigaCodeRunner._authentication_url(
+        "OpenAPI endpoint: https://auth.example/openapi"
+    ) is None
+    assert GigaCodeRunner._authentication_url(
+        json.dumps({"type": "system", "endpoint": "https://auth.example/openapi"})
+    ) is None
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+@pytest.mark.parametrize("is_error", [False, True])
+def test_gigacode_authentication_callbacks_follow_cli_result(
+    settings_factory, tmp_path: Path, stream: str, is_error: bool
+) -> None:
+    executable = tmp_path / "gigacode-auth"
+    acknowledgement = tmp_path / "auth-url-delivered"
+    url = "https://auth.example/device?code=a%2Fb==&state=abc."
+    executable.write_text(
+        """#!/usr/bin/env python3
+import json
+from pathlib import Path
+import sys
+import time
+
+if "--version" in sys.argv:
+    print("0.99.0-auth-test")
+    raise SystemExit(0)
+
+sys.stdin.read()
+"""
+        + f"auth_stream = sys.{stream}\n"
+        + f"auth_url = {url!r}\n"
+        + f"acknowledgement = Path({str(acknowledgement)!r})\n"
+        + f"is_error = {is_error!r}\n"
+        + """
+print("Open browser to authenticate: " + auth_url, file=auth_stream, flush=True)
+deadline = time.monotonic() + 5
+while not acknowledgement.exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit(9)
+    time.sleep(0.01)
+# The same URL may be printed repeatedly while the CLI waits for the browser.
+print("Open browser to authenticate: " + auth_url, file=auth_stream, flush=True)
+print(json.dumps({
+    "type": "result",
+    "is_error": is_error,
+    "error": "Browser authentication failed" if is_error else None,
+    "result": json.dumps({"ok": True}),
+}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    checkout = tmp_path / "repository"
+    checkout.mkdir()
+    authentication_urls: list[str] = []
+    authentication_completed: list[bool] = []
+    progress: list[str] = []
+
+    def on_authentication_url(value: str) -> None:
+        authentication_urls.append(value)
+        acknowledgement.write_text("received", encoding="utf-8")
+
+    runner = GigaCodeRunner(settings_factory(gigacode_command=str(executable)))
+
+    def run() -> None:
+        runner.run_json(
+            checkout=checkout,
+            prompt="Describe image.",
+            schema={"type": "object", "properties": {"ok": {"type": "boolean"}}},
+            authentication_url=on_authentication_url,
+            authentication_complete=lambda: authentication_completed.append(True),
+            progress=progress.append,
+        )
+
+    if is_error:
+        with pytest.raises(RuntimeError, match="Browser authentication failed"):
+            run()
+    else:
+        run()
+
+    assert authentication_urls == [url]
+    assert authentication_completed == ([] if is_error else [True])
+    assert any("waits for browser authentication" in line for line in progress)
+    assert any("authentication completed" in line for line in progress) is not is_error

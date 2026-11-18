@@ -129,6 +129,25 @@ key the cache; source/version provenance is added by the server. Inline SVG diag
 also archived and passed to extraction. Unsupported or unreadable images remain visible
 as warnings with their originals; an extraction failure does not discard page text.
 
+When GigaCode CLI requests browser authentication, the Confluence dashboard shows
+**GigaCode ожидает вход через браузер** above the sources and in the running job.
+Sign into the dashboard as an administrator, then use **Открыть страницу входа** or
+**Скопировать ссылку**. Complete the login in the browser; the existing CLI process
+continues image analysis automatically. There is no need to queue a second synchronization.
+The full URL is also available in the administrator's operation journal under
+`details.authentication_url`. Readers see the waiting state but not the login URL.
+The normal backend log records the job ID and the request for browser authentication,
+without copying the one-time URL or CLI output into the shared server log.
+
+The waiting banner clears when analysis resumes, or the attempt ends, fails or is
+cancelled. Restarting the backend discards the old pending login action and resumes
+the saved synchronization; if the new CLI process requires login it supplies a new
+URL. A link in an old journal entry belongs to that old attempt. The existing
+`KB_GIGACODE_AUTH_TIMEOUT_SECONDS` setting controls the configured login waiting allowance
+(600 seconds by default); analysis has its own timeout. Browser login must use the flow
+supported by the installed CLI; forwarding a URL does not forward a callback listening
+on the backend's localhost to the administrator's computer.
+
 Original attachments of other types are archived. Plugin-specific macros without an API
 text/image representation cannot be reconstructed reliably; the normalized document
 marks macros without a readable representation. Image interpretation is evidence with

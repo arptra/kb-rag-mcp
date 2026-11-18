@@ -15,7 +15,7 @@ interface ConfluenceSource {
 interface ConfluenceJob {
   id: string; source_id: string; index_id: string; type: string; status: string; phase: string;
   message: string; created_at: string; started_at: string | null; completed_at: string | null;
-  progress: Record<string, unknown>; result: Record<string, unknown> | null; error: string | null;
+  progress: Record<string, unknown> & { authentication_required?: boolean; authentication_url?: string | null; authentication_requested_at?: string | null }; result: Record<string, unknown> | null; error: string | null;
 }
 interface ConfluenceCatalog { enabled?: boolean; sources: ConfluenceSource[]; jobs?: ConfluenceJob[]; can_manage: boolean; gigacode?: { available: boolean; error?: string | null } }
 interface LogItem { cursor: string | number; timestamp: string; stage: string; level: string; message: string; details?: Record<string, unknown> }
@@ -27,7 +27,44 @@ interface FailurePage { items: FailedPage[]; total: number; offset: number; limi
 type Request = <T>(path: string, init?: RequestInit) => Promise<T>;
 const active = (status: string) => ["queued", "running", "cancelling"].includes(status);
 const labels: Record<string, string> = { idle: "Готов", queued: "В очереди", running: "Выполняется", paused: "Приостановлен", error: "Ошибка", failed: "Ошибка", completed: "Завершено", completed_with_warnings: "С предупреждениями", cancelled: "Отменено", cancelling: "Отменяется" };
-const stageLabels: Record<string, string> = { discovery: "Поиск дочерних страниц", discovery_retry: "Повторный поиск дочерних страниц", fetch: "Загрузка страницы", attachments: "Загрузка вложений", images: "Обработка изображений", normalization: "Обработка текста", archive: "Сохранение страницы", checkpoint: "Сохранение страницы", indexing: "Индексация", publication: "Публикация", retry_wait: "Ожидание повторной попытки", retry: "Повторная загрузка" };
+const stageLabels: Record<string, string> = { authentication: "Ожидание входа в GigaCode", discovery: "Поиск дочерних страниц", discovery_retry: "Повторный поиск дочерних страниц", fetch: "Загрузка страницы", attachments: "Загрузка вложений", images: "Обработка изображений", normalization: "Обработка текста", archive: "Сохранение страницы", checkpoint: "Сохранение страницы", indexing: "Индексация", publication: "Публикация", retry_wait: "Ожидание повторной попытки", retry: "Повторная загрузка" };
+const awaitingAuthentication = (job: ConfluenceJob) => job.status === "running" && job.progress?.authentication_required === true;
+
+function authenticationUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const candidate = value.trim();
+  if (!candidate || /[\u0000-\u0020\u007f\\]/.test(candidate)) return null;
+  try {
+    const url = new URL(candidate);
+    return ["http:", "https:"].includes(url.protocol) && Boolean(url.hostname) && !url.username && !url.password ? candidate : null;
+  } catch { return null; }
+}
+
+function GigaCodeAuthentication({ job, canManage }: { job: ConfluenceJob; canManage: boolean }) {
+  const url = canManage ? authenticationUrl(job.progress.authentication_url) : null;
+  const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState("");
+  useEffect(() => { setCopied(false); setCopyError(""); }, [url]);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 2500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+  const copy = async () => {
+    if (!url) return;
+    try { await navigator.clipboard.writeText(url); setCopied(true); setCopyError(""); }
+    catch { setCopyError("Буфер обмена недоступен. Скопируйте ссылку из поля ниже."); }
+  };
+  return <section className="confluence-authentication" aria-label="Вход в GigaCode">
+    <div role="status"><strong>GigaCode ожидает вход через браузер</strong><p>{canManage ? "Откройте ссылку и завершите вход. После авторизации обработка продолжится автоматически." : "Войдите как администратор, чтобы увидеть ссылку и пройти авторизацию GigaCode."}</p></div>
+    {canManage && (url ? <>
+      <div className="integration-actions"><a className="button primary" href={url} target="_blank" rel="noopener noreferrer">Открыть страницу входа ↗</a><button className="button secondary" onClick={() => void copy()}>{copied ? "Скопировано" : "Скопировать ссылку"}</button></div>
+      {copyError && <p className="integration-error" role="alert">{copyError}</p>}
+      <details className="confluence-authentication-url" open={Boolean(copyError)}><summary>Полная ссылка для входа</summary><textarea aria-label="Ссылка для входа в GigaCode" value={url} readOnly rows={3} spellCheck={false} onFocus={event => event.currentTarget.select()} /></details>
+    </> : <p className="integration-muted">Ссылка для входа пока недоступна. Статус обновляется автоматически.</p>)}
+    {job.progress.authentication_requested_at && <small className="integration-muted">Ожидание с {integrationDate(job.progress.authentication_requested_at)}</small>}
+  </section>;
+}
 
 function ConfluenceFailures({ job, request }: { job: ConfluenceJob; request: Request }) {
   const [offset, setOffset] = useState(0);
@@ -226,17 +263,21 @@ export default function ConfluenceApp({ password, indexes, indexId, onChanged }:
     catch (caught) { setError(accessError(caught)); } finally { setBusy(false); }
   };
   const sources = (catalog?.sources ?? []).filter(source => !indexId || source.index_id === indexId);
+  const authenticationJobs = [...new Map([...(catalog?.jobs ?? []), ...jobs].map(job => [job.id, job])).values()].filter(job => (!indexId || job.index_id === indexId) && awaitingAuthentication(job));
+  const authenticationSources = [...new Set(authenticationJobs.map(job => sources.find(source => source.id === job.source_id)?.name || job.source_id))];
+  const visibleJobs = [...new Map([...authenticationJobs.filter(job => !sourceFilter || job.source_id === sourceFilter), ...jobs].map(job => [job.id, job])).values()];
   const pagesSource = sources.find(source => source.id === pagesSourceId);
   const sourceBusy = (source: ConfluenceSource) => active(source.status) || jobs.some(job => job.source_id === source.id && active(job.status));
   if (catalog?.enabled === false) return <div className="integration-area confluence-sources"><section className="panel integration-panel"><h3>Источники Confluence</h3><p className="integration-muted" role="status">Интеграция Confluence отключена на сервере.</p></section></div>;
   return <div className="integration-area confluence-sources">
     <section className="panel"><div className="panel-header"><div><span className="eyebrow">Документация по API</span><h3>Источники Confluence</h3></div>{catalog?.can_manage && <button className="button primary" onClick={() => setEditing("new")}>＋ Подключить Confluence</button>}</div>
       {(error || loadError) && <div className="form-error" role="alert">{error || loadError}</div>}{notice && <div className="access-notice" role="status">{notice}</div>}
+      {authenticationJobs.length > 0 && <div className="confluence-authentication-summary" role="status"><div><strong>Требуется вход в GigaCode</strong><p>{authenticationSources.join(", ")}. {catalog?.can_manage ? "Ссылка для входа доступна в карточке задачи ниже." : "Войдите как администратор, чтобы пройти авторизацию."}</p></div>{sourceFilter && <button className="button secondary" onClick={() => setSourceFilter("")}>Показать все задачи</button>}</div>}
       {loading ? <div className="empty-state compact">Загружаем источники…</div> : sources.length ? <div className="table-wrap"><table><thead><tr><th>Источник / корень</th><th>Индекс</th><th>Документы</th><th>Проверки</th><th>Состояние</th><th /></tr></thead><tbody>{sources.map(source => <tr key={source.id}><td><b>{source.name}</b><small><a href={source.root_page_url} target="_blank" rel="noreferrer">Корневая страница ↗</a></small></td><td>{indexes.find(index => index.id === source.index_id)?.name || source.index_id}</td><td>{source.page_count} страниц<small>{source.asset_count} вложений</small></td><td><small>Последняя: {integrationDate(source.last_checked_at)}</small><small>Успешная: {integrationDate(source.last_success_at)}</small><small>Следующая: {source.paused ? "На паузе" : integrationDate(source.next_check_at)}</small></td><td><span className="tag">{labels[source.status] || source.status}</span>{source.last_error && <small className="integration-error">{source.last_error}</small>}</td><td><div className="integration-actions"><button className="button quiet" onClick={() => setPagesSourceId(source.id)}>Страницы</button><button className="button quiet" onClick={() => setSourceFilter(source.id)}>Журнал</button>{catalog?.can_manage && <><button className="button quiet" disabled={busy || sourceBusy(source)} onClick={() => void mutate(`/admin/api/confluence/sources/${encodeURIComponent(source.id)}/sync`, {}, "Синхронизация поставлена в очередь")}>Проверить</button><button className="button quiet" disabled={busy || sourceBusy(source)} onClick={() => setEditing(source)}>Настроить</button><button className="button quiet" disabled={busy} onClick={() => void mutate(`/admin/api/confluence/sources/${encodeURIComponent(source.id)}/pause`, { paused: !source.paused }, source.paused ? "Расписание возобновлено" : "Расписание приостановлено")}>{source.paused ? "Возобновить" : "Пауза"}</button><button className="button quiet" disabled={busy || sourceBusy(source)} onClick={() => { if (window.confirm(`Отключить источник «${source.name}»? Сохранённые документы останутся в индексе.`)) void mutate(`/admin/api/confluence/sources/${encodeURIComponent(source.id)}/delete`, {}, "Источник отключён, документы сохранены"); }}>Отключить</button></>}</div></td></tr>)}</tbody></table></div> : <div className="empty-state compact"><h3>Confluence ещё не подключён</h3><p>Выберите индекс, укажите сервер, корневую страницу и токен.</p></div>}
     </section>
     {pagesSource && <SourcePages key={pagesSource.id} source={pagesSource} request={request} onClose={() => setPagesSourceId(null)} />}
     {catalog && !catalog.can_manage && <ManagementLogin onLogin={login} />}
-    {jobs.length > 0 && <section className="panel integration-panel"><div className="integration-job-head"><h3>Синхронизация и индексация</h3><label>Источник<select value={sourceFilter} onChange={event => setSourceFilter(event.target.value)}><option value="">Все источники</option>{sources.map(source => <option key={source.id} value={source.id}>{source.name}</option>)}</select></label></div>{jobs.map(job => {
+    {visibleJobs.length > 0 && <section className="panel integration-panel"><div className="integration-job-head"><h3>Синхронизация и индексация</h3><label>Источник<select value={sourceFilter} onChange={event => setSourceFilter(event.target.value)}><option value="">Все источники</option>{sources.map(source => <option key={source.id} value={source.id}>{source.name}</option>)}</select></label></div>{visibleJobs.map(job => {
       const progress = job.progress || {}; const count = (key: string) => typeof progress[key] === "number" ? Number(progress[key]) : null;
       const outcome = (key: string) => typeof job.result?.[key] === "number" ? Number(job.result[key]) : count(key);
       const failedItems = outcome("failed_items") ?? 0;
@@ -245,6 +286,7 @@ export default function ConfluenceApp({ password, indexes, indexId, onChanged }:
       const processed = processedChunks ?? count("pages_done");
       const total = processedChunks !== null ? count("total") ?? count("total_chunks") : count("pages_total");
       return <article className="integration-job-row" key={job.id}><div className="integration-job-head"><div><b>{stageLabels[job.phase] && ["retry_wait", "retry", "discovery_retry"].includes(job.phase) ? stageLabels[job.phase] : job.message || stageLabels[job.phase] || job.phase || "Синхронизация Confluence"}</b><small className="integration-muted"> · {labels[job.status] || job.status}</small><div className="integration-muted">{sources.find(source => source.id === job.source_id)?.name || job.source_id} · {indexes.find(index => index.id === job.index_id)?.name || job.index_id} · {integrationDate(job.completed_at || job.started_at || job.created_at)}</div></div><div className="integration-actions">{(failedItems > 0 || failuresJobId === job.id) && <button className="button secondary" aria-expanded={failuresJobId === job.id} onClick={() => setFailuresJobId(failuresJobId === job.id ? null : job.id)}>{failuresJobId === job.id ? "Скрыть ошибки" : `Ошибки загрузки (${failedItems})`}</button>}<button className="button quiet" onClick={() => setExpanded(expanded === job.id ? null : job.id)}>{expanded === job.id ? "Скрыть журнал" : "Журнал"}</button>{catalog?.can_manage && active(job.status) && <button className="button quiet" disabled={busy || job.status === "cancelling"} onClick={() => void mutate(`/admin/api/confluence/jobs/${encodeURIComponent(job.id)}/cancel`, {}, "Отмена запрошена")}>Отменить</button>}</div></div>
+        {awaitingAuthentication(job) && <GigaCodeAuthentication job={job} canManage={catalog?.can_manage === true} />}
         {total !== null && total > 0 && processed !== null && <progress className="integration-progress" value={processed} max={total} aria-label={processedChunks !== null ? "Обработанные фрагменты" : "Проверенные страницы"} />}
         <div className="integration-facts">{[[processedChunks !== null ? "Обработано фрагментов" : "Проверено страниц", processed !== null ? `${processed}${total !== null ? ` / ${total}` : ""}` : null], ["Из кэша", count("reused") ?? count("reused_chunks")], ["Рассчитано", count("computed") ?? count("computed_chunks")], ["Опубликовано", count("published") ?? count("published_chunks")]].map(([label, value]) => value !== null ? <span key={String(label)}>{label}<b>{value}</b></span> : null)}</div>
         <div className="integration-facts">{[["Повторный проход", active(job.status) && retryRound > 0 ? `${retryRound} / 2` : null], ["Ожидают повтора", active(job.status) && (count("retry_pending") ?? 0) > 0 ? count("retry_pending") : null], ["Восстановлено после ошибок", (outcome("recovered_pages") ?? 0) > 0 ? outcome("recovered_pages") : null], ["Страниц с ошибками", failedItems > 0 ? outcome("failed_pages") : null], ["Не прочитано веток", failedItems > 0 ? outcome("failed_branches") : null]].map(([label, value]) => value !== null ? <span key={String(label)}>{label}<b>{value}</b></span> : null)}</div>

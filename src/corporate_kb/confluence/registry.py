@@ -31,6 +31,7 @@ from corporate_kb.confluence.models import (
     SourceConfig,
     SyncCancelled,
 )
+from corporate_kb.gigacode_runner import browser_authentication_url
 from corporate_kb.loaders.base import make_document
 from corporate_kb.loaders.normalizer import DocumentNormalizer
 from corporate_kb.models import Document
@@ -456,6 +457,12 @@ class ConfluenceRegistry:
         result["type"] = "confluence"
         result["progress"] = json.loads(result.pop("progress_json"))
         result["result"] = json.loads(result.pop("result_json"))
+        if result["status"] != "running" and "authentication_required" in result["progress"]:
+            result["progress"].update(
+                authentication_required=False,
+                authentication_url=None,
+                authentication_requested_at=None,
+            )
         return result
 
     def job_status(self, job_id: str) -> dict[str, Any]:
@@ -470,7 +477,7 @@ class ConfluenceRegistry:
             rows = connection.execute(
                 (
                     "SELECT * FROM jobs WHERE (? IS NULL OR source_id=?) ORDER BY "
-                    "created_at DESC LIMIT ?"
+                    "(status='running') DESC,created_at DESC LIMIT ?"
                 ),
                 (source_id, source_id, min(max(limit, 1), 500)),
             )
@@ -576,7 +583,14 @@ class ConfluenceRegistry:
             )
             connection.execute(
                 "UPDATE jobs SET phase=?,message=?,progress_json=? WHERE id=?",
-                (stage, message[:500], _json(progress), job_id),
+                (
+                    "authentication" if progress.get("authentication_required") else stage,
+                    "GigaCode ожидает вход через браузер"
+                    if progress.get("authentication_required")
+                    else message[:500],
+                    _json(progress),
+                    job_id,
+                ),
             )
         # Mirror the durable operation journal to the normal server log, keeping
         # only progress metadata. Extractor stdout/auth URLs can contain secrets
@@ -622,6 +636,7 @@ class ConfluenceRegistry:
             "recovered_pages",
             "discovery_complete",
             "completed_branches",
+            "authentication_required",
         }
         summary = _json({key: value for key, value in details.items() if key in progress_keys})
         with self._state_lock:
@@ -636,6 +651,66 @@ class ConfluenceRegistry:
             server_message[:1000].replace("\n", "\\n").replace("\r", "\\r"),
             summary,
         )
+
+    def _authentication_required(
+        self, job_id: str, url: str, *, page_id: str, attachment_id: str
+    ) -> None:
+        url = browser_authentication_url(url) or ""
+        if not url:
+            return
+        with self._state_lock:
+            cancel = self._cancel.get(job_id)
+            if cancel is not None and cancel.is_set():
+                return
+        if self.job_status(job_id)["status"] != "running":
+            return
+        self._log(
+            job_id,
+            "authentication",
+            "GigaCode ожидает вход через браузер. Откройте ссылку авторизации в задаче.",
+            server_message="GigaCode requires browser authentication; open Confluence job in UI",
+            page_id=page_id,
+            attachment_id=attachment_id,
+            authentication_required=True,
+            authentication_url=url,
+            authentication_requested_at=_now(),
+        )
+
+    def _authentication_finished(self, job_id: str, *, completed: bool = False) -> None:
+        with self._db() as connection:
+            row = connection.execute(
+                "SELECT progress_json FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        if row is None or not json.loads(row[0]).get("authentication_required"):
+            return
+        self._log(
+            job_id,
+            "images",
+            "Авторизация GigaCode завершена; обработка изображений продолжена."
+            if completed
+            else "Ожидание авторизации GigaCode завершено; ссылка больше не активна.",
+            authentication_required=False,
+            authentication_url=None,
+            authentication_requested_at=None,
+        )
+
+    def _image_progress(self, job_id: str, message: str, *, attachment_id: str) -> None:
+        # Raw CLI output can repeat a one-time login URL (including JSON-escaped
+        # variants). Keep it out of shared progress/log text; the dedicated
+        # authentication callback publishes the full URL for administrators.
+        for prefix in (
+            "GigaCode waits for browser authentication",
+            "GigaCode stderr |",
+            "GigaCode stdout (non-JSON) |",
+        ):
+            if message.startswith(prefix):
+                message = prefix.rstrip(" |")
+                break
+        # Structured error summaries can repeat the same login URL as well.
+        message = re.sub(
+            r"https?:(?:\\?/){2}[^\s<>\"']+", "[URL omitted]", message, flags=re.IGNORECASE
+        )
+        self._log(job_id, "images", message, attachment_id=attachment_id)
 
     def _index_progress(self, job_id: str, event: Any) -> None:
         if isinstance(event, dict):
@@ -657,6 +732,7 @@ class ConfluenceRegistry:
         logger.info("Confluence cancellation requested: job=%s", job_id)
         with self._state_lock:
             self._cancel.setdefault(job_id, threading.Event()).set()
+        self._authentication_finished(job_id)
         with self._db() as connection:
             connection.execute(
                 (
@@ -738,8 +814,23 @@ class ConfluenceRegistry:
                 return
             self._lease = lease
             with self._db() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for job in connection.execute(
+                    "SELECT id,progress_json FROM jobs WHERE status IN ('running','queued')"
+                ).fetchall():
+                    progress = json.loads(job["progress_json"])
+                    if "authentication_required" in progress:
+                        progress.update(
+                            authentication_required=False,
+                            authentication_url=None,
+                            authentication_requested_at=None,
+                        )
+                        connection.execute(
+                            "UPDATE jobs SET progress_json=? WHERE id=?",
+                            (_json(progress), job["id"]),
+                        )
                 connection.execute(
-                    "UPDATE jobs SET status='queued',message='Resuming after server "
+                    "UPDATE jobs SET status='queued',phase='queued',message='Resuming after server "
                     "restart' WHERE status='running'"
                 )
             self._stop.clear()
@@ -925,6 +1016,7 @@ class ConfluenceRegistry:
                     (_now(), message, job_id),
                 )
         finally:
+            self._authentication_finished(job_id)
             if client is not None:
                 try:
                     client.close()
@@ -1798,13 +1890,23 @@ class ConfluenceRegistry:
                     job_id, "images", "Analyzing image with GigaCode", attachment_id=attachment.id
                 )
                 try:
-                    output = self.image_extractor.extract(
-                        path,
-                        cancel=cancel,
-                        progress=lambda message: self._log(
-                            job_id, "images", message, attachment_id=attachment.id
-                        ),
-                    )
+                    try:
+                        output = self.image_extractor.extract(
+                            path,
+                            cancel=cancel,
+                            progress=lambda message: self._image_progress(
+                                job_id, message, attachment_id=attachment.id
+                            ),
+                            authentication_url=lambda url: self._authentication_required(
+                                job_id, url, page_id=page_id, attachment_id=attachment.id
+                            ),
+                            authentication_complete=lambda: self._authentication_finished(
+                                job_id, completed=True
+                            ),
+                        )
+                        self._authentication_finished(job_id, completed=True)
+                    finally:
+                        self._authentication_finished(job_id)
                     text = output.markdown()
                     row["extraction_status"] = output.status
                     self._log(
