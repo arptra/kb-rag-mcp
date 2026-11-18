@@ -60,6 +60,7 @@ def _build_worker(
     force_all: bool,
     skip_service_ids: set[str],
     diagnostic_path: Path,
+    discovery_only: bool = False,
 ) -> None:
     def report(message: str) -> None:
         with progress_path.open("a", encoding="utf-8") as handle:
@@ -98,6 +99,7 @@ def _build_worker(
             f"Worker started; pid={os.getpid()}; parent_pid={os.getppid()}; "
             f"thread={threading.current_thread().name}/{threading.get_ident()}; "
             f"repositories={len(repositories)}; force_all={force_all}; "
+            f"discovery_only={discovery_only}; "
             f"forced_services={','.join(sorted(force_service_ids)) or 'none'}; "
             f"skipped_services={','.join(sorted(skip_service_ids)) or 'none'}"
         )
@@ -114,6 +116,7 @@ def _build_worker(
             force_service_ids=force_service_ids,
             force_all=force_all,
             skip_service_ids=skip_service_ids,
+            discovery_only=discovery_only,
         )
         report("Writing system_graph.json")
         JsonGraphStore(graph_path).save(result.graph)
@@ -148,7 +151,14 @@ class ServiceMapProcessRunner:
         force_service_ids: set[str] | None = None,
         force_all: bool = False,
         skip_service_ids: set[str] | None = None,
+        discovery_only: bool = False,
     ) -> ServiceMapBuildResult:
+        """Run analysis or module discovery with cancellation and a hard deadline.
+
+        Discovery returns module identities without parsing sources or publishing
+        intermediate checkpoints. Result files are kept in a temporary directory;
+        this method does not replace the application's persisted graph or map.
+        """
         if cancel is not None and cancel.is_set():
             raise ServiceMapBuildCancelled("Repository analysis was cancelled")
         if not repositories:
@@ -177,6 +187,7 @@ class ServiceMapProcessRunner:
                     force_all,
                     skip_service_ids or set(),
                     diagnostic_path,
+                    discovery_only,
                 ),
                 name="service-map-analysis",
                 daemon=True,
@@ -191,6 +202,7 @@ class ServiceMapProcessRunner:
                     f"start_method=spawn; timeout={self._timeout_seconds}s; "
                     f"repositories={len(repositories)}; "
                     f"force_all={force_all}; "
+                    f"discovery_only={discovery_only}; "
                     f"forced_services={','.join(sorted(force_service_ids or set())) or 'none'}; "
                     f"skipped_services={','.join(sorted(skip_service_ids or set())) or 'none'}"
                 )

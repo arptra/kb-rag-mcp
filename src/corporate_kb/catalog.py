@@ -616,10 +616,9 @@ class RagCatalog:
 
     def start_all_services_ssot_refresh(self) -> CatalogJob:
         """Refresh every connected service, preferring OpenSpec over source parsing."""
-        service_map = self._service_map_store.load()
-        if not service_map.services:
-            raise RuntimeError("No discovered services are available to refresh")
         with self._lock:
+            if not self._state.repositories:
+                raise RuntimeError("No connected repositories are available to refresh")
             active = next(
                 (
                     item
@@ -2413,38 +2412,70 @@ class RagCatalog:
                 if not repositories:
                     raise RuntimeError("No connected repositories are available to refresh")
                 checkout_repository_ids = {item.id for item in repositories}
-                repositories = [
-                    self._ensure_repository_checkout(
-                        item.id,
-                        job_id=job_id,
-                        cancel_event=cancel_event,
-                    )
-                    for item in repositories
-                ]
-                service_map = self._service_map_store.load()
-                services_by_repository: dict[str, list[ServiceRecord]] = {}
-                repository_by_service: dict[str, RepositorySource] = {}
-                for service in service_map.services:
-                    try:
-                        _mapped, repository = self._service_context(service.id)
-                    except KeyError:
-                        self._append_job_log(
-                            job_id,
-                            f"Skipping unmapped service={service.id}; repository was not found",
-                        )
-                        continue
-                    services_by_repository.setdefault(repository.id, []).append(service)
-                    repository_by_service[service.id] = repository
-                if not repository_by_service:
-                    raise RuntimeError("No services are linked to connected repositories")
-
                 affected_index_ids = sorted({item.index_id for item in repositories})
+                self._update_job(
+                    job_id,
+                    status="running",
+                    message="Refreshing Git sources before service discovery",
+                    started_at=_now(),
+                )
                 with self._cancellable_index_locks(affected_index_ids, cancel_event):
+                    previous_map = self._service_map_store.load()
+                    with self._cancellable_lock(self._analysis_lock, cancel_event):
+                        repositories = [
+                            self._ensure_repository_checkout(
+                                item.id,
+                                job_id=job_id,
+                                cancel_event=cancel_event,
+                                refresh=True,
+                            )
+                            for item in repositories
+                        ]
+                        discovery = ServiceMapProcessRunner(
+                            self._graph_settings(),
+                            timeout_seconds=self.settings.repository_analysis_timeout_seconds,
+                        ).build(
+                            self._repository_inputs(repositories),
+                            discovery_only=True,
+                            cancel=cancel_event,
+                            progress=lambda message: self._append_job_log(job_id, message),
+                        )
+                    if discovery.partial:
+                        raise RuntimeError("Service discovery did not complete; refresh stopped")
+                    self._raise_if_cancelled(cancel_event)
+                    repositories_by_path = {
+                        str(Path(item.checkout_path).resolve()): item for item in repositories
+                    }
+                    repositories_by_name = {item.name: item for item in repositories}
+
+                    def owning_repository(service: ServiceRecord) -> RepositorySource | None:
+                        return repositories_by_path.get(service.repository_root or "") or (
+                            repositories_by_name.get(service.repository)
+                        )
+
+                    services_by_repository: dict[str, list[ServiceRecord]] = {}
+                    repository_by_service: dict[str, RepositorySource] = {}
+                    for service in discovery.service_map.services:
+                        repository = owning_repository(service)
+                        if repository is None:
+                            raise RuntimeError(
+                                f"No repository owns discovered service: {service.id}"
+                            )
+                        services_by_repository.setdefault(repository.id, []).append(service)
+                        repository_by_service[service.id] = repository
+                    removed_by_index: dict[str, set[str]] = {}
+                    for service in previous_map.services:
+                        repository = owning_repository(service)
+                        if repository is not None and service.id not in repository_by_service:
+                            removed_by_index.setdefault(repository.index_id, set()).add(service.id)
+                    self._append_job_log(
+                        job_id,
+                        f"Fresh service discovery ready: services={len(repository_by_service)}; "
+                        f"removed={sum(len(ids) for ids in removed_by_index.values())}",
+                    )
                     self._update_job(
                         job_id,
-                        status="running",
                         message=("Checking OpenSpec before GigaCode/static analysis"),
-                        started_at=_now(),
                     )
                     for index_id in affected_index_ids:
                         self._update_index(index_id, status="indexing", error=None)
@@ -2519,10 +2550,19 @@ class RagCatalog:
                     snapshot = self._build_graph(
                         cancel_event=cancel_event,
                         job_id=job_id,
-                        force_service_ids=analyzable_service_ids,
+                        force_all=True,
                         skip_service_ids=skipped_service_ids,
                     )
                     self._raise_if_cancelled(cancel_event)
+
+                    for index_id, removed_service_ids in removed_by_index.items():
+                        removed = self._remove_generated_ssot(index_id, removed_service_ids)
+                        self._append_job_log(
+                            job_id,
+                            f"Removed obsolete generated SSOT: index={index_id}; "
+                            f"services={','.join(sorted(removed_service_ids))}; "
+                            f"documents={removed}",
+                        )
 
                     gigacode_results: list[dict[str, Any]] = []
                     static_ssot_files: list[str] = []
@@ -2577,7 +2617,11 @@ class RagCatalog:
                             job_id,
                             message=f"Rebuilding linked RAG index: {index.name}",
                         )
-                        stats = self._rebuild_index(index_id, cancel_event)
+                        stats = self._rebuild_index(
+                            index_id,
+                            cancel_event,
+                            progress=lambda event: self._index_progress(job_id, event),
+                        )
                         self._append_job_log(
                             job_id,
                             f"RAG index ready: index={index_id}; "
@@ -2598,6 +2642,17 @@ class RagCatalog:
                             "phase": "indexed",
                             "generation_mode": generation_mode,
                             "service_count": len(repository_by_service),
+                            "removed_service_ids": sorted(
+                                {
+                                    service_id
+                                    for ids in removed_by_index.values()
+                                    for service_id in ids
+                                }
+                            ),
+                            "repositories": [
+                                {"id": item.id, "ref": item.ref, "commit": item.commit}
+                                for item in repositories
+                            ],
                             "openspec_service_count": len(skipped_service_ids),
                             "openspec_service_ids": sorted(skipped_service_ids),
                             "analyzed_service_count": len(analyzable_service_ids),
@@ -4282,13 +4337,15 @@ class RagCatalog:
         *,
         job_id: str,
         cancel_event: threading.Event | None,
+        refresh: bool = False,
     ) -> RepositorySource:
         repository = self._repository(repository_id)
-        if Path(repository.checkout_path).is_dir():
+        if Path(repository.checkout_path).is_dir() and not refresh:
             return repository
         self._append_job_log(
             job_id,
-            f"Temporarily restoring checkout for analysis: {repository.name}",
+            f"{'Refreshing' if refresh else 'Temporarily restoring'} checkout for analysis: "
+            f"{repository.name}; ref={repository.ref or 'remote HEAD (default branch)'}",
         )
         paths, records = RepositorySourceManager(self._graph_settings()).materialize(
             [RepositorySpec(source=repository.git_url, ref=repository.ref)],
@@ -4306,6 +4363,12 @@ class RagCatalog:
             }
         )
         self._upsert_repository(replacement)
+        self._append_job_log(
+            job_id,
+            f"Checkout ready: repository={repository.name}; action={ingestion.action}; "
+            f"ref={repository.ref or 'remote HEAD (default branch)'}; "
+            f"previous_commit={repository.commit or 'none'}; commit={ingestion.commit or 'none'}",
+        )
         return replacement
 
     def _cleanup_repository_checkouts(

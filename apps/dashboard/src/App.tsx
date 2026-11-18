@@ -587,12 +587,12 @@ export default function App({ secureMode = false, accountName, onSessionLogout }
               <button
                 className="button secondary"
                 disabled={loading || overview.catalog.jobs.some((job) => job.type === "ssot" && job.target_id === "all-services" && ["queued", "running", "cancelling"].includes(job.status))}
-                title="OpenSpec загружается напрямую; остальные сервисы анализируются через GigaCode, если он доступен, иначе статически. Затем обновляются привязанные индексы."
+                title="Загружает свежие исходники из выбранного Git ref или ветки репозитория по умолчанию, если ref не задан. Использует OpenSpec, а при его отсутствии — GigaCode или статический анализ. Затем перестраивает привязанные индексы. Ход выполнения — в «Операции и логи»."
                 onClick={() => void action(
                   () => post("/admin/api/services/refresh-all", password, {}),
-                  "Обновление SSOT всех сервисов поставлено в очередь",
+                  "Обновление исходников, описаний сервисов и индексов поставлено в очередь. Подробности — в «Операции и логи».",
                 )}
-              >↻ Обновить все SSOT</button>
+              >↻ Обновить все сервисы</button>
             )}
             {page === "services" && <button className="button primary" onClick={() => setSystemSsotModal(true)}>✦ Подготовить SSOT-контекст</button>}
             {page === "servers" && <button className="button primary" onClick={() => setServerModal(true)}>＋ Добавить MCP server</button>}

@@ -108,7 +108,14 @@ class ServiceMapBuilder:
         force_service_ids: set[str] | None = None,
         force_all: bool = False,
         skip_service_ids: set[str] | None = None,
+        discovery_only: bool = False,
     ) -> ServiceMapBuildResult:
+        """Build service facts, or discover current module identities without source analysis.
+
+        Discovery reuses the normal layout cache and service ID disambiguation, but
+        returns before parsing module sources or publishing analysis checkpoints.
+        The caller decides whether to publish the returned graph and service map.
+        """
         if not repositories:
             return ServiceMapBuildResult(
                 self._stamp_algorithm(GraphSnapshot()),
@@ -169,7 +176,7 @@ class ServiceMapBuilder:
                 f"Scan plan: modules={len(targets)}; active={active}; empty={empty}; "
                 f"unsupported={unsupported}; layout_issues={len(issues)}"
             )
-        if targets and checkpoint is not None:
+        if discovery_only or (targets and checkpoint is not None):
             layout_graph = self._run_algorithm(
                 targets,
                 discovery_only=True,
@@ -179,7 +186,15 @@ class ServiceMapBuilder:
                 layout_graph = layout_graph.model_copy(
                     update={"issues": [*layout_graph.issues, *issues]}
                 )
-            layout_result = self.from_graph(layout_graph, repositories)
+            layout_result = self.from_graph(self._stamp_algorithm(layout_graph), repositories)
+            if discovery_only:
+                if progress is not None:
+                    progress(
+                        f"Discovery ready: services={len(layout_result.service_map.services)}; "
+                        "source analysis skipped"
+                    )
+                return layout_result
+            assert checkpoint is not None
             checkpoint(layout_result)
 
         def publish_scan_checkpoint(snapshot: GraphSnapshot) -> None:
