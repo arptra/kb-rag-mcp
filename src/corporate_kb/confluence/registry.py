@@ -623,6 +623,8 @@ class ConfluenceRegistry:
             "reused",
             "published",
             "index_stage",
+            "provider",
+            "elapsed_seconds",
             "phase",
             "attempts",
             "error_type",

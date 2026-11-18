@@ -44,6 +44,26 @@ class IndexBuildTimedOut(RuntimeError):
     """Raised when a RAG index build exceeds its hard deadline."""
 
 
+class _ProgressReporter:
+    """Bound progress I/O while preserving phase boundaries and final counters."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._last_stage: object = None
+        self._last_reported = float("-inf")
+
+    def __call__(self, event: dict[str, object]) -> None:
+        now = time.monotonic()
+        stage = event.get("stage")
+        final = event.get("total") is not None and event.get("completed") == event["total"]
+        if stage == self._last_stage and not final and now - self._last_reported < 0.5:
+            return
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+            handle.flush()
+        self._last_stage, self._last_reported = stage, now
+
+
 class _StagedCacheManager(CacheManager):
     """Read reusable embeddings from the live cache and write only to staging."""
 
@@ -90,11 +110,7 @@ def _build_worker(settings: Settings, staged_dir: Path, error_path: Path) -> Non
             cache=_StagedCacheManager(live_cache_dir, staged_dir),
         )
 
-        def report(event: dict[str, object]) -> None:
-            with error_path.with_name("progress.jsonl").open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-                handle.flush()
-
+        report = _ProgressReporter(error_path.with_name("progress.jsonl"))
         service.build_index(force=True, reuse_unchanged=True, progress=report)
     except BaseException:
         error_path.write_text(traceback.format_exc(), encoding="utf-8")

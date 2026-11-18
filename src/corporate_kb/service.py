@@ -373,7 +373,9 @@ class KnowledgeService:
         if self._progress is not None:
             self._progress({"stage": stage, "at": datetime.now(UTC).isoformat(), **details})
 
-    def _embed_checkpoint_batch(self, chunks: list[Chunk], *, reuse: bool = True) -> np.ndarray:
+    def _embed_checkpoint_batch(
+        self, chunks: list[Chunk], *, reuse: bool = True
+    ) -> tuple[np.ndarray, int, int]:
         identity = self.provider.cache_identity
         cached = (
             self.history.cached_embeddings(
@@ -397,8 +399,16 @@ class KnowledgeService:
             for vector, (_, positions) in zip(fresh, missing.values(), strict=True):
                 for position in positions:
                     matrix[position] = vector
-        self.history.save_embeddings(identity, chunks, matrix, link_chunks=False)
-        return matrix
+            # Existing validated vectors are already durable. Rewriting them makes
+            # a warm rebuild write the whole corpus again, including legacy FK checks.
+            self.history.save_embeddings(
+                identity,
+                [chunks[positions[0]] for _, positions in missing.values()],
+                fresh,
+                link_chunks=False,
+            )
+        computed = sum(len(positions) for _, positions in missing.values())
+        return matrix, len(chunks) - computed, computed
 
     def _reuse_prepared_embeddings(self) -> None:
         """Seed missing vectors from an installed cache only during a rebuild.
@@ -469,7 +479,23 @@ class KnowledgeService:
             len(documents),
             time.perf_counter() - chunk_started,
         )
-        self._report("embedding", total=len(chunks), completed=0)
+        embedding_started = time.perf_counter()
+        self._report(
+            "embedding",
+            total=len(chunks),
+            completed=0,
+            reused=0,
+            computed=0,
+            provider=self.provider.provider_name,
+        )
+        logger.info(
+            "Embedding knowledge chunks: provider=%s model=%s dimension=%d chunks=%d reuse=%s",
+            self.provider.provider_name,
+            self.provider.model_name,
+            self.provider.dimension,
+            len(chunks),
+            reuse_cache,
+        )
         self.cache.cache_dir.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
             prefix=".embedding-build-", dir=self.cache.cache_dir.parent
@@ -486,12 +512,37 @@ class KnowledgeService:
             )
             try:
                 batch_size = getattr(self.settings, "embedding_checkpoint_batch_size", 32)
+                reused = computed = 0
+                last_embedding_log = embedding_started
                 for offset in range(0, len(chunks), batch_size):
                     batch = chunks[offset : offset + batch_size]
-                    embeddings[offset : offset + len(batch)] = self._embed_checkpoint_batch(
+                    batch_matrix, batch_reused, batch_computed = self._embed_checkpoint_batch(
                         batch, reuse=reuse_cache
                     )
-                    self._report("embedding", total=len(chunks), completed=offset + len(batch))
+                    embeddings[offset : offset + len(batch)] = batch_matrix
+                    reused += batch_reused
+                    computed += batch_computed
+                    completed = offset + len(batch)
+                    now = time.perf_counter()
+                    self._report(
+                        "embedding",
+                        total=len(chunks),
+                        completed=completed,
+                        reused=reused,
+                        computed=computed,
+                        provider=self.provider.provider_name,
+                        elapsed_seconds=round(now - embedding_started, 3),
+                    )
+                    if now - last_embedding_log >= 10 or completed == len(chunks):
+                        logger.info(
+                            "Embedded knowledge chunks: %d/%d reused=%d computed=%d seconds=%.3f",
+                            completed,
+                            len(chunks),
+                            reused,
+                            computed,
+                            now - embedding_started,
+                        )
+                        last_embedding_log = now
                 indexed_at = datetime.now(UTC)
                 manifest = CacheManifest(
                     cache_schema_version=CACHE_SCHEMA_VERSION,

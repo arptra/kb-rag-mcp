@@ -148,6 +148,7 @@ class HistoryStore:
                     embedding_key TEXT NOT NULL REFERENCES embeddings(key),
                     PRIMARY KEY(chunk_id, identity)
                 );
+                CREATE INDEX IF NOT EXISTS chunk_embeddings_key ON chunk_embeddings(embedding_key);
             """
             for statement in schema.split(";"):
                 if statement.strip():
@@ -536,14 +537,26 @@ class HistoryStore:
         self, identity: str, texts: list[str], dimension: int
     ) -> dict[str, NDArray[np.float32]]:
         found: dict[str, NDArray[np.float32]] = {}
+        keys = list(dict.fromkeys(embedding_key(identity, text) for text in texts))
+        if not keys:
+            return found
         with self._db() as db:
-            for text in texts:
-                key = embedding_key(identity, text)
-                row = db.execute(
-                    "SELECT dimension,vector FROM embeddings WHERE key=?", (key,)
-                ).fetchone()
-                if row and row[0] == dimension:
-                    vector = np.frombuffer(row[1], dtype=np.float32)
+            # Stay below SQLite's legacy 999-variable limit, including callers that
+            # use a larger checkpoint batch. Duplicate texts share one stored vector.
+            for offset in range(0, len(keys), 500):
+                batch = keys[offset : offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = db.execute(
+                    f"SELECT key,dimension,vector FROM embeddings WHERE key IN ({placeholders})",
+                    batch,
+                )
+                for key, stored_dimension, payload in rows:
+                    if stored_dimension != dimension:
+                        continue
+                    try:
+                        vector = np.frombuffer(payload, dtype=np.float32)
+                    except (TypeError, ValueError):
+                        continue
                     if vector.shape == (dimension,) and np.isfinite(vector).all():
                         found[key] = vector
         return found
@@ -562,7 +575,9 @@ class HistoryStore:
             for chunk, vector in zip(chunks, matrix, strict=True):
                 key = embedding_key(identity, chunk.embedding_text)
                 db.execute(
-                    "INSERT OR REPLACE INTO embeddings VALUES (?,?,?,?)",
+                    "INSERT INTO embeddings VALUES (?,?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET identity=excluded.identity, "
+                    "dimension=excluded.dimension, vector=excluded.vector",
                     (key, identity, len(vector), np.asarray(vector, dtype=np.float32).tobytes()),
                 )
                 if link_chunks:

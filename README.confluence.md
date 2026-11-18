@@ -108,6 +108,21 @@ synchronization runs a build before reporting publication complete. A publish fa
 keeps the source dirty so the next run retries publication without downloading unchanged
 pages again. The serving index is replaced only after its new generation is validated.
 
+The index build still reads and chunks the selected index's current documents and
+publishes a complete generation. Cached vectors are reused without rewriting them;
+only missing text embeddings are calculated and checkpointed. Existing legacy vector
+links receive an index automatically, and vector updates preserve their parent rows.
+No re-download or deletion of existing state is needed for this optimization.
+
+During indexing, the job and backend log expose `index_stage`, `provider`, `completed`,
+`total`, `reused`, `computed` and `elapsed_seconds` when available. For embedding batches,
+`reused + computed = completed`; duplicated text in one batch is computed once.
+With `provider=hash`, embeddings are calculated locally; this avoids neural-model
+inference but still requires tokenization, hashing, reading and publishing the index.
+Repeated progress events are emitted at most twice a second; stage transitions and
+final counters are delivered immediately. This avoids a database commit for every
+document on fast builds while preserving progress reporting and worker cancellation.
+
 ## Current pages and images
 
 `source_updated_at` is the page's modification date from Confluence. The separate

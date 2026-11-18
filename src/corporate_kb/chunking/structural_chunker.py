@@ -100,19 +100,32 @@ class StructuralChunker:
         sentences = [item.strip() for item in _SENTENCE_BOUNDARY.split(block.text) if item.strip()]
         pieces: list[str] = []
         current: list[str] = []
+        # This regex tokenizer cannot join tokens across inserted whitespace.
+        # Custom counters (including subclasses) may use non-additive tokenization.
+        additive = type(self._counter) is SimpleTokenCounter
+        current_tokens = 0
         for sentence in sentences:
-            if self._counter.count(sentence) > self.hard_max_tokens:
+            sentence_tokens = self._counter.count(sentence)
+            if sentence_tokens > self.hard_max_tokens:
                 if current:
                     pieces.append(" ".join(current))
                     current = []
+                    current_tokens = 0
                 pieces.extend(self._split_by_words(sentence))
                 continue
-            candidate = " ".join([*current, sentence])
-            if current and self._counter.count(candidate) > self.hard_max_tokens:
+            if additive:
+                candidate_tokens = current_tokens + sentence_tokens
+            else:
+                candidate_tokens = (
+                    self._counter.count(" ".join([*current, sentence])) if current else 0
+                )
+            if current and candidate_tokens > self.hard_max_tokens:
                 pieces.append(" ".join(current))
                 current = [sentence]
+                current_tokens = sentence_tokens
             else:
                 current.append(sentence)
+                current_tokens = candidate_tokens
         if current:
             pieces.append(" ".join(current))
         return [
@@ -125,13 +138,24 @@ class StructuralChunker:
             return []
         pieces: list[str] = []
         current: list[str] = []
+        additive = type(self._counter) is SimpleTokenCounter
+        current_tokens = 0
         for word in words:
-            candidate = " ".join([*current, word])
-            if current and self._counter.count(candidate) > self.hard_max_tokens:
+            if additive:
+                word_tokens = self._counter.count(word)
+                candidate_tokens = current_tokens + word_tokens
+            else:
+                word_tokens = 0
+                candidate_tokens = (
+                    self._counter.count(" ".join([*current, word])) if current else 0
+                )
+            if current and candidate_tokens > self.hard_max_tokens:
                 pieces.append(" ".join(current))
                 current = [word]
+                current_tokens = word_tokens
             else:
                 current.append(word)
+                current_tokens = candidate_tokens
         if current:
             pieces.append(" ".join(current))
         return pieces
