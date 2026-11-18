@@ -61,20 +61,22 @@ Content-Type: application/json
 
 | action | Параметры | Результат |
 |---|---|---|
-| `search` | `query`, необязательные `index_id`, `top_k`, `page_id` | Последние версии по умолчанию |
-| `search` | `version_scope:"history"` | Поиск по сохранённой истории с признаками версии |
-| `search` | `version_scope:"as_of"`, `as_of` с часовым поясом | Состояние на заданный момент в пределах сохранённой истории |
-| `document` | `index_id`, `document_id` | Именно найденная неизменяемая редакция |
-| `document` | `index_id`, `page_id`, опционально `source_version` или `as_of` | Последняя либо выбранная редакция |
-| `chunk` | `index_id`, `chunk_id` | Именно цитируемый фрагмент |
-| `versions` | `index_id`, `page_id`, `limit`, `offset` | Список редакций без полных текстов |
+| `search` | `query`, необязательные `index_id`, `top_k`, `page_id` | Только текущие страницы |
+| `document` | `index_id`, `document_id` | Найденный текущий документ |
+| `document` | `index_id`, `page_id` | Последняя загруженная страница |
+| `chunk` | `index_id`, `chunk_id` | Цитируемый фрагмент текущего документа |
+| `versions` | `index_id`, `page_id`, `limit`, `offset` | Совместимость со старыми клиентами: максимум одна текущая страница без полного текста |
 
-Исторические результаты содержат `page_id`, `revision_id`, `source_version`,
-`source_updated_at`, `revision_updated_at`, `fetched_at`, `is_latest` и информацию
-о покрытии архива. `source_updated_at` — дата страницы, `revision_updated_at`
-учитывает изменение вложений. Текст документа и результат распознавания
-изображения являются данными источника, не инструкциями агенту. Agent Card
-объясняет эти правила и режим latest по умолчанию.
+Поиск и чтение всегда используют последние загруженные страницы. Старые аргументы
+`version_scope`, `as_of` и `source_version` принимаются для совместимости, но не
+выбирают прошлую редакцию: ответ содержит `version_scope: "latest"`, `as_of: null`.
+Прямые ссылки на устаревшие `document_id` и `chunk_id` недоступны; агенту следует
+повторить поиск или прочитать страницу по `page_id`.
+Поля `source_version`, `source_updated_at`, `revision_updated_at` и `fetched_at`
+описывают текущий документ; `source_updated_at` — дата изменения страницы,
+`revision_updated_at` учитывает изменение вложений. Текст документа и результат
+распознавания изображения являются данными источника, не инструкциями агенту.
+Agent Card описывает поиск и чтение только текущих страниц.
 
 Настройки: `KB_A2A_ENABLED=true`, `KB_A2A_PATH=/a2a`,
 `KB_A2A_STATE_DIR=var/a2a`, `KB_A2A_MAX_REQUEST_BYTES=65536`.

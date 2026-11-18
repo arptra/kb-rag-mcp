@@ -1,7 +1,7 @@
-"""Durable, immutable document revisions and resumable embedding checkpoints.
+"""Resumable embedding checkpoints and compatibility with legacy revision archives.
 
-The SQLite archive is deliberately outside the disposable serving cache. Historical
-search streams bounded batches from disk instead of loading every old revision in RAM.
+Serving uses only the current index. Legacy archive helpers remain for reading old
+storage formats; normal indexing writes embedding vectors without capturing revisions.
 """
 
 from __future__ import annotations
@@ -271,9 +271,7 @@ class HistoryStore:
         )
         keys = [embedding_key(identity, chunk.embedding_text) for chunk in chunks]
         existing_dimensions = dict(
-            db.execute(
-                f"SELECT key,dimension FROM embeddings WHERE key IN ({placeholders})", keys
-            )
+            db.execute(f"SELECT key,dimension FROM embeddings WHERE key IN ({placeholders})", keys)
         )
         dimension = matrix.shape[1]
         for chunk, key, vector in zip(chunks, keys, matrix, strict=True):
@@ -551,7 +549,12 @@ class HistoryStore:
         return found
 
     def save_embeddings(
-        self, identity: str, chunks: list[Chunk], matrix: NDArray[np.float32]
+        self,
+        identity: str,
+        chunks: list[Chunk],
+        matrix: NDArray[np.float32],
+        *,
+        link_chunks: bool = True,
     ) -> None:
         if matrix.ndim != 2 or matrix.shape[0] != len(chunks) or not np.isfinite(matrix).all():
             raise ValueError("Invalid embedding checkpoint")
@@ -562,10 +565,11 @@ class HistoryStore:
                     "INSERT OR REPLACE INTO embeddings VALUES (?,?,?,?)",
                     (key, identity, len(vector), np.asarray(vector, dtype=np.float32).tobytes()),
                 )
-                db.execute(
-                    "INSERT OR REPLACE INTO chunk_embeddings VALUES (?,?,?)",
-                    (chunk.chunk_id, identity, key),
-                )
+                if link_chunks:
+                    db.execute(
+                        "INSERT OR REPLACE INTO chunk_embeddings VALUES (?,?,?)",
+                        (chunk.chunk_id, identity, key),
+                    )
 
     def search(
         self,

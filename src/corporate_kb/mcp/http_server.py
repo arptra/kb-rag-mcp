@@ -438,9 +438,6 @@ def create_http_server(
             publish=lambda index_id, **kwargs: catalog._rebuild_index(
                 index_id, kwargs.get("cancel"), progress=kwargs.get("progress")
             ),
-            archive_document=lambda index_id, document: catalog.service_for(
-                index_id
-            ).archive_document(document, make_current=False),
             page_visibility=lambda index_id, page_id, visible: catalog.service_for(
                 index_id
             ).set_page_visibility(page_id, visible),
@@ -822,8 +819,6 @@ def create_http_server(
                 document = await asyncio.to_thread(
                     catalog.service_for(index_id).read_page,
                     page_id,
-                    source_version=_optional_query(request, "source_version"),
-                    as_of=_optional_query(request, "as_of"),
                 )
                 document_id = document.document_id
             payload = await asyncio.to_thread(
@@ -850,17 +845,18 @@ def create_http_server(
                 raise ValueError("index_id and page_id are required")
             offset = _integer_query(request, "offset", 0, minimum=0, maximum=10000000)
             limit = _integer_query(request, "limit", 50, minimum=1, maximum=100)
-            versions = await asyncio.to_thread(
-                catalog.service_for(index_id).history.list_versions,
-                page_id,
-                limit=limit,
-                offset=offset,
-            )
+            # Keep the old URL usable for clients that have not refreshed yet.
+            # Historical selectors no longer expose older document contents.
+            document = await asyncio.to_thread(catalog.service_for(index_id).read_page, page_id)
+            versions = [document] if offset == 0 else []
             return JSONResponse(
                 {
                     "page_id": page_id,
                     "offset": offset,
                     "limit": limit,
+                    "total": 1,
+                    "has_more": False,
+                    "latest_only": True,
                     "versions": [
                         doc.model_dump(mode="json", exclude={"content", "metadata"})
                         for doc in versions

@@ -25,6 +25,7 @@ class RetryClient:
         self.summary_calls = []
         self.failures = Counter()
         self.history_failures = set()
+        self.history_calls = []
         self.attachment_failures = set()
         self.discovery_calls = 0
         self.discovery_error = False
@@ -67,6 +68,7 @@ class RetryClient:
         return []
 
     def versions(self, page_id):
+        self.history_calls.append(page_id)
         if page_id in self.history_failures:
             raise ConfluenceError("Version listing unavailable", status_code=404)
         return list(range(self.version, 0, -1))
@@ -178,7 +180,7 @@ def test_persistent_page_failure_is_reported_after_three_attempts_without_leakin
     assert published == ["target"]
 
 
-def test_history_404_keeps_latest_page_and_other_pages_are_published(tmp_path):
+def test_unavailable_history_is_never_requested_and_latest_pages_are_published(tmp_path):
     client = RetryClient()
     client.version = 2
     client.history_failures.add("1")
@@ -187,17 +189,15 @@ def test_history_404_keeps_latest_page_and_other_pages_are_published(tmp_path):
 
     completed = synchronize(instance, source)
 
-    assert completed["status"] == "completed_with_warnings"
+    assert completed["status"] == "completed"
     pages = {page["page_id"]: page for page in instance.source_pages(source["id"])}
     assert set(pages) == {"1", "2", "3"}
     assert all(page["state"] == "current" and page["version"] == 2 for page in pages.values())
     assert "revision 2" in instance._current_path("target", source["id"], "1").read_text()
     assert all(is_visible for _, _, is_visible in visibility)
-    failures = instance.job_failures(completed["id"])["items"]
-    assert len(failures) == 1
-    assert failures[0]["page_id"] == "1" and failures[0]["status_code"] == 404
-    assert failures[0]["stage"] == "history" and failures[0]["attempts"] == 3
-    assert completed["result"]["failed_pages"] == 1
+    assert client.history_calls == []
+    assert instance.job_failures(completed["id"])["items"] == []
+    assert completed["result"]["failed_pages"] == 0
     assert published == ["target"]
 
 
@@ -369,25 +369,23 @@ def test_shutdown_during_final_deferred_attempt_retains_remaining_attempt(tmp_pa
     assert published == ["target"]
 
 
-def test_partial_history_progress_is_published_when_latest_page_is_unchanged(tmp_path):
-    class PartialHistoryClient(RetryClient):
+def test_legacy_history_flag_does_not_republish_unchanged_pages(tmp_path):
+    class HistoryRejectingClient(RetryClient):
         def __init__(self):
             super().__init__()
             self.historical_calls = []
 
         def versions(self, page_id):
-            return [3, 2, 1] if page_id == "1" else [3]
+            self.history_calls.append(page_id)
+            raise ConfluenceError("Historical API must not be called", status_code=503)
 
         def page(self, page_id, *, body=True, version=None):
             if version is not None:
                 self.historical_calls.append((page_id, version))
-                if page_id == "1" and version == 1:
-                    raise ConfluenceError(
-                        "Historical revision temporarily unavailable", status_code=503
-                    )
+                raise ConfluenceError("Historical revision must not be called", status_code=503)
             return super().page(page_id, body=body, version=version)
 
-    client = PartialHistoryClient()
+    client = HistoryRejectingClient()
     client.version = 3
     instance, published, visibility = make_registry(tmp_path, client)
     source = add_source(instance)
@@ -398,19 +396,16 @@ def test_partial_history_progress_is_published_when_latest_page_is_unchanged(tmp
 
     completed = synchronize(instance, source)
 
-    assert completed["status"] == "completed_with_warnings"
+    assert completed["status"] == "completed"
     assert completed["result"]["changed"] == 0
-    assert completed["result"]["archived_versions"] == 1
-    assert client.historical_calls.count(("1", 2)) == 1
-    assert client.historical_calls.count(("1", 1)) == 3
-    assert instance.get_source(source["id"])["revision_count"] == 4
+    assert completed["result"]["archived_versions"] == 0
+    assert client.historical_calls == client.history_calls == []
+    assert instance.get_source(source["id"])["revision_count"] == 0
     assert instance._current_path("target", source["id"], "1").read_bytes() == original
     assert all(page["state"] == "current" for page in instance.source_pages(source["id"]))
     assert all(is_visible for _, _, is_visible in visibility)
-    failures = instance.job_failures(completed["id"])["items"]
-    assert len(failures) == 1 and failures[0]["stage"] == "history"
-    assert failures[0]["status_code"] == 503 and failures[0]["attempts"] == 3
-    assert published == ["target", "target"]
+    assert instance.job_failures(completed["id"])["items"] == []
+    assert published == ["target"]
 
 
 def test_partial_legacy_discovery_processes_found_pages_and_preserves_old_pages(tmp_path):

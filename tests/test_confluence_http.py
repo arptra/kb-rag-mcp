@@ -198,7 +198,7 @@ async def test_connection_factory_failure_is_sanitized_and_logged(settings_facto
 
 
 @pytest.mark.asyncio
-async def test_confluence_http_to_history_and_published_index(settings_factory):
+async def test_confluence_http_updates_only_current_published_pages(settings_factory):
     settings = settings_factory()
     settings.knowledge_dir.mkdir(parents=True)
     (settings.knowledge_dir / "existing.md").write_text("# Existing\n\nPreserved knowledge.")
@@ -251,16 +251,18 @@ async def test_confluence_http_to_history_and_published_index(settings_factory):
                 params={"index_id": "default", "page_id": latest.page_id},
             )
         ).json()["versions"]
-        assert len(versions) == 2
-        assert versions[0]["is_latest"] is True and versions[1]["is_latest"] is False
-        old = (
-            await client.get(
-                "/admin/api/indexes/document",
-                params={"index_id": "default", "document_id": latest.document_id},
-            )
-        ).json()
-        assert old["source_version"] == "1" and old["is_latest"] is False
-        assert "100" in old["content"]
+        assert len(versions) == 1
+        assert versions[0]["is_latest"] is True and versions[0]["source_version"] == "2"
+        old = await client.get(
+            "/admin/api/indexes/document",
+            params={"index_id": "default", "document_id": latest.document_id},
+        )
+        assert old.status_code == 404
+        legacy_selector = await client.get(
+            "/admin/api/indexes/document",
+            params={"index_id": "default", "page_id": latest.page_id, "source_version": "1"},
+        )
+        assert legacy_selector.json()["source_version"] == "2"
         logs = (await client.get(f"/admin/api/confluence/jobs/{second['id']}/log")).json()
         assert any(item["stage"] == "indexing" for item in logs["items"])
         assert all("secret-do-not-return" not in str(item) for item in logs["items"])

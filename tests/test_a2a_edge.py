@@ -194,7 +194,7 @@ def test_database_failure_still_releases_capacity(setup_agent, monkeypatch):
         {"action": []},
         {"action": "search", "query": "x", "version_scope": []},
         {"action": "search", "query": "x", "page_id": {"nested": "x"}},
-        {"action": "search", "query": "x", "version_scope": "as_of", "as_of": "2025-01-01"},
+        {"action": "search", "query": "x", "as_of": {"invalid": "type"}},
         {"action": "search", "query": "x", "updated_from": "invalid"},
         {
             "action": "search",
@@ -206,12 +206,6 @@ def test_database_failure_still_releases_capacity(setup_agent, monkeypatch):
         {"action": "document", "page_id": "p", "max_tokens": True},
         {"action": "document", "page_id": "p", "max_tokens": -1},
         {"action": "document", "page_id": "p", "document_id": "d"},
-        {
-            "action": "document",
-            "page_id": "p",
-            "source_version": "1",
-            "as_of": "2025-01-01T00:00:00Z",
-        },
     ],
 )
 def test_malformed_commands_are_rejected_before_creating_task(setup_agent, command):
@@ -247,7 +241,8 @@ def test_list_tasks_rejects_ambiguous_values(setup_agent, params):
         service.dispatch(agent, "ListTasks", params)
 
 
-def test_versions_exclude_large_asset_metadata(setup_agent):
+@pytest.mark.parametrize("offset", [0, 1])
+def test_versions_return_only_current_page_without_large_asset_metadata(setup_agent, offset):
     _, service, agent = setup_agent
 
     class Version:
@@ -263,11 +258,40 @@ def test_versions_exclude_large_asset_metadata(setup_agent):
                 if key not in exclude
             }
 
-    service.catalog.service_for = lambda index: SimpleNamespace(
-        history=SimpleNamespace(list_versions=lambda *args, **kwargs: [Version()])
+    service.catalog.service_for = lambda index: SimpleNamespace(read_page=lambda page_id: Version())
+    result = A2AService.retrieve(
+        service, agent, {"action": "versions", "page_id": "page", "offset": offset}
     )
-    result = A2AService.retrieve(service, agent, {"action": "versions", "page_id": "page"})
-    assert result["indexes"][0]["versions"] == [{"page_id": "page", "source_version": "7"}]
+    assert result["version_scope"] == "latest"
+    assert result["as_of"] is None
+    assert result["indexes"][0]["versions"] == (
+        [{"page_id": "page", "source_version": "7"}] if offset == 0 else []
+    )
+
+
+@pytest.mark.parametrize(
+    "selectors",
+    [
+        {"version_scope": "history"},
+        {"version_scope": "as_of"},
+        {"version_scope": "as_of", "as_of": "2025-01-01"},
+        {"source_version": "1", "as_of": "2025-01-01T00:00:00Z"},
+    ],
+)
+def test_legacy_selectors_are_accepted_as_compatibility_arguments(setup_agent, selectors):
+    _, service, agent = setup_agent
+    assert service.validate_command(
+        agent, {"action": "search", "query": "limits", **selectors}
+    ) == ["allowed"]
+
+
+def test_agent_card_advertises_current_pages_only(setup_agent):
+    _, service, _ = setup_agent
+    card = service.card("http://test/a2a")
+    assert "current" in card["description"]
+    assert all(
+        "history" not in str(skill) and "as_of" not in str(skill) for skill in card["skills"]
+    )
 
 
 def test_agent_index_scope_requires_an_array(tmp_path):

@@ -523,6 +523,69 @@ async def test_admin_browses_and_uploads_documents_to_selected_index(settings_fa
 
 
 @pytest.mark.asyncio
+async def test_admin_document_routes_expose_only_current_content(settings_factory) -> None:
+    service, settings = _indexed_service(settings_factory)
+    old_document = service.list_documents()[0]
+    # Existing installations may still have archived revisions on disk.
+    service.history.archive_document(old_document)
+    current_content = "# Limits\n\nUpdated current daily limit policy."
+    (settings.knowledge_dir / "limits.md").write_text(current_content, encoding="utf-8")
+    service.build_index(force=True)
+    current_document = service.list_documents()[0]
+    assert old_document.document_id != current_document.document_id
+    app = create_http_app(service, settings)
+    transport = httpx.ASGITransport(app=app)
+    headers = {"X-KB-Admin-Password": ADMIN_PASSWORD}
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
+    ):
+        selectors = {
+            "index_id": "default",
+            "page_id": current_document.page_id,
+            "source_version": "1",
+            "as_of": "2000-01-01T00:00:00Z",
+        }
+        detail = await client.get("/admin/api/indexes/document", headers=headers, params=selectors)
+        assert detail.status_code == 200
+        assert detail.json()["content"] == current_content
+        assert detail.json()["document_id"] == current_document.document_id
+
+        versions = await client.get(
+            "/admin/api/indexes/document/versions", headers=headers, params=selectors
+        )
+        assert versions.status_code == 200
+        assert versions.json()["latest_only"] is True
+        assert versions.json()["total"] == 1
+        assert versions.json()["has_more"] is False
+        assert [item["document_id"] for item in versions.json()["versions"]] == [
+            current_document.document_id
+        ]
+        assert "content" not in versions.json()["versions"][0]
+
+        next_page = await client.get(
+            "/admin/api/indexes/document/versions",
+            headers=headers,
+            params={**selectors, "offset": 1},
+        )
+        assert next_page.status_code == 200
+        assert next_page.json()["versions"] == []
+        assert next_page.json()["total"] == 1
+
+        historical_reference = await client.get(
+            "/admin/api/indexes/document",
+            headers=headers,
+            params={"index_id": "default", "document_id": old_document.document_id},
+        )
+        assert historical_reference.status_code == 404
+
+        for endpoint in ("/document", "/document/versions"):
+            denied = await client.get(f"/admin/api/indexes{endpoint}", params=selectors)
+            assert denied.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_admin_registers_checks_and_deletes_external_mcp_servers(
     settings_factory,
     monkeypatch,

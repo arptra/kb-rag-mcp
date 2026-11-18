@@ -114,12 +114,10 @@ class KnowledgeTools:
     ) -> dict[str, Any]:
         if bool(document_id) == bool(page_id):
             raise ValueError("Provide exactly one of document_id or page_id")
-        if document_id and (source_version is not None or as_of is not None):
-            raise ValueError("Version selectors require page_id")
         document = (
             self._service.get_document(document_id)
             if document_id
-            else self._service.read_page(str(page_id), source_version=source_version, as_of=as_of)
+            else self._service.read_page(str(page_id))
         )
         if self._is_legacy_graph_item(document):
             raise KeyError(f"Unknown document: {document_id}")
@@ -189,8 +187,6 @@ class KnowledgeTools:
     ) -> dict[str, Any]:
         if version_scope not in {"latest", "history", "as_of"}:
             raise ValueError("version_scope must be latest, history or as_of")
-        if (version_scope == "as_of") != (as_of is not None):
-            raise ValueError("as_of is required only for version_scope=as_of")
         if not 1 <= top_k <= 20:
             raise ValueError("top_k must be between 1 and 20")
         start, end = utc_datetime(updated_from), utc_datetime(updated_to)
@@ -198,8 +194,7 @@ class KnowledgeTools:
             raise ValueError("updated_from must not exceed updated_to")
         filters = SearchFilters(
             page_id=page_id,
-            version_scope=version_scope,
-            as_of=utc_datetime(as_of),
+            version_scope="latest",
             updated_from=start,
             updated_to=end,
             service=service,
@@ -216,33 +211,28 @@ class KnowledgeTools:
             min_score=min_score,
         )
         results = [item for item in results if not self._is_legacy_graph_item(item)]
-        if version_scope == "history":
-            results.sort(key=lambda item: (not item.is_latest, -item.score, item.chunk_id))
         packed, token_count = self._pack_search_results(
             query=query, results=results, requested_top_k=top_k
         )
-        current_references = (
-            self._service.history.latest_references(
-                [item["page_id"] for item in packed if item.get("page_id")]
-            )
-            if version_scope != "latest"
-            else {}
-        )
         for rank, item in enumerate(packed, 1):
             item["rank"] = rank
-            if version_scope != "latest" and not item["is_latest"]:
-                item["latest_revision"] = current_references.get(item["page_id"])
         payload = {
             "query": query,
-            "version_scope": version_scope,
-            "as_of": as_of,
+            "version_scope": "latest",
+            "as_of": None,
             "result_count": len(packed),
             "retrieved_candidate_count": len(results),
             "context_token_count": token_count,
             "results": packed,
-            "coverage": self._service.history.coverage(
-                page_id, identity=self._service.provider.cache_identity
-            ),
+            "coverage": {
+                "enabled": False,
+                "known_since": None,
+                "revision_count": 0,
+                "has_baseline": False,
+                "complete": False,
+                "pending_chunks": 0,
+                "note": "Only current indexed pages are available.",
+            },
         }
         self.usage.record(
             "kb_search_versions", context_tokens=token_count, result_count=len(packed)

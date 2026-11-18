@@ -70,6 +70,12 @@ class SourceConfig(BaseModel):
     max_pages: int = Field(default=50000, ge=1, le=500000)
     max_attachment_bytes: int = Field(default=25_000_000, ge=1, le=100_000_000)
 
+    @field_validator("include_history")
+    @classmethod
+    def disable_legacy_history(cls, value: bool) -> bool:
+        # Accept saved configurations and old clients without requesting old versions.
+        return False
+
     @property
     def effective_cloud(self) -> bool:
         return self.deployment == "cloud" or (

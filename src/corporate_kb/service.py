@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import sqlite3
 import sys
 import tempfile
 import threading
@@ -109,9 +108,7 @@ class KnowledgeService:
                     embedding_cache_identity=self.provider.cache_identity,
                     chunking=self.chunker.identity,
                 )
-                if cached is not None and not self.history.has_pending_chunks(
-                    self.provider.cache_identity
-                ):
+                if cached is not None:
                     self._stats = self._restore_cached_snapshot(cached)
                     logger.info(
                         "Loaded compatible knowledge index: documents=%d chunks=%d in %.3f seconds",
@@ -221,7 +218,11 @@ class KnowledgeService:
         started = time.perf_counter()
         query_vector = self.provider.embed_query(query)
         active_filters = (filters or SearchFilters()).model_copy(
-            update={"excluded_page_ids": self.history.hidden_page_ids()}
+            update={
+                "excluded_page_ids": self.history.hidden_page_ids(),
+                "version_scope": "latest",
+                "as_of": None,
+            }
         )
         effective_top_k = self.settings.default_top_k if top_k is None else top_k
         results = self.store.search(
@@ -241,23 +242,12 @@ class KnowledgeService:
     def search_versions(
         self, query: str, *, filters: SearchFilters, top_k: int = 3, min_score: float | None = None
     ) -> list[SearchResult]:
-        if filters.version_scope == "latest":
-            return self.search(query, filters=filters, top_k=top_k, min_score=min_score)
-        self.load_read_index()
-        if not query.strip():
-            raise ValueError("query must not be empty")
-        return self.history.search(
-            self.provider.embed_query(query),
-            identity=self.provider.cache_identity,
-            filters=filters,
-            top_k=top_k,
-            min_score=min_score,
-        )
+        """Compatibility entry point: all selectors now search the current index."""
+        return self.search(query, filters=filters, top_k=top_k, min_score=min_score)
 
     def archive_document(self, document: Document, *, make_current: bool = False) -> Document:
-        document = self.history.archive_document(document, make_current=make_current)
-        self.history.archive_chunks(self.chunker.chunk(document))
-        return document
+        """Legacy provider hook; new revisions are no longer archived."""
+        return normalize_document(document)
 
     def set_page_visibility(self, page_id: str, visible: bool) -> None:
         self.history.set_page_visibility(page_id, visible)
@@ -272,26 +262,27 @@ class KnowledgeService:
         self.load_read_index()
         if not self.history.is_visible(page_id):
             raise KeyError(f"Unknown page/version: {page_id}")
-        if source_version is None and as_of is None:
-            documents = self.store.list_documents(SearchFilters(page_id=page_id), limit=1)
-            if documents:
-                return documents[0]
-        document = self.history.read(page_id, source_version=source_version, as_of=as_of)
-        if document is None:
+        # Accept legacy selectors without using them to retrieve stale content.
+        documents = self.store.list_documents(SearchFilters(page_id=page_id), limit=1)
+        if not documents:
             raise KeyError(f"Unknown page/version: {page_id}")
-        return document
+        return documents[0]
 
     def get_document(self, document_id: str) -> Document:
         self.load_read_index()
-        document = self.store.get_document(document_id) or self.history.get_document(document_id)
-        if document is None or not self.history.is_visible(document.page_id):
+        document = self.store.get_document(document_id)
+        if (
+            document is None
+            or not document.is_latest
+            or not self.history.is_visible(document.page_id)
+        ):
             raise KeyError(f"Unknown document_id: {document_id}")
         return document
 
     def get_chunk(self, chunk_id: str) -> Chunk:
         self.load_read_index()
-        chunk = self.store.get_chunk(chunk_id) or self.history.get_chunk(chunk_id)
-        if chunk is None or not self.history.is_visible(chunk.page_id):
+        chunk = self.store.get_chunk(chunk_id)
+        if chunk is None or not chunk.is_latest or not self.history.is_visible(chunk.page_id):
             raise KeyError(f"Unknown chunk_id: {chunk_id}")
         return chunk
 
@@ -303,7 +294,11 @@ class KnowledgeService:
     ) -> list[Document]:
         self.load_read_index()
         active_filters = (filters or SearchFilters()).model_copy(
-            update={"excluded_page_ids": self.history.hidden_page_ids()}
+            update={
+                "excluded_page_ids": self.history.hidden_page_ids(),
+                "version_scope": "latest",
+                "as_of": None,
+            }
         )
         return self.store.list_documents(active_filters, limit=limit)
 
@@ -318,7 +313,11 @@ class KnowledgeService:
         self.load_read_index()
         return self.store.browse_documents(
             (filters or SearchFilters()).model_copy(
-                update={"excluded_page_ids": self.history.hidden_page_ids()}
+                update={
+                    "excluded_page_ids": self.history.hidden_page_ids(),
+                    "version_scope": "latest",
+                    "as_of": None,
+                }
             ),
             query=query,
             offset=offset,
@@ -398,8 +397,42 @@ class KnowledgeService:
             for vector, (_, positions) in zip(fresh, missing.values(), strict=True):
                 for position in positions:
                     matrix[position] = vector
-        self.history.save_embeddings(identity, chunks, matrix)
+        self.history.save_embeddings(identity, chunks, matrix, link_chunks=False)
         return matrix
+
+    def _reuse_prepared_embeddings(self) -> None:
+        """Seed missing vectors from an installed cache only during a rebuild.
+
+        Older installations may have a complete serving cache without the durable
+        vector cache. Reuse their work without restoring any document history.
+        """
+        cached = self.cache.load_compatible(
+            embedding_cache_identity=self.provider.cache_identity, chunking=self.chunker.identity
+        )
+        if cached is None:
+            return
+        identity = self.provider.cache_identity
+        batch_size = getattr(self.settings, "embedding_checkpoint_batch_size", 32)
+        for offset in range(0, len(cached.chunks), batch_size):
+            batch = cached.chunks[offset : offset + batch_size]
+            existing = self.history.cached_embeddings(
+                identity, [chunk.embedding_text for chunk in batch], self.provider.dimension
+            )
+            missing = [
+                i
+                for i, chunk in enumerate(batch)
+                if embedding_key(identity, chunk.embedding_text) not in existing
+            ]
+            if missing:
+                self.history.save_embeddings(
+                    identity,
+                    [batch[i] for i in missing],
+                    cached.embeddings[[offset + i for i in missing]],
+                    link_chunks=False,
+                )
+            self._report(
+                "checkpoint_reuse", completed=offset + len(batch), total=len(cached.chunks)
+            )
 
     def _build_index_locked(
         self,
@@ -410,33 +443,19 @@ class KnowledgeService:
         reuse_cache: bool,
     ) -> IndexStats:
         """Build an index from already-loaded documents while the service lock is held."""
+        if reuse_cache:
+            self._reuse_prepared_embeddings()
         chunk_started = time.perf_counter()
         chunks: list[Chunk] = []
         progress_step = max(100, len(documents) // 20 or 1)
-        # Migrate the last legacy snapshot before a rebuild discards its exact IDs.
-        previous = self.cache.load_snapshot()
-        if previous is not None:
-            self._archive_cached_snapshot(previous)
-        del previous
-        # Exports can contain multiple files for one logical page. Preserve every
-        # captured revision, but publish exactly one current document per page.
-        latest: dict[str, Document] = {}
-        prepared_chunks: dict[str, list[Chunk]] = {}
-        for position, document in enumerate(documents, start=1):
-            normalized = self.history.archive_document(document)
-            document_chunks = self.chunker.chunk(normalized)
-            self.history.archive_chunks(document_chunks)
-            key = normalized.page_id or normalized.source_id
-            old = latest.get(key)
-            if old is None or self._revision_order(normalized) > self._revision_order(old):
-                latest[key] = normalized
-                prepared_chunks[key] = document_chunks
-            self._report("chunking", total=len(documents), completed=position)
-        documents = sorted(latest.values(), key=lambda item: item.source_path)
+        # Exports can contain several versions of a page. Select the latest before
+        # chunking or embedding so obsolete exports never consume index work.
+        documents = self._latest_documents(documents)
         for position, document in enumerate(documents, start=1):
             documents[position - 1] = document.model_copy(update={"is_latest": True})
-            document_chunks = prepared_chunks[document.page_id or document.source_id]
+            document_chunks = self.chunker.chunk(documents[position - 1])
             chunks.extend(document_chunks)
+            self._report("chunking", total=len(documents), completed=position)
             if position == 1 or position % progress_step == 0 or position == len(documents):
                 logger.info(
                     "Chunked knowledge documents: %d/%d (chunks=%d)",
@@ -473,14 +492,6 @@ class KnowledgeService:
                         batch, reuse=reuse_cache
                     )
                     self._report("embedding", total=len(chunks), completed=offset + len(batch))
-                # Historical backfill can be large: retain only one bounded batch in memory.
-                archived_completed = 0
-                for batch in self.history.pending_chunks(
-                    self.provider.cache_identity, batch_size=batch_size
-                ):
-                    self._embed_checkpoint_batch(batch)
-                    archived_completed += len(batch)
-                    self._report("history_embedding", completed=archived_completed)
                 indexed_at = datetime.now(UTC)
                 manifest = CacheManifest(
                     cache_schema_version=CACHE_SCHEMA_VERSION,
@@ -509,8 +520,6 @@ class KnowledgeService:
                 logger.info(
                     "Saved knowledge cache in %.3f seconds", time.perf_counter() - cache_started
                 )
-                if not getattr(self.cache, "defer_history_activation", False):
-                    self.history.activate(documents)
                 serving_matrix = np.load(
                     self.cache.embeddings_path, mmap_mode="r", allow_pickle=False
                 )
@@ -547,72 +556,36 @@ class KnowledgeService:
             len(cached.documents),
             len(cached.chunks),
         )
-        self.store.replace_index(cached.documents, cached.chunks, cached.embeddings)
-        self._archive_cached_snapshot(cached)
-        logger.info("Activating current document revisions: documents=%d", len(cached.documents))
-        self.history.activate(cached.documents)
-        return self._stats_from_cache(cached.manifest)
-
-    def _archive_cached_snapshot(self, cached: CachedIndex) -> None:
-        logger.info("Checking cached snapshot in document history: %s", self.history.path)
-        if self.history.contains_documents(
-            [item.document_id for item in cached.documents]
-        ) and self.history.contains_chunk_embeddings(
-            [item.chunk_id for item in cached.chunks], cached.manifest.embedding_cache_identity
-        ):
-            logger.info("Document history already contains this cached snapshot; import skipped")
-            return
-        started = time.perf_counter()
-        last_logged = started
-        logger.info(
-            "Importing cached snapshot into history: documents=%d chunks=%d. "
-            "Reusing cached vectors without model inference; committed batches survive restart.",
-            len(cached.documents),
-            len(cached.chunks),
+        documents = self._latest_documents(cached.documents)
+        chunks, embeddings = cached.chunks, cached.embeddings
+        if len(documents) != len(cached.documents):
+            # Old exports may have published duplicate logical pages. Filter them
+            # before serving, including direct reads by an obsolete exact ID.
+            current_ids = {document.document_id for document in documents}
+            positions = [i for i, chunk in enumerate(chunks) if chunk.document_id in current_ids]
+            chunks = [chunks[position] for position in positions]
+            embeddings = embeddings[positions]
+        self.store.replace_index(documents, chunks, embeddings)
+        return self._stats_from_cache(cached.manifest).model_copy(
+            update={"document_count": len(documents), "chunk_count": len(chunks)}
         )
 
-        def progress(phase: str, completed: int, total: int) -> None:
-            nonlocal last_logged
-            now = time.perf_counter()
-            if completed in {0, total} or now - last_logged >= 2:
-                logger.info(
-                    "History migration: %s %d/%d (%.1f%%), elapsed %.1fs",
-                    phase,
-                    completed,
-                    total,
-                    100 * completed / total if total else 100,
-                    now - started,
-                )
-                last_logged = now
-            self._report("migration", phase=phase, completed=completed, total=total)
-
-        try:
-            self.history.import_snapshot(
-                cached.documents,
-                cached.chunks,
-                cached.embeddings,
-                cached.manifest.embedding_cache_identity,
-                progress=progress,
-            )
-        except (OSError, sqlite3.OperationalError):
-            logger.exception(
-                "History migration could not write to %s; "
-                "check free space and service permissions. "
-                "The original knowledge cache has not been removed.",
-                self.history.path,
-            )
-            raise
-        logger.info(
-            "Cached snapshot imported into history in %.3f seconds", time.perf_counter() - started
-        )
+    def _latest_documents(self, documents: list[Document]) -> list[Document]:
+        latest: dict[str, Document] = {}
+        for document in documents:
+            key = document.page_id or document.source_id
+            old = latest.get(key)
+            if old is None or self._revision_order(document) > self._revision_order(old):
+                latest[key] = document
+        return sorted(latest.values(), key=lambda item: item.source_path)
 
     @staticmethod
-    def _revision_order(document: Document) -> tuple[datetime, int, str]:
+    def _revision_order(document: Document) -> tuple[int, datetime, str]:
         version = document.source_version or ""
         date = utc_datetime(document.revision_updated_at or document.source_updated_at)
         return (
-            date or datetime.min.replace(tzinfo=UTC),
             int(version) if version.isdecimal() else 0,
+            date or datetime.min.replace(tzinfo=UTC),
             document.document_id,
         )
 

@@ -129,7 +129,7 @@ def register_a2a_routes(
                     for key in ("query", "action", "index_id", "version_scope")
                     if key in command
                 }
-                summary.setdefault("version_scope", "latest")
+                summary["version_scope"] = "latest"
             elif params.get("id"):
                 summary = {"task_id": params["id"]}
             # Reading a streamed body may outlive a token rotation or revocation.

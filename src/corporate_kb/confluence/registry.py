@@ -1,4 +1,4 @@
-"""Durable Confluence sources, immutable revisions and lifecycle-bound synchronization."""
+"""Durable Confluence sources and lifecycle-bound synchronization of current pages."""
 
 from __future__ import annotations
 
@@ -150,7 +150,8 @@ class ConfluenceRegistry:
         self.index_exists = index_exists
         self.knowledge_root = knowledge_root
         self.publish = publish
-        self.archive_document = archive_document
+        # Retain the constructor argument for integrations using the old signature.
+        # Synchronization materializes only the current page and never archives it.
         self.page_visibility = page_visibility
         self.index_guard = index_guard
         self.image_extractor = image_extractor
@@ -202,6 +203,7 @@ class ConfluenceRegistry:
 
     def _source_payload(self, connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         payload: dict[str, Any] = json.loads(row["config_json"])
+        payload["include_history"] = False
         payload.update(
             {
                 key: row[key]
@@ -1324,7 +1326,7 @@ class ConfluenceRegistry:
                 "SELECT publish_pending FROM sources WHERE id=?",
                 (source_id,),
             ).fetchone()[0]
-        if dirty or result["archived_versions"]:
+        if dirty:
             self._log(
                 job_id,
                 "indexing",
@@ -1437,7 +1439,6 @@ class ConfluenceRegistry:
                     raise ConfluenceError(
                         "Page changed during synchronization; retry will fetch a consistent version"
                     )
-                self._archive_source(source_id, page)
                 # Inline SVG diagrams do not appear in the attachment API.
                 for svg in BeautifulSoup(page.body, "html.parser").find_all("svg"):
                     svg_text = str(svg)
@@ -1513,10 +1514,7 @@ class ConfluenceRegistry:
                 document = self._document(
                     config, source_id, page, fingerprint, image_blocks, asset_metadata
                 )
-                stage = "archive"
-                document = self._archive(
-                    config.index_id, source_id, page_id, document, page.version, page.updated_at
-                )
+                stage = "materialization"
                 _atomic_write(
                     current_path,
                     frontmatter.dumps(
@@ -1567,9 +1565,6 @@ class ConfluenceRegistry:
                         "UPDATE pages SET last_seen_job=? WHERE source_id=? AND page_id=?",
                         (job_id, source_id, page_id),
                     )
-            if config.include_history:
-                stage = "history"
-                self._history(job_id, source_id, config, client, page_id, summary.version, cancel)
             if result["warnings"]:
                 stage = "attachments"
                 if attachment_error is not None:
@@ -1665,105 +1660,11 @@ class ConfluenceRegistry:
         return make_document(
             path=self._current_path(config.index_id, source_id, page.id),
             knowledge_root=self.knowledge_root(config.index_id),
-            # Match the materialized Markdown loader so archive and active documents
-            # have the same immutable document_id; source_kind identifies the provider.
+            # Match the materialized Markdown loader; source_kind identifies the provider.
             source_type="markdown",
             content=content,
             front_matter=metadata,
         )
-
-    def _archive(
-        self,
-        index_id: str,
-        source_id: str,
-        page_id: str,
-        document: Document,
-        version: int,
-        updated_at: str | None,
-    ) -> Document:
-        revision_id = str(document.metadata["revision_id"])
-        archive = self.root / "revisions" / source_id / f"{revision_id}.json"
-        if archive.is_file():
-            document = Document.model_validate_json(archive.read_text())
-        else:
-            _atomic_write(archive, document.model_dump_json().encode())
-        if self.archive_document:
-            self.archive_document(index_id, document)
-        with self._db() as connection:
-            connection.execute(
-                (
-                    "INSERT OR IGNORE INTO "
-                    "revisions(id,source_id,page_id,version,source_updated_at,"
-                    "created_at,document_path) VALUES(?,?,?,?,?,?,?)"
-                ),
-                (
-                    revision_id,
-                    source_id,
-                    page_id,
-                    version,
-                    updated_at,
-                    _now(),
-                    archive.relative_to(self.root).as_posix(),
-                ),
-            )
-            # Keep the publication obligation in the same transaction as the
-            # revision checkpoint, including an interrupted historical import.
-            connection.execute("UPDATE sources SET publish_pending=1 WHERE id=?", (source_id,))
-        return document
-
-    def _archive_source(self, source_id: str, page: Page) -> None:
-        payload = page.model_dump_json().encode()
-        digest = hashlib.sha256(payload).hexdigest()
-        path = self.root / "originals" / source_id / f"{digest}.json"
-        if not path.is_file():
-            _atomic_write(path, payload)
-
-    def _history(
-        self,
-        job_id: str,
-        source_id: str,
-        config: SourceConfig,
-        client: Any,
-        page_id: str,
-        current_version: int,
-        cancel: threading.Event,
-    ) -> int:
-        count = 0
-        self._log(job_id, "history", "Checking available historical page versions", page_id=page_id)
-        with self._db() as connection:
-            known = {
-                row[0]
-                for row in connection.execute(
-                    "SELECT version FROM revisions WHERE source_id=? AND page_id=?",
-                    (source_id, page_id),
-                )
-            }
-        for version in client.versions(page_id):
-            self._check_cancel(cancel)
-            if version >= current_version or version in known:
-                continue
-            page = client.page(page_id, version=version)
-            if page.version != version:
-                raise ConfluenceError("Confluence did not return the requested historical version")
-            self._archive_source(source_id, page)
-            doc = self._document(
-                config,
-                source_id,
-                page,
-                f"historical:{version}",
-                ["Историческая версия: вложения текущей страницы к ней не подставляются."],
-            )
-            self._archive(config.index_id, source_id, page_id, doc, version, page.updated_at)
-            # Each archived version is durable even if a later history request fails.
-            with self._db() as connection:
-                connection.execute("UPDATE sources SET publish_pending=1 WHERE id=?", (source_id,))
-                connection.execute(
-                    "UPDATE sync_items SET archived_versions=archived_versions+1 "
-                    "WHERE job_id=? AND task_kind='page' AND page_id=?",
-                    (job_id, page_id),
-                )
-            count += 1
-        return count
 
     def _asset(
         self,

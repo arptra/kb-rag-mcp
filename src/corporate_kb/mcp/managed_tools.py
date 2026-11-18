@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -81,7 +82,12 @@ class ManagedToolDefaults(BaseModel):
     def validate_version_scope(cls, value: str) -> str:
         if value not in {"latest", "history", "as_of"}:
             raise ValueError("version_scope must be latest, history or as_of")
-        return value
+        return "latest"
+
+    @field_validator("as_of")
+    @classmethod
+    def ignore_as_of(cls, value: str | None) -> None:
+        return None
 
 
 class ManagedToolDefinition(BaseModel):
@@ -153,7 +159,14 @@ class ManagedToolDefinition(BaseModel):
             raise ValueError("input_schema.required contains an undeclared property")
         if schema.get("additionalProperties", False) is not False:
             raise ValueError("input_schema.additionalProperties must be false")
-        return schema
+        # Old definitions remain loadable, but new agents are only offered current-page search.
+        current_schema = deepcopy(schema)
+        for legacy in ("version_scope", "as_of"):
+            current_schema["properties"].pop(legacy, None)
+        current_schema["required"] = [
+            name for name in required if name not in {"version_scope", "as_of"}
+        ]
+        return current_schema
 
     @field_validator("index_ids")
     @classmethod
@@ -282,9 +295,8 @@ class ManagedToolRegistry:
                         status=values.get("status", defaults.status),
                         authority=values.get("authority", defaults.authority),
                         source_type=values.get("source_type", defaults.source_type),
-                        version_scope=values.get("version_scope", defaults.version_scope),
+                        version_scope="latest",
                         page_id=values.get("page_id", defaults.page_id),
-                        as_of=values.get("as_of", defaults.as_of),
                         updated_from=values.get("updated_from", defaults.updated_from),
                         updated_to=values.get("updated_to", defaults.updated_to),
                     ),
@@ -325,6 +337,8 @@ class ManagedToolRegistry:
             item["rank"] = rank
         return {
             "query": query,
+            "version_scope": "latest",
+            "as_of": None,
             "result_count": len(selected),
             "retrieved_candidate_count": candidate_count,
             "context_token_count": sum(int(item.get("excerpt_tokens", 0)) for item in selected),
@@ -337,7 +351,7 @@ class ManagedToolRegistry:
         definition: ManagedToolDefinition,
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
-        allowed = set(definition.input_schema["properties"])
+        allowed = set(definition.input_schema["properties"]) | {"version_scope", "as_of"}
         unknown = set(arguments) - allowed
         if unknown:
             raise ValueError(f"Unknown tool arguments: {', '.join(sorted(unknown))}")

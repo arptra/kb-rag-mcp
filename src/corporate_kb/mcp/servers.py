@@ -46,7 +46,7 @@ BUILTIN_TOOLS: tuple[dict[str, str], ...] = (
     {"name": "kb_search", "description": "Search indexed corporate knowledge."},
     {
         "name": "kb_search_versions",
-        "description": "Search latest or historical document revisions.",
+        "description": "Search current indexed documentation.",
     },
     {"name": "kb_get_document", "description": "Read a bounded document extract."},
     {"name": "kb_get_chunk", "description": "Read context around one search chunk."},

@@ -358,3 +358,66 @@ async def test_disabled_integrations_have_explicit_status_and_no_wire_endpoint(s
             "active_agents": 0,
             "calls_last_minute": 0,
         }
+
+
+@pytest.mark.asyncio
+async def test_a2a_legacy_selectors_only_expose_current_page(settings_factory):
+    service, settings = indexed(settings_factory)
+    old = service.list_documents()[0]
+    service.history.archive_document(old)
+    (settings.knowledge_dir / "limits.md").write_text("# Limits\n\nThe daily limit is now 900.")
+    service.build_index(force=True, reuse_unchanged=True)
+    current = service.list_documents()[0]
+    app = create_http_app(service, settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client,
+    ):
+        issued = (
+            await client.post(
+                "/admin/api/a2a/agents", json={"name": "Current Agent", "index_ids": ["default"]}
+            )
+        ).json()
+        headers = {"Authorization": "Bearer " + issued["token"], "A2A-Version": "1.0"}
+        commands = [
+            {"action": "search", "query": "daily limit", "version_scope": "history"},
+            {
+                "action": "search",
+                "query": "daily limit",
+                "version_scope": "as_of",
+                "as_of": "2020-01-01T00:00:00Z",
+            },
+            {
+                "action": "document",
+                "page_id": current.page_id,
+                "source_version": "old",
+                "as_of": "2020-01-01T00:00:00Z",
+            },
+            {"action": "versions", "page_id": current.page_id},
+        ]
+        for command in commands:
+            answer = (await client.post("/a2a", headers=headers, json=message(command))).json()
+            task = answer["result"]["task"]
+            assert task["status"]["state"] == "TASK_STATE_COMPLETED", answer
+            result = task["artifacts"][0]["parts"][0]["data"]
+            assert result["version_scope"] == "latest"
+            assert result["as_of"] is None
+            indexed_result = result["indexes"][0]
+            if command["action"] == "search":
+                assert {hit["document_id"] for hit in indexed_result["results"]} == {
+                    current.document_id
+                }
+            elif command["action"] == "document":
+                assert indexed_result["document_id"] == current.document_id
+                assert "900" in indexed_result["content"]
+            else:
+                assert [item["document_id"] for item in indexed_result["versions"]] == [
+                    current.document_id
+                ]
+        overview = (await client.get("/admin/api/a2a")).json()
+        assert overview["stats"]["total_calls"] == len(commands)
+        assert all(
+            call["request_summary"]["version_scope"] == "latest" for call in overview["calls"]
+        )

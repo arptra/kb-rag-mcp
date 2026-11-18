@@ -78,18 +78,16 @@ BUILTIN_TOOL_DESCRIPTIONS = {
     "kb_connect_services_batch": BATCH_CONNECT_DESCRIPTION,
     "kb_search": SEARCH_DESCRIPTION,
     "kb_search_versions": (
-        "Search versioned documentation in one selected index. Default version_scope='latest' "
-        "returns current pages only. Use 'history' explicitly for captured older revisions or "
-        "'as_of' with an ISO date for the latest known revision on that date. Results include "
-        "page_id, exact document_id, source version/update date and coverage limitations. "
-        "Do not present historical evidence as current. Read exact hits with kb_get_document."
+        "Search current documentation in one selected index. Results always contain the "
+        "latest indexed pages and include page_id, document_id and source update date. "
+        "Read a result with kb_get_document. Legacy version selectors are ignored."
     ),
     "kb_get_document": (
         "Return a bounded extract from one normalized document identified by a search result's "
-        "exact document_id, including archived revisions. Alternatively provide page_id to read "
-        "the latest page, optionally source_version or an ISO as_of timestamp. Provide exactly "
+        "current document_id. Alternatively provide page_id to read the latest indexed page. "
+        "Provide exactly "
         "one of document_id/page_id. Pass index_id from the search result; omitted index_id "
-        "defaults to 'default'. Version fields distinguish historical evidence."
+        "defaults to 'default'. Legacy version selectors are ignored."
     ),
     "kb_get_chunk": (
         "Return a bounded source chunk identified by a search result's chunk_id. Pass index_id "
@@ -160,7 +158,7 @@ def create_mcp_server(
             version_search_name = f"{base}_{suffix}"
             suffix += 1
         logger.warning(
-            "Preserving existing managed tool kb_search_versions; the built-in historical "
+            "Preserving existing managed tool kb_search_versions; the built-in current-page "
             "search is available as %s",
             version_search_name,
         )
@@ -187,8 +185,8 @@ def create_mcp_server(
             "RAG itself. Cite graph evidence and later RAG source_path/source_url separately. "
             "When calling kb_get_chunk or kb_get_document, pass index_id from the managed "
             "search result or kb_search_index response to read the same index. "
-            f"Use {version_search_name} to search latest or historical document revisions; "
-            "the default version_scope is latest."
+            f"Use {version_search_name} to search current indexed pages. All document tools "
+            "return only current content; earlier revisions are unavailable."
         ),
         version=__version__,
         auth=auth,
@@ -503,8 +501,12 @@ def create_mcp_server(
         max_tokens: int | None = None,
         index_id: str = "default",
         page_id: str | None = None,
-        source_version: str | None = None,
-        as_of: str | None = None,
+        source_version: Annotated[
+            str | None, Field(description="Compatibility argument; ignored.", deprecated=True)
+        ] = None,
+        as_of: Annotated[
+            str | None, Field(description="Compatibility argument; ignored.", deprecated=True)
+        ] = None,
     ) -> dict[str, Any]:
         result = tools_for_index(index_id).get_document(
             document_id,
@@ -525,9 +527,13 @@ def create_mcp_server(
         query: str,
         index_id: str = "default",
         top_k: int = 3,
-        version_scope: Literal["latest", "history", "as_of"] = "latest",
+        version_scope: Annotated[
+            str, Field(description="Compatibility argument; always uses latest.", deprecated=True)
+        ] = "latest",
         page_id: str | None = None,
-        as_of: str | None = None,
+        as_of: Annotated[
+            str | None, Field(description="Compatibility argument; ignored.", deprecated=True)
+        ] = None,
         updated_from: str | None = None,
         updated_to: str | None = None,
         min_score: float | None = None,

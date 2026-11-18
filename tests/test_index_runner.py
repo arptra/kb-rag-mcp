@@ -116,7 +116,7 @@ def test_default_watchdog_measures_inactivity_not_total_time(
             runner.build()
 
 
-def test_failed_process_publication_does_not_activate_new_history(settings_factory, monkeypatch):
+def test_failed_process_publication_keeps_current_serving_snapshot(settings_factory, monkeypatch):
     from test_history import write_page
 
     settings = settings_factory()
@@ -131,6 +131,6 @@ def test_failed_process_publication_does_not_activate_new_history(settings_facto
     monkeypatch.setattr(IndexBuildProcessRunner, "_publish", fail)
     with pytest.raises(RuntimeError, match="publication interrupted"):
         IndexBuildProcessRunner(settings, timeout_seconds=30).build()
-    assert service.history.read("confluence:team:123").source_version == "1"
+    assert service.read_page("confluence:team:123").source_version == "1"
     service.reload_cached_index()
     assert service.list_documents()[0].source_version == "1"

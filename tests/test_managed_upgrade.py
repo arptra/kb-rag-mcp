@@ -46,7 +46,7 @@ def indexed(settings_factory, names: list[str]):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("occupied_aliases", [[], ["kb_search_versions_builtin"]])
-async def test_upgrade_preserves_legacy_search_name_and_exposes_history_alias(
+async def test_upgrade_preserves_legacy_search_name_and_exposes_current_page_alias(
     settings_factory, occupied_aliases, caplog
 ):
     names = ["kb_search_versions", "kb_payment_policy", *occupied_aliases]
@@ -57,7 +57,7 @@ async def test_upgrade_preserves_legacy_search_name_and_exposes_history_alias(
     server = create_mcp_server(service, knowledge_tools=tools, managed_tools=registry)
     alias = "kb_search_versions_builtin_2" if occupied_aliases else "kb_search_versions_builtin"
     assert alias in server.instructions
-    assert f"built-in historical search is available as {alias}" in caplog.text
+    assert f"built-in current-page search is available as {alias}" in caplog.text
     async with Client(server) as client:
         listed = {tool.name: tool for tool in await client.list_tools()}
         for name in names:
@@ -67,7 +67,7 @@ async def test_upgrade_preserves_legacy_search_name_and_exposes_history_alias(
         result = await client.call_tool(
             alias, {"query": "daily payment limit", "version_scope": "history"}
         )
-        assert result.structured_content["version_scope"] == "history"
+        assert result.structured_content["version_scope"] == "latest"
         assert result.structured_content["result_count"] == 1
 
     with pytest.raises(ValueError, match="reserved"):

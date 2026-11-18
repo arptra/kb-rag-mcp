@@ -395,3 +395,104 @@ limits-service owns the daily limit decision for payments.
         "limits-service",
     }
     assert result.data["context_token_count"] <= 600
+
+
+@pytest.mark.asyncio
+async def test_mcp_legacy_selectors_return_only_current_pages(settings_factory) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    page = settings.knowledge_dir / "policy.md"
+    page.write_text(
+        "---\npage_id: confluence:team:123\npage_version: 1\nstatus: current\n"
+        "---\n# Payment policy\n\nThe payment window was ten hours.\n"
+    )
+    service = KnowledgeService(
+        settings, provider=HashEmbeddingProvider(settings.embedding_dimension)
+    )
+    service.build_index()
+    old = service.list_documents()[0]
+    # Retained archives from an earlier deployment must not become agent evidence.
+    service.history.archive_document(old)
+    page.write_text(
+        "---\npage_id: confluence:team:123\npage_version: 2\nstatus: current\n"
+        "---\n# Payment policy\n\nThe payment window is two hours.\n"
+    )
+    service.build_index(force=True, reuse_unchanged=True)
+    async with Client(create_mcp_server(service)) as client:
+        listed = {tool.name: tool for tool in await client.list_tools()}
+        assert "current" in listed["kb_search_versions"].description
+        scope_schema = listed["kb_search_versions"].inputSchema["properties"]["version_scope"]
+        assert "enum" not in scope_schema
+        for selectors in (
+            {},
+            {"version_scope": "history"},
+            {"version_scope": "as_of"},
+            {"version_scope": "as_of", "as_of": "2020-01-01T00:00:00Z"},
+        ):
+            result = await client.call_tool(
+                "kb_search_versions", {"query": "payment window", **selectors}
+            )
+            assert result.data["version_scope"] == "latest"
+            assert result.data["as_of"] is None
+            assert {hit["source_version"] for hit in result.data["results"]} == {"2"}
+            assert all(hit["is_latest"] for hit in result.data["results"])
+        document = await client.call_tool(
+            "kb_get_document",
+            {"page_id": "confluence:team:123", "source_version": "1", "as_of": "2020-01-01"},
+        )
+        assert document.data["source_version"] == "2"
+        assert "two hours" in document.data["content"]
+        stale = await client.call_tool(
+            "kb_get_document", {"document_id": old.document_id}, raise_on_error=False
+        )
+        assert stale.is_error
+
+
+@pytest.mark.asyncio
+async def test_managed_legacy_history_defaults_and_schema_use_current_pages(
+    settings_factory, tmp_path
+) -> None:
+    settings = settings_factory()
+    settings.knowledge_dir.mkdir(parents=True)
+    (settings.knowledge_dir / "limits.md").write_text("# Limits\n\nCurrent limits policy.")
+    service = KnowledgeService(
+        settings, provider=HashEmbeddingProvider(settings.embedding_dimension)
+    )
+    service.build_index()
+    path = tmp_path / "old-managed.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "kb_legacy_policy",
+                    "description": "Find the payment policy for an agent.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "version_scope": {"type": "string"},
+                            "as_of": {"type": "string"},
+                        },
+                        "required": ["query", "as_of"],
+                        "additionalProperties": False,
+                    },
+                    "defaults": {"version_scope": "as_of", "as_of": "2020-01-01"},
+                }
+            ]
+        )
+    )
+    tools = KnowledgeTools(service)
+    registry = ManagedToolRegistry(path, tools)
+    definition = registry.list()[0]
+    assert definition.defaults.version_scope == "latest"
+    assert definition.defaults.as_of is None
+    assert definition.input_schema["required"] == ["query"]
+    assert set(definition.input_schema["properties"]) == {"query"}
+    async with Client(
+        create_mcp_server(service, knowledge_tools=tools, managed_tools=registry)
+    ) as client:
+        for selectors in ({}, {"version_scope": "history", "as_of": "2020-01-01"}):
+            result = await client.call_tool(definition.name, {"query": "limits", **selectors})
+            assert result.structured_content["version_scope"] == "latest"
+            assert result.structured_content["as_of"] is None
+            assert result.structured_content["results"]

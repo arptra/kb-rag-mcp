@@ -37,6 +37,7 @@ class FakeClient:
         self.version = 1
         self.asset_version = 1
         self.page_calls = []
+        self.version_calls = []
         self.denied = False
         self.discovery_error = False
 
@@ -82,6 +83,7 @@ class FakeClient:
         return f"image-version-{attachment.version}".encode()
 
     def versions(self, page_id):
+        self.version_calls.append(page_id)
         return list(range(self.version, 0, -1))
 
 
@@ -101,7 +103,7 @@ def registry(tmp_path, client=None, **kwargs):
     return instance, client, published, archived, visibility
 
 
-def test_registry_binding_secrets_noop_history_and_attachment_updates(tmp_path):
+def test_registry_binding_secrets_latest_only_and_attachment_updates(tmp_path):
     instance, client, published, archived, _ = registry(tmp_path)
     with pytest.raises(ValueError, match="existing"):
         instance.upsert_source(config(index_id="missing").model_dump(), "top-secret")
@@ -110,10 +112,10 @@ def test_registry_binding_secrets_noop_history_and_attachment_updates(tmp_path):
     assert b"top-secret" not in instance.database_path.read_bytes()
     first = instance.run_job(instance.queue_sync(source["id"])["id"])
     assert first["status"] == "completed"
-    assert len(published) == 1 and len(archived) == 2
-    assert all(index == "target" for index, _ in archived)
+    assert len(published) == 1 and archived == []
     loaded = FileSystemDocumentLoader().load_directory(tmp_path / "knowledge" / "target")
-    assert {item.document_id for item in loaded} == {doc.document_id for _, doc in archived}
+    assert len(loaded) == 2
+    assert {item.metadata["page_version"] for item in loaded} == {1}
     assert len(list((tmp_path / "knowledge" / "target").rglob("*.md"))) == 2
     assert not (tmp_path / "unsafe.png").exists()
     client.page_calls.clear()
@@ -124,13 +126,48 @@ def test_registry_binding_secrets_noop_history_and_attachment_updates(tmp_path):
     client.asset_version = 2
     third = instance.run_job(instance.queue_sync(source["id"])["id"])
     assert third["result"]["changed"] == 2
-    assert instance.get_source(source["id"])["revision_count"] == 4
+    assert instance.get_source(source["id"])["revision_count"] == 0
     client.version = 3
-    instance.upsert_source({"include_history": True}, source_id=source["id"])
+    updated = instance.upsert_source({"include_history": True}, source_id=source["id"])
+    assert updated["include_history"] is False
     fourth = instance.run_job(instance.queue_sync(source["id"])["id"])
-    assert fourth["result"]["archived_versions"] == 2
-    assert any(doc.metadata["page_version"] == 2 for _, doc in archived)
-    assert len({doc.metadata["revision_id"] for _, doc in archived}) == len(archived)
+    assert fourth["result"]["changed"] == 2
+    assert fourth["result"]["archived_versions"] == 0
+    assert client.version_calls == []
+    assert all(version is None for _, _, version in client.page_calls)
+    assert archived == []
+    loaded = FileSystemDocumentLoader().load_directory(tmp_path / "knowledge" / "target")
+    assert {item.metadata["page_version"] for item in loaded} == {3}
+    assert not (instance.root / "originals").exists()
+    assert not (instance.root / "revisions").exists()
+
+
+def test_saved_history_flag_is_ignored_without_removing_legacy_archives(tmp_path):
+    instance, client, _, archived, _ = registry(tmp_path)
+    source = instance.upsert_source(config().model_dump(), "secret")
+    instance.run_job(instance.queue_sync(source["id"])["id"])
+    legacy = config(include_history=True).model_dump()
+    legacy["include_history"] = True
+    with instance._db() as db:
+        db.execute(
+            "UPDATE sources SET config_json=? WHERE id=?", (json.dumps(legacy), source["id"])
+        )
+    for directory in ("originals", "revisions"):
+        path = instance.root / directory / source["id"] / "legacy.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("legacy snapshot")
+    reopened, client, _, archived, _ = registry(tmp_path, client=client)
+    assert reopened.get_source(source["id"])["include_history"] is False
+    client.version = 3
+    completed = reopened.run_job(reopened.queue_sync(source["id"])["id"])
+    assert completed["status"] == "completed"
+    assert client.version_calls == []
+    assert all(version is None for _, _, version in client.page_calls)
+    assert archived == []
+    assert {page["version"] for page in reopened.source_pages(source["id"])} == {3}
+    for directory in ("originals", "revisions"):
+        files = list((instance.root / directory).rglob("*.json"))
+        assert len(files) == 1 and files[0].read_text() == "legacy snapshot"
 
 
 def test_sync_journal_is_mirrored_to_server_without_document_content(tmp_path, caplog):
@@ -262,11 +299,11 @@ def test_jobs_deduplicate_cancel_cursor_logs_and_resume_after_publish_failure(tm
         RuntimeError("synthetic build failure")
     )
     assert instance.run_job(queued["id"])["status"] == "failed"
-    assert instance.get_source(source["id"])["revision_count"] == 2
+    assert instance.get_source(source["id"])["revision_count"] == 0
     instance.publish = real_publish
     done = instance.run_job(instance.queue_sync(source["id"])["id"])
     assert done["status"] == "completed" and len(published) == 1
-    assert instance.get_source(source["id"])["revision_count"] == 2
+    assert instance.get_source(source["id"])["revision_count"] == 0
     first = instance.job_log(done["id"], limit=2)
     second = instance.job_log(done["id"], cursor=first["next_cursor"], limit=2)
     assert first["has_more"] and second["items"][0]["cursor"] > first["next_cursor"]
@@ -539,7 +576,7 @@ def test_connection_check_is_read_only_and_index_lock_wait_is_cancellable(tmp_pa
         worker.join(timeout=1)
 
 
-def test_real_history_service_keeps_one_revision_per_snapshot(settings_factory, tmp_path):
+def test_real_service_exposes_latest_without_archiving_page_snapshots(settings_factory, tmp_path):
     from corporate_kb.service import KnowledgeService
 
     settings = settings_factory(
@@ -571,11 +608,11 @@ def test_real_history_service_keeps_one_revision_per_snapshot(settings_factory, 
     second = instance.run_job(instance.queue_sync(source["id"])["id"])
     assert second["status"] == "completed", second
     assert service.read_page(logical).source_version == "2"
-    assert service.read_page(logical, source_version="1").source_version == "1"
+    assert service.read_page(logical, source_version="1").source_version == "2"
     with service.history._db() as db:
         assert (
             db.execute("SELECT COUNT(*) FROM revisions WHERE page_id=?", (logical,)).fetchone()[0]
-            == 2
+            == 0
         )
     client.denied = True
     instance.run_job(instance.queue_sync(source["id"])["id"])

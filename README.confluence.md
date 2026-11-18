@@ -7,9 +7,9 @@ managed through `/admin/api/confluence`; ordinary readers cannot change credenti
 ## Configuration and authentication
 
 Set `KB_CONFLUENCE_STATE_DIR` to a persistent directory outside the disposable embedding
-cache. The directory holds SQLite state, encrypted credentials, original page bodies,
-immutable normalized revisions, attachments and image extraction results. Back up this
-directory together with `KB_HISTORY_DIR`. Its `credentials.key` is necessary to decrypt
+cache. The directory holds SQLite state, encrypted credentials, attachments and image
+extraction results. Current page text is materialized in the selected index's knowledge
+directory. Back up both directories. The state directory's `credentials.key` decrypts
 the saved tokens and must be included in a protected backup. The key and database are
 created with owner-only file permissions; source responses never return a token.
 
@@ -31,8 +31,8 @@ source through the dashboard/API immediately queues its first synchronization. T
 sync discovers the root and descendants using paginated APIs, then saves their stable
 IDs, parent relationships, versions and modification dates. Each later run checks the
 tree and attachment versions again. Unchanged pages do not download the body or trigger
-an index build. New attachment versions create a new snapshot even if the page version
-has not changed. Text or image changes publish only to the source's selected index.
+an index build. New attachment versions refresh the current document even if the page
+version has not changed. Text or image changes publish only to the source's selected index.
 Cloud traversal follows paginated `direct-children` recursively through pages, folders,
 databases, whiteboards and embeds, avoiding the depth limit of the descendants API.
 Only page content is indexed. Cloud attachment downloads use the supported REST
@@ -42,13 +42,13 @@ request `expand=version` to detect image-only updates.
 One Confluence service token imports a shared corpus. Confluence per-person permissions
 are not automatically copied into this application's users. Connect a subtree whose
 content is intended for this KB's audience. A confirmed page-level access denial hides
-that page's current content and history until access is confirmed again; the protected
-archive is retained. An incomplete traversal or network error never marks absent pages
-as deleted. Leaving the configured subtree removes a page from current results while
-retaining its archive.
+that page's content until access is confirmed again. An incomplete traversal or network
+error never marks absent pages as deleted. Leaving the configured subtree removes a
+page from current results. Archives created by earlier releases are left on disk but
+are not used by search or agent tools.
 
 Disconnecting a source stops its schedule and removes the connection from the active
-list. Existing indexed documents, history and authenticated image evidence remain
+list. Existing indexed documents and authenticated image evidence remain
 available. An attachment from a page with confirmed access loss stays hidden even after
 the source is disconnected.
 
@@ -73,7 +73,7 @@ must be running for scheduled work. A missed check is queued once after startup.
 
 Manual and scheduled requests share a durable queue and duplicate active requests for
 one source resolve to the same job. Only one scheduler owns a state directory. Interrupted
-jobs resume after restart, reusing saved page/attachment revisions and indexing
+jobs resume after restart, reusing saved current pages, attachments and indexing
 checkpoints. Canceling a job retains completed checkpoints. The scheduler and embedding
 worker propagate cancellation while waiting for an index lock, downloading, extracting
 images and indexing.
@@ -92,7 +92,7 @@ attempt count and sanitized error, 50 items at a time. A discovery failure is sh
 as an unreadable branch: its descendants may not have been discovered yet. The report
 refreshes while the selected job runs and remains available after completion. A job
 that still has failed pages or branches finishes with warnings and publishes the
-successfully loaded pages. Previous saved snapshots are retained on transient errors;
+successfully loaded pages. Previously saved current pages are retained on transient errors;
 confirmed access denial retains the existing access-loss behavior. Incomplete discovery
 never treats unseen pages as deleted. Run **Проверить** on the source to start another
 synchronization after resolving a persistent error.
@@ -108,25 +108,18 @@ synchronization runs a build before reporting publication complete. A publish fa
 keeps the source dirty so the next run retries publication without downloading unchanged
 pages again. The serving index is replaced only after its new generation is validated.
 
-## History and images
+## Current pages and images
 
 `source_updated_at` is the page's modification date from Confluence. The separate
-`snapshot_updated_at` is the latest page/attachment modification date for the snapshot;
-if the API omits an attachment date, its first observed timestamp is used. These are
-distinct from fetching and indexing dates. A normal search uses current revisions.
-Historical tools can select a revision or date without mixing later image changes into
-an earlier snapshot.
-
-Enable `include_history` to backfill page versions still available through Confluence.
-Historical page text is fetched with an explicit version. Current attachments are never
-silently substituted into an older page version: backfilled versions say that their
-historical attachment association is unavailable. Attachments and image evidence
-observed by this service remain bound to their exact archived snapshot.
-Data Center version enumeration uses `/rest/experimental/content/{id}/version`, as
-described by [Atlassian](https://support.atlassian.com/confluence/kb/how-to-retrieve-all-previous-versions-of-content-using-the-rest-api/).
-This is an experimental endpoint and availability must be checked on the target server.
-If it is unavailable, disable backfilling existing history; snapshots observed by this
-service still retain their history.
+`snapshot_updated_at` is the latest page/attachment modification date for the current
+document; if the API omits an attachment date, its first observed timestamp is used. These are
+distinct from fetching and indexing dates and remain available as document metadata.
+Synchronization always loads only the current Confluence page. It does not list or fetch
+historical versions and does not create page archives or original-body snapshots.
+The legacy `include_history` configuration field is accepted for compatibility but
+always normalized to `false`, including when reading older saved connections.
+Existing page archive files are not deleted during an upgrade; they are not used for
+search or agent responses. MCP and A2A retrieve current documents only.
 
 Image analysis uses the configured GigaCode runner, with one downloaded image in an
 isolated workspace, read-only tools, cancellation and a locally validated JSON result.
@@ -137,9 +130,9 @@ also archived and passed to extraction. Unsupported or unreadable images remain 
 as warnings with their originals; an extraction failure does not discard page text.
 
 Original attachments of other types are archived. Plugin-specific macros without an API
-text/image representation cannot be reconstructed reliably; their original storage body
-is retained. Image interpretation is evidence with explicit uncertainty, not a guarantee
-that every diagram relationship is recognized correctly.
+text/image representation cannot be reconstructed reliably; the normalized document
+marks macros without a readable representation. Image interpretation is evidence with
+explicit uncertainty, not a guarantee that every diagram relationship is recognized correctly.
 
 Downloads are bounded in size and time. API pagination is restricted to the configured
 origin. Cloud's signed `*.media.atlassian.com` downloads use a separate client without
@@ -149,7 +142,7 @@ rejected. Remote filenames never become managed filesystem paths.
 ## Operations and API
 
 Jobs persist each stage (`discovery`, `fetch`, `attachments`, `images`, `normalization`,
-`history`, `checkpoint`, `indexing`, `publication`) with UTC timestamps, counters,
+`checkpoint`, `indexing`, `publication`) with UTC timestamps, counters,
 cache hits, warnings and errors. Log reads use a cursor and bounded page size rather
 than repeatedly loading an entire growing log. Tokens and Authorization headers are
 redacted from persisted messages.
