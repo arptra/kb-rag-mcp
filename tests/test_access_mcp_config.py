@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 import ssl
 import time
 
@@ -36,8 +35,7 @@ def _exported_token(
     assert response.status_code == 200, response.text
     payload = response.json()
     assert set(payload) == {"config", "expires_at", "user"}
-    assert isinstance(payload["expires_at"], int)
-    assert payload["expires_at"] > time.time()
+    assert payload["expires_at"] is None
     servers = payload["config"]["mcpServers"]
     assert set(servers) == (
         {"corporate-kb", "corporate-skills"} if skills_path is not None else {"corporate-kb"}
@@ -145,6 +143,7 @@ async def test_export_uses_separate_secure_cookie_and_survives_browser_logout(se
     ):
         browser = await client.post("/auth/browser-session", json={})
         assert browser.status_code == 200
+        assert browser.json()["expires_at"] > time.time()
         browser_token = client.cookies[USER_COOKIE]
 
         response = await client.post(
@@ -162,6 +161,7 @@ async def test_export_uses_separate_secure_cookie_and_survives_browser_logout(se
         cookie = response.headers["set-cookie"].lower()
         assert all(flag in cookie for flag in ("httponly", "secure", "samesite=strict", "path=/"))
         assert "domain=" not in cookie
+        assert f"max-age={settings.access_token_ttl_seconds}" in cookie
 
         repeated = await client.post(ENDPOINT, json={})
         assert _exported_token(repeated) == token
@@ -178,6 +178,52 @@ async def test_export_uses_separate_secure_cookie_and_survives_browser_logout(se
         assert (await client.get("/auth/status")).json()["authenticated"] is False
         assert (await client.get("/admin/api/catalog")).status_code == 401
         assert _exported_token(await client.post(ENDPOINT, json={})) == token
+
+
+@pytest.mark.asyncio
+async def test_export_token_survives_restart_and_browser_session_expiry(secured, monkeypatch):
+    app, settings, _, certificates = secured
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=_CertificateScopeApp(app, certificates["client"])),
+            base_url=ORIGIN,
+            headers={"origin": ORIGIN},
+        ) as client,
+    ):
+        browser = await client.post("/auth/browser-session", json={})
+        browser_token = client.cookies[USER_COOKIE]
+        token = _exported_token(await client.post(ENDPOINT, json={}))
+        browser_expires_at = browser.json()["expires_at"]
+
+    monkeypatch.setattr("corporate_kb.access.store._now", lambda: browser_expires_at + 1)
+    restarted = create_http_app(KnowledgeService(settings), settings)
+    async with (
+        restarted.router.lifespan_context(restarted),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=restarted), base_url=ORIGIN,
+        ) as client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=_CertificateScopeApp(restarted, certificates["client"])
+            ),
+            base_url=ORIGIN,
+            headers={"origin": ORIGIN},
+            cookies={CONFIG_COOKIE: token},
+        ) as certificate_client,
+    ):
+        assert (await client.get(
+            "/api/v1/stats", headers={"authorization": f"Bearer {token}"}
+        )).status_code == 200
+        assert (await client.get(
+            "/api/v1/stats", headers={"cookie": f"{USER_COOKIE}={browser_token}"}
+        )).status_code == 401
+        assert _exported_token(await certificate_client.post(ENDPOINT, json={})) == token
+        reissued = await certificate_client.post(
+            "/auth/token", json={}, headers={"authorization": f"Bearer {token}"}
+        )
+        assert reissued.json()["access_token"] == token
+        assert reissued.json()["expires_at"] is None
 
 
 @pytest.mark.asyncio
@@ -363,11 +409,8 @@ async def test_config_cookie_is_reused_only_for_same_certificate(secured):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalidation", ["expiry", "token_revocation"])
-async def test_active_certificate_can_replace_expired_or_revoked_export_token(
-    secured, invalidation
-):
-    app, settings, store, certificates = secured
+async def test_active_certificate_can_replace_revoked_export_token(secured):
+    app, _, store, certificates = secured
     async with (
         app.router.lifespan_context(app),
         httpx.AsyncClient(
@@ -377,12 +420,8 @@ async def test_active_certificate_can_replace_expired_or_revoked_export_token(
         ) as client,
     ):
         first = _exported_token(await client.post(ENDPOINT, json={}))
-        if invalidation == "expiry":
-            with sqlite3.connect(settings.access_db_path) as database:
-                database.execute("UPDATE user_tokens SET expires_at = ?", (int(time.time()) - 1,))
-        else:
-            token_id = store.list_tokens()["items"][0]["id"]
-            store.revoke_token(token_id, actor="test-admin")
+        token_id = store.list_tokens()["items"][0]["id"]
+        store.revoke_token(token_id, actor="test-admin")
         assert store.verify_user_token(first) is None
         second = _exported_token(await client.post(ENDPOINT, json={}))
         assert second != first

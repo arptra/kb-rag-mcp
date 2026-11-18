@@ -20,7 +20,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import Any, Literal, TypeGuard
 
 from corporate_kb.access.models import (
     AccessDenied,
@@ -32,7 +32,7 @@ from corporate_kb.access.models import (
     normalize_common_name,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _LOGIN_FAILURE_LIMIT = 5
 _ADDRESS_FAILURE_LIMIT = 30
 _LOGIN_WINDOW_SECONDS = 900
@@ -43,6 +43,13 @@ _CN_INDEX = (
 _CN_ARCHIVE_SCHEMA = """CREATE TABLE legacy_user_identities (
     id TEXT PRIMARY KEY, canonical_user_id TEXT NOT NULL REFERENCES users(id),
     migrated_at INTEGER NOT NULL, original_record TEXT NOT NULL
+)"""
+_USER_TOKENS_SCHEMA = """CREATE TABLE user_tokens (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
+    token_hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL,
+    created_at INTEGER NOT NULL, expires_at INTEGER,
+    last_used_at INTEGER, revoked_at INTEGER,
+    purpose TEXT NOT NULL DEFAULT 'mcp' CHECK(purpose IN ('mcp','browser'))
 )"""
 _SCHEMA = (
     """CREATE TABLE users (
@@ -56,12 +63,7 @@ _SCHEMA = (
     )""",
     _CN_INDEX,
     _CN_ARCHIVE_SCHEMA,
-    """CREATE TABLE user_tokens (
-        id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
-        token_hash TEXT NOT NULL UNIQUE, prefix TEXT NOT NULL,
-        created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
-        last_used_at INTEGER, revoked_at INTEGER
-    )""",
+    _USER_TOKENS_SCHEMA,
     "CREATE INDEX user_tokens_user_id ON user_tokens(user_id)",
     """CREATE TABLE admins (
         id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
@@ -249,9 +251,40 @@ class AccessStore:
                 for statement in _SCHEMA:
                     connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-            elif version == 1:
-                self._migrate_common_names(connection)
+            else:
+                if version == 1:
+                    self._migrate_common_names(connection)
+                if version < 3:
+                    self._migrate_permanent_tokens(connection)
                 connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+
+    def _migrate_permanent_tokens(self, connection: sqlite3.Connection) -> None:
+        """Keep legacy credentials and revocations, removing only automatic expiry.
+
+        Older schemas did not distinguish browser sessions from MCP tokens. All
+        existing credentials retain their identity; newly issued browser sessions
+        have an explicit purpose and keep their finite lifetime.
+        """
+        count = connection.execute("SELECT COUNT(*) FROM user_tokens").fetchone()[0]
+        connection.execute(_USER_TOKENS_SCHEMA.replace("user_tokens (", "user_tokens_v3 (", 1))
+        connection.execute(
+            """INSERT INTO user_tokens_v3
+            (id, user_id, token_hash, prefix, created_at, expires_at,
+             last_used_at, revoked_at, purpose)
+            SELECT id, user_id, token_hash, prefix, created_at, NULL,
+                   last_used_at, revoked_at, 'mcp' FROM user_tokens"""
+        )
+        connection.execute("DROP TABLE user_tokens")
+        connection.execute("ALTER TABLE user_tokens_v3 RENAME TO user_tokens")
+        connection.execute("CREATE INDEX user_tokens_user_id ON user_tokens(user_id)")
+        self._audit(
+            connection,
+            actor="migration",
+            action="schema.permanent_tokens_migrated",
+            target_type="schema",
+            target_id="3",
+            details=json.dumps({"tokens_preserved": count}),
+        )
 
     def _migrate_common_names(self, connection: sqlite3.Connection) -> None:
         """Merge v1 certificate identities by CN in the surrounding write transaction.
@@ -430,8 +463,12 @@ class AccessStore:
         certificate: CertificateIdentity,
         existing_token: str | None = None,
         address: str = "",
+        *,
+        purpose: Literal["mcp", "browser"] = "mcp",
     ) -> IssuedToken:
-        """Enroll a transport-authenticated CN; certificate properties are metadata."""
+        """Issue a permanent MCP credential or a finite browser session for a CN."""
+        if purpose not in {"mcp", "browser"}:
+            raise ValueError("Token purpose must be mcp or browser")
         now = _now()
         fingerprint = certificate.fingerprint.lower()
         if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
@@ -508,8 +545,9 @@ class AccessStore:
                 if _valid_token(existing_token):
                     token = connection.execute(
                         """SELECT * FROM user_tokens WHERE token_hash = ? AND user_id = ?
-                        AND revoked_at IS NULL AND expires_at > ?""",
-                        (_secret_hash(existing_token), user_id, now),
+                        AND revoked_at IS NULL AND purpose = ?
+                        AND (purpose = 'mcp' OR expires_at > ?)""",
+                        (_secret_hash(existing_token), user_id, purpose, now),
                     ).fetchone()
                 if token is not None:
                     assert existing_token is not None
@@ -527,17 +565,22 @@ class AccessStore:
                     result = IssuedToken(
                         token=existing_token,
                         token_id=token["id"],
-                        expires_at=token["expires_at"],
+                        expires_at=None if purpose == "mcp" else token["expires_at"],
                         user=_user_payload(user),
                         created=False,
                     )
                 else:
                     secret = "kb_" + secrets.token_urlsafe(32)
                     token_id = _new_id()
-                    expires_at = now + self.token_ttl_seconds
+                    expires_at = now + self.token_ttl_seconds if purpose == "browser" else None
                     connection.execute(
-                        "INSERT INTO user_tokens VALUES (?,?,?,?,?,?,NULL,NULL)",
-                        (token_id, user_id, _secret_hash(secret), secret[:11], now, expires_at),
+                        """INSERT INTO user_tokens
+                        (id, user_id, token_hash, prefix, created_at, expires_at, purpose)
+                        VALUES (?,?,?,?,?,?,?)""",
+                        (
+                            token_id, user_id, _secret_hash(secret), secret[:11], now,
+                            expires_at, purpose,
+                        ),
                     )
                     self._audit(
                         connection,
@@ -574,7 +617,8 @@ class AccessStore:
             row = connection.execute(
                 """SELECT u.*, t.id AS token_id FROM user_tokens t
                 JOIN users u ON u.id = t.user_id WHERE t.token_hash = ?
-                AND t.revoked_at IS NULL AND t.expires_at > ? AND u.status = 'active'
+                AND t.revoked_at IS NULL AND (t.purpose = 'mcp' OR t.expires_at > ?)
+                AND u.status = 'active'
                 AND u.common_name IS NOT NULL""",
                 (_secret_hash(token), now),
             ).fetchone()
@@ -801,14 +845,18 @@ class AccessStore:
             ).fetchone()[0]
             items = []
             for row in rows:
-                payload = {key: row[key] for key in ("id", "user_id", "common_name", "prefix")}
+                payload = {
+                    key: row[key] for key in ("id", "user_id", "common_name", "prefix", "purpose")
+                }
                 for key in ("created_at", "expires_at", "last_used_at", "revoked_at"):
                     payload[key] = _iso(row[key])
+                if row["purpose"] == "mcp":
+                    payload["expires_at"] = None
                 payload["status"] = (
                     "revoked"
                     if row["revoked_at"] is not None
                     else "expired"
-                    if row["expires_at"] <= _now()
+                    if row["purpose"] == "browser" and row["expires_at"] <= _now()
                     else "active"
                 )
                 items.append(payload)

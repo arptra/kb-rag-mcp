@@ -79,7 +79,7 @@ class CertificateIdentity:
 class IssuedToken:
     token: str
     token_id: str
-    expires_at: int
+    expires_at: int | None
     user: dict[str, Any]
     created: bool
 

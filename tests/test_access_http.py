@@ -282,6 +282,7 @@ async def test_enrollment_registry_reuse_revocation_and_mcp(secured):
         issued = await client.post("/auth/token", json={})
         assert issued.status_code == 200, issued.text
         assert issued.headers["cache-control"] == "no-store"
+        assert issued.json()["expires_at"] is None
         token = issued.json()["access_token"]
         user_id = issued.json()["user"]["id"]
         client.headers["authorization"] = f"Bearer {token}"

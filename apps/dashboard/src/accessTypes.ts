@@ -19,8 +19,9 @@ export interface AccessTokenRecord {
   user_id: string;
   common_name?: string | null;
   prefix: string;
+  purpose?: "mcp" | "browser";
   created_at: string;
-  expires_at: string;
+  expires_at: string | null;
   last_used_at: string | null;
   revoked_at: string | null;
   status: "active" | "revoked" | "expired";

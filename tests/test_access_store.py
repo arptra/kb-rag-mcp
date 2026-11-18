@@ -51,7 +51,7 @@ def test_enroll_reuse_and_public_payload(
 ) -> None:
     issued = store.enroll(certificate, address="192.0.2.10")
     assert issued.created is True
-    assert issued.expires_at == NOW + 600
+    assert issued.expires_at is None
     assert issued.user["subject"] == certificate.subject
     assert issued.user["common_name"] == "Developer One"
     assert issued.user["created_at"].endswith("Z")
@@ -76,19 +76,50 @@ def test_enroll_reuse_and_public_payload(
     assert {"user.enrolled", "user.token_issued", "user.token_reused"} <= actions
 
 
-def test_token_expiry_is_independent_of_certificate_dates(
+def test_mcp_token_survives_time_and_restart_without_rotation(
     store: AccessStore, certificate: CertificateIdentity, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     short_certificate = replace(certificate, not_after=NOW + 20)
     issued = store.enroll(short_certificate)
-    assert issued.expires_at == NOW + 600
+    assert issued.expires_at is None
     monkeypatch.setattr("corporate_kb.access.store._now", lambda: NOW + 20)
     assert store.verify_user_token(issued.token) is not None
     assert store.list_tokens()["items"][0]["status"] == "active"
     assert store.enroll(short_certificate, existing_token=issued.token).token == issued.token
+    monkeypatch.setattr("corporate_kb.access.store._now", lambda: NOW + 100 * 365 * 86400)
+    reopened = AccessStore(store.path, token_ttl_seconds=300)
+    assert reopened.verify_user_token(issued.token) is not None
+    assert reopened.list_tokens()["items"][0]["status"] == "active"
+    assert reopened.list_tokens()["items"][0]["expires_at"] is None
+    reused = reopened.enroll(short_certificate, existing_token=issued.token)
+    assert reused.token == issued.token
+    assert reused.token_id == issued.token_id
+    assert reused.created is False
+    assert reopened.list_tokens()["total"] == 1
+
+
+def test_browser_session_remains_finite_and_separate_from_mcp(
+    store: AccessStore, certificate: CertificateIdentity, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp = store.enroll(certificate)
+    browser = store.enroll(certificate, existing_token=mcp.token, purpose="browser")
+    assert browser.created is True
+    assert browser.token != mcp.token
+    assert browser.expires_at == NOW + 600
+    assert store.enroll(
+        certificate, existing_token=browser.token, purpose="browser"
+    ).token == browser.token
+    assert store.verify_user_token(browser.token) is not None
     monkeypatch.setattr("corporate_kb.access.store._now", lambda: NOW + 600)
-    assert store.verify_user_token(issued.token) is None
-    assert store.list_tokens()["items"][0]["status"] == "expired"
+    reopened = AccessStore(store.path, token_ttl_seconds=300)
+    assert reopened.verify_user_token(browser.token) is None
+    assert reopened.verify_user_token(mcp.token) is not None
+    statuses = {row["purpose"]: row["status"] for row in reopened.list_tokens()["items"]}
+    assert statuses == {"browser": "expired", "mcp": "active"}
+    replacement = reopened.enroll(certificate, existing_token=browser.token, purpose="browser")
+    assert replacement.created is True
+    assert replacement.token != browser.token
+    assert reopened.enroll(certificate, existing_token=mcp.token).token == mcp.token
 
 
 @pytest.mark.parametrize("changes", [{"not_before": NOW + 1}, {"not_after": NOW}])
@@ -96,7 +127,7 @@ def test_certificate_dates_are_metadata_not_account_authorization(
     store: AccessStore, certificate: CertificateIdentity, changes: dict[str, int]
 ) -> None:
     issued = store.enroll(replace(certificate, **changes))
-    assert issued.expires_at == NOW + 600
+    assert issued.expires_at is None
     assert store.verify_user_token(issued.token) is not None
     assert store.list_users()["total"] == 1
 
@@ -163,19 +194,19 @@ def test_cyrillic_common_name_token_verification(
     assert store.verify_user_token(issued.token, common_name="Александр") is None
 
 
-def test_unknown_or_expired_token_can_be_replaced_only_by_enrollment(
+def test_unknown_token_can_be_replaced_but_time_does_not_rotate_known_mcp_token(
     store: AccessStore, certificate: CertificateIdentity, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first = store.enroll(certificate)
     monkeypatch.setattr("corporate_kb.access.store._now", lambda: NOW + 600)
-    assert store.verify_user_token(first.token) is None
+    assert store.verify_user_token(first.token) is not None
     second = store.enroll(certificate, existing_token=first.token)
-    assert second.created is True
-    assert first.token != second.token
+    assert second.created is False
+    assert first.token == second.token
     assert first.user["id"] == second.user["id"]
     third = store.enroll(certificate, existing_token="unknown-token-but-long-enough")
     assert third.created is True
-    assert store.list_tokens()["total"] == 3
+    assert store.list_tokens()["total"] == 2
 
 
 def test_existing_token_from_other_common_name_is_never_reused(

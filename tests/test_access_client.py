@@ -67,7 +67,7 @@ def fake_enrollment(monkeypatch):
     return calls, state
 
 
-def _connect(config: Path, **kwargs: Any) -> tuple[Path, int]:
+def _connect(config: Path, **kwargs: Any) -> tuple[Path, int | None]:
     return client.connect_client(
         server_url=kwargs.pop("server_url", SERVER),
         cert=config.parent / "client.crt",
@@ -100,7 +100,7 @@ def test_connect_preserves_settings_and_reuses_only_same_origin_bearer(tmp_path,
     path, expiry = _connect(config)
     result = json.loads(config.read_text())
     assert path == config
-    assert expiry > time.time()
+    assert expiry is not None and expiry > time.time()
     assert result["theme"] == "dark"
     assert result["mcpServers"]["another"] == document["mcpServers"]["another"]
     entry = result["mcpServers"]["corporate-kb"]
@@ -131,6 +131,16 @@ def test_connect_new_config_uses_optional_ca_and_certificate(tmp_path, fake_enro
     assert certificate["certfile"] == str(tmp_path / "client.crt")
     assert certificate["keyfile"] == str(tmp_path / "client.key")
     assert not next(call["headers"] for call in calls if "url" in call)
+
+
+def test_connect_accepts_permanent_token(tmp_path, fake_enrollment):
+    config = tmp_path / "settings.json"
+    fake_enrollment[1]["payload"]["expires_at"] = None
+    path, expiry = _connect(config)
+    assert path == config
+    assert expiry is None
+    entry = json.loads(config.read_text())["mcpServers"]["corporate-kb"]
+    assert entry["headers"]["Authorization"] == f"Bearer {TOKEN}"
 
 
 @pytest.mark.parametrize(
@@ -269,6 +279,7 @@ def test_network_failure_and_cli_never_show_secrets(tmp_path, fake_enrollment):
         {"token_type": "Basic"},
         {"expires_at": 1},
         {"expires_at": True},
+        {"expires_at": "never"},
         {"mcp_path": "https://evil.example.test/mcp"},
         {"mcp_path": "//evil/mcp"},
         {"mcp_path": "/../auth"},
@@ -277,6 +288,14 @@ def test_network_failure_and_cli_never_show_secrets(tmp_path, fake_enrollment):
 )
 def test_invalid_enrollment_response_does_not_write(tmp_path, fake_enrollment, change):
     fake_enrollment[1]["payload"].update(change)
+    config = tmp_path / "settings.json"
+    with pytest.raises(client.EnrollmentError, match="invalid enrollment"):
+        _connect(config)
+    assert not config.exists()
+
+
+def test_enrollment_requires_explicit_token_lifetime(tmp_path, fake_enrollment):
+    del fake_enrollment[1]["payload"]["expires_at"]
     config = tmp_path / "settings.json"
     with pytest.raises(client.EnrollmentError, match="invalid enrollment"):
         _connect(config)
@@ -311,7 +330,10 @@ def test_tls_load_failure_is_sanitized(tmp_path, fake_enrollment, monkeypatch):
     assert TOKEN not in str(caught.value)
 
 
-def test_cli_success_prints_no_token(tmp_path, fake_enrollment):
+@pytest.mark.parametrize("permanent", [False, True])
+def test_cli_success_prints_no_token(tmp_path, fake_enrollment, permanent):
+    if permanent:
+        fake_enrollment[1]["payload"]["expires_at"] = None
     result = CliRunner().invoke(
         client.app,
         [
@@ -328,6 +350,7 @@ def test_cli_success_prints_no_token(tmp_path, fake_enrollment):
     )
     assert result.exit_code == 0, result.output
     assert "saved to" in result.output
+    assert ("no expiration" if permanent else "Unix timestamp") in result.output
     assert TOKEN not in result.output
     assert OLD_TOKEN not in result.output
 
@@ -343,7 +366,7 @@ def test_stdio_setup_keeps_token_out_of_arguments(tmp_path, fake_enrollment):
     assert "httpUrl" not in entry
 
 
-def test_stdio_proxy_renews_each_start_and_preserves_settings(
+def test_stdio_proxy_saves_explicit_replacement_and_preserves_settings(
     tmp_path, fake_enrollment, monkeypatch
 ):
     config = tmp_path / "settings.json"
@@ -386,7 +409,12 @@ def test_stdio_revocation_does_not_open_proxy_or_rewrite(tmp_path, fake_enrollme
     assert config.read_bytes() == raw
 
 
-def test_stdio_valid_token_reuse_does_not_rewrite(tmp_path, fake_enrollment, monkeypatch):
+@pytest.mark.parametrize("permanent", [False, True])
+def test_stdio_valid_token_reuse_does_not_rewrite(
+    tmp_path, fake_enrollment, monkeypatch, permanent
+):
+    if permanent:
+        fake_enrollment[1]["payload"]["expires_at"] = None
     config = tmp_path / "settings.json"
     _connect(config, transport="stdio")
     previous = config.stat()

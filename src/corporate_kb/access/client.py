@@ -284,9 +284,15 @@ def _enroll(
     if (
         not _valid_token(token)
         or payload.get("token_type") != "Bearer"
-        or not isinstance(expiry, int)
-        or isinstance(expiry, bool)
-        or expiry <= time.time()
+        or "expires_at" not in payload
+        or (
+            expiry is not None
+            and (
+                not isinstance(expiry, int)
+                or isinstance(expiry, bool)
+                or expiry <= time.time()
+            )
+        )
         or not _valid_mcp_path(path)
     ):
         raise EnrollmentError("Server returned an invalid enrollment response.")
@@ -335,7 +341,7 @@ def connect_client(
     replace: bool = False,
     transport: str = "http",
     service: str = "kb",
-) -> tuple[Path, int]:
+) -> tuple[Path, int | None]:
     """Enroll over mTLS, then merge a bearer credential into one local MCP entry."""
     origin = _https_origin(server_url, base_only=True)
     name = _service_name(service, name)
@@ -434,7 +440,7 @@ def proxy_client(
     name: str | None = None,
     service: str = "kb",
 ) -> None:
-    """Refresh the saved credential at each stdio startup before opening remote MCP."""
+    """Validate and reuse the saved credential before opening remote MCP."""
     origin = _https_origin(server_url, base_only=True)
     name = _service_name(service, name)
     snapshot = read_config(config)
@@ -478,7 +484,9 @@ def connect(
     replace: Annotated[
         bool, typer.Option(help="Allow replacing another origin/transport.")
     ] = False,
-    transport: Annotated[str, typer.Option(help="http, or stdio for startup renewal.")] = "http",
+    transport: Annotated[
+        str, typer.Option(help="http, or stdio with startup access checks.")
+    ] = "http",
     service: Annotated[str, typer.Option(help="MCP service: kb or skills.")] = "kb",
 ) -> None:
     """Obtain or reuse an access token and save it in the chosen MCP configuration."""
@@ -497,10 +505,12 @@ def connect(
     except EnrollmentError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from None
-    typer.echo(
-        f"MCP entry '{_service_name(service, name)}' saved to {path}. "
-        f"Token expires at Unix timestamp {expiry}."
+    lifetime = (
+        "Token has no expiration and remains valid until revoked."
+        if expiry is None
+        else f"Token expires at Unix timestamp {expiry}."
     )
+    typer.echo(f"MCP entry '{_service_name(service, name)}' saved to {path}. {lifetime}")
     typer.echo("Restart or reconnect the MCP client to reload its settings.")
 
 

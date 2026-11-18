@@ -130,7 +130,7 @@ async def _use_real_proxy(config: Path, source_path: str, stderr_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_actual_stdio_proxy_enrollment_tools_reuse_and_expiry_renewal(secured, pki):
+async def test_actual_stdio_proxy_reuses_permanent_token_and_honors_revocation(secured, pki):
     app, settings, store, _ = secured
     directory, _ = pki
     config = directory / "client-settings.json"
@@ -142,6 +142,7 @@ async def test_actual_stdio_proxy_enrollment_tools_reuse_and_expiry_renewal(secu
         output, connect_errors = await _run_connect(directory, origin, config, child_env)
         first = json.loads(config.read_text())["mcpServers"]["corporate-kb"]["env"][TOKEN_ENV]
         assert first not in output + connect_errors
+        assert "no expiration" in output
         assert len(store.list_tokens()["items"]) == 1
 
         initial_errors = await _use_real_proxy(
@@ -152,32 +153,32 @@ async def test_actual_stdio_proxy_enrollment_tools_reuse_and_expiry_renewal(secu
         assert len(store.list_tokens()["items"]) == 1
         assert first not in initial_errors
 
-        # Expire the test credential without waiting for the configured production TTL.
+        # A legacy deadline must not rotate a persistent credential on client restart.
         with sqlite3.connect(settings.access_db_path) as database:
             database.execute("UPDATE user_tokens SET expires_at = ?", (int(time.time()) - 1,))
-        assert store.verify_user_token(first) is None
+        assert store.verify_user_token(first) is not None
 
-        renewed_errors = await _use_real_proxy(
-            config, source_path, directory / "renewed-stderr.log"
+        previous = config.stat()
+        restarted_errors = await _use_real_proxy(
+            config, source_path, directory / "restarted-stderr.log"
         )
+        current = json.loads(config.read_text())
+        assert current["mcpServers"]["corporate-kb"]["env"][TOKEN_ENV] == first
+        assert config.stat().st_ino == previous.st_ino
+        assert config.stat().st_mtime_ns == previous.st_mtime_ns
+        assert len(store.list_tokens()["items"]) == 1
+        assert current["unrelated"] is True
+        assert current["mcpServers"]["other"] == {"command": "keep"}
+        assert first not in restarted_errors
+
+        store.logout_user(first)
+        logout_errors = await _use_real_proxy(config, source_path, directory / "logout-stderr.log")
         current = json.loads(config.read_text())
         second = current["mcpServers"]["corporate-kb"]["env"][TOKEN_ENV]
         assert second != first
         assert store.verify_user_token(second) is not None
-        assert len(store.list_tokens()["items"]) == 2
-        assert current["unrelated"] is True
-        assert current["mcpServers"]["other"] == {"command": "keep"}
-        assert first not in renewed_errors
-        assert second not in renewed_errors
-
-        store.logout_user(second)
-        logout_errors = await _use_real_proxy(config, source_path, directory / "logout-stderr.log")
-        current = json.loads(config.read_text())
-        third = current["mcpServers"]["corporate-kb"]["env"][TOKEN_ENV]
-        assert third != second
-        assert store.verify_user_token(third) is not None
+        assert first not in logout_errors
         assert second not in logout_errors
-        assert third not in logout_errors
 
         active = next(
             token for token in store.list_tokens()["items"] if token["status"] == "active"
@@ -187,13 +188,13 @@ async def test_actual_stdio_proxy_enrollment_tools_reuse_and_expiry_renewal(secu
             config, source_path, directory / "revoked-stderr.log"
         )
         current = json.loads(config.read_text())
-        fourth = current["mcpServers"]["corporate-kb"]["env"][TOKEN_ENV]
-        assert fourth != third
-        user = store.verify_user_token(fourth)
+        third = current["mcpServers"]["corporate-kb"]["env"][TOKEN_ENV]
+        assert third != second
+        user = store.verify_user_token(third)
         assert user is not None
+        assert second not in revoked_errors
         assert third not in revoked_errors
-        assert fourth not in revoked_errors
-        assert len(store.list_tokens()["items"]) == 4
+        assert len(store.list_tokens()["items"]) == 3
 
         # Unlike individual credential renewal, principal revocation must stop startup.
         store.revoke_user(user["id"], actor="test-admin", reason="Offboarding")
@@ -216,6 +217,6 @@ async def test_actual_stdio_proxy_enrollment_tools_reuse_and_expiry_renewal(secu
         assert process.returncode == 1
         assert stdout == b""
         assert "Access denied or revoked" in stderr.decode()
-        assert fourth not in stderr.decode()
+        assert third not in stderr.decode()
         assert config.read_bytes() == config_before
-        assert len(store.list_tokens()["items"]) == 4
+        assert len(store.list_tokens()["items"]) == 3

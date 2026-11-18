@@ -187,10 +187,10 @@ def _certificate(subject: str) -> CertificateIdentity:
     )
 
 
-def test_fresh_database_uses_v2_with_partial_unique_common_name(tmp_path):
+def test_fresh_database_uses_v3_with_partial_unique_common_name(tmp_path):
     store = AccessStore(tmp_path / "new.sqlite3")
     with sqlite3.connect(store.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         index = connection.execute(
             "SELECT sql FROM sqlite_master WHERE name = 'users_common_name'"
         ).fetchone()[0]
@@ -212,7 +212,9 @@ def test_v1_migration_preserves_tokens_admins_sessions_audit_and_disables_unknow
     store = AccessStore(legacy_path)
     for table, expected in untouched.items():
         assert _rows(legacy_path, table) == expected
-    assert _rows(legacy_path, "user_tokens") == old_tokens
+    assert _rows(legacy_path, "user_tokens") == [
+        {**row, "expires_at": None, "purpose": "mcp"} for row in old_tokens
+    ]
     assert _rows(legacy_path, "audit_events")[: len(old_events)] == old_events
     assert store.verify_admin_session(ADMIN_TOKEN)["id"] == _id(90)
     assert store.verify_user_token(token, common_name="Developer")["id"] == _id(1)
@@ -226,7 +228,7 @@ def test_v1_migration_preserves_tokens_admins_sessions_audit_and_disables_unknow
     assert store.verify_user_token(unknown) is None
     reused = store.enroll(_certificate("CN=Developer"), existing_token=token)
     assert reused.token == token
-    assert reused.expires_at == NOW + 30  # Never extend an existing token during migration/renewal.
+    assert reused.expires_at is None
     assert store.login_admin("admin", PASSWORD).admin["id"] == _id(90)
     for secret in (token, unknown, ambiguous, malformed, ADMIN_TOKEN, PASSWORD):
         assert secret.encode() not in legacy_path.read_bytes()
@@ -250,7 +252,8 @@ def test_duplicate_cn_merges_deterministically_and_archives_original_rows(legacy
     assert user["subject"] == "CN=Café,O=Latest"
     assert _rows(legacy_path, "users")[0]["created_at"] == NOW - 200
     assert _rows(legacy_path, "user_tokens") == [
-        {**row, "user_id": _id(1)} for row in original_tokens
+        {**row, "user_id": _id(1), "expires_at": None, "purpose": "mcp"}
+        for row in original_tokens
     ]
     archives = _rows(legacy_path, "legacy_user_identities")
     assert {item["id"] for item in archives} == set(original_users)
@@ -335,21 +338,26 @@ def test_any_revoked_duplicate_revokes_entire_cn_without_losing_old_tokens(legac
     assert restored.token not in (active, revoked)
 
 
-def test_migration_never_extends_an_already_expired_token(legacy_path):
+def test_migration_makes_expired_unrevoked_tokens_permanent_without_rotation(legacy_path):
     expired = _add_user(legacy_path, 1, "CN=Developer", expires_at=NOW - 1)
     before = _rows(legacy_path, "user_tokens")
     store = AccessStore(legacy_path, token_ttl_seconds=600)
-    assert _rows(legacy_path, "user_tokens") == before
-    assert store.verify_user_token(expired) is None
-    assert store.list_tokens()["items"][0]["status"] == "expired"
+    assert _rows(legacy_path, "user_tokens") == [
+        {**row, "expires_at": None, "purpose": "mcp"} for row in before
+    ]
+    assert store.verify_user_token(expired)["id"] == _id(1)
+    assert store.list_tokens()["items"][0]["status"] == "active"
     renewed = store.enroll(_certificate("CN=Developer"), existing_token=expired)
     assert renewed.user["id"] == _id(1)
-    assert renewed.token != expired
-    assert renewed.expires_at == NOW + 600
+    assert renewed.token == expired
+    assert renewed.token_id == before[0]["id"]
+    assert renewed.expires_at is None
+    assert store.list_tokens()["total"] == 1
 
 
+@pytest.mark.parametrize("failed_action", ["user.cn_merged", "schema.permanent_tokens_migrated"])
 def test_cn_migration_rolls_back_all_ddl_merges_and_token_changes_on_failure(
-    legacy_path, monkeypatch
+    legacy_path, monkeypatch, failed_action
 ):
     _add_user(legacy_path, 1, "CN=Developer", created_at=NOW - 200)
     _add_user(legacy_path, 2, "CN=Developer")
@@ -359,7 +367,7 @@ def test_cn_migration_rolls_back_all_ddl_merges_and_token_changes_on_failure(
     original_audit = AccessStore._audit
 
     def fail_on_merge(connection, **kwargs):
-        if kwargs["action"] == "user.cn_merged":
+        if kwargs["action"] == failed_action:
             raise RuntimeError("simulated migration write failure")
         return original_audit(connection, **kwargs)
 
@@ -393,5 +401,6 @@ def test_concurrent_initializers_migrate_one_time_without_losing_records(legacy_
         assert store.verify_user_token(second)["id"] == _id(1)
     actions = [event["action"] for event in stores[0].list_events()["items"]]
     assert actions.count("schema.cn_identity_migrated") == 1
+    assert actions.count("schema.permanent_tokens_migrated") == 1
     assert actions.count("user.cn_merged") == 1
     assert len(_rows(legacy_path, "legacy_user_identities")) == 2

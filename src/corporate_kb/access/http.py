@@ -246,8 +246,10 @@ class AccessControl:
                 certificate,
                 existing_token=existing,
                 address=_address(request),
+                purpose="browser" if browser else "mcp",
             )
             if browser:
+                assert issued.expires_at is not None
                 response = _response({"user": issued.user, "expires_at": issued.expires_at})
                 response.set_cookie(
                     USER_COOKIE,
@@ -328,7 +330,13 @@ class AccessControl:
                 secure=True,
                 httponly=True,
                 samesite="strict",
-                max_age=max(0, issued.expires_at - int(time.time())),
+                # This cookie only remembers the previously exported token. Its
+                # lifetime never limits the validity of a downloaded MCP config.
+                max_age=(
+                    self.settings.access_token_ttl_seconds
+                    if issued.expires_at is None
+                    else max(0, issued.expires_at - int(time.time()))
+                ),
             )
             return response
 

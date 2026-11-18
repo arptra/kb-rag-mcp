@@ -116,6 +116,7 @@ class Settings(BaseSettings):
     access_client_certificate_mode: Literal["trusted_ca", "presented"] = "presented"
     access_bootstrap_admin_username: str = "admin"
     access_bootstrap_admin_password: SecretStr | None = None
+    # Legacy setting now controls browser sessions only; MCP tokens never expire.
     access_token_ttl_seconds: int = Field(default=2_592_000, ge=300, le=31_536_000)
     access_admin_session_ttl_seconds: int = Field(default=28_800, ge=300, le=604_800)
 

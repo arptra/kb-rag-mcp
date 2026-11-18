@@ -18,7 +18,7 @@ interface PersonalMcpConfig {
       "corporate-skills"?: McpConnection;
     };
   };
-  expires_at: number;
+  expires_at: number | null;
   user: AccessUser;
 }
 
@@ -83,10 +83,11 @@ export default function McpConnectApp() {
   }, [check, protocol]);
 
   useEffect(() => {
-    if (!result) return;
+    if (!result || result.expires_at === null) return;
+    const expiresAt = result.expires_at;
     let timer = 0;
     const expire = () => {
-      const remaining = result.expires_at * 1000 - Date.now();
+      const remaining = expiresAt * 1000 - Date.now();
       if (remaining <= 0) {
         setResult(null);
         setNotice("Срок действия токена истёк. Нажмите «Получить MCP-конфиг» и обновите подключённые корпоративные MCP в настройках клиента.");
@@ -116,7 +117,7 @@ export default function McpConnectApp() {
         signal: controller.signal,
       });
       if (request !== generation.current || document.visibilityState === "hidden") return;
-      if (!Number.isFinite(response.expires_at) || response.expires_at * 1000 <= Date.now()) {
+      if (response.expires_at !== null && (!Number.isFinite(response.expires_at) || response.expires_at * 1000 <= Date.now())) {
         throw new Error("Сервер вернул истёкший срок токена. Повторите запрос или обратитесь к администратору.");
       }
       setSelectedServers(response.config.mcpServers["corporate-skills"] ? ["corporate-kb", "corporate-skills"] : ["corporate-kb"]);
@@ -129,7 +130,7 @@ export default function McpConnectApp() {
   };
 
   const copy = async () => {
-    if (!result || !selectedConfig || !hasSelection || result.expires_at * 1000 <= Date.now()) return;
+    if (!result || !selectedConfig || !hasSelection || (result.expires_at !== null && result.expires_at * 1000 <= Date.now())) return;
     const request = generation.current;
     setError("");
     try {
@@ -145,7 +146,7 @@ export default function McpConnectApp() {
   };
 
   const download = () => {
-    if (!result || !selectedConfig || !hasSelection || result.expires_at * 1000 <= Date.now()) return;
+    if (!result || !selectedConfig || !hasSelection || (result.expires_at !== null && result.expires_at * 1000 <= Date.now())) return;
     const file = new Blob([`${JSON.stringify(selectedConfig, null, 2)}\n`], { type: "application/json;charset=utf-8" });
     const url = URL.createObjectURL(file);
     const anchor = document.createElement("a");
@@ -186,7 +187,7 @@ export default function McpConnectApp() {
             {status?.user && <div className="access-account-identity"><small>Учётная запись{status.user.common_name ? " · CN" : ""}</small><b>{status.user.common_name || status.user.subject || status.user.id}</b></div>}
             {import.meta.env.DEV && <p className="connect-dev-note">Предпросмотр Vite не передаёт клиентский TLS-сертификат. Для получения конфига используйте собранную страницу /connect непосредственно на HTTPS-порту backend.</p>}
             <div className="connect-actions"><button className="button primary" disabled={!canIssue} onClick={() => void issue()}>{busy ? "Подождите…" : "Получить MCP-конфиг"}</button><button className="button secondary" disabled={busy} onClick={() => void check()}>Повторить проверку</button></div>
-            <p className="connect-help">Одинаковый CN означает одну учётную запись независимо от издателя и отпечатка сертификата. Токен действует до своего срока истечения или отзыва. После истечения получите конфиг снова и обновите выбранные подключения в клиенте. Заблокированного пользователя может восстановить только администратор.</p>
+            <p className="connect-help">Одинаковый CN означает одну учётную запись независимо от издателя и отпечатка сертификата. MCP-токен действует без срока истечения, сохраняется после перезапуска сервера и работает до отзыва токена или доступа пользователя. Заблокированного пользователя может восстановить только администратор.</p>
           </div>
           {error && <div className="form-error" role="alert">{error}</div>}
           {notice && <div className="access-notice" role="status">{notice}</div>}
@@ -196,7 +197,7 @@ export default function McpConnectApp() {
           <div className="connect-config-body">
             <details className="connect-certificate-details"><summary>Последний сертификат · справочные данные</summary><p>Subject: {result.user.subject || "—"}</p><p>Издатель: {result.user.issuer || "—"}</p><p>SHA-256: <code>{result.user.fingerprint || "—"}</code></p><small>Эти сведения не определяют учётную запись или роль администратора.</small></details>
             <div className="connect-secret-warning"><b>Внутри — секретный токен доступа.</b><span>Не отправляйте этот JSON в чат, не публикуйте его и не коммитьте в Git. Скачанный файл и содержимое буфера обмена остаются у вас даже после закрытия страницы.</span></div>
-            <p className="connect-expiry">Действует до <time dateTime={new Date(result.expires_at * 1000).toISOString()}>{new Date(result.expires_at * 1000).toLocaleString("ru-RU")}</time> · время вашего устройства</p>
+            <p className="connect-expiry">{result.expires_at === null ? "Без срока действия · до отзыва" : <>Действует до <time dateTime={new Date(result.expires_at * 1000).toISOString()}>{new Date(result.expires_at * 1000).toLocaleString("ru-RU")}</time> · время вашего устройства</>}</p>
             <div className="connect-merge-note connect-server-selection" role="group" aria-label="Сервисы для подключения">
               <b>Выберите MCP-серверы</b>
               <p>
@@ -228,7 +229,7 @@ export default function McpConnectApp() {
             <textarea ref={configField} id="personal-mcp-config" className="connect-json" value={configText} readOnly spellCheck={false} autoComplete="off" aria-describedby="connect-merge-note" />
             <div className="connect-actions"><button className="button primary" disabled={!hasSelection} onClick={() => void copy()}>Скопировать JSON</button><button className="button secondary" disabled={!hasSelection} onClick={download}>Скачать corporate-mcp.json</button><button className="button quiet" onClick={() => { ++generation.current; setResult(null); setNotice("Конфиг скрыт. Токен остаётся действительным; для отзыва обратитесь к администратору."); }}>Скрыть конфиг</button></div>
             <div className="connect-merge-note" id="connect-merge-note"><b>Не заменяйте весь файл настроек клиента.</b><p>Добавьте или обновите выбранные записи <code>corporate-kb</code>{result.config.mcpServers["corporate-skills"] && <> и <code>corporate-skills</code></>} внутри <code>mcpServers</code>. Другие серверы и настройки оставьте без изменений. Затем сохраните настройки и переподключите MCP в клиенте.</p><p>Эта страница не изменяет файлы на вашем компьютере автоматически. Формат конфигурации поддерживается клиентами с полями <code>mcpServers</code>, <code>httpUrl</code> и <code>headers</code>.</p></div>
-            <p className="connect-help">Конфиг хранится только в памяти этой страницы и скрывается при переключении вкладки, уходе со страницы, повторной проверке или истечении токена. Скрытие и выход из дашборда не отзывают скопированный или скачанный MCP-токен. Для отзыва отдельного токена или блокировки всего доступа обратитесь к администратору.</p>
+            <p className="connect-help">Конфиг хранится только в памяти этой страницы и скрывается при переключении вкладки, уходе со страницы, повторной проверке. Скрытие и выход из дашборда не отзывают скопированный или скачанный MCP-токен. Для отзыва отдельного токена или блокировки всего доступа обратитесь к администратору.</p>
           </div>
         </section>}
         </>}
