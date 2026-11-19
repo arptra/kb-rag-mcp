@@ -337,6 +337,36 @@ def register_a2a_routes(
         except (ValueError, TypeError) as exc:
             return response({"error": str(exc)}, 400)
 
+    @server.custom_route("/admin/api/a2a/calls", methods=["DELETE"], include_in_schema=False)
+    async def clear_calls(request: Request) -> JSONResponse:
+        if not await manager_authorized(request):
+            return response(
+                {"error": "Administrator authentication required"},
+                401 if settings.access_enabled else 403,
+            )
+        try:
+            return response(await asyncio.to_thread(
+                engine.store.clear_calls, request.query_params.get("agent_id")
+            ))
+        except ValueError as exc:
+            return response({"error": str(exc)}, 400)
+
+    @server.custom_route(
+        "/admin/api/a2a/agents/{agent_id}", methods=["DELETE"], include_in_schema=False
+    )
+    async def delete_agent(request: Request) -> JSONResponse:
+        if not await manager_authorized(request):
+            return response(
+                {"error": "Administrator authentication required"},
+                401 if settings.access_enabled else 403,
+            )
+        try:
+            return response(await asyncio.to_thread(
+                engine.delete_agent, request.path_params["agent_id"]
+            ))
+        except KeyError:
+            return response({"error": "Agent not found"}, 404)
+
     @server.custom_route(
         "/admin/api/a2a/agents/{agent_id}/rotate", methods=["POST"], include_in_schema=False
     )

@@ -207,6 +207,12 @@ cache hits, warnings and errors. Log reads use a cursor and bounded page size ra
 than repeatedly loading an entire growing log. Tokens and Authorization headers are
 redacted from persisted messages.
 
+The administrator can clear a source's synchronization journal with **Очистить журнал**
+in its row. This removes log entries across that source's jobs, including entries
+already written by running jobs. It preserves source configuration, schedules,
+documents, attachments, job progress and retry/failure reports. Running jobs continue
+and new entries appear normally; other sources' journals are unaffected.
+
 Main endpoints:
 
 - `GET /admin/api/confluence` — source/job summary and extractor availability.
@@ -216,6 +222,8 @@ Main endpoints:
 - `PATCH /admin/api/confluence/sources/{id}` — update configuration or token.
 - `POST /admin/api/confluence/sources/{id}/sync` — manual synchronization.
 - `POST /admin/api/confluence/sources/{id}/pause` — pause/resume schedule.
+- `POST /admin/api/confluence/sources/{id}/logs/clear` — administrator-only journal
+  cleanup for all jobs of this source, without cancelling synchronization.
 - `POST /admin/api/confluence/sources/{id}/delete` — disconnect while retaining indexed content
   and archived evidence.
 - `GET /admin/api/confluence/sources/{id}/pages?offset=0&limit=100&query=` — bounded saved

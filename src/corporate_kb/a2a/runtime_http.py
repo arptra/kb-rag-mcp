@@ -65,3 +65,14 @@ def register_runtime_routes(
             return reply(data)
         except ValueError as exc:
             return reply({"error": str(exc)}, 400)
+
+    @server.custom_route("/admin/api/a2a/events", methods=["DELETE"], include_in_schema=False)
+    async def clear_events(request: Request) -> JSONResponse:
+        if not await manager_authorized(request):
+            return reply({"error": "Administrator access required"}, 401)
+        try:
+            return reply(await asyncio.to_thread(
+                store.clear_events, request.query_params.get("agent_id")
+            ))
+        except ValueError as exc:
+            return reply({"error": str(exc)}, 400)

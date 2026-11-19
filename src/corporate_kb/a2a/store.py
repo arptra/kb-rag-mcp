@@ -57,12 +57,34 @@ class A2AStore:
                     agent_id TEXT NOT NULL, agent_name TEXT NOT NULL, task_id TEXT NOT NULL,
                     phase TEXT NOT NULL, message TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS task_events_agent ON task_events(agent_id,id);
+                CREATE TABLE IF NOT EXISTS usage_totals (
+                    agent_id TEXT NOT NULL, status TEXT NOT NULL, count INTEGER NOT NULL,
+                    PRIMARY KEY(agent_id,status));
+                CREATE TABLE IF NOT EXISTS usage_recent (
+                    timestamp REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS usage_recent_timestamp ON usage_recent(timestamp);
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    name TEXT PRIMARY KEY);
             """)
+            db.execute("BEGIN IMMEDIATE")
             columns = {row[1] for row in db.execute("PRAGMA table_info(agents)")}
             if "credential_version" not in columns:
                 db.execute(
                     "ALTER TABLE agents ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 1"
                 )
+            if not db.execute(
+                "SELECT 1 FROM schema_migrations WHERE name='persistent_usage'"
+            ).fetchone():
+                db.execute(
+                    "INSERT INTO usage_totals(agent_id,status,count) "
+                    "SELECT COALESCE(agent_id,''),status,COUNT(*) FROM calls "
+                    "GROUP BY COALESCE(agent_id,''),status"
+                )
+                db.execute(
+                    "INSERT INTO usage_recent(timestamp) SELECT timestamp FROM calls "
+                    "WHERE timestamp>?", (time.time() - 60,)
+                )
+                db.execute("INSERT INTO schema_migrations VALUES('persistent_usage')")
         self.path.chmod(0o600)
 
     @contextmanager
@@ -99,11 +121,17 @@ class A2AStore:
             return [
                 self._public(row, row["call_count"])
                 for row in db.execute(
-                    "SELECT a.*, (SELECT COUNT(*) FROM calls c WHERE "
-                    "c.agent_id=a.id) AS call_count "
+                    "SELECT a.*, (SELECT COALESCE(SUM(count),0) FROM usage_totals u WHERE "
+                    "u.agent_id=a.id) AS call_count "
                     "FROM agents a ORDER BY created_at DESC"
                 )
             ]
+
+    @staticmethod
+    def _call_count(db: sqlite3.Connection, agent_id: str) -> int:
+        return int(db.execute(
+            "SELECT COALESCE(SUM(count),0) FROM usage_totals WHERE agent_id=?", (agent_id,)
+        ).fetchone()[0])
 
     def issue(
         self, name: str, index_ids: list[str], days: int = 30, *, agent_id: str | None = None
@@ -124,6 +152,7 @@ class A2AStore:
         digest = hashlib.sha256(token.encode()).hexdigest()
         expires = time.time() + days * 86400
         with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
             if agent_id is None:
                 agent_id = str(uuid4())
                 db.execute(
@@ -155,7 +184,8 @@ class A2AStore:
                     (digest, token[:12], expires, agent_id),
                 )
             row = db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
-        return {"agent": self._public(row), "token": token, "expires_at": expires}
+            count = self._call_count(db, agent_id)
+        return {"agent": self._public(row, count), "token": token, "expires_at": expires}
 
     def rotate(self, agent_id: str, days: int = 30) -> dict[str, Any]:
         agent = self.agent(agent_id)
@@ -164,15 +194,52 @@ class A2AStore:
     def agent(self, agent_id: str) -> dict[str, Any]:
         with self.db() as db:
             row = db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+            count = self._call_count(db, agent_id)
         if row is None:
             raise KeyError("Unknown A2A agent")
-        return self._public(row)
+        return self._public(row, count)
 
     def revoke(self, agent_id: str) -> dict[str, Any]:
         self.agent(agent_id)
         with self.db() as db:
             db.execute("UPDATE agents SET revoked=1 WHERE id=?", (agent_id,))
         return self.agent(agent_id)
+
+    def delete_agent(self, agent_id: str) -> dict[str, Any]:
+        """Invalidate credentials and remove owned work atomically; retain external usage."""
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("DELETE FROM agents WHERE id=?", (agent_id,)).rowcount:
+                raise KeyError("Unknown A2A agent")
+            tasks = db.execute("DELETE FROM tasks WHERE agent_id=?", (agent_id,)).rowcount
+            events = db.execute("DELETE FROM task_events WHERE agent_id=?", (agent_id,)).rowcount
+        return {"deleted": True, "agent_id": agent_id,
+                "deleted_tasks": tasks, "deleted_events": events}
+
+    @staticmethod
+    def _validate_log_scope(agent_id: str | None) -> None:
+        if agent_id is not None and (
+            not isinstance(agent_id, str) or not agent_id.strip() or len(agent_id) > 256
+        ):
+            raise ValueError("agent_id must contain 1-256 characters")
+
+    def clear_calls(self, agent_id: str | None = None) -> dict[str, Any]:
+        self._validate_log_scope(agent_id)
+        with self.db() as db:
+            deleted = (
+                db.execute("DELETE FROM calls WHERE agent_id=?", (agent_id,))
+                if agent_id is not None else db.execute("DELETE FROM calls")
+            ).rowcount
+        return {"deleted_count": deleted, "agent_id": agent_id}
+
+    def clear_events(self, agent_id: str | None = None) -> dict[str, Any]:
+        self._validate_log_scope(agent_id)
+        with self.db() as db:
+            deleted = (
+                db.execute("DELETE FROM task_events WHERE agent_id=?", (agent_id,))
+                if agent_id is not None else db.execute("DELETE FROM task_events")
+            ).rowcount
+        return {"deleted_count": deleted, "agent_id": agent_id}
 
     def authenticate(self, token: str) -> dict[str, Any] | None:
         if not isinstance(token, str) or not token.startswith("a2a_") or len(token) > 256:
@@ -210,6 +277,7 @@ class A2AStore:
                        "transport", "client", "mode", "effort", "request_id"}
         }
         with self.db() as db:
+            stamp = time.time()
             db.execute(
                 (
                     "INSERT INTO "
@@ -218,7 +286,7 @@ class A2AStore:
                 ),
                 (
                     now(),
-                    time.time(),
+                    stamp,
                     agent["id"] if agent else None,
                     agent["name"] if agent else None,
                     clean(method, 80),
@@ -228,6 +296,13 @@ class A2AStore:
                     json.dumps(safe, ensure_ascii=False),
                 ),
             )
+            db.execute(
+                "INSERT INTO usage_totals(agent_id,status,count) VALUES(?,?,1) "
+                "ON CONFLICT(agent_id,status) DO UPDATE SET count=count+1",
+                (agent["id"] if agent else "", status),
+            )
+            db.execute("INSERT INTO usage_recent(timestamp) VALUES(?)", (stamp,))
+            db.execute("DELETE FROM usage_recent WHERE timestamp<=?", (stamp - 60,))
             if agent:
                 db.execute("UPDATE agents SET last_used_at=? WHERE id=?", (now(), agent["id"]))
 
@@ -264,10 +339,10 @@ class A2AStore:
     def stats(self) -> dict[str, Any]:
         with self.db() as db:
             counts = dict(
-                db.execute("SELECT status,COUNT(*) FROM calls GROUP BY status").fetchall()
+                db.execute("SELECT status,SUM(count) FROM usage_totals GROUP BY status").fetchall()
             )
             recent = db.execute(
-                "SELECT COUNT(*) FROM calls WHERE timestamp>?", (time.time() - 60,)
+                "SELECT COUNT(*) FROM usage_recent WHERE timestamp>?", (time.time() - 60,)
             ).fetchone()[0]
             active = db.execute(
                 "SELECT COUNT(*) FROM agents WHERE revoked=0 AND expires_at>?", (time.time(),)
@@ -287,9 +362,9 @@ class A2AStore:
         with self.db() as db:
             db.execute(
                 "INSERT INTO task_events(created_at,agent_id,agent_name,task_id,phase,message) "
-                "VALUES(?,?,?,?,?,?)",
+                "SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM agents WHERE id=?)",
                 (now(), agent["id"], clean(agent["name"], 120), task_id,
-                 clean(phase, 80), clean(message)),
+                 clean(phase, 80), clean(message), agent["id"]),
             )
             db.execute("DELETE FROM task_events WHERE id <= "
                        "(SELECT COALESCE(MAX(id),0)-10000 FROM task_events)")
@@ -319,6 +394,8 @@ class A2AStore:
     ) -> tuple[dict[str, Any], bool]:
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM agents WHERE id=?", (agent_id,)).fetchone():
+                raise PermissionError("Agent no longer exists")
             old = db.execute(
                 "SELECT fingerprint,payload FROM tasks WHERE agent_id=? AND message_id=?",
                 (agent_id, message_id),

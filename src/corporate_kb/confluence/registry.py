@@ -534,6 +534,24 @@ class ConfluenceRegistry:
             "has_more": len(rows) > limit,
         }
 
+    def clear_source_logs(self, source_id: str) -> dict[str, Any]:
+        """Clear journal entries without changing jobs, checkpoints or source data."""
+        with self._db() as connection:
+            # Serialize with event writers: entries committed after this clear
+            # remain available, including to clients using an older cursor.
+            connection.execute("BEGIN IMMEDIATE")
+            self._source_row(connection, source_id)
+            removed = connection.execute(
+                "DELETE FROM events WHERE job_id IN (SELECT id FROM jobs WHERE source_id=?)",
+                (source_id,),
+            ).rowcount
+            # Never reset sqlite_sequence: existing clients must still see the
+            # next event after their last cursor even when every log is empty.
+        logger.info(
+            "Confluence source logs cleared: source=%s deleted_events=%d", source_id, removed
+        )
+        return {"status": "cleared", "source_id": source_id, "deleted_events": removed}
+
     def job_failures(self, job_id: str, *, offset: int = 0, limit: int = 50) -> dict[str, Any]:
         if offset < 0 or not 1 <= limit <= 200:
             raise ValueError("Invalid failure pagination")

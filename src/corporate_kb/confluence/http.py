@@ -173,6 +173,10 @@ def register_confluence_routes(
     async def delete(request: Request) -> dict[str, Any]:
         return await asyncio.to_thread(registry.delete_source, request.path_params["source_id"])
 
+    @route("/sources/{source_id}/logs/clear", ["POST"], manage=True)
+    async def clear_logs(request: Request) -> dict[str, Any]:
+        return await asyncio.to_thread(registry.clear_source_logs, request.path_params["source_id"])
+
     @route("/sources/{source_id}/pages", ["GET"])
     async def pages(request: Request) -> dict[str, Any]:
         return await asyncio.to_thread(

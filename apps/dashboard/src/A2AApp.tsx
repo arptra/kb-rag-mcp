@@ -44,6 +44,9 @@ export default function A2AApp({ password = "", indexes = [], connectionMode = f
   const [configProtocol, setConfigProtocol] = useState<"mcp" | "a2a">("mcp");
   const [events, setEvents] = useState<A2AEvent[]>([]);
   const [eventsError, setEventsError] = useState("");
+  const [logsRevision, setLogsRevision] = useState(0);
+  const logsGeneration = useRef(0);
+  const logsMutating = useRef(false);
   const [tab, setTab] = useState<"agents" | "calls">("agents");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -52,24 +55,29 @@ export default function A2AApp({ password = "", indexes = [], connectionMode = f
   const [notice, setNotice] = useState("");
   const secretField = useRef<HTMLTextAreaElement>(null);
   const generation = useRef(0);
+  const catalogGeneration = useRef(0);
   const choices = indexes.length ? indexes : catalog?.indexes ?? [];
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    const currentGeneration = ++catalogGeneration.current;
     setLoading(true);
     try {
       const current = await request<A2AStatus>("/auth/a2a/status", { signal });
+      if (signal?.aborted || currentGeneration !== catalogGeneration.current) return;
       setStatus(current);
       if (current.enabled === false) { ++generation.current; setCatalog(null); setIssued(null); setLoadError(""); return; }
       try {
         const data = await request<A2ACatalog>("/admin/api/a2a", { signal });
+        if (signal?.aborted || currentGeneration !== catalogGeneration.current) return;
         if (!data.can_manage) { ++generation.current; setIssued(null); }
         setCatalog(data); setStatus(data); setLoadError("");
       } catch (caught) {
+        if (signal?.aborted || currentGeneration !== catalogGeneration.current) return;
         if (caught instanceof ApiError && [401, 403].includes(caught.status) && !current.can_manage) { setCatalog(null); setIssued(null); setLoadError(""); }
         else throw caught;
       }
-    } catch (caught) { if (!signal?.aborted) setLoadError(accessError(caught)); }
-    finally { if (!signal?.aborted) setLoading(false); }
+    } catch (caught) { if (!signal?.aborted && currentGeneration === catalogGeneration.current) setLoadError(accessError(caught)); }
+    finally { if (!signal?.aborted && currentGeneration === catalogGeneration.current) setLoading(false); }
   }, [request, password]);
   useEffect(() => {
     const controller = new AbortController(); let timer = 0;
@@ -91,41 +99,44 @@ export default function A2AApp({ password = "", indexes = [], connectionMode = f
   }, [issued]);
 
   const loadCalls = useCallback(async (next: string | number | null = null, signal?: AbortSignal) => {
+    if (logsMutating.current) return;
+    const current = logsGeneration.current;
     const params = new URLSearchParams({ limit: "50" });
     if (next !== null) params.set("cursor", String(next));
     if (agentFilter) params.set("agent_id", agentFilter);
     try {
       const data = await request<{ calls: A2ACall[]; next_cursor: string | number | null }>(`/admin/api/a2a/calls?${params}`, { signal });
-      if (signal?.aborted) return;
+      if (signal?.aborted || current !== logsGeneration.current) return;
       setCalls(current => next !== null ? [...new Map([...current, ...data.calls].map(call => [call.id, call])).values()].slice(-500) : data.calls);
       callCursor.current = data.next_cursor; setCursor(data.next_cursor); setError("");
-    } catch (caught) { if (!signal?.aborted) setError(accessError(caught)); }
+    } catch (caught) { if (!signal?.aborted && current === logsGeneration.current) setError(accessError(caught)); }
   }, [request, agentFilter]);
   useEffect(() => {
     if (!catalog || tab !== "calls") return;
-    const controller = new AbortController(); let timer = 0; callCursor.current = null; setCalls([]);
+    const controller = new AbortController(); let timer = 0; callCursor.current = null; setCursor(null); setCalls([]);
     const poll = async () => { await loadCalls(callCursor.current, controller.signal); if (!controller.signal.aborted) timer = window.setTimeout(poll, 5000); };
     void poll(); return () => { controller.abort(); window.clearTimeout(timer); };
-  }, [Boolean(catalog), tab, loadCalls]);
+  }, [Boolean(catalog), tab, loadCalls, logsRevision]);
   useEffect(() => {
     if (!catalog?.can_manage || tab !== "calls") return;
     const controller = new AbortController(); let timer = 0;
     setEvents([]); setEventsError("");
     const poll = async () => {
-      if (document.visibilityState !== "hidden") {
+      if (document.visibilityState !== "hidden" && !logsMutating.current) {
+        const current = logsGeneration.current;
         const params = new URLSearchParams({ limit: "100" });
         if (agentFilter) params.set("agent_id", agentFilter);
         try {
           const data = await request<{ events: A2AEvent[] }>(`/admin/api/a2a/events?${params}`, { signal: controller.signal });
-          if (!controller.signal.aborted) { setEvents(data.events); setEventsError(""); }
+          if (!controller.signal.aborted && current === logsGeneration.current) { setEvents(data.events); setEventsError(""); }
         } catch (caught) {
-          if (!controller.signal.aborted) { setEventsError(accessError(caught)); if (caught instanceof ApiError && [401, 403].includes(caught.status)) setEvents([]); }
+          if (!controller.signal.aborted && current === logsGeneration.current) { setEventsError(accessError(caught)); if (caught instanceof ApiError && [401, 403].includes(caught.status)) setEvents([]); }
         }
       }
       if (!controller.signal.aborted) timer = window.setTimeout(poll, 5000);
     };
     void poll(); return () => { controller.abort(); window.clearTimeout(timer); };
-  }, [catalog?.can_manage, tab, agentFilter, request, revision]);
+  }, [catalog?.can_manage, tab, agentFilter, request, revision, logsRevision]);
 
   const issue = async (event?: FormEvent, agent?: A2AAgent) => {
     event?.preventDefault(); if (busy) return;
@@ -143,6 +154,37 @@ export default function A2AApp({ password = "", indexes = [], connectionMode = f
     setBusy(true); setError("");
     try { await request(`/admin/api/a2a/agents/${encodeURIComponent(agent.id)}/revoke`, { method: "POST", body: "{}" }); setIssued(null); setNotice("Доступ A2A отозван"); await load(); }
     catch (caught) { setError(accessError(caught)); } finally { setBusy(false); }
+  };
+  const removeAgent = async (agent: A2AAgent) => {
+    if (busy || !window.confirm(`Удалить агента «${agent.name}»? Токен перестанет работать, текущие задачи будут остановлены. Его задачи и шаги исследования будут удалены. История вызовов останется в журнале до отдельной очистки.`)) return;
+    ++generation.current; ++catalogGeneration.current; ++logsGeneration.current;
+    logsMutating.current = true;
+    setBusy(true); setError(""); setNotice("");
+    try {
+      await request(`/admin/api/a2a/agents/${encodeURIComponent(agent.id)}`, { method: "DELETE" });
+      setIssued(current => current?.agent.id === agent.id ? null : current);
+      setCatalog(current => current ? { ...current, agents: current.agents.filter(item => item.id !== agent.id) } : current);
+      if (agentFilter === agent.id) setAgentFilter("");
+      setNotice(`Агент «${agent.name}» удалён`);
+      await load();
+    } catch (caught) { setError(accessError(caught)); }
+    finally { ++logsGeneration.current; logsMutating.current = false; setLogsRevision(value => value + 1); setBusy(false); }
+  };
+  const clearLogs = async (kind: "calls" | "events") => {
+    const label = kind === "calls" ? "журнал вызовов" : "журнал шагов исследования";
+    const scope = agentFilter ? `агента «${catalog?.agents.find(agent => agent.id === agentFilter)?.name || agentFilter}»` : "всех агентов";
+    if (busy || !window.confirm(`Очистить ${label} для ${scope}? Счётчики вызовов и задачи сохранятся. Новые записи продолжат появляться.`)) return;
+    ++logsGeneration.current; logsMutating.current = true;
+    setBusy(true); setError(""); setNotice("");
+    try {
+      const params = new URLSearchParams();
+      if (agentFilter) params.set("agent_id", agentFilter);
+      const result = await request<{ deleted_count: number }>(`/admin/api/a2a/${kind}${params.size ? `?${params}` : ""}`, { method: "DELETE" });
+      if (kind === "calls") { setCalls([]); callCursor.current = null; setCursor(null); }
+      else { setEvents([]); setEventsError(""); }
+      setNotice(`Журнал очищен: удалено записей — ${result.deleted_count}. Счётчики вызовов сохранены.`);
+    } catch (caught) { setError(accessError(caught)); }
+    finally { ++logsGeneration.current; logsMutating.current = false; setLogsRevision(value => value + 1); setBusy(false); }
   };
   const secretText = issued ? JSON.stringify(configProtocol === "mcp" ? issued.mcp_config ?? { mcpServers: { "corporate-knowledge-agent": { url: issued.endpoint, headers: { Authorization: `Bearer ${issued.token}` } } } } : issued.config ?? { endpoint: issued.endpoint, agent_card_url: issued.agent_card_url, headers: { Authorization: `Bearer ${issued.token}`, "A2A-Version": "1.0" } }, null, 2) : "";
   const copy = async () => {
@@ -171,9 +213,9 @@ export default function A2AApp({ password = "", indexes = [], connectionMode = f
           <div><button className="button primary" disabled={busy || !selected.length || !name.trim()}>{busy ? "Выдаём…" : "Создать агента и выдать токен"}</button></div>
         </form></section>}
         {issued && <section className="panel integration-panel" aria-live="polite"><h3>Токен выдан · {issued.agent.name}</h3><p className="integration-muted">Показывается один раз. Действует до {integrationDate(issued.expires_at)}. Сохраните конфиг перед уходом со страницы.</p><label>Способ подключения<select value={configProtocol} onChange={event => setConfigProtocol(event.target.value as "mcp" | "a2a")}><option value="mcp">GigaAgent / MCP</option><option value="a2a">A2A</option></select></label><p className="integration-muted">{configProtocol === "mcp" ? "Добавьте сервер в MCP-подключения GigaAgent. Он получит инструменты исследования, поиска и чтения документов. Этот доступ использует токен агента и отдельный журнал A2A." : "Передайте конфиг клиенту A2A. Описание агента содержит форматы сообщений, задач и результатов."}</p><textarea ref={secretField} className="connect-json" value={secretText} readOnly autoComplete="off" spellCheck={false} aria-label="Конфиг подключения с секретным токеном" /><div className="integration-actions"><button className="button primary" onClick={() => void copy()}>Скопировать</button><button className="button secondary" onClick={download}>Скачать конфиг</button><button className="button quiet" onClick={() => setIssued(null)}>Скрыть</button></div></section>}
-        <section className="panel"><div className="panel-header"><div><h3>Зарегистрированные агенты</h3></div></div><div className="table-wrap"><table><thead><tr><th>Агент</th><th>Индексы</th><th>Токен</th><th>Последний вызов</th><th /></tr></thead><tbody>{catalog.agents.map(agent => <tr key={agent.id}><td><b>{agent.name}</b><small>{agent.status || (agent.revoked_at ? "Отозван" : "Активен")}</small></td><td>{agent.index_ids.map(id => <span className="tag" key={id}>{choices.find(index => index.id === id)?.name || id}</span>)}</td><td><code>{agent.token_prefix || agent.prefix || "Скрыт"}</code><small>До {integrationDate(agent.expires_at)}</small></td><td>{integrationDate(agent.last_used_at)}</td><td>{catalog.can_manage && <div className="integration-actions"><button className="button quiet" disabled={busy || Boolean(agent.revoked_at) || agent.status === "revoked"} onClick={() => { if (window.confirm(`Заменить токен «${agent.name}»? Старый токен перестанет работать.`)) void issue(undefined, agent); }}>Заменить токен</button><button className="button quiet" disabled={busy || Boolean(agent.revoked_at) || agent.status === "revoked"} onClick={() => void revoke(agent)}>Отозвать</button></div>}</td></tr>)}</tbody></table>{!catalog.agents.length && <div className="empty-state compact">Агенты пока не зарегистрированы</div>}</div></section>
-      </> : <><section className="panel integration-panel"><div className="integration-actions"><label>Агент<select value={agentFilter} onChange={event => setAgentFilter(event.target.value)}><option value="">Все агенты</option>{catalog.agents.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label><button className="button secondary" onClick={() => void loadCalls(cursor)}>Проверить новые записи</button><small className="integration-muted">Обновляется каждые 5 секунд · последние 500 записей</small></div><div className="table-wrap"><table><thead><tr><th>Время</th><th>Агент</th><th>Операция</th><th>Результат</th><th>Время, мс</th></tr></thead><tbody>{calls.map(call => <tr key={call.id}><td>{integrationDate(call.created_at || call.timestamp)}</td><td>{call.agent_name || catalog.agents.find(agent => agent.id === call.agent_id)?.name || call.agent_id}</td><td>{call.method || "—"}{(call.tool || call.action) && <small>{call.tool || call.action}{call.index_id ? ` · ${call.index_id}` : ""}{call.version_scope ? ` · ${call.version_scope}` : ""}</small>}{call.query && <small>{call.query}</small>}</td><td>{call.status || "—"}{call.error && <small className="integration-error">{call.error}</small>}</td><td>{call.duration_ms ?? "—"}</td></tr>)}</tbody></table></div>{!calls.length && <div className="empty-state compact">Вызовов пока нет</div>}</section>
-      {catalog.can_manage && <section className="panel integration-panel"><h3>Шаги исследования</h3><p className="integration-muted">Поиск, чтение документов и подготовка ответа · последние 100 шагов. Они не увеличивают счётчик внешних вызовов A2A.</p>{eventsError && <div className="form-error" role="alert">{eventsError}</div>}<div className="table-wrap"><table><thead><tr><th>Время</th><th>Агент / задача</th><th>Шаг</th><th>Подробности</th></tr></thead><tbody>{events.map(event => <tr key={event.id}><td>{integrationDate(event.created_at)}</td><td>{event.agent_name || "—"}{event.task_id && <small>{event.task_id}</small>}</td><td>{event.phase}</td><td>{event.message}</td></tr>)}</tbody></table></div>{!events.length && !eventsError && <div className="empty-state compact">Шагов исследования пока нет</div>}</section>}</>}
+        <section className="panel"><div className="panel-header"><div><h3>Зарегистрированные агенты</h3></div></div><div className="table-wrap"><table><thead><tr><th>Агент</th><th>Индексы</th><th>Токен</th><th>Последний вызов</th><th /></tr></thead><tbody>{catalog.agents.map(agent => <tr key={agent.id}><td><b>{agent.name}</b><small>{agent.status || (agent.revoked_at ? "Отозван" : "Активен")}</small></td><td>{agent.index_ids.map(id => <span className="tag" key={id}>{choices.find(index => index.id === id)?.name || id}</span>)}</td><td><code>{agent.token_prefix || agent.prefix || "Скрыт"}</code><small>До {integrationDate(agent.expires_at)}</small></td><td>{integrationDate(agent.last_used_at)}</td><td>{catalog.can_manage && <div className="integration-actions"><button className="button quiet" disabled={busy || Boolean(agent.revoked_at) || agent.status === "revoked"} onClick={() => { if (window.confirm(`Заменить токен «${agent.name}»? Старый токен перестанет работать.`)) void issue(undefined, agent); }}>Заменить токен</button><button className="button quiet" disabled={busy || Boolean(agent.revoked_at) || agent.status === "revoked"} onClick={() => void revoke(agent)}>Отозвать</button><button className="button quiet" disabled={busy} onClick={() => void removeAgent(agent)}>Удалить агента</button></div>}</td></tr>)}</tbody></table>{!catalog.agents.length && <div className="empty-state compact">Агенты пока не зарегистрированы</div>}</div></section>
+      </> : <><section className="panel integration-panel"><div className="integration-actions"><label>Агент<select value={agentFilter} disabled={busy} onChange={event => setAgentFilter(event.target.value)}><option value="">Все агенты</option>{catalog.agents.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label><button className="button secondary" disabled={busy} onClick={() => void loadCalls(cursor)}>Проверить новые записи</button>{catalog.can_manage && <button className="button quiet" disabled={busy} onClick={() => void clearLogs("calls")}>{agentFilter ? "Очистить вызовы агента" : "Очистить все вызовы"}</button>}<small className="integration-muted">Обновляется каждые 5 секунд · последние 500 записей. Очистка журнала сохраняет счётчики вызовов.</small></div><div className="table-wrap"><table><thead><tr><th>Время</th><th>Агент</th><th>Операция</th><th>Результат</th><th>Время, мс</th></tr></thead><tbody>{calls.map(call => <tr key={call.id}><td>{integrationDate(call.created_at || call.timestamp)}</td><td>{call.agent_name || catalog.agents.find(agent => agent.id === call.agent_id)?.name || call.agent_id}</td><td>{call.method || "—"}{(call.tool || call.action) && <small>{call.tool || call.action}{call.index_id ? ` · ${call.index_id}` : ""}{call.version_scope ? ` · ${call.version_scope}` : ""}</small>}{call.query && <small>{call.query}</small>}</td><td>{call.status || "—"}{call.error && <small className="integration-error">{call.error}</small>}</td><td>{call.duration_ms ?? "—"}</td></tr>)}</tbody></table></div>{!calls.length && <div className="empty-state compact">Вызовов пока нет</div>}</section>
+      {catalog.can_manage && <section className="panel integration-panel"><div className="integration-actions"><h3>Шаги исследования</h3><button className="button quiet" disabled={busy} onClick={() => void clearLogs("events")}>{agentFilter ? "Очистить шаги агента" : "Очистить все шаги"}</button></div><p className="integration-muted">Поиск, чтение документов и подготовка ответа · последние 100 шагов. Они не увеличивают счётчик внешних вызовов A2A.</p>{eventsError && <div className="form-error" role="alert">{eventsError}</div>}<div className="table-wrap"><table><thead><tr><th>Время</th><th>Агент / задача</th><th>Шаг</th><th>Подробности</th></tr></thead><tbody>{events.map(event => <tr key={event.id}><td>{integrationDate(event.created_at)}</td><td>{event.agent_name || "—"}{event.task_id && <small>{event.task_id}</small>}</td><td>{event.phase}</td><td>{event.message}</td></tr>)}</tbody></table></div>{!events.length && !eventsError && <div className="empty-state compact">Шагов исследования пока нет</div>}</section>}</>}
     </>}
   </div>;
 }

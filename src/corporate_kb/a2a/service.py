@@ -134,7 +134,16 @@ class A2AService:
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="a2a")
         self._capacity = BoundedSemaphore(32)
         self._signals: dict[str, Event] = {}
+        self._signal_agents: dict[str, str] = {}
         self._signals_lock = Lock()
+
+    def delete_agent(self, agent_id: str) -> dict[str, Any]:
+        with self._signals_lock:
+            result = self.store.delete_agent(agent_id)
+            for task_id, owner in self._signal_agents.items():
+                if owner == agent_id:
+                    self._signals[task_id].set()
+        return result
 
     def start(self) -> None:
         self.store.recover()
@@ -388,6 +397,7 @@ class A2AService:
         cancel = Event()
         with self._signals_lock:
             self._signals[task["id"]] = cancel
+            self._signal_agents[task["id"]] = agent["id"]
         try:
             if self.store.task(agent["id"], task["id"])["status"]["state"] in TERMINAL:
                 return
@@ -471,6 +481,7 @@ class A2AService:
                                             task["status"]["state"])
                 with self._signals_lock:
                     self._signals.pop(task["id"], None)
+                    self._signal_agents.pop(task["id"], None)
                 self._capacity.release()
 
     def _assert_access(self, agent: dict[str, Any]) -> None:
