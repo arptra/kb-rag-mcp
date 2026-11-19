@@ -248,9 +248,6 @@ async def test_version_rejection_retains_request_id_method_and_agent_in_journal(
 @pytest.mark.parametrize(
     ("method", "version", "hint"),
     [
-        ("initialize", None, "MCP"),
-        ("tools/list", "1.0", "MCP"),
-        ("tools/call", "0.3", "MCP"),
         ("message/send", "1.0", "0.3"),
         ("made-up-method", None, "Supported methods"),
     ],

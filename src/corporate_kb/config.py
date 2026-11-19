@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -60,6 +61,9 @@ class Settings(BaseSettings):
     gigacode_timeout_seconds: int = Field(default=600, ge=30, le=7200)
     gigacode_max_session_turns: int = Field(default=30, ge=2, le=500)
     gigacode_max_tool_calls: int = Field(default=50, ge=1, le=5000)
+    harness_enabled: bool = False
+    harness_state_dir: Path = Path("var/harness")
+    harness_model_profile_path: Path | None = None
     domscribe_enabled: bool = False
     domscribe_workspace_root: Path = Path(".")
     domscribe_poll_interval_seconds: float = Field(default=0.5, ge=0.1, le=10.0)
@@ -100,6 +104,7 @@ class Settings(BaseSettings):
     a2a_state_dir: Path = Path("var/a2a")
     a2a_path: str = "/a2a"
     a2a_max_request_bytes: int = Field(default=65536, ge=1024, le=1048576)
+    a2a_allowed_origins: tuple[str, ...] = ()
     auto_index: bool = False
     log_level: str = "INFO"
     mcp_http_host: str = "127.0.0.1"
@@ -119,6 +124,23 @@ class Settings(BaseSettings):
     # Legacy setting now controls browser sessions only; MCP tokens never expire.
     access_token_ttl_seconds: int = Field(default=2_592_000, ge=300, le=31_536_000)
     access_admin_session_ttl_seconds: int = Field(default=28_800, ge=300, le=604_800)
+
+    @field_validator("a2a_allowed_origins")
+    @classmethod
+    def validate_a2a_origins(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        origins = []
+        for value in values:
+            parsed = urlsplit(value.strip())
+            if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                    or parsed.username or parsed.password or parsed.path not in {"", "/"}
+                    or parsed.query or parsed.fragment or "*" in parsed.netloc):
+                raise ValueError(
+                    "A2A allowed origins must be explicit HTTP(S) origins without paths"
+                )
+            # Accessing port also validates malformed numeric ports.
+            _ = parsed.port
+            origins.append(f"{parsed.scheme}://{parsed.netloc.lower()}")
+        return tuple(dict.fromkeys(origins))
 
     @field_validator("mcp_http_path")
     @classmethod
@@ -157,6 +179,11 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_skills_routes(self) -> Settings:
         prefix = self.skills_mcp_path.rpartition("/")[0]
+        if self.harness_enabled and any(
+            route == "/harness" or route.startswith("/harness/")
+            for route in (self.mcp_http_path, self.a2a_path, prefix)
+        ):
+            raise ValueError("Harness must have its own /harness route prefix")
         if self.skills_registry_enabled and (
             self.mcp_http_path == prefix or self.mcp_http_path.startswith(prefix + "/")
         ):
@@ -204,6 +231,11 @@ class Settings(BaseSettings):
                 "history_dir": resolve(self.history_dir),
                 "confluence_state_dir": resolve(self.confluence_state_dir),
                 "a2a_state_dir": resolve(self.a2a_state_dir),
+                "harness_state_dir": resolve(self.harness_state_dir),
+                "harness_model_profile_path": (
+                    resolve(self.harness_model_profile_path)
+                    if self.harness_model_profile_path is not None else None
+                ),
                 "ssot_knowledge_dir": resolve(self.ssot_knowledge_dir),
                 "ssot_cache_dir": resolve(self.ssot_cache_dir),
                 "benchmark_questions_path": resolve(self.benchmark_questions_path),

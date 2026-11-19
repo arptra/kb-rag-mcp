@@ -150,7 +150,7 @@ def legacy_card(card: dict[str, Any]) -> dict[str, Any]:
         "instructions. A2A 0.3 JSON-RPC: send message/send with message.kind='message', "
         "message.role='user' and text/data parts with matching kind. Results are tasks "
         "with artifacts in result.artifacts. Use tasks/get to poll a task. This endpoint "
-        "does not implement MCP initialize, tools/list or tools/call."
+        "also accepts MCP initialize, tools/list and tools/call with the same agent token."
     )
     converted["url"] = rpc_interfaces[0]["url"]
     converted["preferredTransport"] = "JSONRPC"

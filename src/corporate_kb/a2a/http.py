@@ -13,6 +13,14 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from corporate_kb.a2a.compat import LEGACY_METHOD_MAP, legacy_card, legacy_request, legacy_result
+from corporate_kb.a2a.mcp_gateway import (
+    cors_headers,
+    is_mcp_method,
+    mcp_config,
+    mcp_response,
+    origin_allowed,
+    preflight,
+)
 from corporate_kb.a2a.service import (
     PROTOCOL_VERSION,
     SUPPORTED_METHODS,
@@ -75,12 +83,14 @@ def register_a2a_routes(
         return {
             **payload,
             **info(request),
+            "mcp_config": mcp_config(info(request)["endpoint"], payload["token"]),
             "config": {
                 **connection_contract(),
                 "url": info(request)["endpoint"],
                 "agentCardUrl": info(request)["agent_card_url"],
                 "legacyAgentCardUrl": info(request)["agent_card_url"] + "?A2A-Version=0.3",
                 "protocolBinding": "JSONRPC",
+                **mcp_config(info(request)["endpoint"], payload["token"]),
                 "headers": {
                     "Authorization": "Bearer " + payload["token"],
                     "Content-Type": "application/json",
@@ -103,9 +113,16 @@ def register_a2a_routes(
         return response(legacy_card(engine.card(info(request)["endpoint"])), version="0.3")
 
     @server.custom_route(settings.a2a_path, methods=["GET"], include_in_schema=False)
-    async def connection_help(request: Request) -> JSONResponse:
+    async def connection_help(request: Request) -> Response:
         # An agent given only URL/token can discover the request contract instead
         # of guessing RPC method names. This contains no credentials or index data.
+        if "text/event-stream" in request.headers.get("accept", ""):
+            # MCP permits a stateless JSON transport without a server event stream.
+            return Response(
+                status_code=405 if origin_allowed(request, settings.a2a_allowed_origins) else 403,
+                headers={"Allow": "POST", "Cache-Control": "no-store",
+                         **cors_headers(request, settings.a2a_allowed_origins)},
+            )
         version = request.headers.get("a2a-version") or request.query_params.get("A2A-Version")
         if version not in {None, "", "1.0", "0.3", "0.3.0"}:
             return response({"error": "Supported A2A versions: 1.0, 0.3"}, 400)
@@ -118,6 +135,7 @@ def register_a2a_routes(
                 + ("?A2A-Version=0.3" if selected == "0.3" else ""),
                 "protocolBinding": "JSONRPC",
                 "httpMethod": "POST",
+                **mcp_config(info(request)["endpoint"], "<agent-token>"),
                 "headers": {
                     "Authorization": "Bearer <agent-token>",
                     "Content-Type": "application/json",
@@ -126,6 +144,10 @@ def register_a2a_routes(
             },
             version=selected,
         )
+
+    @server.custom_route(settings.a2a_path, methods=["OPTIONS"], include_in_schema=False)
+    async def mcp_preflight(request: Request) -> Response:
+        return preflight(request, settings.a2a_allowed_origins)
 
     @server.custom_route(settings.a2a_path, methods=["POST"], include_in_schema=False)
     async def rpc(request: Request) -> Response:
@@ -141,7 +163,8 @@ def register_a2a_routes(
             return JSONResponse(
                 {"error": "invalid or expired A2A token"},
                 status_code=401,
-                headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+                headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store",
+                         **cors_headers(request, settings.a2a_allowed_origins)},
             )
         method, request_id, summary = "unknown", None, {}
         wire_version = PROTOCOL_VERSION
@@ -158,6 +181,9 @@ def register_a2a_routes(
                 raise RpcError(-32600, str(exc)) from None
             request_id = payload.get("id")
             method = payload.get("method", "unknown")
+            if is_mcp_method(method):
+                return await mcp_response(request, payload, engine, agent, token, started,
+                                          settings.a2a_allowed_origins)
             if (
                 payload.get("jsonrpc") != "2.0"
                 or not isinstance(method, str)

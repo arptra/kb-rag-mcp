@@ -89,6 +89,10 @@ export default defineConfig(({ command, mode }) => {
     server: {
       https: tls,
       proxy: {
+        "/harness": {
+          target: process.env.VITE_BACKEND_URL ?? "https://127.0.0.1:8000",
+          secure: false,
+        },
         [a2aProxyPattern]: {
           target: process.env.VITE_BACKEND_URL ?? "https://127.0.0.1:8000",
           secure: false,

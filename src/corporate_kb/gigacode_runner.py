@@ -9,6 +9,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -99,6 +100,54 @@ class GigaCodeCancelled(RuntimeError):
 
 class GigaCodeTimedOut(RuntimeError):
     """Raised when GigaCode does not stop within the configured deadline."""
+
+
+@dataclass(frozen=True, slots=True)
+class GigaCodeModelProfile:
+    """Deployment-verified launcher contract for model-only invocations.
+
+    The administrator must verify that this exact launcher/version/argument set
+    disables native tools and inherited MCP, hooks, and context. This declaration
+    is not a sandbox or proof of isolation. Arguments may select a trusted
+    launcher configuration, but cannot replace the runner's input/output, turn
+    limit, fresh session, or temporary workspace. An argument-free wrapper still
+    needs an explicit version and isolation notes. No CLI profile is implicit.
+    """
+
+    name: str
+    cli_version: str
+    arguments: tuple[str, ...]
+    isolation_notes: str
+
+    def __post_init__(self) -> None:
+        for field in ("name", "cli_version", "isolation_notes"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Model profile {field} must be explicitly provided")
+        if self.cli_version != self.cli_version.strip() or self.cli_version == "unknown":
+            raise ValueError("Model profile cli_version must be an exact known version")
+        if not isinstance(self.arguments, tuple):
+            raise ValueError("Model profile arguments must be an immutable tuple")
+        reserved = {
+            "--output-format", "--input-format", "--max-session-turns", "--prompt",
+            "--prompt-interactive", "--continue", "--resume", "--session-id",
+            "--fork-session", "--sandbox-session-id", "--cwd", "--working-directory",
+            "--include-directories", "--add-dir", "--directory", "--worktree", "--help",
+            "--version",
+        }
+        reserved_short = {"-o", "-p", "-i", "-c", "-r", "-h", "-v"}
+        for argument in self.arguments:
+            if not isinstance(argument, str) or not argument or "\0" in argument:
+                raise ValueError("Model profile arguments must be nonempty strings without NUL")
+            flag = re.sub(r"([a-z])([A-Z])", r"\1-\2", argument.split("=", 1)[0])
+            flag = flag.replace("_", "-").lower()
+            if (
+                flag in reserved
+                or argument == "--"
+                or (argument.startswith("-") and not argument.startswith("--")
+                    and argument[:2] in reserved_short)
+            ):
+                raise ValueError(f"Model profile cannot override runner argument: {flag}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +257,46 @@ class GigaCodeRunner:
             debug_directory=debug_directory,
             allow_edits=allow_edits,
         )
+        return self._json_result(invocation)
+
+    def run_model_json(
+        self,
+        *,
+        prompt: str,
+        schema: dict[str, Any],
+        profile: GigaCodeModelProfile | None = None,
+        cancel: CancellationSignal | None = None,
+        progress: Callable[[str], None] | None = None,
+        authentication_url: Callable[[str], None] | None = None,
+        authentication_complete: Callable[[], None] | None = None,
+    ) -> GigaCodeJsonResult:
+        """Return a JSON decision using an explicitly verified no-tools launcher.
+
+        A fresh directory prevents this call from using a repository checkout.
+        The trusted profile must separately prevent inherited user/system config
+        and tool execution. Native-tool event rejection is defense in depth; an
+        emitted event does not guarantee that the CLI has not executed the tool.
+        JSON Schema is delivered in the prompt; callers validate its semantics.
+        """
+        if not isinstance(profile, GigaCodeModelProfile):
+            raise ValueError("A verified GigaCode model-only launcher profile is required")
+        with tempfile.TemporaryDirectory(prefix="kb-gigacode-model-") as directory:
+            invocation = self._run_payload(
+                checkout=Path(directory),
+                prompt=prompt,
+                schema=schema,
+                normalizer=lambda payload: payload,
+                allow_text_fallback=False,
+                cancel=cancel,
+                progress=progress,
+                authentication_url=authentication_url,
+                authentication_complete=authentication_complete,
+                model_profile=profile,
+            )
+        return self._json_result(invocation)
+
+    @staticmethod
+    def _json_result(invocation: _InvocationResult) -> GigaCodeJsonResult:
         event = invocation.result_event
         analyzed_files = invocation.payload.get("analyzed_files", [])
         if not isinstance(analyzed_files, list) or not all(
@@ -266,11 +355,20 @@ class GigaCodeRunner:
         authentication_complete: Callable[[], None] | None = None,
         debug_directory: Path | None = None,
         allow_edits: bool = False,
+        model_profile: GigaCodeModelProfile | None = None,
     ) -> _InvocationResult:
         """Run the shared supervised process and return its structured payload."""
         status = self.status(refresh=True)
         if not status["available"]:
             raise RuntimeError(str(status["error"]))
+        if model_profile is not None:
+            if allow_edits:
+                raise ValueError("A model-only profile cannot enable workspace edits")
+            if status["version"] != model_profile.cli_version:
+                raise RuntimeError(
+                    f"Model profile {model_profile.name!r} requires CLI version "
+                    f"{model_profile.cli_version!r}; found {status['version']!r}"
+                )
         root = checkout.resolve()
         if not root.is_dir():
             raise ValueError(f"GigaCode checkout is not a directory: {root}")
@@ -283,17 +381,24 @@ class GigaCodeRunner:
             if allow_edits
             else "shell,write,edit,agent,web_fetch,web_search"
         )
-        command = [
-            executable,
-            "--output-format",
-            "stream-json",
-            "--exclude-tools",
-            excluded_tools,
-            "--max-session-turns",
-            str(self._settings.gigacode_max_session_turns),
-        ]
-        if allow_edits:
-            command.extend(["--approval-mode", "auto-edit"])
+        max_turns = 2 if model_profile is not None else self._settings.gigacode_max_session_turns
+        if model_profile is not None:
+            command = [
+                executable, *model_profile.arguments,
+                "--output-format", "stream-json", "--max-session-turns", str(max_turns),
+            ]
+        else:
+            command = [
+                executable,
+                "--output-format",
+                "stream-json",
+                "--exclude-tools",
+                excluded_tools,
+                "--max-session-turns",
+                str(max_turns),
+            ]
+            if allow_edits:
+                command.extend(["--approval-mode", "auto-edit"])
         environment = os.environ.copy()
         environment.setdefault("NO_COLOR", "1")
         creation: dict[str, Any] = {"start_new_session": os.name != "nt"}
@@ -307,16 +412,21 @@ class GigaCodeRunner:
                 f"executable={executable}; cwd={root}; output=stream-json; "
                 f"timeout={self._settings.gigacode_timeout_seconds}s; "
                 f"auth_timeout={self._settings.gigacode_auth_timeout_seconds}s; "
-                f"max_turns={self._settings.gigacode_max_session_turns}; "
+                f"max_turns={max_turns}; "
                 f"max_tools_advisory={self._settings.gigacode_max_tool_calls}; "
                 f"read_only={str(not allow_edits).lower()}; "
                 f"approval_mode={'auto-edit' if allow_edits else 'default'}; "
-                "schema_delivery=prompt"
+                "schema_delivery=prompt; "
+                f"model_profile={model_profile.name if model_profile else 'none'}"
             )
-        bounded_prompt = self._prompt_with_output_contract(
-            prompt,
-            schema=schema,
-            read_only=not allow_edits,
+        bounded_prompt = (
+            self._model_prompt_with_output_contract(prompt, schema)
+            if model_profile is not None
+            else self._prompt_with_output_contract(
+                prompt,
+                schema=schema,
+                read_only=not allow_edits,
+            )
         )
         if debug_directory is not None:
             debug_directory.mkdir(parents=True, exist_ok=True)
@@ -333,7 +443,7 @@ class GigaCodeRunner:
                         "read_only": not allow_edits,
                         "approval_mode": "auto-edit" if allow_edits else "default",
                         "timeout_seconds": self._settings.gigacode_timeout_seconds,
-                        "max_session_turns": self._settings.gigacode_max_session_turns,
+                        "max_session_turns": max_turns,
                         "max_tool_calls_advisory": self._settings.gigacode_max_tool_calls,
                     },
                     ensure_ascii=False,
@@ -443,6 +553,12 @@ class GigaCodeRunner:
                     if progress is not None:
                         progress(f"GigaCode stdout (non-JSON) | {line[:1000]}")
                     continue
+                if model_profile is not None and self._has_native_tool_event(event):
+                    raise RuntimeError(
+                        "Model-only launcher emitted a native tool event; invocation aborted. "
+                        "Its isolation contract must be re-verified; the tool may already "
+                        "have executed."
+                    )
                 if event.get("type") == "result":
                     result_event = event
                 elif event.get("type") == "assistant":
@@ -467,6 +583,7 @@ class GigaCodeRunner:
                 if progress is not None:
                     progress(self._event_summary(event))
         except BaseException as exc:
+            self._stop(process)
             self._write_debug_failure(debug_directory, exc)
             raise
         finally:
@@ -602,6 +719,53 @@ class GigaCodeRunner:
             "executable": executable,
             "version": version[-1][:300] if version else "unknown",
         }
+
+    @staticmethod
+    def _model_prompt_with_output_contract(prompt: str, schema: dict[str, Any]) -> str:
+        return (
+            "You are the model-only decision step of an external orchestrator. "
+            "Return one JSON decision. Do not call native CLI tools. Tools described in "
+            "the input are choices for the external orchestrator, not tools to execute here. "
+            "Use only the supplied messages and evidence. Do not pretend to read a "
+            "repository, files, or external sources.\n\n"
+            + prompt.rstrip()
+            + "\n\nMODEL DECISION OUTPUT CONTRACT:\n"
+            + "Return exactly one JSON object, with no Markdown fences or surrounding prose, "
+            + "satisfying this JSON Schema (delivered as prompt instructions):\n"
+            + json.dumps(schema, ensure_ascii=False, indent=2)
+        )
+
+    @staticmethod
+    def _has_native_tool_event(event: dict[str, Any]) -> bool:
+        # The result's JSON decision may describe tool calls for the outer graph.
+        # Inspect stream envelopes, never parse the model's textual JSON as events.
+        if event.get("type") == "result":
+            return False
+        native_types = {
+            "tool_use", "tool_call", "tool_result", "tool_response", "function_call",
+            "function_result", "input_json_delta", "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+        }
+
+        def native(value: object) -> bool:
+            if isinstance(value, list):
+                return any(native(item) for item in value)
+            if not isinstance(value, dict):
+                return False
+            if value.get("type") in native_types or value.get("subtype") in native_types:
+                return True
+            if value.get("role") in {"tool", "function"}:
+                return True
+            if any(value.get(key) for key in ("tool_calls", "function_call", "functionCall")):
+                return True
+            return any(
+                native(value.get(key))
+                for key in (
+                    "message", "content", "event", "content_block", "delta", "item", "parts",
+                )
+            )
+
+        return native(event)
 
     def _prompt_with_output_contract(
         self,

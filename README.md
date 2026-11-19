@@ -13,6 +13,8 @@
 
 Отдельные пошаговые инструкции:
 
+- [план общего агентского сервиса и экспериментальный адаптер GigaCode для LangGraph](README.agent-service.md);
+- [отдельный модуль «Харнес»: включение, режимы, усилие и самостоятельный запуск](README.harness.md);
 - [текущее устройство module-aware анализа repository, lifecycle jobs и SSOT workflow](README.repository-analysis.md);
 - [evidence-backed граф Java/Spring-репозиториев для GigaCode](README.gigacode-graph.md);
 - [подключение GigaCode на клиентском компьютере](README.client.md);

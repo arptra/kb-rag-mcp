@@ -322,6 +322,7 @@ def create_http_server(
     *,
     skills_registry: SkillsRegistry | None = None,
     runtimes: list[Any] | None = None,
+    extension_apps: list[tuple[str, Starlette]] | None = None,
 ) -> FastMCP:
     """Create the shared FastMCP server with optional persistent per-person access."""
     token = validate_http_settings(settings)
@@ -402,9 +403,31 @@ def create_http_server(
     def integration_indexes() -> list[dict[str, Any]]:
         return [{"id": item["id"], "name": item["name"]} for item in catalog.payload()["indexes"]]
 
+    if settings.harness_enabled and extension_apps is not None:
+        # Keep the optional module, its workers and storage out of the default path.
+        from corporate_kb.harness_integration import create_embedded_harness
+
+        extension_apps.append(("/harness", create_embedded_harness(
+            settings, catalog, access=access, authorized=integration_reader_authorized,
+        )))
+
     a2a: A2AService | None = None
     if settings.a2a_enabled:
-        a2a = A2AService(A2AStore(settings.a2a_state_dir), catalog)
+        from corporate_kb.a2a.research import ResearchBridge
+        from corporate_kb.a2a.runtime_http import register_runtime_routes
+        from corporate_kb.agents.activation import GigaCodeAgentController
+
+        agent_store = A2AStore(settings.a2a_state_dir)
+        agent_controller = GigaCodeAgentController(settings)
+        a2a = A2AService(
+            agent_store, catalog,
+            research=ResearchBridge(settings, agent_store, catalog, agent_controller),
+        )
+        register_runtime_routes(
+            server, agent_controller, agent_store,
+            manager_authorized=integration_manager_authorized,
+            reader_authorized=integration_reader_authorized,
+        )
         register_a2a_routes(
             server,
             a2a,
@@ -588,6 +611,10 @@ def create_http_server(
             return _admin_denied(settings)
         try:
             payload = await asyncio.to_thread(admin.overview)
+            payload["harness"] = {
+                "enabled": settings.harness_enabled,
+                "url": "/harness/" if settings.harness_enabled else None,
+            }
             payload["a2a_usage"] = (
                 {"enabled": True, **await asyncio.to_thread(a2a.store.stats)}
                 if a2a is not None
@@ -1809,7 +1836,11 @@ def create_http_app(service: KnowledgeService, settings: Settings) -> ASGIApp:
         else None
     )
     runtimes: list[Any] = []
-    server = create_http_server(service, settings, skills_registry=registry, runtimes=runtimes)
+    extension_apps: list[tuple[str, Starlette]] = []
+    server = create_http_server(
+        service, settings, skills_registry=registry, runtimes=runtimes,
+        extension_apps=extension_apps,
+    )
     app = server.http_app(
         path=settings.mcp_http_path,
         host_origin_protection=False,
@@ -1822,6 +1853,8 @@ def create_http_app(service: KnowledgeService, settings: Settings) -> ASGIApp:
         # ASGI mounting keeps discovery separate. FastMCP.mount() would merge the tools.
         app.router.routes.insert(0, Mount(prefix, app=skills_app))
         runtimes.append(registry)
+    for prefix, extension_app in extension_apps:
+        app.router.routes.insert(0, Mount(prefix, app=extension_app))
     knowledge_lifespan = app.router.lifespan_context
 
     @asynccontextmanager
@@ -1830,6 +1863,10 @@ def create_http_app(service: KnowledgeService, settings: Settings) -> ASGIApp:
             await stack.enter_async_context(knowledge_lifespan(application))
             if skills_app is not None:
                 await stack.enter_async_context(skills_app.lifespan(skills_app))
+            for _, extension_app in extension_apps:
+                await stack.enter_async_context(
+                    extension_app.router.lifespan_context(extension_app)
+                )
             for runtime in runtimes:
                 await asyncio.to_thread(runtime.start)
                 stack.push_async_callback(asyncio.to_thread, runtime.stop)
@@ -1838,6 +1875,7 @@ def create_http_app(service: KnowledgeService, settings: Settings) -> ASGIApp:
     app.router.lifespan_context = lifespan
     app.state.skills_registry = registry
     app.state.integrations = runtimes
+    app.state.extension_apps = extension_apps
     return app
 
 

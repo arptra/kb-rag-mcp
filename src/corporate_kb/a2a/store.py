@@ -52,6 +52,11 @@ class A2AStore:
                     updated_at TEXT NOT NULL, payload TEXT NOT NULL,
                     UNIQUE(agent_id,message_id));
                 CREATE INDEX IF NOT EXISTS tasks_agent ON tasks(agent_id,updated_at);
+                CREATE TABLE IF NOT EXISTS task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
+                    agent_id TEXT NOT NULL, agent_name TEXT NOT NULL, task_id TEXT NOT NULL,
+                    phase TEXT NOT NULL, message TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS task_events_agent ON task_events(agent_id,id);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(agents)")}
             if "credential_version" not in columns:
@@ -201,7 +206,8 @@ class A2AStore:
         safe = {
             key: clean(value, 1000 if key == "query" else 200)
             for key, value in summary.items()
-            if key in {"query", "action", "index_id", "version_scope", "task_id"}
+            if key in {"query", "action", "index_id", "version_scope", "task_id", "tool",
+                       "transport", "client", "mode", "effort", "request_id"}
         }
         with self.db() as db:
             db.execute(
@@ -273,6 +279,40 @@ class A2AStore:
             "active_agents": active,
             "calls_last_minute": recent,
         }
+
+    def record_event(
+        self, agent: dict[str, Any], task_id: str, phase: str, message: str
+    ) -> None:
+        """Internal steps are a separate journal, never extra external API calls."""
+        with self.db() as db:
+            db.execute(
+                "INSERT INTO task_events(created_at,agent_id,agent_name,task_id,phase,message) "
+                "VALUES(?,?,?,?,?,?)",
+                (now(), agent["id"], clean(agent["name"], 120), task_id,
+                 clean(phase, 80), clean(message)),
+            )
+            db.execute("DELETE FROM task_events WHERE id <= "
+                       "(SELECT COALESCE(MAX(id),0)-10000 FROM task_events)")
+
+    def events(self, *, cursor: int = 0, limit: int = 100,
+               agent_id: str | None = None) -> dict[str, Any]:
+        if cursor < 0 or not 1 <= limit <= 500:
+            raise ValueError("Invalid event cursor or limit")
+        where = "id>?"
+        args: list[Any] = [cursor]
+        if agent_id:
+            where += " AND agent_id=?"
+            args.append(agent_id)
+        with self.db() as db:
+            order = "ASC" if cursor else "DESC"
+            rows = list(db.execute(
+                f"SELECT * FROM task_events WHERE {where} ORDER BY id {order} LIMIT ?",
+                (*args, limit),
+            ))
+        if not cursor:
+            rows.reverse()
+        return {"events": [dict(row) for row in rows],
+                "next_cursor": max([cursor, *(row["id"] for row in rows)])}
 
     def create_task(
         self, agent_id: str, message_id: str, fingerprint: str, task: dict[str, Any]

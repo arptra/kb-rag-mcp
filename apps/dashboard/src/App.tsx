@@ -548,6 +548,11 @@ export default function App({ secureMode = false, accountName, onSessionLogout }
               {item.id === "operations" && <em>{overview.catalog.jobs.filter((job) => ["queued", "running", "cancelling", "failed"].includes(job.status)).length}</em>}
             </button>
           ))}
+          {overview.harness?.enabled && (
+            <button onClick={() => window.location.assign("/harness/")}>
+              <span className="nav-mark">✦</span>Харнес <em>↗</em>
+            </button>
+          )}
         </nav>
         <div className="sidebar-foot">
           {secureMode && accountName && <div className="access-account-identity"><small>Учётная запись</small><b>{accountName}</b></div>}
