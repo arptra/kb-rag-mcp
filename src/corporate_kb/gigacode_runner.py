@@ -242,8 +242,15 @@ class GigaCodeRunner:
         authentication_complete: Callable[[], None] | None = None,
         debug_directory: Path | None = None,
         allow_edits: bool = False,
+        decision_only: bool = False,
     ) -> GigaCodeJsonResult:
-        """Execute one strict JSON-contract analysis without accepting prose fallback."""
+        """Execute a JSON analysis using the existing CLI command and login.
+
+        Decision requests use only supplied evidence and reject native tool events;
+        they do not require a model profile or change the CLI launch arguments.
+        This guard is not an OS sandbox: CLI settings and authentication are shared
+        with ordinary analysis, and a reported tool may already have executed.
+        """
         invocation = self._run_payload(
             checkout=checkout,
             prompt=prompt,
@@ -256,6 +263,7 @@ class GigaCodeRunner:
             authentication_complete=authentication_complete,
             debug_directory=debug_directory,
             allow_edits=allow_edits,
+            decision_only=decision_only,
         )
         return self._json_result(invocation)
 
@@ -356,8 +364,11 @@ class GigaCodeRunner:
         debug_directory: Path | None = None,
         allow_edits: bool = False,
         model_profile: GigaCodeModelProfile | None = None,
+        decision_only: bool = False,
     ) -> _InvocationResult:
         """Run the shared supervised process and return its structured payload."""
+        if decision_only and allow_edits:
+            raise ValueError("A decision request cannot enable workspace edits")
         status = self.status(refresh=True)
         if not status["available"]:
             raise RuntimeError(str(status["error"]))
@@ -421,7 +432,7 @@ class GigaCodeRunner:
             )
         bounded_prompt = (
             self._model_prompt_with_output_contract(prompt, schema)
-            if model_profile is not None
+            if model_profile is not None or decision_only
             else self._prompt_with_output_contract(
                 prompt,
                 schema=schema,
@@ -553,11 +564,12 @@ class GigaCodeRunner:
                     if progress is not None:
                         progress(f"GigaCode stdout (non-JSON) | {line[:1000]}")
                     continue
-                if model_profile is not None and self._has_native_tool_event(event):
+                if (
+                    model_profile is not None or decision_only
+                ) and self._has_native_tool_event(event):
                     raise RuntimeError(
-                        "Model-only launcher emitted a native tool event; invocation aborted. "
-                        "Its isolation contract must be re-verified; the tool may already "
-                        "have executed."
+                        "GigaCode emitted a native tool event during a JSON decision; "
+                        "invocation aborted. The tool may already have executed."
                     )
                 if event.get("type") == "result":
                     result_event = event

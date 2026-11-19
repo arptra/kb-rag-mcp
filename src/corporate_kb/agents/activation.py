@@ -2,7 +2,8 @@
 
 Status contains a browser authorization URL and is for administrators only. Model
 messages, launcher output and exception text are never copied into events/logs.
-The CLI has no implicit tool policy: a deployment-verified profile is mandatory.
+Uses the existing analysis CLI launcher and its browser authentication, without
+requiring a separate model account, SDK or launcher profile.
 """
 
 from __future__ import annotations
@@ -11,11 +12,13 @@ import asyncio
 import copy
 import json
 import logging
+import tempfile
 import threading
 import time
 from collections import deque
 from contextlib import suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
@@ -25,7 +28,7 @@ from corporate_kb.config import Settings
 from corporate_kb.gigacode_runner import (
     CancellationSignal,
     GigaCodeCancelled,
-    GigaCodeModelProfile,
+    GigaCodeJsonResult,
     GigaCodeRunner,
     GigaCodeTimedOut,
     browser_authentication_url,
@@ -94,12 +97,9 @@ class GigaCodeAgentController:
         settings: Settings,
         *,
         runner: Any | None = None,
-        profile: GigaCodeModelProfile | None = None,
     ) -> None:
-        self._settings = settings
         self._runner = runner if runner is not None else GigaCodeRunner(settings)
-        self._injected_profile = profile
-        self._profile: GigaCodeModelProfile | None = None
+        self._activated = False
         self._lock = threading.RLock()
         self._workers_changed = threading.Condition(self._lock)
         self._execution_lock = threading.Lock()
@@ -135,7 +135,7 @@ class GigaCodeAgentController:
             generation = self._generation
             cancel = self._cancel = threading.Event()
             self._enabled = True
-            self._profile = None
+            self._activated = False
             self._set_state("starting", "Запускается GigaCode; проверяется авторизация.")
             worker = threading.Thread(
                 target=self._activate,
@@ -152,7 +152,7 @@ class GigaCodeAgentController:
             self._cancel.set()
             self._generation += 1
             self._enabled = False
-            self._profile = None
+            self._activated = False
             self._set_state("disabled", "Агент выключен. Активные запуски останавливаются.")
             return self.status()
 
@@ -207,42 +207,32 @@ class GigaCodeAgentController:
         with self._lock:
             if self._current(generation):
                 self._set_state(
-                    "ready" if self._profile is not None else "starting",
+                    "ready" if self._activated else "starting",
                     "Авторизация завершена; GigaCode продолжает работу.",
                 )
 
-    def _load_profile(self) -> GigaCodeModelProfile:
-        if self._injected_profile is not None:
-            return self._injected_profile
-        path = self._settings.harness_model_profile_path
-        if path is None:
-            raise _ProfileError(
-                "Профиль запуска GigaCode не настроен. Укажите "
-                "KB_HARNESS_MODEL_PROFILE_PATH для проверенной версии CLI без "
-                "встроенных инструментов, MCP и hooks."
+    def _run_json(
+        self,
+        generation: int,
+        *,
+        prompt: str,
+        schema: dict[str, Any],
+        cancel: CancellationSignal,
+    ) -> GigaCodeJsonResult:
+        # Reuse the working analysis launcher, including its existing CLI account
+        # and OAuth flow. Do not hand the CLI a checkout or the backend directory.
+        with tempfile.TemporaryDirectory(prefix="kb-gigacode-agent-") as directory:
+            result: GigaCodeJsonResult = self._runner.run_json(
+                checkout=Path(directory),
+                prompt=prompt,
+                schema=copy.deepcopy(schema),
+                allow_edits=False,
+                decision_only=True,
+                cancel=cancel,
+                authentication_url=lambda url: self._auth_url(generation, url),
+                authentication_complete=lambda: self._auth_complete(generation),
             )
-        try:
-            if path.stat().st_size > 16_384:
-                raise ValueError("oversized profile")
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if (
-                not isinstance(data, dict)
-                or set(data)
-                != {
-                    "name",
-                    "cli_version",
-                    "arguments",
-                    "isolation_notes",
-                }
-                or not isinstance(data["arguments"], list)
-            ):
-                raise ValueError("invalid profile")
-            return GigaCodeModelProfile(**{**data, "arguments": tuple(data["arguments"])})
-        except (OSError, ValueError, TypeError):
-            raise _ProfileError(
-                "Профиль запуска GigaCode недоступен или некорректен. "
-                "Проверьте файл KB_HARNESS_MODEL_PROFILE_PATH на сервере."
-            ) from None
+            return result
 
     def _acquire(self, cancel: CancellationSignal) -> None:
         while not cancel.is_set():
@@ -258,30 +248,22 @@ class GigaCodeAgentController:
         try:
             self._acquire(cancel)
             acquired = True
-            profile = self._load_profile()
             status = self._runner.status(refresh=True)
             if not status.get("available"):
-                raise _ProfileError(
+                raise _ConfigurationError(
                     "GigaCode недоступен на сервере. Проверьте установку, "
                     "KB_GIGACODE_ENABLED и KB_GIGACODE_COMMAND."
                 )
-            if status.get("version") != profile.cli_version:
-                raise _ProfileError(
-                    "Версия GigaCode отличается от проверенного профиля. "
-                    "Обновите KB_HARNESS_MODEL_PROFILE_PATH после проверки новой версии CLI."
-                )
-            result = self._runner.run_model_json(
+            result = self._run_json(
+                generation,
                 prompt='Return exactly {"ready": true}. This is a readiness check; use no tools.',
-                schema=copy.deepcopy(_PROBE_SCHEMA),
-                profile=profile,
+                schema=_PROBE_SCHEMA,
                 cancel=cancel,
-                authentication_url=lambda url: self._auth_url(generation, url),
-                authentication_complete=lambda: self._auth_complete(generation),
             )
             Draft202012Validator(_PROBE_SCHEMA).validate(result.payload)
             with self._lock:
                 if self._current(generation):
-                    self._profile = profile
+                    self._activated = True
                     self._set_state("ready", "GigaCode готов. Агент может исследовать документы.")
         except GigaCodeCancelled:
             pass
@@ -295,7 +277,7 @@ class GigaCodeAgentController:
                 self._workers_changed.notify_all()
 
     def _failed(self, generation: int, exc: Exception) -> None:
-        if isinstance(exc, _ProfileError):
+        if isinstance(exc, _ConfigurationError):
             message = str(exc)
         elif isinstance(exc, GigaCodeTimedOut):
             message = (
@@ -318,14 +300,13 @@ class GigaCodeAgentController:
     ) -> dict[str, Any]:
         """Request one validated decision; execution remains in the outer runtime."""
         with self._lock:
-            if not self._enabled or self._profile is None or self._state == "error":
+            if not self._enabled or not self._activated or self._state == "error":
                 raise RuntimeError(
                     "GigaCode agent is not ready; enable it in the administration UI"
                 )
-            generation, generation_cancel, profile = (
+            generation, generation_cancel = (
                 self._generation,
                 self._cancel,
-                self._profile,
             )
         if cancel.is_set():
             raise GigaCodeCancelled("GigaCode operation was cancelled")
@@ -343,7 +324,6 @@ class GigaCodeAgentController:
             asyncio.to_thread(
                 self._decide_sync,
                 generation,
-                profile,
                 prompt,
                 validators,
                 combined,
@@ -360,7 +340,6 @@ class GigaCodeAgentController:
     def _decide_sync(
         self,
         generation: int,
-        profile: GigaCodeModelProfile,
         prompt: str,
         validators: dict[str, Draft202012Validator],
         cancel: CancellationSignal,
@@ -371,13 +350,11 @@ class GigaCodeAgentController:
         try:
             self._acquire(cancel)
             acquired = True
-            result = self._runner.run_model_json(
+            result = self._run_json(
+                generation,
                 prompt=prompt,
-                schema=copy.deepcopy(_DECISION_SCHEMA),
-                profile=profile,
+                schema=_DECISION_SCHEMA,
                 cancel=cancel,
-                authentication_url=lambda url: self._auth_url(generation, url),
-                authentication_complete=lambda: self._auth_complete(generation),
             )
             if cancel.is_set():
                 raise GigaCodeCancelled("GigaCode operation was cancelled")
@@ -420,7 +397,7 @@ class GigaCodeAgentController:
                 self._workers_changed.notify_all()
 
 
-class _ProfileError(ValueError):
+class _ConfigurationError(ValueError):
     """Only trusted, static administrator-facing configuration messages."""
 
 

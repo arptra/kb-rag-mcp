@@ -5,26 +5,17 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from corporate_kb.agents.activation import GigaCodeAgentController
-from corporate_kb.gigacode_runner import (
-    GigaCodeCancelled,
-    GigaCodeModelProfile,
-    GigaCodeRunner,
-)
+from corporate_kb.gigacode_runner import GigaCodeCancelled
 
-_VERSION = "verified-test-launcher 1.0"
+_VERSION = "corporate-gigacode 26.11"
 _URL = "https://login.example.test/device?code=private-device-secret"
-_PROFILE = GigaCodeModelProfile(
-    "test-no-tools",
-    _VERSION,
-    (),
-    "Test launcher has no tools, MCP, hooks or ambient context",
-)
 _TOOLS = [
     {
         "type": "function",
@@ -53,6 +44,7 @@ class FakeRunner:
         self.block = False
         self.error: Exception | None = None
         self.decision = {"content": "Answer [1]", "tool_calls": []}
+        self.probe_payload = {"ready": True}
         self.active = self.max_active = 0
         self.lock = threading.Lock()
 
@@ -60,7 +52,12 @@ class FakeRunner:
         self.probes += 1
         return {"available": self.available, "version": self.version, "error": _URL}
 
-    def run_model_json(self, **kwargs: Any) -> Any:
+    def run_json(self, **kwargs: Any) -> Any:
+        assert kwargs["checkout"].is_dir()
+        assert not list(kwargs["checkout"].iterdir())
+        assert kwargs["decision_only"] is True
+        assert kwargs["allow_edits"] is False
+        assert "profile" not in kwargs
         with self.lock:
             self.calls.append(kwargs)
             self.active += 1
@@ -77,7 +74,7 @@ class FakeRunner:
             if self.error:
                 raise self.error
             return SimpleNamespace(
-                payload={"ready": True}
+                payload=self.probe_payload
                 if "ready" in kwargs["schema"]["properties"]
                 else self.decision,
             )
@@ -98,7 +95,7 @@ def wait_state(controller: GigaCodeAgentController, state: str) -> dict[str, Any
 
 def activated(settings_factory) -> tuple[GigaCodeAgentController, FakeRunner]:
     runner = FakeRunner()
-    controller = GigaCodeAgentController(settings_factory(), runner=runner, profile=_PROFILE)
+    controller = GigaCodeAgentController(settings_factory(), runner=runner)
     controller.enable()
     wait_state(controller, "ready")
     runner.started.clear()
@@ -117,7 +114,7 @@ async def decide(controller: GigaCodeAgentController, **kwargs: Any) -> dict[str
 
 def test_disabled_on_restart_does_not_probe_or_spawn(settings_factory):
     runner = FakeRunner()
-    controller = GigaCodeAgentController(settings_factory(), runner=runner, profile=_PROFILE)
+    controller = GigaCodeAgentController(settings_factory(), runner=runner)
     assert controller.status()["state"] == "disabled"
     assert controller.status()["available"] is False
     assert runner.probes == 0
@@ -126,48 +123,63 @@ def test_disabled_on_restart_does_not_probe_or_spawn(settings_factory):
         asyncio.run(decide(controller))
 
 
-def test_profile_is_required_before_cli_is_probed(settings_factory):
+@pytest.mark.parametrize("legacy_profile", ["unset", "missing", "invalid"])
+def test_activation_ignores_legacy_model_profile(settings_factory, tmp_path, legacy_profile):
     runner = FakeRunner()
+    path = None if legacy_profile == "unset" else tmp_path / "old-profile.json"
+    if legacy_profile == "invalid":
+        path.write_text("not a valid profile")
+    controller = GigaCodeAgentController(
+        settings_factory(harness_model_profile_path=path), runner=runner,
+    )
+    controller.enable()
+    status = wait_state(controller, "ready")
+    assert status["available"]
+    assert len(runner.calls) == 1
+    assert "profile" not in runner.calls[0]
+    assert not runner.calls[0]["checkout"].exists()
+    controller.stop()
+
+
+@pytest.mark.parametrize("version", ["different-version", "unknown"])
+def test_available_cli_does_not_require_pinned_version(settings_factory, version):
+    runner = FakeRunner()
+    runner.version = version
     controller = GigaCodeAgentController(settings_factory(), runner=runner)
     controller.enable()
-    status = wait_state(controller, "error")
-    assert "KB_HARNESS_MODEL_PROFILE_PATH" in status["message"]
-    assert not status["available"]
-    assert runner.probes == 0
-    assert not runner.calls
+    assert wait_state(controller, "ready")["available"]
+    controller.stop()
 
 
-@pytest.mark.parametrize("version,available", [("different", True), (_VERSION, False)])
-def test_bad_cli_rejected_before_auth_launch(settings_factory, version, available):
+def test_unavailable_cli_rejected_before_auth_launch(settings_factory):
     runner = FakeRunner()
-    runner.version, runner.available = version, available
-    controller = GigaCodeAgentController(settings_factory(), runner=runner, profile=_PROFILE)
+    runner.available = False
+    controller = GigaCodeAgentController(settings_factory(), runner=runner)
     controller.enable()
     status = wait_state(controller, "error")
     assert _URL not in json.dumps(status)
     assert not runner.calls
 
 
-def test_load_verified_profile_from_server_file(settings_factory, tmp_path):
-    path = tmp_path / "profile.json"
-    path.write_text(
-        json.dumps(
-            {
-                "name": _PROFILE.name,
-                "cli_version": _VERSION,
-                "arguments": [],
-                "isolation_notes": _PROFILE.isolation_notes,
-            }
-        )
-    )
+def test_auth_completion_does_not_bypass_readiness_validation(settings_factory):
     runner = FakeRunner()
-    controller = GigaCodeAgentController(
-        settings_factory(harness_model_profile_path=path),
-        runner=runner,
-    )
+    runner.block = runner.authenticate = True
+    runner.probe_payload = {"ready": False}
+    controller = GigaCodeAgentController(settings_factory(), runner=runner)
+    controller.enable()
+    wait_state(controller, "authentication_required")
+    runner.calls[0]["authentication_complete"]()
+    status = controller.status()
+    assert status["state"] == "starting"
+    assert not status["available"]
+    with pytest.raises(RuntimeError, match="not ready"):
+        asyncio.run(decide(controller))
+    runner.release.set()
+    assert not wait_state(controller, "error")["available"]
+    assert not runner.calls[0]["checkout"].exists()
+    runner.probe_payload = {"ready": True}
     controller.enable()
     assert wait_state(controller, "ready")["available"]
-    assert runner.calls[0]["profile"] == _PROFILE
     controller.stop()
 
 
@@ -177,7 +189,7 @@ def test_concurrent_enable_is_idempotent_and_auth_url_is_admin_status_only(
 ):
     runner = FakeRunner()
     runner.block = runner.authenticate = True
-    controller = GigaCodeAgentController(settings_factory(), runner=runner, profile=_PROFILE)
+    controller = GigaCodeAgentController(settings_factory(), runner=runner)
     with ThreadPoolExecutor(max_workers=10) as executor:
         list(executor.map(lambda _: controller.enable(), range(30)))
     status = wait_state(controller, "authentication_required")
@@ -194,7 +206,7 @@ def test_concurrent_enable_is_idempotent_and_auth_url_is_admin_status_only(
 def test_disable_cancels_and_old_callbacks_cannot_restore_new_generation(settings_factory):
     runner = FakeRunner()
     runner.block = runner.authenticate = True
-    controller = GigaCodeAgentController(settings_factory(), runner=runner, profile=_PROFILE)
+    controller = GigaCodeAgentController(settings_factory(), runner=runner)
     controller.enable()
     wait_state(controller, "authentication_required")
     old = runner.calls[0]
@@ -218,11 +230,12 @@ def test_disable_cancels_and_old_callbacks_cannot_restore_new_generation(setting
 def test_failure_redacts_exception_and_can_be_retried(settings_factory, caplog):
     runner = FakeRunner()
     runner.error = RuntimeError("Bearer private-token " + _URL)
-    controller = GigaCodeAgentController(settings_factory(), runner=runner, profile=_PROFILE)
+    controller = GigaCodeAgentController(settings_factory(), runner=runner)
     controller.enable()
     status = wait_state(controller, "error")
     assert "private" not in json.dumps(status)
     assert "private" not in caplog.text
+    assert not runner.calls[0]["checkout"].exists()
     runner.error = None
     controller.enable()
     assert wait_state(controller, "ready")["available"]
@@ -232,7 +245,7 @@ def test_failure_redacts_exception_and_can_be_retried(settings_factory, caplog):
 def test_invalid_auth_urls_are_ignored(settings_factory):
     runner = FakeRunner()
     runner.block = True
-    controller = GigaCodeAgentController(settings_factory(), runner=runner, profile=_PROFILE)
+    controller = GigaCodeAgentController(settings_factory(), runner=runner)
     controller.enable()
     assert runner.started.wait(2)
     callback = runner.calls[0]["authentication_url"]
@@ -251,6 +264,8 @@ def test_decision_schema_tools_and_context_are_enforced(settings_factory):
     result = asyncio.run(decide(controller))
     assert result == runner.decision
     assert "GIGACODE_AGENT_REQUEST" in runner.calls[-1]["prompt"]
+    assert runner.calls[0]["checkout"] != runner.calls[1]["checkout"]
+    assert all(not call["checkout"].exists() for call in runner.calls)
     with pytest.raises(ValueError, match="character limit"):
         asyncio.run(decide(controller, max_input_chars=20))
     assert len(runner.calls) == 2
@@ -366,7 +381,7 @@ def test_cancel_pending_authentication_does_not_claim_ready(settings_factory, as
 
 
 def test_event_history_is_bounded_and_snapshot_is_detached(settings_factory):
-    controller = GigaCodeAgentController(settings_factory(), runner=FakeRunner(), profile=_PROFILE)
+    controller = GigaCodeAgentController(settings_factory(), runner=FakeRunner())
     for _ in range(60):
         controller.enable()
         wait_state(controller, "ready")
@@ -378,39 +393,61 @@ def test_event_history_is_bounded_and_snapshot_is_detached(settings_factory):
     controller.stop()
 
 
-def test_real_runner_forwards_model_auth_callbacks(settings_factory, tmp_path):
+def test_real_cli_activation_authentication_and_decision_without_profile(
+    settings_factory, tmp_path,
+):
     executable = tmp_path / "fake-gigacode"
+    capture, authorized = tmp_path / "calls.jsonl", tmp_path / "authorized"
     executable.write_text(
         "#!/usr/bin/env python3\n"
-        "import json,sys\n"
+        "import json,os,sys,time\n"
+        "from pathlib import Path\n"
         f"version = {_VERSION!r}\n"
         "if '--version' in sys.argv:\n"
         " print(version); raise SystemExit(0)\n"
-        "sys.stdin.read()\n"
-        f"print(json.dumps({{'type': 'auth', 'url': {_URL!r}}}), flush=True)\n"
-        "print(json.dumps({'type':'system','subtype':'init','session_id':'test'}), flush=True)\n"
-        "print(json.dumps({'type':'result','is_error':False,"
-        "'result':{'ready':True}}), flush=True)\n"
+        "prompt = sys.stdin.read()\n"
+        f"with Path({str(capture)!r}).open('a') as capture:\n"
+        " capture.write(json.dumps({'cwd':os.getcwd(),'args':sys.argv[1:]})+'\\n')\n"
+        f"print(json.dumps({{'type':'auth','url':{_URL!r}}}),flush=True)\n"
+        f"while not Path({str(authorized)!r}).exists(): time.sleep(0.005)\n"
+        "print(json.dumps({'type':'system','subtype':'init','session_id':'test'}),flush=True)\n"
+        "payload = {'content':'Verified answer [1]','tool_calls':[]} "
+        "if 'GIGACODE_AGENT_REQUEST' in prompt else {'ready':True}\n"
+        "print(json.dumps({'type':'result','is_error':False,'result':payload}),flush=True)\n"
     )
     executable.chmod(0o755)
-    urls, completed = [], []
-    result = GigaCodeRunner(settings_factory(gigacode_command=str(executable))).run_model_json(
-        prompt='Return {"ready":true}',
-        schema={"type": "object"},
-        profile=_PROFILE,
-        authentication_url=urls.append,
-        authentication_complete=lambda: completed.append(True),
-    )
-    assert result.payload == {"ready": True}
-    assert urls == [_URL]
-    assert completed == [True]
+    settings = settings_factory(gigacode_command=str(executable), gigacode_max_session_turns=7)
+    controller = GigaCodeAgentController(settings)
+    controller.enable()
+    waiting = wait_state(controller, "authentication_required")
+    assert waiting["authentication_url"] == _URL
+    assert not waiting["available"]
+    authorized.touch()
+    assert wait_state(controller, "ready")["authentication_url"] is None
+    assert asyncio.run(decide(controller)) == {
+        "content": "Verified answer [1]", "tool_calls": [],
+    }
+    controller.stop()
+    calls = [json.loads(line) for line in capture.read_text().splitlines()]
+    assert len(calls) == 2
+    assert calls[0]["cwd"] != calls[1]["cwd"]
+    for call in calls:
+        assert not Path(call["cwd"]).exists()
+        assert call["args"] == [
+            "--output-format", "stream-json", "--exclude-tools",
+            "shell,write,edit,agent,web_fetch,web_search", "--max-session-turns", "7",
+        ]
 
 
-def test_disable_stops_real_authorization_subprocess(settings_factory, tmp_path):
+@pytest.mark.parametrize("outcome", ["cancel", "error"])
+def test_authorization_subprocess_and_temporary_checkout_are_cleaned(
+    settings_factory, tmp_path, outcome,
+):
     executable, stopped = tmp_path / "fake-waiting-cli", tmp_path / "stopped"
+    checkout = tmp_path / "checkout.txt"
     executable.write_text(
         "#!/usr/bin/env python3\n"
-        "import json,signal,sys,time\n"
+        "import json,os,signal,sys,time\n"
         "from pathlib import Path\n"
         "if '--version' in sys.argv:\n"
         f" print({_VERSION!r}); raise SystemExit(0)\n"
@@ -420,16 +457,21 @@ def test_disable_stops_real_authorization_subprocess(settings_factory, tmp_path)
         "signal.signal(signal.SIGINT,stop)\n"
         "signal.signal(signal.SIGTERM,stop)\n"
         "sys.stdin.read()\n"
+        f"Path({str(checkout)!r}).write_text(os.getcwd())\n"
         f"print(json.dumps({{'type':'auth','url':{_URL!r}}}),flush=True)\n"
+        f"if {outcome!r} == 'error': raise SystemExit(7)\n"
         "time.sleep(15)\n"
     )
     executable.chmod(0o755)
-    controller = GigaCodeAgentController(
-        settings_factory(gigacode_command=str(executable)), profile=_PROFILE,
-    )
+    controller = GigaCodeAgentController(settings_factory(gigacode_command=str(executable)))
     controller.enable()
-    wait_state(controller, "authentication_required")
-    controller.stop()
-    assert stopped.read_text() == "stopped"
-    assert controller.status()["state"] == "disabled"
+    if outcome == "cancel":
+        wait_state(controller, "authentication_required")
+        controller.stop()
+        assert stopped.read_text() == "stopped"
+        assert controller.status()["state"] == "disabled"
+    else:
+        assert not wait_state(controller, "error")["available"]
+        controller.stop()
+    assert not Path(checkout.read_text()).exists()
     assert controller.status()["authentication_url"] is None
