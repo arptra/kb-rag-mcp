@@ -689,6 +689,19 @@ class ConfluenceClient:
                             f"Attachment HTTP {response.status_code}",
                             status_code=response.status_code,
                         )
+                    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                    if content_type in {"text/html", "application/xhtml+xml"} and (
+                        attachment.media_type.lower().startswith("image/")
+                        or attachment.title.lower().endswith(
+                            (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp")
+                        )
+                    ):
+                        raise ConfluenceError(
+                            "Attachment download returned HTML instead of an image "
+                            "[attachment_html_response]. Check Confluence/SSO download access; "
+                            "the response was not sent to GigaCode.",
+                            error_code="attachment_html_response",
+                        )
                     chunks, size = [], 0
                     for chunk in response.iter_bytes(64 * 1024):
                         self._check_cancel()

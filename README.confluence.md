@@ -144,6 +144,32 @@ key the cache; source/version provenance is added by the server. Inline SVG diag
 also archived and passed to extraction. Unsupported or unreadable images remain visible
 as warnings with their originals; an extraction failure does not discard page text.
 
+Only successful (`ok`) image results are reused from the extraction cache. A previous
+`partial`, `unsupported` or `unreadable` result is analyzed again on retry, including
+results saved by older versions. Missing/corrupt cache entries are regenerated.
+Known image signatures select the temporary file extension; renaming an unknown
+binary file to PNG is not used as a substitute for conversion. Image filenames are
+also recognized when Confluence reports the generic `application/octet-stream` type.
+
+The operation journal distinguishes download problems from image-analysis problems:
+
+- `attachment_html_response`: the image download endpoint returned HTML (often an
+  SSO/login response), even if its HTTP status was 200; it was not sent to GigaCode.
+- `image_input_empty`, `image_input_html`, `image_input_format`: the local input is
+  empty, contains HTML or has an unrecognized format; analysis did not start.
+- `image_timeout`: waiting for browser login or image analysis exceeded the CLI limit.
+- `image_invalid_result`: GigaCode's JSON, schema or reported input file was invalid.
+- `image_runner_error`: the CLI failed without a valid result; this does not establish
+  that the image format itself is unsupported.
+- `image_partial`, `image_unreadable`, `image_unsupported`: GigaCode returned this
+  status. Check original quality, format, and the configured CLI/model's image tools;
+  the status alone does not prove a file cannot be processed by another configuration.
+- `image_extractor_unconfigured`: no GigaCode image extractor is configured.
+
+Entries include page/attachment IDs and safe failure codes; analysis-start events also
+record input size and extension. Raw CLI exception text, model explanations, credentials
+and attachment download URLs are not copied into these diagnostic messages.
+
 When GigaCode CLI requests browser authentication, the Confluence dashboard shows
 **GigaCode ожидает вход через браузер** above the sources and in the running job.
 Sign into the dashboard as an administrator, then use **Открыть страницу входа** or

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -14,8 +15,50 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from corporate_kb.confluence.models import SyncCancelled
+from corporate_kb.confluence.models import ConfluenceError, SyncCancelled
 from corporate_kb.gigacode_runner import GigaCodeRunner
+
+
+def image_input_extension(path: Path, data: bytes) -> str:
+    """Identify common image headers without relabelling arbitrary bytes as PNG.
+
+    This is an input sanity check, not a full decoder or a CLI capability probe.
+    Keep known suffixes as a fallback for image variants without a recognized header.
+    """
+    if not data or not data.strip():
+        raise ConfluenceError("Image input is empty.", error_code="image_input_empty")
+    prefix = data[:16384].lstrip(b"\xef\xbb\xbf \t\r\n")
+    markup = re.sub(
+        rb"\A(?:<\?xml[^>]*\?>\s*|<!--.*?-->\s*)+", b"", prefix,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if re.match(
+        rb"(?:<!doctype\s+html\b|<(?:html|head|body|form)(?:\s|>))", markup,
+        flags=re.IGNORECASE,
+    ):
+        raise ConfluenceError(
+            "Image input contains an HTML page instead of image bytes; check attachment access.",
+            error_code="image_input_html",
+        )
+    suffix = path.suffix.lower()
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return suffix if suffix in {".jpg", ".jpeg"} else ".jpg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if data.startswith(b"BM"):
+        return ".bmp"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    if re.match(rb"<svg(?:\s|/?>)", markup):
+        return ".svg"
+    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}:
+        return suffix
+    raise ConfluenceError(
+        "Image input format is not recognized; expected PNG, JPEG, GIF, WebP, SVG or BMP.",
+        error_code="image_input_format",
+    )
 
 
 class ImageNode(BaseModel):
@@ -106,14 +149,24 @@ class GigaCodeImageExtractor:
         authentication_complete: Callable[[], None] | None = None,
     ) -> ImageExtraction:
         cancel = cancel or threading.Event()
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        data = path.read_bytes()
+        image_name = "attachment" + image_input_extension(path, data)
+        digest = hashlib.sha256(data).hexdigest()
         key = hashlib.sha256(f"{digest}:{self.identity}".encode()).hexdigest()
         cached = self.cache_dir / f"{key}.json"
         if cached.is_file():
-            result = ImageExtraction.model_validate_json(cached.read_text())
-            if progress:
-                progress("image cache hit")
-            return result
+            try:
+                result = ImageExtraction.model_validate_json(cached.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                if progress:
+                    progress("image cache ignored: invalid cached result")
+            else:
+                if result.status == "ok" and result.analyzed_files == [image_name]:
+                    if progress:
+                        progress("image cache hit")
+                    return result
+                if progress:
+                    progress("image cache ignored: incomplete result or different input name")
         while not self._semaphore.acquire(timeout=0.1):
             if cancel.is_set():
                 raise SyncCancelled("Image extraction cancelled")
@@ -122,13 +175,6 @@ class GigaCodeImageExtractor:
                 raise SyncCancelled("Image extraction cancelled")
             with tempfile.TemporaryDirectory(prefix="image-", dir=self.cache_dir) as temporary:
                 workdir = Path(temporary)
-                extension = (
-                    path.suffix.lower()
-                    if path.suffix.lower()
-                    in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}
-                    else ".png"
-                )
-                image_name = "attachment" + extension
                 shutil.copyfile(path, workdir / image_name)
                 prompt = (
                     f"Read the image file {image_name} using your image-reading tool. "
@@ -153,6 +199,8 @@ class GigaCodeImageExtractor:
                 result = ImageExtraction.model_validate(response.payload)
                 if result.analyzed_files != [image_name]:
                     raise ValueError("Image extraction reported an unexpected input file")
+                if result.status != "ok":
+                    return result
                 payload = json.dumps(result.model_dump(by_alias=True), ensure_ascii=False)
                 with tempfile.NamedTemporaryFile(
                     mode="w", dir=self.cache_dir, delete=False

@@ -22,8 +22,10 @@ from urllib.parse import quote, urlsplit
 import frontmatter
 from bs4 import BeautifulSoup
 from cryptography.fernet import Fernet
+from pydantic import ValidationError
 
 from corporate_kb.confluence.client import ConfluenceClient
+from corporate_kb.confluence.images import image_input_extension
 from corporate_kb.confluence.models import (
     Attachment,
     ConfluenceError,
@@ -31,12 +33,35 @@ from corporate_kb.confluence.models import (
     SourceConfig,
     SyncCancelled,
 )
-from corporate_kb.gigacode_runner import browser_authentication_url
+from corporate_kb.gigacode_runner import GigaCodeTimedOut, browser_authentication_url
 from corporate_kb.loaders.base import make_document
 from corporate_kb.loaders.normalizer import DocumentNormalizer
 from corporate_kb.models import Document
 
 logger = logging.getLogger(__name__)
+
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}
+_IMAGE_STATUS_HINTS = {
+    "partial": "GigaCode returned only part of the image content; the original is retained",
+    "unreadable": "GigaCode reported unreadable content; check the original and image tool support",
+    "unsupported": "GigaCode could not view this input; check its image tool, model and format",
+}
+
+
+def _image_failure(exc: Exception) -> tuple[str, str]:
+    """Explain the failing stage without publishing CLI output or document content."""
+    if isinstance(exc, ConfluenceError):
+        return exc.error_code or "image_input", str(exc)
+    if isinstance(exc, GigaCodeTimedOut):
+        return "image_timeout", "GigaCode timed out while waiting for login or image analysis"
+    if isinstance(exc, FileNotFoundError):
+        return "image_file_missing", "The local image file or GigaCode executable was not found"
+    if isinstance(exc, PermissionError):
+        return "image_file_permission", "Access to the local image file or GigaCode was denied"
+    if isinstance(exc, (ValidationError, ValueError)):
+        return "image_invalid_result", "Image result failed JSON, schema or input-file validation"
+    return "image_runner_error", "GigaCode image analysis failed before returning a valid result"
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -628,6 +653,9 @@ class ConfluenceRegistry:
             "phase",
             "attempts",
             "error_type",
+            "error_code",
+            "image_status",
+            "input_extension",
             "status_code",
             "retry_round",
             "wait_seconds",
@@ -1597,7 +1625,12 @@ class ConfluenceRegistry:
                         reason = self._error_summary(exc)
                         warning = f"Attachment {attachment.id}: {reason}"
                         result["warnings"].append(warning)
-                        self._log(job_id, "attachments", warning, level="warning", page_id=page_id)
+                        self._log(
+                            job_id, "attachments", warning, level="warning", page_id=page_id,
+                            attachment_id=attachment.id,
+                            error_code=getattr(exc, "error_code", None),
+                            status_code=getattr(exc, "status_code", None),
+                        )
                 self._log(
                     job_id,
                     "normalization",
@@ -1770,11 +1803,30 @@ class ConfluenceRegistry:
         client: Any,
         cancel: threading.Event,
     ) -> tuple[dict[str, Any], str]:
+        is_image = attachment.media_type.lower().startswith("image/") or (
+            Path(attachment.title).suffix.lower() in _IMAGE_SUFFIXES
+        )
         with self._db() as connection:
             existing = connection.execute(
                 "SELECT * FROM assets WHERE source_id=? AND attachment_id=? AND version=?",
                 (source_id, attachment.id, attachment.version),
             ).fetchone()
+        created_at = existing["created_at"] if existing else _now()
+        if existing and config.analyze_images and is_image:
+            archived_path = self.root / existing["path"]
+            try:
+                with archived_path.open("rb") as handle:
+                    image_input_extension(archived_path, handle.read(16384))
+            except FileNotFoundError:
+                existing = None
+            except ConfluenceError as exc:
+                if exc.error_code in {"image_input_empty", "image_input_html"}:
+                    existing = None
+            if existing is None:
+                self._log(
+                    job_id, "attachments", "Invalid cached image download; fetching it again",
+                    page_id=page_id, attachment_id=attachment.id,
+                )
         if existing:
             row = dict(existing)
             self._log(
@@ -1798,6 +1850,14 @@ class ConfluenceRegistry:
             )
             if len(data) > config.max_attachment_bytes:
                 raise ConfluenceError("Attachment exceeds configured size limit")
+            if config.analyze_images and is_image:
+                try:
+                    image_input_extension(Path(attachment.title), data)
+                except ConfluenceError as exc:
+                    if exc.error_code in {"image_input_empty", "image_input_html"}:
+                        # A login page/empty response must not become a permanent
+                        # archive hit on every later download retry.
+                        raise
             digest = hashlib.sha256(data).hexdigest()
             asset_id = hashlib.sha256(
                 f"{source_id}:{attachment.id}:{attachment.version}".encode()
@@ -1830,14 +1890,17 @@ class ConfluenceRegistry:
                 "path": path.relative_to(self.root).as_posix(),
                 "extraction_json": None,
                 "error": None,
-                "created_at": _now(),
+                "created_at": created_at,
             }
             with self._db() as connection:
                 connection.execute(
                     (
                         "INSERT INTO "
                         "assets(id,source_id,page_id,attachment_id,version,title,"
-                        "media_type,sha256,path,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)"
+                        "media_type,sha256,path,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(id) DO UPDATE SET sha256=excluded.sha256,"
+                        "path=excluded.path,media_type=excluded.media_type,"
+                        "extraction_json=NULL,error=NULL"
                     ),
                     tuple(
                         row[key]
@@ -1865,7 +1928,7 @@ class ConfluenceRegistry:
             )
         text = ""
         path = self.root / row["path"]
-        if config.analyze_images and attachment.media_type.startswith("image/"):
+        if config.analyze_images and is_image:
             try:
                 cached_extraction = (
                     json.loads(row["extraction_json"]) if row["extraction_json"] else {}
@@ -1889,7 +1952,9 @@ class ConfluenceRegistry:
                 )
             elif self.image_extractor:
                 self._log(
-                    job_id, "images", "Analyzing image with GigaCode", attachment_id=attachment.id
+                    job_id, "images", "Analyzing image with GigaCode", attachment_id=attachment.id,
+                    page_id=page_id, input_extension=path.suffix.lower(),
+                    bytes=path.stat().st_size if path.is_file() else 0,
                 )
                 try:
                     try:
@@ -1911,11 +1976,17 @@ class ConfluenceRegistry:
                         self._authentication_finished(job_id)
                     text = output.markdown()
                     row["extraction_status"] = output.status
+                    hint = _IMAGE_STATUS_HINTS.get(output.status)
                     self._log(
                         job_id,
                         "images",
-                        f"Image analysis completed: {output.status}",
+                        f"Image analysis completed: {output.status}"
+                        + (f" [image_{output.status}]: {hint}" if hint else ""),
+                        level="warning" if hint else "info",
+                        page_id=page_id,
                         attachment_id=attachment.id,
+                        image_status=output.status,
+                        error_code=f"image_{output.status}" if hint else None,
                     )
                     encoded = _json(
                         {
@@ -1931,15 +2002,19 @@ class ConfluenceRegistry:
                         )
                 except Exception as exc:
                     self._check_cancel(cancel)
+                    error_code, hint = _image_failure(exc)
                     row["extraction_status"] = "error"
                     row["extraction_error"] = self._error_summary(exc)
                     self._log(
                         job_id,
                         "images",
-                        row["extraction_error"],
+                        f"Image analysis failed [{error_code}]: {hint}. "
+                        + row["extraction_error"],
                         level="warning",
                         page_id=page_id,
                         attachment_id=attachment.id,
+                        error_type=type(exc).__name__,
+                        error_code=error_code,
                     )
                     text = (
                         f"Image extraction unavailable ({type(exc).__name__}); original retained."
@@ -1951,6 +2026,15 @@ class ConfluenceRegistry:
             else:
                 row["extraction_status"] = "error"
                 text = "Image extraction unavailable: GigaCode image extractor is not configured."
+                self._log(
+                    job_id, "images", text, level="warning", page_id=page_id,
+                    attachment_id=attachment.id, error_code="image_extractor_unconfigured",
+                )
+        elif config.analyze_images:
+            self._log(
+                job_id, "attachments", "Attachment archived without image analysis: non-image file",
+                page_id=page_id, attachment_id=attachment.id,
+            )
         block = ""
         if text:
             block = (
