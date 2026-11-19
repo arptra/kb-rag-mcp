@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import secrets
-from collections.abc import Awaitable, Callable
-from pathlib import Path
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from threading import Event
 from typing import Any
 
@@ -17,11 +16,13 @@ from starlette.requests import Request
 from agent_harness.config import HarnessSettings
 from agent_harness.contracts import Evidence, Principal
 from agent_harness.http import create_app
+from agent_harness.integrations import IntegrationHub
+from agent_harness.integrations_config import IntegrationStore
 from agent_harness.runtime import HarnessRuntime
 from corporate_kb.access.http import AccessControl
+from corporate_kb.agents.activation import GigaCodeAgentController
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
-from corporate_kb.gigacode_runner import GigaCodeModelProfile, GigaCodeRunner
 
 
 class CatalogSource:
@@ -87,25 +88,26 @@ class CatalogSource:
         return self._evidence(result, index_id)
 
 
-class UnavailableModel:
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-
-    def status(self) -> dict[str, Any]:
-        return {"available": False, "name": "GigaCode", "reason": self.reason}
-
-    async def decide(self, **kwargs: Any) -> dict[str, Any]:
-        raise RuntimeError(self.reason)
-
-
 class GigaCodeDecisionModel:
-    """Translate the portable decision port into the independently tested chat adapter."""
+    """Public model port over the existing launcher; keep login details administrative."""
 
-    def __init__(self, chat_model: Any) -> None:
-        self.chat_model = chat_model
+    def __init__(self, controller: GigaCodeAgentController, *, owns_controller: bool) -> None:
+        self.model_control = controller
+        self.owns_controller = owns_controller
 
     def status(self) -> dict[str, Any]:
-        return {"available": True, "name": "GigaCode", "reason": None}
+        state = self.model_control.status()
+        return {
+            "name": "GigaCode",
+            "enabled": bool(state.get("enabled")),
+            "available": bool(state.get("available")),
+            "state": state.get("state"),
+            "reason": state.get("message", ""),
+        }
+
+    def close(self) -> None:
+        if self.owns_controller:
+            self.model_control.stop()
 
     async def decide(
         self,
@@ -115,73 +117,23 @@ class GigaCodeDecisionModel:
         cancel: Event,
         max_input_chars: int,
     ) -> dict[str, Any]:
-        from langchain_core.messages import (
-            AIMessage,
-            BaseMessage,
-            HumanMessage,
-            SystemMessage,
-            ToolMessage,
-        )
-
-        history: list[BaseMessage] = []
-        for message in messages:
-            role, content = message["role"], message.get("content", "")
-            if role == "system":
-                history.append(SystemMessage(content=content))
-            elif role == "user":
-                history.append(HumanMessage(content=content))
-            elif role == "assistant":
-                history.append(AIMessage(content=content, tool_calls=message.get("tool_calls", [])))
-            elif role == "tool":
-                history.append(
-                    ToolMessage(
-                        content=content,
-                        tool_call_id=message["tool_call_id"],
-                        status=message.get("status", "success"),
-                    )
-                )
-            else:
-                raise ValueError("Unsupported harness conversation role")
-        model = self.chat_model.model_copy(update={"max_input_chars": max_input_chars})
-        reply = await model.bind_tools(tools, tool_choice="auto" if tools else "none").ainvoke(
-            history,
+        return await self.model_control.decide(
+            messages=messages,
+            tools=tools,
             cancel=cancel,
+            max_input_chars=max_input_chars,
         )
-        return {"content": reply.content, "tool_calls": [dict(call) for call in reply.tool_calls]}
 
 
-def _load_profile(path: Path) -> GigaCodeModelProfile:
-    if path.stat().st_size > 16_384:
-        raise ValueError("Model profile is too large")
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or set(data) != {
-        "name",
-        "cli_version",
-        "arguments",
-        "isolation_notes",
-    }:
-        raise ValueError("Model profile must contain name, cli_version, arguments, isolation_notes")
-    if not isinstance(data["arguments"], list):
-        raise ValueError("Model profile arguments must be an array")
-    return GigaCodeModelProfile(**{**data, "arguments": tuple(data["arguments"])})
-
-
-def build_model(settings: Settings) -> GigaCodeDecisionModel | UnavailableModel:
-    if settings.harness_model_profile_path is None:
-        return UnavailableModel("Модель не настроена. Доступен поиск по источникам.")
-    try:
-        profile = _load_profile(settings.harness_model_profile_path)
-        from corporate_kb.agents.gigacode_model import GigaCodeChatModel
-
-        runner = GigaCodeRunner(settings)
-        status = runner.status()
-        if not status["available"] or status["version"] != profile.cli_version:
-            return UnavailableModel("Проверьте установленный GigaCode и версию профиля запуска.")
-        return GigaCodeDecisionModel(GigaCodeChatModel(runner=runner, launch_profile=profile))
-    except ImportError:
-        return UnavailableModel("Установите дополнительные зависимости модели: extra agents.")
-    except (OSError, ValueError, TypeError):
-        return UnavailableModel("Проверенный профиль запуска GigaCode недоступен или некорректен.")
+def build_model(
+    settings: Settings,
+    *,
+    controller: GigaCodeAgentController | None = None,
+) -> GigaCodeDecisionModel:
+    return GigaCodeDecisionModel(
+        controller if controller is not None else GigaCodeAgentController(settings),
+        owns_controller=controller is None,
+    )
 
 
 def create_embedded_harness(
@@ -190,6 +142,8 @@ def create_embedded_harness(
     *,
     access: AccessControl | None,
     authorized: Callable[[Request], Awaitable[bool]],
+    manager_authorized: Callable[[Request], Awaitable[bool]],
+    controller: GigaCodeAgentController | None = None,
 ) -> Starlette:
     # Grants remain in this adapter, not in portable state or model prompts. Recheck
     # the original credentials before each source call; revocation takes effect.
@@ -235,17 +189,41 @@ def create_embedded_harness(
         original = grants.get(principal.owner_id)
         return original is not None and await identity(original) == principal
 
+    model = build_model(settings, controller=controller)
+    integrations = IntegrationHub(IntegrationStore(settings.harness_state_dir), check)
     runtime = HarnessRuntime(
-        HarnessSettings(enabled=True, state_dir=settings.harness_state_dir),
+        HarnessSettings(
+            enabled=True,
+            state_dir=settings.harness_state_dir,
+            authentication_timeout_seconds=settings.gigacode_auth_timeout_seconds,
+        ),
         source=CatalogSource(catalog, check),
-        model=build_model(settings),
+        model=model,
+        tools=integrations,
     )
-    app = create_app(runtime, authenticate)
+    app = create_app(
+        runtime,
+        authenticate,
+        model_control=model.model_control,
+        authorize_model_manager=manager_authorized,
+        integrations=integrations,
+    )
+    original_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(application: Starlette) -> AsyncIterator[None]:
+        try:
+            async with original_lifespan(application):
+                yield
+        finally:
+            await asyncio.to_thread(model.close)
+
+    app.router.lifespan_context = lifespan
     app.state.harness_runtime = runtime
     return app
 
 
-def standalone_providers() -> tuple[CatalogSource, GigaCodeDecisionModel | UnavailableModel]:
+def standalone_providers() -> tuple[CatalogSource, GigaCodeDecisionModel]:
     """Optional factory for a separate process reading this portal's configured indexes."""
     from corporate_kb.mcp.tools import KnowledgeTools
     from corporate_kb.service import create_service

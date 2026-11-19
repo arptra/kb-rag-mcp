@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import importlib
 import os
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,8 @@ from starlette.requests import Request
 from agent_harness.config import HarnessSettings
 from agent_harness.contracts import Principal
 from agent_harness.http import create_app
+from agent_harness.integrations import IntegrationHub
+from agent_harness.integrations_config import IntegrationStore
 from agent_harness.runtime import HarnessRuntime
 
 
@@ -73,7 +77,38 @@ def build_app(environ: Mapping[str, str] | None = None) -> Starlette:
         else HarnessSettings(enabled=True)
     )
     source, model = _providers(environment.get("HARNESS_PROVIDER_FACTORY", ""))
-    return create_app(HarnessRuntime(settings, source=source, model=model), authenticate)
+    control = getattr(model, "model_control", None)
+
+    async def manager(request: Request) -> bool:
+        # This entrypoint has one explicitly configured operator account.
+        return await authenticate(request) is not None
+
+    async def authorized(principal: Principal) -> bool:
+        return principal == identity
+
+    integrations = IntegrationHub(IntegrationStore(settings.state_dir), authorized)
+
+    app = create_app(
+        HarnessRuntime(settings, source=source, model=model, tools=integrations),
+        authenticate,
+        model_control=control,
+        authorize_model_manager=manager,
+        integrations=integrations,
+    )
+    original_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(application: Starlette) -> AsyncIterator[None]:
+        try:
+            async with original_lifespan(application):
+                yield
+        finally:
+            close = getattr(model, "close", None)
+            if callable(close):
+                await asyncio.to_thread(close)
+
+    app.router.lifespan_context = lifespan
+    return app
 
 
 def main() -> None:

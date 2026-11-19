@@ -8,7 +8,7 @@ import logging
 import secrets
 import ssl
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -323,6 +323,7 @@ def create_http_server(
     skills_registry: SkillsRegistry | None = None,
     runtimes: list[Any] | None = None,
     extension_apps: list[tuple[str, Starlette]] | None = None,
+    shutdown_callbacks: list[Callable[[], None]] | None = None,
 ) -> FastMCP:
     """Create the shared FastMCP server with optional persistent per-person access."""
     token = validate_http_settings(settings)
@@ -403,25 +404,38 @@ def create_http_server(
     def integration_indexes() -> list[dict[str, Any]]:
         return [{"id": item["id"], "name": item["name"]} for item in catalog.payload()["indexes"]]
 
+    agent_controller = None
+    if settings.a2a_enabled or (
+        settings.harness_enabled and extension_apps is not None and shutdown_callbacks is not None
+    ):
+        from corporate_kb.agents.activation import GigaCodeAgentController
+
+        agent_controller = GigaCodeAgentController(settings)
+        if shutdown_callbacks is not None:
+            shutdown_callbacks.append(agent_controller.stop)
+
     if settings.harness_enabled and extension_apps is not None:
         # Keep the optional module, its workers and storage out of the default path.
         from corporate_kb.harness_integration import create_embedded_harness
 
         extension_apps.append(("/harness", create_embedded_harness(
             settings, catalog, access=access, authorized=integration_reader_authorized,
+            manager_authorized=integration_manager_authorized, controller=agent_controller,
         )))
 
     a2a: A2AService | None = None
     if settings.a2a_enabled:
         from corporate_kb.a2a.research import ResearchBridge
         from corporate_kb.a2a.runtime_http import register_runtime_routes
-        from corporate_kb.agents.activation import GigaCodeAgentController
 
         agent_store = A2AStore(settings.a2a_state_dir)
-        agent_controller = GigaCodeAgentController(settings)
+        assert agent_controller is not None
         a2a = A2AService(
             agent_store, catalog,
-            research=ResearchBridge(settings, agent_store, catalog, agent_controller),
+            research=ResearchBridge(
+                settings, agent_store, catalog, agent_controller,
+                owns_controller=shutdown_callbacks is None,
+            ),
         )
         register_runtime_routes(
             server, agent_controller, agent_store,
@@ -1837,9 +1851,10 @@ def create_http_app(service: KnowledgeService, settings: Settings) -> ASGIApp:
     )
     runtimes: list[Any] = []
     extension_apps: list[tuple[str, Starlette]] = []
+    shutdown_callbacks: list[Callable[[], None]] = []
     server = create_http_server(
         service, settings, skills_registry=registry, runtimes=runtimes,
-        extension_apps=extension_apps,
+        extension_apps=extension_apps, shutdown_callbacks=shutdown_callbacks,
     )
     app = server.http_app(
         path=settings.mcp_http_path,
@@ -1860,6 +1875,8 @@ def create_http_app(service: KnowledgeService, settings: Settings) -> ASGIApp:
     @asynccontextmanager
     async def lifespan(application: Starlette) -> AsyncIterator[None]:
         async with AsyncExitStack() as stack:
+            for callback in shutdown_callbacks:
+                stack.push_async_callback(asyncio.to_thread, callback)
             await stack.enter_async_context(knowledge_lifespan(application))
             if skills_app is not None:
                 await stack.enter_async_context(skills_app.lifespan(skills_app))

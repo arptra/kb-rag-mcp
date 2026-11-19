@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from agent_harness.config import HarnessSettings
-from agent_harness.contracts import Evidence, ModelPort, Principal, RunRequest, SourcePort
+from agent_harness.contracts import Evidence, ModelPort, Principal, RunRequest, SourcePort, ToolPort
 from agent_harness.policy import BUDGETS, QUICK_BUDGETS, SYSTEM_PROMPT, TOOLS, validate_call
 from agent_harness.store import ACTIVE, RunStore, timestamp
 
@@ -61,8 +61,10 @@ class HarnessRuntime:
         settings: HarnessSettings,
         source: SourcePort | None = None,
         model: ModelPort | None = None,
+        tools: ToolPort | None = None,
     ) -> None:
         self.settings, self.source, self.model = settings, source, model
+        self.tools = tools
         self._store: RunStore | None = None
         self._queues: dict[str, asyncio.Queue[tuple[Principal, str]]] = {
             lane: asyncio.Queue(maxsize=settings.queue_max) for lane in ("quick", "investigate")
@@ -192,8 +194,8 @@ class HarnessRuntime:
             "enabled": self.settings.enabled,
             "started": self._started,
             "model": model,
-            "source_available": self.source is not None,
-            "sources_available": self.source is not None,
+            "source_available": self.source is not None or bool(indexes),
+            "sources_available": self.source is not None or bool(indexes),
             "indexes": indexes,
             "queues": {
                 lane: {
@@ -237,19 +239,26 @@ class HarnessRuntime:
     async def _indexes(
         self, principal: Principal, timeout: float | None = None
     ) -> list[dict[str, str]]:
-        if self.source is None:
-            return []
-        try:
-            items = await asyncio.wait_for(
-                self.source.indexes(principal), timeout or self.settings.source_timeout_seconds
-            )
-            return [
-                {"id": str(item["id"]), "name": str(item.get("name", item["id"]))}
+        async def catalog(provider: SourcePort | ToolPort) -> list[dict[str, str]]:
+            try:
+                return await asyncio.wait_for(
+                    provider.indexes(principal),
+                    timeout or self.settings.source_timeout_seconds,
+                )
+            except Exception:
+                return []
+
+        catalogs = await asyncio.gather(
+            *(catalog(provider) for provider in (self.source, self.tools) if provider is not None)
+        )
+        return list(
+            {
+                str(item["id"]): {"id": str(item["id"]), "name": str(item.get("name", item["id"]))}
+                for items in catalogs
                 for item in items
                 if item.get("id")
-            ][:1000]
-        except Exception:
-            return []
+            }.values()
+        )[:1000]
 
     @staticmethod
     def _visible(run: dict[str, Any], indexes: list[dict[str, str]]) -> dict[str, Any]:
@@ -301,7 +310,8 @@ class HarnessRuntime:
         timeout = getattr(self.settings, f"{run['mode']}_timeout_seconds")
         deadline = started + timeout
         self._clocks[run["id"]] = _RunClock(
-            self.settings.authentication_timeout_seconds, principal.owner_id,
+            self.settings.authentication_timeout_seconds,
+            principal.owner_id,
         )
         run.update(status="running", phase="searching", started_at=timestamp())
         self.store.save(principal.owner_id, run)
@@ -340,6 +350,14 @@ class HarnessRuntime:
             terminal = "partial" if run["evidence"] else "failed"
             run["warnings"].append(f"Исследование не завершено ({type(exc).__name__}).")
         finally:
+            if self.tools is not None:
+                try:
+                    await asyncio.wait_for(
+                        self.tools.close_run(run["id"]),
+                        self.settings.cleanup_timeout_seconds,
+                    )
+                except Exception:
+                    self._warn(run, "Очистка песочницы не подтверждена; сообщите администратору.")
             if terminal:
                 run["status"] = terminal
             if not run["answer"]:
@@ -419,15 +437,29 @@ class HarnessRuntime:
         if len(selected) > self.settings.max_indexes:
             run["warnings"].append("Область поиска ограничена бюджетом числа индексов.")
         run["index_ids"] = selected[: self.settings.max_indexes]
-        if not run["index_ids"] or self.source is None:
+        if not run["index_ids"]:
             run["status"] = "partial"
             run["warnings"].append("Нет доступных источников; состояние системы не проверено.")
             return
         query = run["question"]
         if run["parent_question"]:
             query = run["parent_question"] + "\n" + "Дополнительный вопрос: " + query
-        bootstrap = run["index_ids"][: budget.source_calls]
-        if len(bootstrap) < len(run["index_ids"]):
+        external = (
+            await self.tools.describe(principal, run["index_ids"])
+            if self.tools is not None and run["mode"] == "investigate"
+            else []
+        )
+        external_ids = (
+            {item["id"] for item in await self.tools.indexes(principal)}
+            if self.tools is not None
+            else set()
+        )
+        knowledge_ids = [item for item in run["index_ids"] if item not in external_ids]
+        if run["mode"] == "quick" and set(run["index_ids"]) & external_ids:
+            self._warn(run, "Быстрый ответ использует RAG. Код, MCP и A2A доступны в исследовании.")
+        search_limit = max(1, budget.source_calls // 2) if external else budget.source_calls
+        bootstrap = knowledge_ids[:search_limit] if self.source is not None else []
+        if len(bootstrap) < len(knowledge_ids):
             self._warn(run, "Часть индексов не опрошена: исчерпан бюджет источников.")
         await asyncio.gather(
             *(
@@ -456,7 +488,7 @@ class HarnessRuntime:
         if event.is_set():
             return
         await self._refresh_authentication(run)
-        if not model_status["available"] or not run["evidence"]:
+        if not model_status["available"] or (not run["evidence"] and not external):
             run["status"] = "partial"
             run["warnings"].append(
                 model_status["reason"]
@@ -481,7 +513,10 @@ class HarnessRuntime:
             run["phase"] = "investigating"
             self.store.save(principal.owner_id, run)
             try:
-                decision = await self._decide(run, event, TOOLS, exchange, deadline - reserve)
+                tool_catalog = [*(TOOLS if knowledge_ids else []), *external]
+                decision = await self._decide(
+                    run, event, tool_catalog, exchange, deadline - reserve
+                )
             except _AuthenticationTimeout:
                 raise
             except TimeoutError:
@@ -504,7 +539,18 @@ class HarnessRuntime:
                     continue
                 name, args = str(call.get("name", "")), call.get("args", {})
                 try:
-                    validated = validate_call(name, args, set(run["index_ids"]))
+                    if name in {item["function"]["name"] for item in external}:
+                        result = await self._external_tool(
+                            principal,
+                            run,
+                            event,
+                            name,
+                            args,
+                            deadline - reserve,
+                        )
+                        exchange.append({"name": name, "result": result})
+                        continue
+                    validated = validate_call(name, args, set(knowledge_ids))
                     if name == "search_knowledge":
                         result = await self._search(
                             principal,
@@ -524,6 +570,43 @@ class HarnessRuntime:
         if not event.is_set():
             self._warn(run, "Исследование ограничено бюджетом; итог по собранным источникам.")
             await self._synthesize(principal, run, event)
+
+    async def _external_tool(
+        self,
+        principal: Principal,
+        run: dict[str, Any],
+        event: Event,
+        name: str,
+        args: Any,
+        deadline: float,
+    ) -> str:
+        assert self.tools is not None
+        run["metrics"]["source_calls"] += 1
+        try:
+            timeout = min(600, max(0.01, deadline - self._now(run)))
+            items = await asyncio.wait_for(
+                self.tools.call(
+                    name,
+                    args,
+                    principal=principal,
+                    run_id=run["id"],
+                    index_ids=run["index_ids"],
+                    cancel=event,
+                ),
+                timeout,
+            )
+            accepted = 0
+            for item in items:
+                if item.index_id not in run["index_ids"]:
+                    raise ValueError("Tool evidence is outside run scope")
+                accepted += self._add_evidence(run, item, item.index_id)
+            return f"Получено подтверждений: {accepted}."
+        except Exception as exc:
+            message = f"Инструмент {name} недоступен ({type(exc).__name__})."
+            self._warn(run, message)
+            return message
+        finally:
+            self._checkpoint(principal, run, event)
 
     async def _search(
         self,
@@ -615,9 +698,12 @@ class HarnessRuntime:
             return False
         payload = item.model_dump()
         profile = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
-        payload["text"] = payload["text"][
-            : min(self.settings.evidence_chars, profile.evidence_chars)
-        ]
+        text_limit = (
+            min(8000, self.settings.investigate_context_chars // 3)
+            if item.kind == "tool_metadata"
+            else min(self.settings.evidence_chars, profile.evidence_chars)
+        )
+        payload["text"] = payload["text"][:text_limit]
         payload["title"] = payload["title"][:300]
         payload["id"] = payload["id"][:1000]
         payload["url"] = payload["url"][:2000] if payload["url"] else None
@@ -646,7 +732,9 @@ class HarnessRuntime:
             int(getattr(self.settings, f"{run['mode']}_context_chars") * profile.context_ratio),
         )
         context: dict[str, Any] = {
-            "allowed_indexes": run["index_ids"],
+            "allowed_indexes": [],
+            "selected_index_count": len(run["index_ids"]),
+            "index_catalog_truncated": False,
             "evidence": [],
             "prior_tool_attempts": exchange or [],
             "history_question_not_evidence": run["parent_question"],
@@ -655,15 +743,38 @@ class HarnessRuntime:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": run["question"]},
         ]
-        remaining = maximum - len(json.dumps(messages, ensure_ascii=False)) - 4500
+        tool_reserve = max(4500, len(json.dumps(tools, ensure_ascii=False)) + 1000)
+        remaining = maximum - len(json.dumps(messages, ensure_ascii=False)) - tool_reserve
         for item in run["evidence"]:
-            candidate = {**context, "evidence": [*context["evidence"], item]}
+            catalog = list(dict.fromkeys([*context["allowed_indexes"], item["index_id"]]))
+            candidate = {
+                **context,
+                "allowed_indexes": catalog,
+                "evidence": [*context["evidence"], item],
+            }
             if len(json.dumps(candidate, ensure_ascii=False)) > remaining:
                 self._warn(run, "Часть evidence не помещается в контекст модели.")
-                break
+                continue
             context = candidate
+        catalog_budget = min(4000, max(0, remaining // 3))
+        for index_id in run["index_ids"]:
+            if index_id in context["allowed_indexes"]:
+                continue
+            catalog = [*context["allowed_indexes"], index_id]
+            candidate = {**context, "allowed_indexes": catalog}
+            if len(json.dumps(catalog, ensure_ascii=False)) > catalog_budget:
+                continue
+            if len(json.dumps(candidate, ensure_ascii=False)) <= remaining:
+                context = candidate
+        if len(context["allowed_indexes"]) < len(run["index_ids"]):
+            context["index_catalog_truncated"] = True
+            self._warn(
+                run,
+                "Каталог индексов для модели ограничен контекстом; "
+                "полная выбранная область сохранена в запуске.",
+            )
         messages.append({"role": "user", "content": json.dumps(context, ensure_ascii=False)})
-        if len(json.dumps(messages, ensure_ascii=False)) > maximum - 4000:
+        if len(json.dumps(messages, ensure_ascii=False)) > maximum - tool_reserve + 500:
             raise ValueError("Input context budget exceeded")
         run["metrics"]["model_calls"] += 1
         # Model cancellation is separate from user cancellation so an exhausted
@@ -719,6 +830,8 @@ class HarnessRuntime:
         if not isinstance(content, str) or not content.strip():
             return False
         run["answer"] = content.strip()[: self.settings.answer_chars]
+        if not any(item.get("kind", "source") == "source" for item in run["evidence"]):
+            self._warn(run, "Ответ не подтверждён источниками; состояние системы не проверено.")
         run["status"] = "partial" if run["warnings"] else "completed"
         return True
 

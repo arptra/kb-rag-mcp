@@ -21,7 +21,7 @@ class RunRequest(BaseModel):
     question: str = Field(min_length=1, max_length=8000)
     mode: Literal["quick", "investigate"] = "quick"
     effort: Literal["low", "medium", "high"] = "medium"
-    index_ids: list[str] = Field(default_factory=list, max_length=16)
+    index_ids: list[str] = Field(default_factory=list, max_length=1000)
     parent_run_id: str | None = Field(default=None, max_length=80)
 
     @field_validator("question")
@@ -42,6 +42,7 @@ class Evidence(BaseModel):
     index_id: str
     url: str | None = None
     revision: str | None = None
+    kind: Literal["source", "tool_metadata"] = "source"
 
 
 class SourcePort(Protocol):
@@ -80,3 +81,26 @@ class ModelPort(Protocol):
         cancel: Event,
         max_input_chars: int,
     ) -> dict[str, Any]: ...
+
+
+class ToolPort(Protocol):
+    """Optional tools own execution isolation and recheck access on every call."""
+
+    async def indexes(self, principal: Principal) -> list[dict[str, str]]: ...
+
+    async def describe(
+        self, principal: Principal, index_ids: list[str]
+    ) -> list[dict[str, Any]]: ...
+
+    async def call(
+        self,
+        name: str,
+        args: Any,
+        *,
+        principal: Principal,
+        run_id: str,
+        index_ids: list[str],
+        cancel: Event,
+    ) -> list[Evidence]: ...
+
+    async def close_run(self, run_id: str) -> None: ...

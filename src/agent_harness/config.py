@@ -22,7 +22,7 @@ class HarnessSettings(BaseSettings):
     final_reserve_seconds: float = Field(default=30, ge=0, le=300)
     quick_context_chars: int = Field(default=24_000, ge=12_000, le=200_000)
     investigate_context_chars: int = Field(default=48_000, ge=12_000, le=400_000)
-    max_indexes: int = Field(default=8, ge=1, le=16)
+    max_indexes: int = Field(default=1000, ge=1, le=1000)
     results_per_index: int = Field(default=3, ge=1, le=10)
     evidence_chars: int = Field(default=2000, ge=100, le=10_000)
     max_evidence: int = Field(default=24, ge=1, le=100)

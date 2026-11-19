@@ -117,14 +117,20 @@ class ResearchBridge:
     """Keep the workflow on one event loop; A2A's existing workers await its results."""
 
     def __init__(
-        self, settings: Settings, store: A2AStore, catalog: RagCatalog, controller: Any
+        self,
+        settings: Settings,
+        store: A2AStore,
+        catalog: RagCatalog,
+        controller: Any,
+        *,
+        owns_controller: bool = True,
     ) -> None:
         self.controller = controller
+        self.owns_controller = owns_controller
         self.source = AgentSources(store, catalog)
         self.settings = HarnessSettings(
             enabled=True,
             state_dir=settings.a2a_state_dir / "research",
-            max_indexes=16,
             authentication_timeout_seconds=settings.gigacode_auth_timeout_seconds,
         )
         self._lock = Lock()
@@ -247,7 +253,8 @@ class ResearchBridge:
             self.source.citations.pop(principal.owner_id, None)
 
     def stop(self) -> None:
-        self.controller.stop()
+        if self.owns_controller:
+            self.controller.stop()
         with self._lock:
             self._stopped = True
             if self._loop is not None:

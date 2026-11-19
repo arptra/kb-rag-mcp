@@ -152,7 +152,7 @@ class A2AService:
         with self._signals_lock:
             for signal in self._signals.values():
                 signal.set()
-        if self.research is not None:
+        if self.research is not None and getattr(self.research, "owns_controller", True):
             self.research.controller.disable()
         self._pool.shutdown(wait=True, cancel_futures=False)
         if self.research is not None:

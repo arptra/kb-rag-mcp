@@ -63,9 +63,45 @@ class FakeRuntime:
         return run
 
 
+class FakeModelControl:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.state = "disabled"
+
+    def _snapshot(self) -> dict[str, Any]:
+        return {
+            "enabled": self.state != "disabled",
+            "available": False,
+            "state": self.state,
+            "authentication_url": (
+                "https://login.example.test/?code=private-browser-code"
+                if self.state == "authentication_required" else None
+            ),
+            "events": [{"message": "private-manager-event"}],
+        }
+
+    def status(self) -> dict[str, Any]:
+        self.calls.append("status")
+        return self._snapshot()
+
+    def enable(self) -> dict[str, Any]:
+        self.calls.append("enable")
+        self.state = "authentication_required"
+        return self._snapshot()
+
+    def disable(self) -> dict[str, Any]:
+        self.calls.append("disable")
+        self.state = "disabled"
+        return self._snapshot()
+
+
 async def authenticate(request: Request) -> Principal | None:
     owner = request.headers.get("x-test-owner")
     return Principal(owner_id=owner) if owner else None
+
+
+async def model_manager(request: Request) -> bool:
+    return request.headers.get("x-test-role") == "manager"
 
 
 @pytest.fixture
@@ -82,6 +118,25 @@ async def client(runtime: FakeRuntime) -> AsyncIterator[httpx.AsyncClient]:
         yield connection
 
 
+@pytest.fixture
+def model_control() -> FakeModelControl:
+    return FakeModelControl()
+
+
+@pytest.fixture
+async def control_client(
+    runtime: FakeRuntime, model_control: FakeModelControl,
+) -> AsyncIterator[httpx.AsyncClient]:
+    app = http.create_app(
+        cast(HarnessRuntime, runtime), authenticate,
+        model_control=model_control, authorize_model_manager=model_manager,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as connection:
+        yield connection
+
+
 @pytest.mark.parametrize(
     ("method", "path"),
     [
@@ -90,6 +145,9 @@ async def client(runtime: FakeRuntime) -> AsyncIterator[httpx.AsyncClient]:
         ("POST", "/api/runs"),
         ("GET", "/api/runs/run-1"),
         ("POST", "/api/runs/run-1/cancel"),
+        ("GET", "/api/model"),
+        ("POST", "/api/model/enable"),
+        ("POST", "/api/model/disable"),
     ],
 )
 async def test_all_data_endpoints_authenticate_before_runtime(
@@ -100,6 +158,121 @@ async def test_all_data_endpoints_authenticate_before_runtime(
     assert response.headers["cache-control"] == "no-store"
     assert response.json() == {"error": "Authentication required"}
     assert not runtime.calls
+
+
+async def test_model_manager_can_enable_observe_login_and_disable(
+    control_client: httpx.AsyncClient, model_control: FakeModelControl,
+) -> None:
+    headers = {"x-test-owner": "alice", "x-test-role": "manager"}
+    initial = await control_client.get("/api/model", headers=headers)
+    assert initial.json()["can_manage"] is True
+    assert initial.json()["state"] == "disabled"
+    enabled = await control_client.post("/api/model/enable", headers=headers, json={})
+    assert enabled.status_code == 200
+    assert enabled.json()["can_manage"] is True
+    assert enabled.json()["state"] == "authentication_required"
+    assert "private-browser-code" in enabled.json()["authentication_url"]
+    state = await control_client.get("/api/model", headers=headers)
+    assert state.json()["authentication_url"] == enabled.json()["authentication_url"]
+    disabled = await control_client.post("/api/model/disable", headers=headers)
+    assert disabled.status_code == 200
+    assert disabled.json()["state"] == "disabled"
+    assert disabled.json()["authentication_url"] is None
+    assert model_control.calls == ["status", "enable", "status", "disable"]
+    for response in (initial, enabled, state, disabled):
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["referrer-policy"] == "no-referrer"
+
+
+async def test_model_controls_recheck_privileges_without_leaking_private_state(
+    control_client: httpx.AsyncClient, model_control: FakeModelControl,
+) -> None:
+    manager = {"x-test-owner": "alice", "x-test-role": "manager"}
+    await control_client.post("/api/model/enable", headers=manager)
+    reader = {"x-test-owner": "alice"}
+    response = await control_client.get("/api/model", headers=reader)
+    assert response.status_code == 200
+    assert response.json() == {"can_manage": False}
+    for operation in ("enable", "disable"):
+        rejected = await control_client.post(f"/api/model/{operation}", headers=reader)
+        assert rejected.status_code == 403
+        assert "private-browser-code" not in rejected.text
+        assert "private-manager-event" not in rejected.text
+        assert rejected.headers["cache-control"] == "no-store"
+    public_status = await control_client.get("/api/status", headers=reader)
+    assert "private-browser-code" not in public_status.text
+    assert "private-manager-event" not in public_status.text
+    assert model_control.calls == ["enable"]
+
+
+async def test_model_manager_check_does_not_replace_regular_authentication(
+    control_client: httpx.AsyncClient, model_control: FakeModelControl,
+) -> None:
+    for method, path in (
+        ("GET", "/api/model"),
+        ("POST", "/api/model/enable"),
+        ("POST", "/api/model/disable"),
+    ):
+        response = await control_client.request(method, path, headers={"x-test-role": "manager"})
+        assert response.status_code == 401
+    assert not model_control.calls
+
+
+async def test_absent_model_control_remains_compatible(client: httpx.AsyncClient) -> None:
+    headers = {"x-test-owner": "alice", "x-test-role": "manager"}
+    response = await client.get("/api/model", headers=headers)
+    assert response.json() == {"can_manage": False}
+    for operation in ("enable", "disable"):
+        response = await client.post(f"/api/model/{operation}", headers=headers)
+        assert response.status_code == 503
+
+
+async def test_control_without_manager_authorizer_denies_access(
+    runtime: FakeRuntime, model_control: FakeModelControl,
+) -> None:
+    app = http.create_app(cast(HarnessRuntime, runtime), authenticate, model_control=model_control)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        headers = {"x-test-owner": "alice", "x-test-role": "manager"}
+        assert (await client.get("/api/model", headers=headers)).json() == {"can_manage": False}
+        assert (await client.post("/api/model/enable", headers=headers)).status_code == 403
+    assert not model_control.calls
+
+
+@pytest.mark.parametrize("operation", ["enable", "disable"])
+async def test_model_controls_reject_cross_origin_requests(
+    control_client: httpx.AsyncClient, model_control: FakeModelControl, operation: str,
+) -> None:
+    response = await control_client.post(
+        f"/api/model/{operation}",
+        headers={
+            "x-test-owner": "alice", "x-test-role": "manager", "origin": "https://foreign.test",
+        },
+    )
+    assert response.status_code == 403
+    assert not model_control.calls
+
+
+@pytest.mark.parametrize("operation", ["enable", "disable"])
+async def test_model_control_body_is_bounded_and_cannot_change_configuration(
+    control_client: httpx.AsyncClient, model_control: FakeModelControl, operation: str,
+) -> None:
+    headers = {"x-test-owner": "alice", "x-test-role": "manager"}
+    path = f"/api/model/{operation}"
+    for body in ('{"command":"untrusted-launcher"}', "[]", "not-json"):
+        response = await control_client.post(path, headers=headers, content=body)
+        assert response.status_code == 400
+    response = await control_client.post(path, headers=headers, content=b"x" * 65_537)
+    assert response.status_code == 413
+
+    async def chunks() -> AsyncIterator[bytes]:
+        yield b"x" * 40_000
+        yield b"x" * 40_000
+
+    response = await control_client.post(path, headers=headers, content=chunks())
+    assert response.status_code == 413
+    assert not model_control.calls
 
 
 async def test_run_contract_and_identity_are_forwarded(
@@ -144,7 +317,7 @@ async def test_foreign_and_missing_run_look_the_same(client: httpx.AsyncClient) 
         {}, {"question": " "}, {"question": "x", "mode": "magic"},
         {"question": "x", "effort": "unlimited"},
         {"question": "x", "owner_id": "someone-else"},
-        {"question": "x" * 8001}, {"question": "x", "index_ids": ["a"] * 17},
+        {"question": "x" * 8001}, {"question": "x", "index_ids": ["a"] * 1001},
         ["not", "an object"],
     ],
 )

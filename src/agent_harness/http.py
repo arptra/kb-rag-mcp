@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from pydantic import ValidationError
@@ -17,9 +18,12 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from agent_harness.contracts import Principal, RunRequest
+from agent_harness.integrations import IntegrationHub
+from agent_harness.integrations_config import IntegrationSettings
 from agent_harness.runtime import HarnessRuntime, HarnessUnavailableError, QueueFullError
 
 Authenticate = Callable[[Request], Awaitable[Principal | None]]
+AuthorizeModelManager = Callable[[Request], Awaitable[bool]]
 _MAX_BODY_BYTES = 65_536
 _STATIC = Path(__file__).with_name("static")
 _HEADERS = {
@@ -27,6 +31,16 @@ _HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
 }
+
+
+class ModelControl(Protocol):
+    """Optional host-owned controls; status may include private browser login data."""
+
+    def status(self) -> dict[str, Any]: ...
+
+    def enable(self) -> dict[str, Any]: ...
+
+    def disable(self) -> dict[str, Any]: ...
 
 
 def _json(payload: Any, *, status: int = 200) -> JSONResponse:
@@ -102,13 +116,17 @@ def create_app(
     authenticate: Authenticate,
     *,
     manage_lifespan: bool = True,
+    model_control: ModelControl | None = None,
+    authorize_model_manager: AuthorizeModelManager | None = None,
+    integrations: IntegrationHub | None = None,
 ) -> Starlette:
     """Create an app usable alone or mounted under a host-owned authenticated path.
 
     Every data endpoint invokes the host's authentication callback. Public static
     files contain no runtime state, credentials or source contents. A mounted host
     enters this app's lifespan explicitly, or uses ``manage_lifespan=False`` when
-    it starts/stops the runtime itself.
+    it starts/stops the runtime itself. Optional model controls require separate
+    host authorization; their private state is never returned to ordinary readers.
     """
 
     async def principal(request: Request, *, mutate: bool = False) -> Principal:
@@ -145,6 +163,83 @@ def create_app(
         if data.strip() not in {b"", b"{}"}:
             raise HTTPException(400, "Cancel does not accept a request body")
         return _json(await runtime.cancel(identity, _run_id(request)))
+
+    async def model_status(request: Request) -> Response:
+        await principal(request)
+        if (
+            model_control is None
+            or authorize_model_manager is None
+            or not await authorize_model_manager(request)
+        ):
+            return _json({"can_manage": False})
+        state = await asyncio.to_thread(model_control.status)
+        return _json({**state, "can_manage": True})
+
+    async def model_action(request: Request) -> Response:
+        await principal(request, mutate=True)
+        if model_control is None:
+            raise HTTPException(503, "Model controls are not configured")
+        if authorize_model_manager is None or not await authorize_model_manager(request):
+            raise HTTPException(403, "Model administrator access required")
+        data = await _body(request)
+        if data.strip() not in {b"", b"{}"}:
+            raise HTTPException(400, "Model controls do not accept a request body")
+        operation = (
+            model_control.enable if request.url.path.endswith("/enable") else model_control.disable
+        )
+        state = await asyncio.to_thread(operation)
+        return _json({**state, "can_manage": True})
+
+    async def settings_access(request: Request) -> bool:
+        await principal(request, mutate=request.method != "GET")
+        return bool(
+            integrations is not None
+            and authorize_model_manager is not None
+            and await authorize_model_manager(request)
+        )
+
+    async def integration_settings(request: Request) -> Response:
+        permitted = await settings_access(request)
+        if not permitted:
+            if request.method == "GET":
+                return _json({"can_manage": False})
+            raise HTTPException(403, "Harness administrator access required")
+        assert integrations is not None
+        if request.method == "PUT":
+            try:
+                parsed = IntegrationSettings.model_validate_json(await _body(request))
+            except (ValidationError, ValueError):
+                raise HTTPException(
+                    400, "Проверьте адреса, ID и ограничения подключений."
+                ) from None
+            await asyncio.to_thread(integrations.store.save, parsed)
+        settings = await asyncio.to_thread(integrations.store.load)
+        return _json({"can_manage": True, "settings": settings.model_dump()})
+
+    async def probe_integration(request: Request) -> Response:
+        if not await settings_access(request):
+            raise HTTPException(403, "Harness administrator access required")
+        assert integrations is not None
+        try:
+            payload = json.loads(await _body(request))
+        except (ValueError, UnicodeError, RecursionError):
+            raise HTTPException(400, "Invalid probe request") from None
+        if (
+            not isinstance(payload, dict)
+            or set(payload) - {"kind", "id"}
+            or not isinstance(payload.get("kind"), str)
+            or payload.get("kind") not in {"repository", "connection", "sandbox"}
+            or not isinstance(payload.get("id", ""), str)
+        ):
+            raise HTTPException(400, "Invalid probe request")
+        try:
+            result = await asyncio.wait_for(
+                integrations.probe(payload["kind"], payload.get("id", "")),
+                65,
+            )
+        except TimeoutError:
+            result = {"available": False, "message": "Подключение не ответило вовремя."}
+        return _json(result)
 
     async def index(_: Request) -> Response:
         return _static("index.html", "text/html")
@@ -186,6 +281,11 @@ def create_app(
             Route("/assets/app.js", javascript),
             Route("/assets/styles.css", stylesheet),
             Route("/api/status", status),
+            Route("/api/model", model_status),
+            Route("/api/model/enable", model_action, methods=["POST"]),
+            Route("/api/model/disable", model_action, methods=["POST"]),
+            Route("/api/settings", integration_settings, methods=["GET", "PUT"]),
+            Route("/api/settings/probe", probe_integration, methods=["POST"]),
             Route("/api/runs", runs, methods=["GET", "POST"]),
             Route("/api/runs/{run_id}", get_run),
             Route("/api/runs/{run_id}/cancel", cancel_run, methods=["POST"]),
