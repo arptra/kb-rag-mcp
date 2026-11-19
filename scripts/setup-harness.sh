@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
-# Install the checked-in dependency versions and prepare reusable sandbox images.
+# Install project dependencies and prepare reusable sandbox images.
 set -euo pipefail
 
 show_help() {
   cat <<'EOF'
-Подготовка Harness: ./scripts/setup-harness.sh [--deps-only]
+Подготовка Harness: ./scripts/setup-harness.sh [--deps-only] [--installer auto|pip|uv]
 
 Без флагов:
-  1. Устанавливает зависимости проекта из uv.lock в .venv.
+  1. Устанавливает зависимости проекта в .venv.
   2. Собирает harness-sandbox:local (Git/SSH/Python/поиск).
   3. Собирает harness-sandbox-java21:local (дополнительно Java 21 и Maven).
 
 --deps-only  Обновить только зависимости Python, без Docker.
+--installer auto  Использовать установленный uv, иначе pip (по умолчанию).
+--installer pip   Использовать pip и версии из pyproject.toml, без uv и uv.lock.
+--installer uv    Использовать установленный uv и точные версии из uv.lock.
 --help, -h   Показать справку.
 
 Нужны uv или Python 3.12; для образов — работающий Docker Engine.
-Если uv отсутствует, скрипт устанавливает его из PyPI только в .venv.
+uv автоматически не устанавливается. Для корпоративной сети выбирайте
+--installer pip: сохраняются настройки pip, прокси, каталога пакетов и сертификатов.
 При установленном uv Python 3.12 при необходимости загружается автоматически.
 Первой установке нужен доступ к реестрам пакетов/образов. Повторная сборка
 использует Docker cache; во время вопросов пакеты и образы не скачиваются.
@@ -24,21 +28,35 @@ EOF
 }
 
 deps_only=false
-for argument in "$@"; do
-  case "${argument}" in
+installer=auto
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --deps-only) deps_only=true ;;
+    --installer)
+      if [[ $# -lt 2 ]]; then
+        echo "После --installer укажите auto, pip или uv." >&2
+        exit 2
+      fi
+      installer="$2"
+      shift
+      ;;
     --help|-h) show_help; exit 0 ;;
-    *) echo "Неизвестный аргумент: ${argument}" >&2; show_help >&2; exit 2 ;;
+    *) echo "Неизвестный аргумент: $1" >&2; show_help >&2; exit 2 ;;
   esac
+  shift
 done
+case "${installer}" in
+  auto|pip|uv) ;;
+  *) echo "Неизвестный установщик: ${installer}. Выберите auto, pip или uv." >&2; exit 2 ;;
+esac
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd -- "${script_dir}/.." && pwd)"
 venv_dir="${project_root}/.venv"
 cd "${project_root}"
 
-if [[ ! -f uv.lock || ! -f pyproject.toml ]]; then
-  echo "Не найдены pyproject.toml и uv.lock рядом с scripts/. Нужен полный репозиторий." >&2
+if [[ ! -f pyproject.toml ]]; then
+  echo "Не найден pyproject.toml рядом с scripts/. Нужен полный репозиторий." >&2
   exit 1
 fi
 
@@ -63,39 +81,56 @@ if [[ -x "${venv_dir}/bin/python" ]]; then
   fi
 fi
 
-if [[ -x "${venv_dir}/bin/uv" ]]; then
-  uv_bin="${venv_dir}/bin/uv"
-elif command -v uv >/dev/null 2>&1; then
-  uv_bin="$(command -v uv)"
-else
-  if [[ ! -x "${venv_dir}/bin/python" ]]; then
-    python_bin="${PYTHON_BIN:-python3.12}"
-    if ! command -v "${python_bin}" >/dev/null 2>&1; then
-      echo "Нужен uv или Python 3.12. Установите один из них и повторите команду." >&2
-      echo "Для другого пути к Python используйте PYTHON_BIN=/path/to/python3.12." >&2
-      exit 1
-    fi
-    python_version="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-    if [[ "${python_version}" != 3.12 ]]; then
-      echo "PYTHON_BIN должен указывать на Python 3.12; найден ${python_version}." >&2
-      exit 1
-    fi
-    "${python_bin}" -m venv "${venv_dir}"
+uv_bin=""
+if [[ "${installer}" != pip ]]; then
+  if [[ -x "${venv_dir}/bin/uv" ]]; then
+    uv_bin="${venv_dir}/bin/uv"
+  elif command -v uv >/dev/null 2>&1; then
+    uv_bin="$(command -v uv)"
   fi
-  if ! "${venv_dir}/bin/python" -m pip --version >/dev/null 2>&1; then
-    "${venv_dir}/bin/python" -m ensurepip --upgrade
+fi
+if [[ "${installer}" == auto ]]; then
+  if [[ -n "${uv_bin}" ]]; then
+    installer=uv
+  else
+    installer=pip
   fi
-  "${venv_dir}/bin/python" -m pip install --disable-pip-version-check \
-    --index-url https://pypi.org/simple uv
-  uv_bin="${venv_dir}/bin/uv"
 fi
 
-# Explicitly target this checkout, even when the caller has another venv active.
-export UV_PROJECT_ENVIRONMENT="${venv_dir}"
-export UV_CACHE_DIR="${project_root}/.uv-cache"
-export UV_PYTHON_INSTALL_DIR="${project_root}/.uv-python"
-echo "Устанавливаем зависимости Harness из uv.lock…"
-"${uv_bin}" sync --project "${project_root}" --python 3.12 --locked --inexact --no-dev
+if [[ "${installer}" == pip ]]; then
+  if [[ ! -f "${script_dir}/setup-pip.sh" ]]; then
+    echo "Не найден scripts/setup-pip.sh. Обновите скрипты из полного репозитория." >&2
+    exit 1
+  fi
+  if [[ ! -x "${venv_dir}/bin/python" ]]; then
+    python_bin="${PYTHON_BIN:-python3.12}"
+    if command -v "${python_bin}" >/dev/null 2>&1; then
+      python_version="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+      if [[ "${python_version}" != 3.12 ]]; then
+        echo "PYTHON_BIN должен указывать на Python 3.12; найден ${python_version}." >&2
+        exit 1
+      fi
+    fi
+  fi
+  echo "Устанавливаем зависимости Harness через pip из pyproject.toml (без uv.lock)…"
+  echo "Используются ваши настройки pip, прокси и каталога пакетов."
+  bash "${script_dir}/setup-pip.sh" --no-dev
+else
+  if [[ -z "${uv_bin}" ]]; then
+    echo "uv не установлен. Используйте --installer pip или установите uv отдельно." >&2
+    exit 1
+  fi
+  if [[ ! -f uv.lock ]]; then
+    echo "Не найден uv.lock. Обновите репозиторий или выберите --installer pip." >&2
+    exit 1
+  fi
+  # Explicitly target this checkout, even when the caller has another venv active.
+  export UV_PROJECT_ENVIRONMENT="${venv_dir}"
+  export UV_CACHE_DIR="${project_root}/.uv-cache"
+  export UV_PYTHON_INSTALL_DIR="${project_root}/.uv-python"
+  echo "Устанавливаем зависимости Harness из uv.lock…"
+  "${uv_bin}" sync --project "${project_root}" --python 3.12 --locked --inexact --no-dev
+fi
 
 if [[ "${deps_only}" == true ]]; then
   echo "Зависимости готовы. Docker-образы не собирались; запущенный сервер нужно перезапустить."
