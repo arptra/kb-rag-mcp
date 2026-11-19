@@ -2,6 +2,7 @@ export class ApiError extends Error {
   constructor(
     message: string,
     public status: number,
+    public details?: { error_code?: string; upstream_status?: number },
   ) {
     super(message);
   }

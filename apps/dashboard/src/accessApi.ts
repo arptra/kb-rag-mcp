@@ -31,7 +31,12 @@ export async function accessApi<T>(path: string, init: RequestInit = {}): Promis
       const message = payload && typeof payload === "object" && "error" in payload
         ? String(payload.error)
         : `Ошибка запроса (${response.status})`;
-      throw new ApiError(message, response.status);
+      const details: { error_code?: string; upstream_status?: number } = {};
+      if (payload && typeof payload === "object") {
+        if ("error_code" in payload && typeof payload.error_code === "string") details.error_code = payload.error_code;
+        if ("upstream_status" in payload && typeof payload.upstream_status === "number") details.upstream_status = payload.upstream_status;
+      }
+      throw new ApiError(message, response.status, details);
     }
     return payload as T;
   } catch (error) {

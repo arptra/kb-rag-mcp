@@ -71,6 +71,7 @@ def test_page_failure_report_keeps_original_urls_after_source_edit(tmp_path, clo
 
     registry.upsert_source(
         {"base_url": "https://replacement.example/new-context", "root_page_url": "99"},
+        token="replacement-server-token",
         source_id=source["id"],
     )
 

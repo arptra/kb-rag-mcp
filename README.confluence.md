@@ -26,6 +26,24 @@ older saved sources that still contain a Cloud email. The dashboard omits that e
 in Data Center requests. Existing `auto` connections with a username retain Basic
 authentication for compatibility; choose Data Center explicitly when using a PAT.
 
+When connecting another root page, the dashboard reuses saved credentials for the same
+Confluence server. A selector lists existing connections and their account names;
+choosing one fills the server and authentication settings without returning its token
+to the browser. The form automatically selects a matching saved connection and checks
+access to the new root before saving. Administrators can instead enter a new token.
+An authentication failure prompts for another saved connection or new credentials;
+network, TLS, rate-limit and page-permission errors do not invalidate saved credentials.
+
+The administrative `GET /admin/api/confluence/credentials` endpoint returns only safe
+connection metadata. Pass `credential_source_id` instead of `token` to connection
+tests, source creation or updates. Reuse copies encrypted credentials into the target
+source, along with the donor's deployment and username; the target index, root and
+schedule remain independent. Updating or disconnecting one source does not rotate or
+remove credentials from other sources. Reuse is restricted to the same scheme, host,
+port and Confluence API base path (Cloud's implicit `/wiki` is recognized). Changing
+servers requires a matching saved connection or a new token, including when editing
+an existing source. Existing connections are available without a migration.
+
 The connection test reads root metadata without saving settings or content. Creating a
 source through the dashboard/API immediately queues its first synchronization. This
 sync discovers the root and descendants using paginated APIs, then saves their stable
@@ -216,6 +234,8 @@ and new entries appear normally; other sources' journals are unaffected.
 Main endpoints:
 
 - `GET /admin/api/confluence` — source/job summary and extractor availability.
+- `GET /admin/api/confluence/credentials` — administrator-only saved credential choices;
+  metadata only, no tokens or encrypted credentials.
 - `POST /admin/api/confluence/test` — read-only root connection check.
 - `GET|POST /admin/api/confluence/sources` — list/create connections; creation also queues
   the initial synchronization.

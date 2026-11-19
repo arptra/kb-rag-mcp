@@ -1,5 +1,6 @@
-import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { accessError } from "./accessApi";
+import { ApiError } from "./api";
 import { ManagementLogin, integrationDate, useManagementApi } from "./managementApi";
 import type { RagIndex } from "./types";
 import "./integrations.css";
@@ -11,6 +12,10 @@ interface ConfluenceSource {
   analyze_images: boolean; schedule: Schedule; credential_configured: boolean;
   paused: boolean; status: string; last_checked_at: string | null; last_success_at: string | null;
   next_check_at: string | null; last_error: string | null; page_count: number; asset_count: number;
+}
+interface ConfluenceCredential {
+  source_id: string; name: string; base_url: string; deployment: ConfluenceSource["deployment"];
+  username: string | null; auth_mode: "basic" | "bearer"; last_success_at: string | null;
 }
 interface ConfluenceJob {
   id: string; source_id: string; index_id: string; type: string; status: string; phase: string;
@@ -38,6 +43,31 @@ function authenticationUrl(value: unknown): string | null {
     const url = new URL(candidate);
     return ["http:", "https:"].includes(url.protocol) && Boolean(url.hostname) && !url.username && !url.password ? candidate : null;
   } catch { return null; }
+}
+
+function confluenceServerScope(value: string, deployment: ConfluenceSource["deployment"]): string | null {
+  try {
+    const candidate = value.trim();
+    if (/[\u0000-\u0020\u007f\\]/.test(candidate)) return null;
+    const url = new URL(candidate);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) return null;
+    const cloud = deployment === "cloud" || (deployment === "auto" && url.hostname.toLowerCase().endsWith(".atlassian.net"));
+    let path = url.pathname.replace(/\/+$/, "");
+    if (cloud && !path) path = "/wiki";
+    return `${url.origin}${path}${cloud ? "/api/v2" : "/rest/api"}`;
+  } catch { return null; }
+}
+
+function credentialMatchesServer(credential: ConfluenceCredential, base: string): boolean {
+  const scope = confluenceServerScope(base, credential.deployment);
+  return scope !== null && scope === confluenceServerScope(credential.base_url, credential.deployment);
+}
+
+function confluenceConnectionError(error: unknown): string {
+  if (error instanceof ApiError && (error.details?.error_code === "authentication" || error.details?.upstream_status === 401)) {
+    return "Confluence не принял выбранные данные доступа. Выберите другой сохранённый доступ или введите новый токен. Сохранённые данные не удалены.";
+  }
+  return accessError(error);
 }
 
 function GigaCodeAuthentication({ job, canManage }: { job: ConfluenceJob; canManage: boolean }) {
@@ -176,41 +206,114 @@ function SourceForm({ source, indexes, initialIndex, request, gigacodeAvailable,
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState("");
   const [check, setCheck] = useState<string | null>(null);
+  const [credentials, setCredentials] = useState<ConfluenceCredential[]>([]);
+  const [credentialsLoading, setCredentialsLoading] = useState(true);
+  const [credentialsError, setCredentialsError] = useState("");
+  const [credentialsRevision, setCredentialsRevision] = useState(0);
+  const [credentialId, setCredentialId] = useState(source?.credential_configured ? source.id : "");
+  const [manualCredentials, setManualCredentials] = useState(false);
   const formRef = useRef<HTMLFormElement>(null);
   const connectionRevision = useRef(0);
+  const successfulRevision = useRef<number | null>(null);
+  const successfulAt = useRef(0);
+  const connectionEdited = useRef(false);
+  const operation = useRef<AbortController | null>(null);
+  useEffect(() => () => operation.current?.abort(), []);
+  useEffect(() => {
+    const controller = new AbortController();
+    setCredentialsLoading(true); setCredentialsError("");
+    void request<{ credentials: ConfluenceCredential[] }>("/admin/api/confluence/credentials", { signal: controller.signal })
+      .then(result => { if (!controller.signal.aborted) setCredentials(result.credentials); })
+      .catch(caught => { if (!controller.signal.aborted) setCredentialsError(accessError(caught)); })
+      .finally(() => { if (!controller.signal.aborted) setCredentialsLoading(false); });
+    return () => controller.abort();
+  }, [request, credentialsRevision]);
+  const availableCredentials = useMemo(() => {
+    const saved = [...credentials];
+    if (source?.credential_configured && !saved.some(item => item.source_id === source.id)) {
+      saved.push({ source_id: source.id, name: source.name, base_url: source.base_url, deployment: source.deployment, username: source.username, auth_mode: source.deployment !== "data_center" && source.username ? "basic" : "bearer", last_success_at: source.last_success_at });
+    }
+    const lastSuccess = (value: string | null) => value ? Date.parse(value) || 0 : 0;
+    return saved.sort((left, right) => lastSuccess(right.last_success_at) - lastSuccess(left.last_success_at) || left.name.localeCompare(right.name));
+  }, [credentials, source]);
+  const selectedCredential = availableCredentials.find(item => item.source_id === credentialId && credentialMatchesServer(item, base)) ?? null;
+  useEffect(() => {
+    if (busy || checking || manualCredentials || token) return;
+    if (availableCredentials.some(item => item.source_id === credentialId && credentialMatchesServer(item, base))) return;
+    const serverScopes = new Set(availableCredentials.map(item => confluenceServerScope(item.base_url, item.deployment)));
+    const candidate = !source && !base.trim() && !connectionEdited.current && !credentialsLoading && serverScopes.size === 1 && !serverScopes.has(null)
+      ? availableCredentials[0]
+      : availableCredentials.find(item => credentialMatchesServer(item, base));
+    if (candidate) {
+      setCredentialId(candidate.source_id); setDeployment(candidate.deployment); setUsername(candidate.username || "");
+      if (!base.trim()) setBase(candidate.base_url);
+    } else if (credentialId) setCredentialId("");
+  }, [availableCredentials, base, credentialId, manualCredentials, token, source, credentialsLoading, busy, checking]);
+  const chooseCredential = (id: string) => {
+    connectionEdited.current = true; setCredentialId(id); setManualCredentials(!id); setToken("");
+    const chosen = availableCredentials.find(item => item.source_id === id);
+    if (chosen) { setBase(chosen.base_url); setDeployment(chosen.deployment); setUsername(chosen.username || ""); }
+  };
   let autoCloud = false;
   try { autoCloud = deployment === "auto" && new URL(base.trim()).hostname.toLowerCase().endsWith(".atlassian.net"); } catch { /* An incomplete URL is validated by the form. */ }
   const effectiveCloud = deployment === "cloud" || autoCloud;
   useEffect(() => {
-    ++connectionRevision.current; setCheck(null); setError("");
-  }, [base, root, deployment, username, token, index]);
-  const payload = () => ({ name: name.trim() || `Confluence · ${new URL(base).hostname}`.slice(0, 120), index_id: index, base_url: base.trim(), root_page_url: root.trim(), deployment, username: deployment === "data_center" ? null : username.trim() || null, ...(token ? { token } : {}), schedule, include_history: false, analyze_images: images, enabled: source?.enabled ?? true });
+    ++connectionRevision.current; successfulRevision.current = null; setCheck(null); setError("");
+  }, [base, root, deployment, username, token, index, credentialId, selectedCredential?.base_url, selectedCredential?.deployment, selectedCredential?.username]);
+  const payload = () => ({ name: name.trim() || `Confluence · ${new URL(base).hostname}`.slice(0, 120), index_id: index, base_url: base.trim(), root_page_url: root.trim(), deployment: selectedCredential?.deployment ?? deployment, username: selectedCredential ? selectedCredential.username : deployment === "data_center" ? null : username.trim() || null, ...(selectedCredential ? { credential_source_id: selectedCredential.source_id } : token ? { token } : {}), schedule, include_history: false, analyze_images: images, enabled: source?.enabled ?? true });
+  const verifyConnection = async (body: ReturnType<typeof payload>, testedRevision: number, signal: AbortSignal) => {
+    const result = await request<Record<string, unknown>>("/admin/api/confluence/test", { method: "POST", body: JSON.stringify({ ...body, ...(source ? { source_id: source.id } : {}) }), signal });
+    if (signal.aborted || testedRevision !== connectionRevision.current) return false;
+    successfulRevision.current = testedRevision;
+    successfulAt.current = Date.now();
+    const title = typeof result.root_page_title === "string" ? result.root_page_title : typeof result.title === "string" ? result.title : "";
+    setCheck(title ? `Доступ к странице «${title}» проверен` : typeof result.message === "string" ? result.message : "Подключение проверено");
+    return true;
+  };
   const test = async () => {
-    if (!formRef.current?.reportValidity()) return;
+    if (busy || checking || !formRef.current?.reportValidity()) return;
     const testedRevision = connectionRevision.current;
+    const controller = new AbortController(); operation.current = controller;
+    successfulRevision.current = null;
     setChecking(true); setError(""); setCheck(null);
     try {
-      const result = await request<Record<string, unknown>>("/admin/api/confluence/test", { method: "POST", body: JSON.stringify({ ...payload(), ...(source ? { source_id: source.id } : {}) }) });
-      if (testedRevision === connectionRevision.current) setCheck(typeof result.message === "string" ? result.message : `Подключение проверено${result.title ? `: ${String(result.title)}` : ""}`);
-    } catch (caught) { if (testedRevision === connectionRevision.current) setError(accessError(caught)); } finally { setChecking(false); }
+      await verifyConnection(payload(), testedRevision, controller.signal);
+    } catch (caught) { if (!controller.signal.aborted && testedRevision === connectionRevision.current) setError(confluenceConnectionError(caught)); }
+    finally { if (!controller.signal.aborted) setChecking(false); if (operation.current === controller) operation.current = null; }
   };
   const submit = async (event: FormEvent) => {
-    event.preventDefault(); if (!index || busy) return;
+    event.preventDefault(); if (!index || busy || checking || !formRef.current?.reportValidity()) return;
+    const submittedRevision = connectionRevision.current;
+    const controller = new AbortController(); operation.current = controller;
     setBusy(true); setError("");
-    try { await request(source ? `/admin/api/confluence/sources/${encodeURIComponent(source.id)}` : "/admin/api/confluence/sources", { method: source ? "PATCH" : "POST", body: JSON.stringify(payload()) }); setToken(""); onSaved(); }
-    catch (caught) { setError(accessError(caught)); } finally { setBusy(false); }
+    try {
+      const body = payload();
+      if (selectedCredential && (successfulRevision.current !== submittedRevision || Date.now() - successfulAt.current > 60_000)) {
+        setChecking(true); setCheck(null);
+        if (!await verifyConnection(body, submittedRevision, controller.signal)) return;
+        setChecking(false);
+      }
+      if (controller.signal.aborted || submittedRevision !== connectionRevision.current) return;
+      await request(source ? `/admin/api/confluence/sources/${encodeURIComponent(source.id)}` : "/admin/api/confluence/sources", { method: source ? "PATCH" : "POST", body: JSON.stringify(body), signal: controller.signal });
+      if (!controller.signal.aborted) { setToken(""); onSaved(); }
+    } catch (caught) { successfulRevision.current = null; if (!controller.signal.aborted && submittedRevision === connectionRevision.current) setError(confluenceConnectionError(caught)); }
+    finally { if (!controller.signal.aborted) { setBusy(false); setChecking(false); } if (operation.current === controller) operation.current = null; }
   };
   return <div className="modal-backdrop" onMouseDown={() => { if (!busy && !checking) onClose(); }} role="presentation"><section className="modal confluence-form" role="dialog" aria-modal="true" aria-labelledby="confluence-form-title" onMouseDown={event => event.stopPropagation()}>
     <header className="modal-header"><div><span className="eyebrow">Confluence → выбранный индекс</span><h2 id="confluence-form-title">{source ? "Настроить источник" : "Подключить Confluence"}</h2></div><button className="icon-button" aria-label="Закрыть" disabled={busy || checking} onClick={onClose}>×</button></header>
     <form ref={formRef} className="modal-form" onSubmit={event => void submit(event)}>
-      <div className="confluence-form-grid"><div className="modal-form">
+      <fieldset disabled={busy || checking} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}><div className="confluence-form-grid"><div className="modal-form">
         <label>Название · необязательно<input maxLength={120} value={name} onChange={event => setName(event.target.value)} placeholder="Заполнится из адреса Confluence" /></label>
         <label>Целевой индекс · обязательно<select required disabled={Boolean(source)} value={index} onChange={event => setIndex(event.target.value)}><option value="">Выберите индекс</option>{indexes.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select><small>{source ? "Для другого индекса создайте новое подключение." : "Актуальные страницы и описания изображений будут доступны читателям этого индекса."}</small></label>
-        <label>Адрес Confluence<input required type="url" value={base} onChange={event => setBase(event.target.value)} placeholder="https://confluence.company.ru" /></label>
+        <label>Данные доступа<select value={selectedCredential?.source_id ?? ""} onChange={event => chooseCredential(event.target.value)}><option value="">Ввести новый токен</option>{availableCredentials.map(item => <option key={item.source_id} value={item.source_id}>{item.name} · {item.base_url} · {item.auth_mode === "basic" ? item.username || "Atlassian" : "Персональный токен"}</option>)}</select><small>{credentialsLoading ? "Загружаем сохранённые подключения… Новый токен можно ввести вручную." : selectedCredential ? "Используем сохранённый на сервере токен. Для другой корневой страницы вводить его повторно не нужно." : "Для знакомого сервера доступ подбирается автоматически. Можно выбрать другое подключение или ввести новый токен."}</small></label>
+        {credentialsError && <div className="callout"><p>Не удалось загрузить сохранённые подключения: {credentialsError}. Можно ввести токен вручную.</p><button type="button" className="button quiet" disabled={credentialsLoading} onClick={() => setCredentialsRevision(value => value + 1)}>Повторить загрузку</button></div>}
+        <label>Адрес Confluence<input required type="url" value={base} onChange={event => { connectionEdited.current = true; setBase(event.target.value); }} placeholder="https://confluence.company.ru" /></label>
         <label>Корневая страница<input required type="url" value={root} onChange={event => setRoot(event.target.value)} placeholder="https://confluence.company.ru/pages/viewpage.action?pageId=123" /></label>
-        <label>Тип Confluence<select value={deployment} onChange={event => setDeployment(event.target.value as ConfluenceSource["deployment"])}><option value="auto">Определить автоматически</option><option value="data_center">Data Center · персональный токен</option><option value="cloud">Cloud · API token</option></select></label>
-        {deployment !== "data_center" && <label>Email Atlassian{effectiveCloud ? " · обязательно" : " · для Cloud"}<input type="text" inputMode="email" maxLength={320} required={effectiveCloud} pattern={effectiveCloud ? ".*\\S.*" : undefined} value={username} onChange={event => setUsername(event.target.value)} autoComplete="username" /><small>{autoCloud ? "По адресу atlassian.net определён Confluence Cloud. Нужен email учётной записи, для которой выдан API token." : effectiveCloud ? "Укажите email учётной записи Atlassian, для которой выдан API token." : "Для Confluence Cloud нужны email и API token. Для Data Center достаточно персонального токена."}</small></label>}
-        <label>{source ? "Новый токен · оставить пустым, чтобы сохранить" : "Токен"}<input type="password" required={!source} value={token} onChange={event => setToken(event.target.value)} autoComplete="new-password" /><small>Токен передаётся серверу и не возвращается в интерфейс.</small></label>
+        {selectedCredential ? <div className="callout"><b>{selectedCredential.auth_mode === "basic" ? "Email и токен" : "Персональный токен"}</b>{selectedCredential.username && <p>Учётная запись: {selectedCredential.username}</p>}<small>Источник доступа: {selectedCredential.name}. Последняя успешная синхронизация: {integrationDate(selectedCredential.last_success_at)}. Перед сохранением проверим доступ к выбранной корневой странице.</small>{source?.id !== selectedCredential.source_id && <p className="integration-muted">Данные исходного подключения не изменятся.</p>}</div> : <>
+        <label>Тип Confluence<select value={deployment} onChange={event => { connectionEdited.current = true; setManualCredentials(true); setDeployment(event.target.value as ConfluenceSource["deployment"]); }}><option value="auto">Определить автоматически</option><option value="data_center">Data Center · персональный токен</option><option value="cloud">Cloud · API token</option></select></label>
+        {deployment !== "data_center" && <label>Email Atlassian{effectiveCloud ? " · обязательно" : " · для Cloud"}<input type="text" inputMode="email" maxLength={320} required={effectiveCloud} pattern={effectiveCloud ? ".*\\S.*" : undefined} value={username} onChange={event => { connectionEdited.current = true; setManualCredentials(true); setUsername(event.target.value); }} autoComplete="username" /><small>{autoCloud ? "По адресу atlassian.net определён Confluence Cloud. Нужен email учётной записи, для которой выдан API token." : effectiveCloud ? "Укажите email учётной записи Atlassian, для которой выдан API token." : "Для Confluence Cloud нужны email и API token. Для Data Center достаточно персонального токена."}</small></label>}
+        <label>Новый токен<input type="password" required value={token} onChange={event => { connectionEdited.current = true; setManualCredentials(true); setToken(event.target.value); }} autoComplete="new-password" /><small>Токен передаётся серверу и не возвращается в интерфейс.{source ? " Обновится только это подключение." : ""}</small></label>
+        </>}
       </div><div className="modal-form">
         <label>Проверять обновления<select value={schedule.kind} onChange={event => setSchedule(current => ({ ...current, kind: event.target.value as Schedule["kind"] }))}><option value="manual">Только вручную</option><option value="interval">С интервалом</option><option value="daily">Ежедневно</option><option value="weekly">Еженедельно</option></select></label>
         {schedule.kind === "interval" && <label>Интервал, минут<input required type="number" min={1} max={525600} value={schedule.interval_minutes} onChange={event => setSchedule(current => ({ ...current, interval_minutes: Number(event.target.value) }))} /></label>}
@@ -221,9 +324,9 @@ function SourceForm({ source, indexes, initialIndex, request, gigacodeAvailable,
         <label className="integration-check"><input type="checkbox" checked={images} onChange={event => setImages(event.target.checked)} /><span>Обрабатывать изображения через GigaCode<small>SVG, BMP, JPG, JPEG, PNG</small></span></label>
         {images && <div className={`callout ${gigacodeAvailable === false ? "integration-error" : ""}`}>{gigacodeAvailable === false ? "GigaCode сейчас недоступен. Статус обработки изображений будет виден в журнале." : gigacodeAvailable ? "GigaCode доступен на сервере" : "Доступность GigaCode проверяется на сервере"}</div>}
         <small>Синхронизация выполняется на сервере. Закрытие страницы её не останавливает.</small>
-      </div></div>
+      </div></div></fieldset>
       {error && <div className="form-error" role="alert">{error}</div>}{check && <div className="access-notice" role="status">{check}</div>}
-      <div className="modal-actions"><button type="button" className="button quiet" disabled={busy || checking} onClick={onClose}>Отмена</button><button type="button" className="button secondary" disabled={busy || checking} onClick={() => void test()}>{checking ? "Проверяем…" : "Проверить доступ"}</button><button className="button primary" disabled={busy || checking || !index}>{busy ? "Сохраняем…" : source ? "Сохранить" : "Подключить и синхронизировать"}</button></div>
+      <div className="modal-actions"><button type="button" className="button quiet" disabled={busy || checking} onClick={onClose}>Отмена</button><button type="button" className="button secondary" disabled={busy || checking} onClick={() => void test()}>{checking ? "Проверяем…" : "Проверить доступ"}</button><button className="button primary" disabled={busy || checking || !index}>{busy ? checking ? "Проверяем доступ…" : "Сохраняем…" : source ? "Сохранить" : "Подключить и синхронизировать"}</button></div>
     </form>
   </section></div>;
 }

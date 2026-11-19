@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
@@ -20,6 +21,7 @@ from typing import Any, cast
 from urllib.parse import quote, urlsplit
 
 import frontmatter
+import httpx
 from bs4 import BeautifulSoup
 from cryptography.fernet import Fernet
 from pydantic import ValidationError
@@ -282,25 +284,114 @@ class ConfluenceRegistry:
                 )
             ]
 
+    def list_credentials(self) -> list[dict[str, Any]]:
+        """Describe reusable accounts without exposing their stored credentials."""
+        with self._db() as connection:
+            result = []
+            for row in connection.execute(
+                "SELECT id,config_json,last_success_at FROM sources "
+                "WHERE archived=0 AND length(credential)>0 ORDER BY created_at,id"
+            ):
+                config = SourceConfig.model_validate_json(row["config_json"])
+                result.append({
+                    "source_id": row["id"],
+                    "name": config.name,
+                    "base_url": config.base_url,
+                    "deployment": config.deployment,
+                    "username": config.username,
+                    "auth_mode": config.auth_mode,
+                    "last_success_at": row["last_success_at"],
+                })
+            return result
+
+    @staticmethod
+    def _credential_scope(config: SourceConfig) -> tuple[str, str, int, str]:
+        """Match the effective API destination, including its Confluence context."""
+        value = config.base_url
+        if "\\" in value or any(
+            ord(character) < 32 or ord(character) == 127 for character in value
+        ):
+            raise ValueError("Invalid Confluence server URL for saved credentials")
+        try:
+            parsed = urlsplit(value)
+            # Use the transport's IDNA rules. Python's legacy IDNA codec can
+            # otherwise collapse different hosts (for example ß and ss).
+            host = httpx.URL(value).raw_host.decode("ascii")
+            with suppress(ValueError):
+                host = ipaddress.ip_address(host).compressed
+            port = parsed.port
+            if port is None:
+                port = 443 if parsed.scheme == "https" else 80
+        except (ValueError, httpx.InvalidURL):
+            raise ValueError("Invalid Confluence server URL for saved credentials") from None
+        path = parsed.path.rstrip("/")
+        if config.effective_cloud and not path:
+            path = "/wiki"
+        api_path = path + ("/api/v2" if config.effective_cloud else "/rest/api")
+        return parsed.scheme, host, port, api_path
+
+    def _config_with_credential(
+        self,
+        connection: sqlite3.Connection,
+        values: dict[str, Any],
+        token: str | None,
+        previous: sqlite3.Row | None,
+        credential_source_id: str | None,
+    ) -> tuple[SourceConfig, bytes]:
+        """Resolve a server-side credential copy only within its original API scope."""
+        donor: sqlite3.Row | None
+        if credential_source_id is not None:
+            if not isinstance(credential_source_id, str) or not credential_source_id.strip():
+                raise ValueError("credential_source_id must be a nonempty string")
+            if token is not None:
+                raise ValueError("Use either token or credential_source_id, not both")
+            donor = self._source_row(connection, credential_source_id.strip())
+            donor_config = SourceConfig.model_validate_json(donor["config_json"])
+            values = {
+                **values,
+                "deployment": donor_config.deployment,
+                "username": donor_config.username,
+            }
+        else:
+            donor = previous if token is None else None
+        parsed = SourceConfig.model_validate(values)
+        if token is not None:
+            if not isinstance(token, str):
+                raise ValueError("token must be a string")
+            token = token.strip()
+            if not token or len(token) > 8192 or "\n" in token or "\r" in token:
+                raise ValueError("A valid Confluence token is required")
+            return parsed, self._cipher.encrypt(token.encode())
+        if donor is None or not donor["credential"]:
+            raise ValueError("Confluence token is required")
+        original = SourceConfig.model_validate_json(donor["config_json"])
+        if self._credential_scope(parsed) != self._credential_scope(original):
+            raise ValueError(
+                "Saved Confluence credentials can only be used for the same server and "
+                "API context; enter a new token for a different destination"
+            )
+        return parsed, bytes(donor["credential"])
+
     def test_connection(
         self,
         config: dict[str, Any],
         token: str | None = None,
         source_id: str | None = None,
+        *,
+        credential_source_id: str | None = None,
     ) -> dict[str, Any]:
         """Read the root only; do not save configuration, credentials or page content."""
         values = dict(config)
-        if source_id:
-            with self._db() as connection:
-                source = self._source_row(connection, source_id)
+        with self._db() as connection:
+            source = self._source_row(connection, source_id) if source_id else None
+            if source:
                 values = {**json.loads(source["config_json"]), **values}
-                if not token:
-                    token = self._cipher.decrypt(source["credential"]).decode()
-        parsed = SourceConfig.model_validate(values)
+            parsed, encrypted = self._config_with_credential(
+                connection, values, token, source, credential_source_id
+            )
         if not self.index_exists(parsed.index_id):
             raise ValueError("Select an existing RAG index")
-        if not token:
-            raise ValueError("Confluence token is required")
+        token = self._cipher.decrypt(encrypted).decode()
         client = None
         started = monotonic()
         logger.info(
@@ -348,6 +439,8 @@ class ConfluenceRegistry:
         config: dict[str, Any],
         token: str | None = None,
         source_id: str | None = None,
+        *,
+        credential_source_id: str | None = None,
     ) -> dict[str, Any]:
         values = dict(config)
         if "interval_minutes" in values and "schedule" not in values:
@@ -357,13 +450,16 @@ class ConfluenceRegistry:
                 "interval_minutes": interval or 60,
             }
         with self._db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             if source_id:
                 previous = self._source_row(connection, source_id)
                 merged = {**json.loads(previous["config_json"]), **values}
             else:
                 previous = None
                 merged = values
-            parsed = SourceConfig.model_validate(merged)
+            parsed, encrypted = self._config_with_credential(
+                connection, merged, token, previous, credential_source_id
+            )
             if not self.index_exists(parsed.index_id):
                 raise ValueError("Select an existing RAG index")
             if previous and json.loads(previous["config_json"])["index_id"] != parsed.index_id:
@@ -378,15 +474,6 @@ class ConfluenceRegistry:
                 raise ValueError(
                     "Wait for synchronization to finish or cancel it before changing the source"
                 )
-            if token is not None:
-                token = token.strip()
-                if not token or len(token) > 8192 or "\n" in token or "\r" in token:
-                    raise ValueError("A valid Confluence token is required")
-                encrypted = self._cipher.encrypt(token.encode())
-            elif previous:
-                encrypted = previous["credential"]
-            else:
-                raise ValueError("Confluence token is required")
             source_id = source_id or uuid.uuid4().hex
             now = _now()
             if previous:

@@ -110,15 +110,22 @@ def register_confluence_routes(
             "can_manage": await manager_authorized(request),
         }
 
+    @route("/credentials", ["GET"], manage=True)
+    async def credentials(request: Request) -> dict[str, Any]:
+        return {"credentials": await asyncio.to_thread(registry.list_credentials)}
+
     @route("/sources", ["POST"], manage=True)
     async def create(request: Request) -> dict[str, Any]:
         data = await body(request, 65536)
         if not await manager_authorized(request):
             raise PermissionError("Administrator session expired")
         token = data.pop("token", None)
+        credential_source_id = data.pop("credential_source_id", None)
         if token is not None and not isinstance(token, str):
             raise ValueError("token must be a string")
-        source = await asyncio.to_thread(registry.upsert_source, data, token)
+        source = await asyncio.to_thread(
+            registry.upsert_source, data, token, credential_source_id=credential_source_id
+        )
         job = await asyncio.to_thread(registry.queue_sync, source["id"])
         return {"source": source, "job": job}
 
@@ -128,12 +135,14 @@ def register_confluence_routes(
         if not await manager_authorized(request):
             raise PermissionError("Administrator session expired")
         token, source_id = data.pop("token", None), data.pop("source_id", None)
+        credential_source_id = data.pop("credential_source_id", None)
         if token is not None and not isinstance(token, str):
             raise ValueError("token must be a string")
         if source_id is not None and not isinstance(source_id, str):
             raise ValueError("source_id must be a string")
         return await asyncio.to_thread(
-            registry.test_connection, data, token=token, source_id=source_id
+            registry.test_connection, data, token=token, source_id=source_id,
+            credential_source_id=credential_source_id,
         )
 
     @route("/sources/{source_id}", ["PATCH"], manage=True)
@@ -142,11 +151,13 @@ def register_confluence_routes(
         if not await manager_authorized(request):
             raise PermissionError("Administrator session expired")
         token = data.pop("token", None)
+        credential_source_id = data.pop("credential_source_id", None)
         if token is not None and not isinstance(token, str):
             raise ValueError("token must be a string")
         return {
             "source": await asyncio.to_thread(
-                registry.upsert_source, data, token, request.path_params["source_id"]
+                registry.upsert_source, data, token, request.path_params["source_id"],
+                credential_source_id=credential_source_id,
             )
         }
 
