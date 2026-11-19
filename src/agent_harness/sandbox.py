@@ -23,6 +23,7 @@ from typing import Any
 from uuid import uuid4
 
 from agent_harness.contracts import Evidence, Principal
+from agent_harness.credentials import CredentialStore
 from agent_harness.integrations_config import RepositoryConfig, SandboxConfig
 
 
@@ -33,7 +34,7 @@ class SandboxError(RuntimeError):
 # These programs are supplied by the server, never loaded from the repository.
 # Isolated Python (-I -S) prevents the checkout from supplying imported modules.
 CLONE_SCRIPT = r"""
-import json, os, subprocess, sys
+import json, os, shutil, subprocess, sys
 url, ref = sys.argv[1:]
 token = os.environ.pop("HARNESS_GIT_TOKEN", "")
 env = {
@@ -45,7 +46,26 @@ env = {
 if token:
     env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.extraHeader",
                GIT_CONFIG_VALUE_0="Authorization: Bearer " + token)
+if not url.startswith("https://"):
+    credentials = json.loads(sys.stdin.buffer.read(65537))
+    os.mkdir("/tmp/harness-ssh", 0o700)
+    for name, content in (("key", credentials["private_key"]),
+                          ("known_hosts", credentials["known_hosts"])):
+        fd = os.open("/tmp/harness-ssh/" + name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(content)
+    env["GIT_SSH_COMMAND"] = (
+        "ssh -F /dev/null -i /tmp/harness-ssh/key "
+        "-o UserKnownHostsFile=/tmp/harness-ssh/known_hosts "
+        "-o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes "
+        "-o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none "
+        "-o ForwardAgent=no -o ClearAllForwardings=yes -o PasswordAuthentication=no "
+        "-o KbdInteractiveAuthentication=no -o PreferredAuthentications=publickey "
+        "-o ConnectTimeout=15 -o LogLevel=ERROR"
+    )
+    env["GIT_SSH_VARIANT"] = "ssh"
 git = ["git", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+       "-c", "protocol.ssh.allow=always",
        "-c", "protocol.file.allow=never", "-c", "protocol.ext.allow=never",
        "-c", "core.hooksPath=/dev/null", "-c", "http.followRedirects=false"]
 def execute(args, cwd=None):
@@ -61,6 +81,8 @@ execute(["fetch", "--depth", "1", "--no-tags", "--no-recurse-submodules",
          "origin", ref], "repo")
 execute(["checkout", "--detach", "--force", "FETCH_HEAD"], "repo")
 print(json.dumps({"commit": execute(["rev-parse", "HEAD"], "repo")}))
+if not url.startswith("https://"):
+    shutil.rmtree("/tmp/harness-ssh")
 """
 
 READ_SCRIPT = r"""
@@ -155,7 +177,7 @@ class _Result:
 @dataclass
 class _Checkout:
     volume: str
-    fingerprint: tuple[str, str, str]
+    fingerprint: tuple[str, ...]
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     commit: str = ""
     dirty: bool = False
@@ -175,7 +197,8 @@ class _Run:
 
 
 class SandboxBackend:
-    def __init__(self) -> None:
+    def __init__(self, credentials: CredentialStore | None = None) -> None:
+        self.credentials = credentials
         self._runs: dict[str, _Run] = {}
         self._capacity = asyncio.Condition()
         self._active = 0
@@ -265,6 +288,7 @@ class SandboxBackend:
         output_limit: int,
         container: str = "",
         token: str = "",
+        stdin_data: bytes | None = None,
     ) -> _Result:
         self._check(cancel, run, deadline)
         try:
@@ -273,6 +297,9 @@ class SandboxBackend:
                 *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE
+                if stdin_data is not None
+                else asyncio.subprocess.DEVNULL,
                 env=self._environment(token),
                 start_new_session=True,
             )
@@ -294,12 +321,25 @@ class SandboxBackend:
             asyncio.create_task(drain(proc.stderr, buffers[1])),
         ]
         waiter = asyncio.create_task(proc.wait())
+
+        async def supply_input() -> None:
+            if stdin_data is not None and proc.stdin is not None:
+                try:
+                    proc.stdin.write(stdin_data)
+                    await proc.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                finally:
+                    proc.stdin.close()
+
+        writer = asyncio.create_task(supply_input())
         try:
             while not waiter.done():
                 self._check(cancel, run, deadline)
                 await asyncio.wait({waiter}, timeout=0.05)
             self._check(cancel, run, deadline)
             await asyncio.wait_for(asyncio.gather(*readers), max(0, deadline - time.monotonic()))
+            await asyncio.wait_for(writer, max(0, deadline - time.monotonic()))
         except BaseException:
             if container:
                 with suppress(SandboxError, OSError, TimeoutError):
@@ -308,7 +348,9 @@ class SandboxBackend:
             await waiter
             for reader in readers:
                 reader.cancel()
+            writer.cancel()
             await asyncio.gather(*readers, return_exceptions=True)
+            await asyncio.gather(writer, return_exceptions=True)
             raise
         out, err = (bytes(buf).decode("utf-8", "replace") for buf in buffers)
         truncated |= len(out) + len(err) > output_limit
@@ -411,6 +453,7 @@ class SandboxBackend:
         *,
         clone: bool,
         token: str = "",
+        stdin: bool = False,
     ) -> tuple[str, list[str]]:
         name = "harness-" + uuid4().hex
         args = [
@@ -452,6 +495,8 @@ class SandboxBackend:
         ]
         if clone and token:
             args += ["--env", "HARNESS_GIT_TOKEN"]
+        if stdin:
+            args += ["--interactive"]
         return name, [*args, "--entrypoint", command[0], config.image, *command[1:]]
 
     async def _container(
@@ -465,8 +510,11 @@ class SandboxBackend:
         deadline: float,
         clone: bool = False,
         token: str = "",
+        stdin_data: bytes | None = None,
     ) -> _Result:
-        name, args = self._command(config, checkout, command, clone=clone, token=token)
+        name, args = self._command(
+            config, checkout, command, clone=clone, token=token, stdin=stdin_data is not None
+        )
         result = await self._exec(
             args,
             cancel=cancel,
@@ -475,10 +523,12 @@ class SandboxBackend:
             output_limit=config.max_output_chars * 2,
             container=name,
             token=token,
+            stdin_data=stdin_data,
         )
         if result.code and clone:
             raise SandboxError(
-                "Repository clone failed; check the ref, access and local sandbox image"
+                "Repository clone failed; check the ref, access, SSH key/known_hosts "
+                "and local sandbox image"
             )
         return result
 
@@ -520,7 +570,13 @@ class SandboxBackend:
         run.tasks.add(task)
         run.idle.clear()
         deadline = time.monotonic() + config.timeout_seconds
-        fingerprint = (repository.url, repository.ref, repository.credential_env)
+        fingerprint = (
+            repository.url,
+            repository.ref,
+            repository.credential_env,
+            repository.ssh_key_id,
+            config.image,
+        )
         checkout = run.repositories.setdefault(
             repository.id, _Checkout("harness-" + uuid4().hex, fingerprint)
         )
@@ -560,6 +616,16 @@ class SandboxBackend:
             raise SandboxError("Repository credential is not configured on the server")
         if "\r" in token or "\n" in token:
             raise SandboxError("Repository credential has an invalid format")
+        stdin_data = None
+        if not repository.url.startswith("https://"):
+            if not repository.ssh_key_id or self.credentials is None:
+                raise SandboxError("Выберите SSH-ключ и known_hosts в настройках репозитория.")
+            try:
+                stdin_data = self.credentials.load(repository.ssh_key_id).clone_input()
+            except (KeyError, ValueError):
+                raise SandboxError(
+                    "SSH-ключ недоступен. Проверьте настройки репозитория."
+                ) from None
         # Mark before spawning: an interrupted Docker client may have created the volume.
         checkout.created = True
         try:
@@ -613,6 +679,7 @@ class SandboxBackend:
                 deadline=deadline,
                 clone=True,
                 token=token,
+                stdin_data=stdin_data,
             )
             commit = self._json(output).get("commit", "")
             if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40,64}", commit):

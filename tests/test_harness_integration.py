@@ -207,7 +207,7 @@ async def test_existing_launcher_activates_harness_without_profile_and_keeps_log
         assert len(controllers) == 1
         controller = controllers[0]
         harness = dict(app.state.extension_apps)["/harness"]
-        assert harness.state.harness_runtime.model.model_control is controller
+        assert harness.state.harness_runtime.model.fallback.model_control is controller
         if a2a_enabled:
             assert app.state.integrations[0].research.controller is controller
         status = await client.get("/harness/api/status", headers=reader)

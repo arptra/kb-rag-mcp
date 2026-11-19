@@ -29,6 +29,7 @@
           <div class="breadcrumb">История запросов <span aria-hidden="true">/</span> <strong id="page-label">Новый запрос</strong></div>
           <div class="topbar-actions">
             <span id="connection-state" class="connection-state"><span class="connection-dot" aria-hidden="true"></span><span id="connection-label">Подключаемся</span></span>
+            <button id="memory-open" class="settings-open" type="button" hidden>Память</button>
             <button id="settings-open" class="settings-open" type="button" hidden>Настройки</button>
             <button id="auth-open" class="icon-button" type="button" aria-label="Вход в Harness" title="Вход в Harness">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M16.5 9.5a4.5 4.5 0 1 0-4.4 5.5H14v3h3v-3h3v-4h-4.3"/><circle cx="8" cy="10" r="1"/></svg>
@@ -58,6 +59,7 @@
                   </fieldset>
                   <label class="effort-select" for="effort">Усилие <select id="effort" name="effort"><option value="low">Низкое</option><option value="medium" selected>Обычное</option><option value="high">Высокое</option></select></label>
                 </div>
+                <div class="composer-environment"><label class="environment-select" for="sandbox-profile">Среда выполнения<select id="sandbox-profile" name="sandbox_profile_id" disabled><option value="">По умолчанию</option></select></label><p id="environment-description">Песочница используется в исследовании.</p></div>
                 <div class="composer-footer"><p id="mode-description">Базы знаний, без запуска песочниц.</p><button id="submit-question" class="primary-button" type="submit"><span>Отправить</span><span aria-hidden="true">↗</span></button></div>
               </form>
               <div class="composer-hint"><span>⌘ / Ctrl + Enter — отправить</span><span id="character-count">0 / 8 000</span></div>
@@ -80,7 +82,9 @@
               <div id="run-warnings" class="run-warnings" hidden></div>
               <div id="answer" class="answer"></div>
               <div id="answer-placeholder" class="answer-placeholder" hidden><p>Сведения появятся здесь.<br><span>Найденные материалы доступны в блоке подтверждений уже во время работы.</span></p></div>
-              <div class="run-footer"><span id="run-metrics" class="muted"></span><button id="deepen-run" class="secondary-button" type="button" hidden>Исследовать глубже <span aria-hidden="true">↗</span></button></div>
+              <div id="run-memory-used" class="run-memory-used" hidden></div>
+              <p id="run-environment" class="run-environment" hidden></p>
+              <div class="run-footer"><span id="run-metrics" class="muted"></span><div class="run-actions"><button id="remember-run" class="text-button" type="button" hidden>Запомнить уточнение</button><button id="resume-run" class="secondary-button" type="button" hidden>Продолжить с выбранными источниками</button><button id="deepen-run" class="secondary-button" type="button" hidden>Исследовать глубже <span aria-hidden="true">↗</span></button><button id="delete-run" class="text-button" type="button">Удалить запрос</button></div></div>
             </section>
           </div>
 
@@ -114,6 +118,12 @@
               <p id="evidence-empty" class="empty-description">Здесь появятся материалы, найденные для вашего запроса.</p>
               <div id="evidence-list" class="evidence-list"></div>
             </section>
+            <section id="discoveries-card" class="evidence-card" aria-labelledby="discoveries-heading" hidden>
+              <div class="card-heading"><h2 id="discoveries-heading">Обнаруженные</h2><span id="discoveries-count" class="count-badge">0</span></div>
+              <p class="card-description">Ссылки из материалов. Подключение требует настройки и разрешения доступа.</p>
+              <div id="run-discoveries" class="discovery-list"></div>
+              <p id="discovery-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
+            </section>
             <p class="reading-note">Проверяйте важные выводы по первоисточникам. Если данных недостаточно, это будет видно в ответе.</p>
           </aside>
         </div>
@@ -128,6 +138,9 @@
             <button id="settings-tab-repositories" type="button" role="tab" aria-selected="true" aria-controls="settings-panel-repositories" tabindex="0" data-settings-tab="repositories">Репозитории</button>
             <button id="settings-tab-connections" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-connections" tabindex="-1" data-settings-tab="connections">MCP и A2A</button>
             <button id="settings-tab-sandbox" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-sandbox" tabindex="-1" data-settings-tab="sandbox">Песочницы</button>
+            <button id="settings-tab-ssh" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-ssh" tabindex="-1" data-settings-tab="ssh">SSH-ключи</button>
+            <button id="settings-tab-discoveries" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-discoveries" tabindex="-1" data-settings-tab="discoveries">Обнаруженные</button>
+            <button id="settings-tab-model" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-model" tabindex="-1" data-settings-tab="model">Модель</button>
           </div>
         </header>
         <div class="settings-content">
@@ -146,10 +159,97 @@
             <section id="settings-panel-sandbox" role="tabpanel" aria-labelledby="settings-tab-sandbox" tabindex="0" hidden>
               <div class="settings-section-heading"><div><h3>Изолированное выполнение</h3><p>Для работы с кодом нужен готовый образ и доступный сервис песочниц на сервере. Здесь можно проверить готовность и задать ограничения.</p></div></div>
               <div id="settings-sandbox"></div>
+              <div class="settings-section-heading sandbox-profiles-heading"><div><h3>Дополнительные среды</h3><p>Подготовленные среды для разных проектов. Пользователь выбирает среду при запуске исследования; ограничения выше применяются ко всем средам.</p></div><button id="settings-add-sandbox-profile" class="secondary-button" type="button">Добавить среду</button></div>
+              <div id="settings-sandbox-profiles" class="settings-items"></div>
+              <p id="settings-sandbox-profiles-empty" class="settings-empty">Дополнительные среды пока не настроены.</p>
+            </section>
+            <section id="settings-panel-ssh" role="tabpanel" aria-labelledby="settings-tab-ssh" tabindex="0" hidden>
+              <div class="settings-section-heading"><div><h3>Доступ к Git по SSH</h3><p>Ключ хранится на сервере и используется только для клонирования. В репозитории выберите его по названию.</p></div><button id="ssh-new" class="secondary-button" type="button">Добавить ключ</button></div>
+              <div id="ssh-list" class="settings-items"></div>
+              <p id="ssh-empty" class="settings-empty">SSH-ключи пока не добавлены.</p>
+              <div id="ssh-editor" class="settings-resource ssh-editor" hidden>
+                <h4 id="ssh-editor-title">Новый SSH-ключ</h4>
+                <div class="settings-grid">
+                  <label class="settings-field wide"><span class="settings-field-label">Название</span><input id="ssh-name" type="text" autocomplete="off" maxlength="160" placeholder="Например, Git сервисов"></label>
+                  <label class="settings-field wide"><span class="settings-field-label">Загрузить приватный ключ из файла</span><input id="ssh-file" type="file"><small class="settings-field-help">OpenSSH или PEM без пароля, до 24 КБ. Можно вставить содержимое ниже.</small></label>
+                  <label class="settings-field wide"><span class="settings-field-label">Приватный ключ</span><textarea id="ssh-private-key" class="secret-field" rows="5" maxlength="24000" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label>
+                  <label class="settings-field wide"><span class="settings-field-label">Проверенные ключи серверов · known_hosts</span><textarea id="ssh-known-hosts" rows="4" maxlength="24000" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="git.example.ru ssh-ed25519 AAAA…"></textarea><small class="settings-field-help">Возьмите записи known_hosts у администратора Git. Они нужны, чтобы проверить подлинность сервера.</small></label>
+                </div>
+                <p class="settings-field-help">Ключ отправляется на сервер при нажатии «Сохранить ключ». В истории и настройках репозитория остаётся только его идентификатор.</p>
+                <div class="resource-actions"><button id="ssh-cancel" class="text-button" type="button">Отмена</button><button id="ssh-save" class="secondary-button" type="button">Сохранить ключ</button></div>
+              </div>
+              <p id="ssh-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
+            </section>
+            <section id="settings-panel-discoveries" role="tabpanel" aria-labelledby="settings-tab-discoveries" tabindex="0" hidden>
+              <div class="settings-section-heading"><div><h3>Новые ресурсы и запросы доступа</h3><p>Агент замечает ссылки в ходе исследования. Вы проверяете адрес и выбираете, кому открыть подключение. Само обнаружение не предоставляет доступ.</p></div><button id="discoveries-refresh" class="secondary-button" type="button">Обновить</button></div>
+              <div id="settings-discoveries" class="settings-items"></div>
+              <p id="settings-discoveries-empty" class="settings-empty">Обнаруженные ресурсы появятся здесь.</p>
+            </section>
+            <section id="settings-panel-model" role="tabpanel" aria-labelledby="settings-tab-model" tabindex="0" hidden>
+              <div class="settings-section-heading"><div><h3>Как подключать модель</h3><p>GigaCode используется по умолчанию. Для прямого подключения укажите адрес API модели и, если требуется, корпоративные сертификаты.</p></div></div>
+              <div class="settings-resource">
+                <div class="settings-grid model-connection-fields">
+                  <label class="settings-field wide"><span class="settings-field-label">Способ подключения</span><select id="model-provider"><option value="gigacode">GigaCode · исполнитель</option><option value="openai">Напрямую · OpenAI-совместимый API</option></select></label>
+                  <div id="direct-model-fields" class="settings-grid wide" hidden>
+                    <label class="settings-field wide"><span class="settings-field-label">Базовый адрес API</span><input id="direct-model-url" type="url" maxlength="2000" autocomplete="off" placeholder="https://model.example.ru/v1"><small class="settings-field-help">HTTPS-адрес без токена и пароля.</small></label>
+                    <label class="settings-field wide"><span class="settings-field-label">Название модели в API</span><input id="direct-model-name" maxlength="200" autocomplete="off" placeholder="model-name"></label>
+                    <label class="settings-field wide"><span class="settings-field-label">Имя переменной с API-ключом на сервере</span><input id="direct-model-token" maxlength="128" pattern="[A-Z][A-Z0-9_]{0,127}" autocomplete="off" placeholder="MODEL_API_KEY"><small class="settings-field-help">Только имя переменной. Сам API-ключ здесь не сохраняется.</small></label>
+                    <label class="settings-field wide"><span class="settings-field-label">Сертификаты подключения</span><select id="direct-model-tls"><option value="">Системные доверенные сертификаты</option></select></label>
+                    <label class="settings-field"><span class="settings-field-label">Ожидание ответа, секунды</span><input id="direct-model-timeout" type="number" min="5" max="300" value="60"></label>
+                  </div>
+                </div>
+                <div class="resource-actions"><button id="model-connection-save" class="secondary-button" type="button">Сохранить подключение</button><button id="model-connection-probe" class="text-button" type="button">Проверить подключение</button></div>
+                <p id="model-connection-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
+              </div>
+              <div class="settings-section-heading tls-section-heading"><div><h3>Сертификаты TLS</h3><p>Корпоративный центр сертификации и клиентская пара для mTLS, если сервер модели их требует.</p></div><button id="tls-new" class="secondary-button" type="button">Добавить сертификаты</button></div>
+              <div id="tls-list" class="settings-items"></div>
+              <p id="tls-empty" class="settings-empty">Используется системное хранилище доверенных сертификатов.</p>
+              <div id="tls-editor" class="settings-resource" hidden>
+                <h4 id="tls-editor-title">Набор сертификатов</h4>
+                <div class="settings-grid">
+                  <label class="settings-field wide"><span class="settings-field-label">Название</span><input id="tls-name" maxlength="160" autocomplete="off"></label>
+                  <label class="settings-field wide"><span class="settings-field-label">Сертификат центра сертификации · CA</span><input id="tls-ca-file" type="file" accept=".pem,.crt,.cer"><textarea id="tls-ca" rows="4" maxlength="24000" autocomplete="off" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----"></textarea></label>
+                  <label class="settings-field wide"><span class="settings-field-label">Клиентский сертификат · для mTLS</span><input id="tls-cert-file" type="file" accept=".pem,.crt,.cer"><textarea id="tls-cert" rows="4" maxlength="24000" autocomplete="off" spellcheck="false" placeholder="Необязательно"></textarea></label>
+                  <label class="settings-field wide"><span class="settings-field-label">Приватный ключ клиентского сертификата</span><input id="tls-key-file" type="file" accept=".pem,.key"><textarea id="tls-key" class="secret-field" rows="4" maxlength="16000" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Укажите вместе с клиентским сертификатом"></textarea></label>
+                </div>
+                <p class="settings-field-help">Содержимое будет отправлено только при сохранении. Приватный ключ не возвращается в интерфейс.</p>
+                <div class="resource-actions"><button id="tls-cancel" class="text-button" type="button">Отмена</button><button id="tls-save" class="secondary-button" type="button">Сохранить сертификаты</button></div>
+              </div>
+              <p id="tls-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
             </section>
           </fieldset>
         </div>
         <footer class="settings-footer"><p id="settings-feedback" role="status" aria-live="polite">Загружаем настройки…</p><div><button id="settings-discard" class="text-button" type="button" disabled>Отменить изменения</button><button id="settings-save" class="primary-button" type="submit" disabled>Сохранить</button></div></footer>
+      </form>
+    </dialog>
+
+    <dialog id="memory-dialog" class="memory-dialog" aria-labelledby="memory-title">
+      <header class="dialog-heading"><div><h2 id="memory-title">Память Harness</h2><p>Ваши уточнения помогают в следующих похожих запросах. Источники проверяются заново.</p></div><button id="memory-close" class="icon-button" type="button" aria-label="Закрыть память">×</button></header>
+      <div class="memory-toolbar"><label class="settings-switch"><input id="memory-enabled" type="checkbox" role="switch"><span>Использовать мою память</span></label><button id="memory-new" class="secondary-button" type="button">Добавить запись</button></div>
+      <p class="settings-field-help">Это сохранённые подсказки, а не обучение модели. Предложения после ошибок остаются черновиками, пока вы их не подтвердите.</p>
+      <p id="memory-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
+      <div id="memory-error" class="settings-error" role="alert" hidden></div>
+      <form id="memory-editor" class="settings-resource memory-editor" hidden>
+        <h3 id="memory-editor-title">Новая запись</h3>
+        <div class="settings-grid">
+          <label class="settings-field wide"><span class="settings-field-label">Название</span><input id="memory-name" maxlength="160" required autocomplete="off"></label>
+          <label class="settings-field"><span class="settings-field-label">Тип записи</span><select id="memory-kind"><option value="note">Заметка</option><option value="correction">Уточнение ответа</option><option value="lesson">Урок из ошибки</option></select></label>
+          <label class="settings-field wide"><span class="settings-field-label">Что нужно учитывать в будущем</span><textarea id="memory-text" rows="5" maxlength="2400" required placeholder="Укажите проверенное уточнение, рабочий способ или причину ошибки."></textarea></label>
+          <fieldset class="memory-sources wide"><legend>Связанные источники</legend><div id="memory-sources" class="memory-source-list"></div><p class="settings-field-help">Запись используется только в доступной вам области поиска.</p></fieldset>
+          <label class="memory-confirm wide"><input id="memory-confirmed" type="checkbox"><span>Подтверждаю запись: использовать её в похожих запросах<small>Без подтверждения запись сохранится как черновик.</small></span></label>
+        </div>
+        <div class="resource-actions"><button id="memory-cancel" class="text-button" type="button">Отмена</button><button id="memory-save" class="secondary-button" type="submit">Сохранить запись</button></div>
+      </form>
+      <div id="memory-list" class="settings-items"></div>
+      <p id="memory-empty" class="settings-empty">Пока ничего не запомнено. Можно добавить запись или сохранить уточнение к ответу.</p>
+    </dialog>
+
+    <dialog id="delete-dialog" class="auth-dialog" aria-labelledby="delete-title">
+      <form id="delete-form">
+        <div class="dialog-heading"><h2 id="delete-title">Удалить запрос?</h2><button id="delete-close" class="icon-button" type="button" aria-label="Закрыть">×</button></div>
+        <p id="delete-description"></p>
+        <div id="delete-error" class="settings-error" role="alert" hidden></div>
+        <div class="dialog-actions"><button id="delete-cancel" class="text-button" type="button">Отмена</button><button id="delete-confirm" class="primary-button" type="submit">Удалить</button></div>
       </form>
     </dialog>
 

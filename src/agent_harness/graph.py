@@ -1,0 +1,361 @@
+"""Durable LangGraph orchestration with private threads and conservative tool recovery."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+from dataclasses import dataclass
+from threading import Event
+from typing import TYPE_CHECKING, Any, TypedDict, cast
+
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
+
+from agent_harness.contracts import Principal
+from agent_harness.policy import BUDGETS, QUICK_BUDGETS, TOOLS, validate_call
+
+if TYPE_CHECKING:
+    from agent_harness.runtime import HarnessRuntime
+
+
+class GraphState(TypedDict, total=False):
+    run: dict[str, Any]
+    next_step: str
+    knowledge_ids: list[str]
+    bootstrap: list[str]
+    external: list[dict[str, Any]]
+    calls: list[Any]
+    exchange: list[dict[str, Any]]
+
+
+@dataclass
+class ExecutionContext:
+    principal: Principal
+    run: dict[str, Any]
+    cancel: Event
+    deadline: float
+
+
+class HarnessGraph:
+    def __init__(self, engine: HarnessRuntime, checkpointer: AsyncSqliteSaver) -> None:
+        self.engine = engine
+        self.checkpointer = checkpointer
+        builder = StateGraph(GraphState, context_schema=ExecutionContext)
+        builder.add_node("prepare", self.prepare)
+        builder.add_node("collect", self.collect)
+        builder.add_node("decide", self.decide)
+        builder.add_node("tools", self.tools)
+        builder.add_node("synthesize", self.synthesize)
+        builder.add_edge(START, "prepare")
+        for name in ("prepare", "collect", "decide", "tools"):
+            builder.add_conditional_edges(
+                name,
+                self.route,
+                {
+                    "collect": "collect",
+                    "decide": "decide",
+                    "tools": "tools",
+                    "synthesize": "synthesize",
+                    "done": END,
+                },
+            )
+        builder.add_edge("synthesize", END)
+        self.graph = builder.compile(checkpointer=checkpointer, name="harness-investigation")
+
+    @staticmethod
+    def thread_id(principal: Principal, run_id: str) -> str:
+        owner = hashlib.sha256(principal.owner_id.encode()).hexdigest()[:32]
+        return f"harness:{owner}:{run_id}"
+
+    def config(self, principal: Principal, run_id: str) -> RunnableConfig:
+        return {
+            "configurable": {"thread_id": self.thread_id(principal, run_id)},
+            "recursion_limit": 128,
+        }
+
+    async def execute(self, context: ExecutionContext, *, resume: bool = False) -> None:
+        config = self.config(context.principal, context.run["id"])
+        state: GraphState | None = {"run": copy.deepcopy(context.run)}
+        if resume:
+            snapshot = await self.graph.aget_state(config)
+            if not snapshot.values:
+                raise ValueError("Контрольная точка не найдена. Создайте новый запрос.")
+            checkpoint = dict(snapshot.values)
+            pending = "tools" in snapshot.next or bool(checkpoint.get("calls"))
+            if pending:
+                self.engine._warn(
+                    context.run,
+                    "Прерванный вызов инструмента не повторён: результат неизвестен. "
+                    "Проверяем состояние заново перед следующими действиями.",
+                )
+            # A restored sandbox has been cleaned up. Re-plan using current tool
+            # availability instead of replaying pending commands or stale clone IDs.
+            context.run["evidence"] = [
+                item for item in context.run["evidence"] if not item["index_id"].startswith("repo:")
+            ]
+            await self.graph.aupdate_state(
+                config,
+                {
+                    "run": copy.deepcopy(context.run),
+                    "calls": [],
+                    "exchange": [],
+                    "next_step": "collect",
+                },
+                as_node="prepare",
+            )
+            state = None
+        await self.graph.ainvoke(state, config=config, context=context, durability="sync")
+
+    async def has_checkpoint(self, principal: Principal, run_id: str) -> bool:
+        snapshot = await self.graph.aget_state(self.config(principal, run_id))
+        return bool(snapshot.values)
+
+    async def delete(self, principal: Principal, run_id: str) -> None:
+        await self.checkpointer.adelete_thread(self.thread_id(principal, run_id))
+
+    async def prune(self) -> None:
+        known = self.engine.store.run_ids()
+        async with self.checkpointer.conn.execute(
+            "SELECT DISTINCT thread_id FROM checkpoints"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for (thread_id,) in rows:
+            if str(thread_id).rsplit(":", 1)[-1] not in known:
+                await self.checkpointer.adelete_thread(str(thread_id))
+
+    @staticmethod
+    def route(state: GraphState) -> str:
+        return state.get("next_step", "done")
+
+    def _context(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> ExecutionContext:
+        context = runtime.context
+        context.run.clear()
+        context.run.update(copy.deepcopy(state["run"]))
+        return context
+
+    def _result(self, context: ExecutionContext, next_step: str, **values: Any) -> GraphState:
+        visible = copy.deepcopy(context.run)
+        # Terminal status is published only after the durable graph and sandbox
+        # cleanup finish, so deletion cannot race an unfinished checkpoint write.
+        if visible["status"] not in {"queued", "running", "cancelling"}:
+            visible["status"] = "running"
+        self.engine._checkpoint(context.principal, visible, context.cancel)
+        return cast(
+            GraphState, {"run": copy.deepcopy(context.run), "next_step": next_step, **values}
+        )
+
+    def _reserve_deadline(self, context: ExecutionContext) -> float:
+        settings = self.engine.settings
+        return context.deadline - min(
+            settings.final_reserve_seconds, settings.investigate_timeout_seconds / 4
+        )
+
+    async def prepare(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
+        context = self._context(state, runtime)
+        run, principal = context.run, context.principal
+        available = {
+            item["id"]
+            for item in await self.engine._indexes(principal, self.engine._source_timeout(run))
+        }
+        requested = list(dict.fromkeys(run["index_ids"]))
+        if set(requested) - available:
+            run["status"] = "failed"
+            self.engine._warn(run, "Один или несколько выбранных индексов недоступны.")
+            return self._result(context, "done")
+        selected = requested or sorted(available)
+        if len(selected) > self.engine.settings.max_indexes:
+            self.engine._warn(run, "Область поиска ограничена бюджетом числа индексов.")
+        run["index_ids"] = selected[: self.engine.settings.max_indexes]
+        if not run["index_ids"]:
+            run["status"] = "partial"
+            self.engine._warn(run, "Нет доступных источников; состояние системы не проверено.")
+            return self._result(context, "done")
+        return self._result(context, "collect", calls=[], exchange=[])
+
+    async def collect(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
+        context = self._context(state, runtime)
+        run, principal, event = context.run, context.principal, context.cancel
+        engine = self.engine
+        budget = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
+        engine._semaphores[run["id"]] = asyncio.Semaphore(budget.parallelism)
+        available = {item["id"] for item in await engine._indexes(principal)}
+        if set(run["index_ids"]) - available:
+            raise ValueError("Source access changed during the investigation")
+        parent = engine._parent_context(principal, run, available)
+        run["parent_question"] = parent["question"] if parent else None
+        query = ((run["parent_question"] + "\nFollow-up: ") if parent else "") + run["question"]
+        external = (
+            await engine.tools.describe(principal, run["index_ids"])
+            if engine.tools and run["mode"] == "investigate"
+            else []
+        )
+        external_ids = (
+            {item["id"] for item in await engine.tools.indexes(principal)}
+            if engine.tools
+            else set()
+        )
+        knowledge = [item for item in run["index_ids"] if item not in external_ids]
+        if run["mode"] == "quick" and set(run["index_ids"]) & external_ids:
+            engine._warn(
+                run, "Быстрый ответ использует RAG. Код, MCP и A2A доступны в исследовании."
+            )
+        remaining = max(0, budget.source_calls - run["metrics"]["source_calls"])
+        limit = min(
+            remaining, max(1, budget.source_calls // 2) if external else budget.source_calls
+        )
+        bootstrap = knowledge[:limit] if engine.source else []
+        if len(bootstrap) < len(knowledge):
+            engine._warn(run, "Часть индексов не опрошена: исчерпан бюджет источников.")
+        await asyncio.gather(
+            *(
+                engine._search(
+                    principal,
+                    run,
+                    event,
+                    index,
+                    query[:8000],
+                    deadline=context.deadline - engine.settings.quick_timeout_seconds / 3
+                    if run["mode"] == "quick"
+                    else None,
+                )
+                for index in bootstrap
+            )
+        )
+        if event.is_set():
+            return self._result(context, "done")
+        model = await engine._model_status()
+        while model.get("state") == "authentication_required" and not event.is_set():
+            await engine._refresh_authentication(run)
+            engine.store.save(principal.owner_id, run)
+            await asyncio.sleep(0.025)
+            model = await engine._model_status()
+        if event.is_set():
+            return self._result(context, "done")
+        await engine._refresh_authentication(run)
+        if not model["available"] or (not run["evidence"] and not external):
+            run["status"] = "partial"
+            engine._warn(
+                run,
+                model["reason"]
+                if not model["available"]
+                else "Подтверждающие источники не найдены.",
+            )
+            return self._result(context, "done")
+        return self._result(
+            context,
+            "synthesize" if run["mode"] == "quick" else "decide",
+            external=external,
+            knowledge_ids=knowledge,
+            exchange=[],
+            calls=[],
+        )
+
+    async def decide(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
+        context = self._context(state, runtime)
+        run, event, engine = context.run, context.cancel, self.engine
+        budget = BUDGETS[run["effort"]]
+        if event.is_set():
+            return self._result(context, "done")
+        if (
+            engine._now(run) >= self._reserve_deadline(context)
+            or run["metrics"]["model_calls"] >= budget.model_calls - 1
+            or run["metrics"]["tool_calls"] >= budget.tool_calls
+            or run["metrics"]["source_calls"] >= budget.source_calls
+        ):
+            engine._warn(run, "Исследование ограничено бюджетом; итог по собранным источникам.")
+            return self._result(context, "synthesize")
+        run["phase"] = "investigating"
+        engine.store.save(context.principal.owner_id, run)
+        catalog = [*(TOOLS if state.get("knowledge_ids") else []), *state.get("external", [])]
+        try:
+            decision = await engine._decide(
+                context.principal,
+                run,
+                event,
+                catalog,
+                state.get("exchange", []),
+                self._reserve_deadline(context),
+            )
+        except TimeoutError as exc:
+            # Authentication exhaustion belongs to the outer run controller.
+            if type(exc).__name__ == "_AuthenticationTimeout":
+                raise
+            engine._warn(run, "Время поиска исчерпано; зарезервирован итоговый ответ.")
+            return self._result(context, "synthesize")
+        calls = decision.get("tool_calls", [])
+        if not calls:
+            return self._result(context, "done" if engine._answer(run, decision) else "synthesize")
+        return self._result(
+            context,
+            "tools",
+            calls=calls[: budget.tool_calls - run["metrics"]["tool_calls"]],
+            exchange=[],
+        )
+
+    async def tools(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
+        context = self._context(state, runtime)
+        engine, run, principal, event = self.engine, context.run, context.principal, context.cancel
+        budget = BUDGETS[run["effort"]]
+        calls = list(state.get("calls", []))
+        if event.is_set():
+            return self._result(context, "done", calls=[])
+        if (
+            not calls
+            or engine._now(run) >= self._reserve_deadline(context)
+            or run["metrics"]["tool_calls"] >= budget.tool_calls
+            or run["metrics"]["source_calls"] >= budget.source_calls
+        ):
+            return self._result(context, "decide", calls=[])
+        call = calls.pop(0)
+        run["metrics"]["tool_calls"] += 1
+        if not isinstance(call, dict):
+            engine._warn(run, "Некорректный формат вызова инструмента отклонён.")
+            return self._result(context, "tools" if calls else "decide", calls=calls)
+        name, args = str(call.get("name", "")), call.get("args", {})
+        try:
+            if name in {item["function"]["name"] for item in state.get("external", [])}:
+                result = await engine._external_tool(
+                    principal, run, event, name, args, self._reserve_deadline(context)
+                )
+            else:
+                validated = validate_call(name, args, set(state.get("knowledge_ids", [])))
+                result = (
+                    await engine._search(
+                        principal,
+                        run,
+                        event,
+                        validated["index_id"],
+                        validated["query"],
+                        validated["limit"],
+                    )
+                    if name == "search_knowledge"
+                    else await engine._read(principal, run, event, validated)
+                )
+        except (ValueError, TypeError):
+            result = "Вызов отклонён: недопустимый инструмент, аргументы или индекс."
+            engine._warn(run, result)
+            engine.memory.record_failure(
+                principal.owner_id, run, operation="invalid", index_ids=run["index_ids"]
+            )
+        return self._result(
+            context,
+            "tools" if calls else "decide",
+            calls=calls,
+            exchange=[*state.get("exchange", []), {"name": name, "result": result}],
+        )
+
+    async def synthesize(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
+        context = self._context(state, runtime)
+        run = context.run
+        budget = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
+        if not context.cancel.is_set() and run["metrics"]["model_calls"] < budget.model_calls:
+            await self.engine._synthesize(context.principal, run, context.cancel)
+        elif not context.cancel.is_set():
+            run["status"] = "partial"
+            self.engine._warn(
+                run, "Бюджет модели исчерпан. Для нового исследования создайте запрос."
+            )
+        return self._result(context, "done")

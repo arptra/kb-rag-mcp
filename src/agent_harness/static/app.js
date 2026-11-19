@@ -4,6 +4,7 @@
   const AUTH_KEY = "agent-harness.auth.v1";
   const ACTIVE = new Set(["queued", "running", "cancelling"]);
   const MODEL_PENDING = new Set(["starting", "authentication_required"]);
+  const SETTINGS_TABS = ["repositories", "connections", "sandbox", "ssh", "discoveries", "model"];
   const STATUS_LABELS = {
     queued: "Запрос принят", running: "Работаем над запросом", completed: "Готово",
     partial: "Собраны доступные сведения", cancelling: "Останавливаем работу", cancelled: "Остановлено", timed_out: "Время работы истекло",
@@ -22,11 +23,18 @@
     evidenceSignature: null, historySignature: null, answerSignature: null, presentedRunId: null,
     modelDetails: null, modelEndpointAvailable: null, modelError: "", modelBusy: null,
     modelPollTimer: null, modelPollController: null, modelActionController: null,
+    sandboxProfiles: [], selectedSandboxProfile: "", sandboxProfilesController: null,
   };
   const settingsState = {
     canManage: false, checked: false, config: null, saved: "", dirty: false, busy: null,
     controller: null, generation: 0, activeTab: "repositories", message: "", probes: new Map(),
   };
+  const sshState = { credentials: [], controller: null, busy: false, editingId: null, generation: 0 };
+  const memoryState = { available: false, enabled: true, memories: [], editing: null, controller: null, busy: false };
+  const discoveryState = { current: [], all: [], signature: null, controller: null, adminController: null, busy: new Set() };
+  const deletionState = { target: null, controller: null };
+  const modelConnectionState = { settings: null, saved: "", controller: null, busy: false, dirty: false };
+  const tlsState = { credentials: [], controller: null, busy: false, editingId: null, generation: 0 };
   try {
     const saved = JSON.parse(sessionStorage.getItem(AUTH_KEY) || "null");
     if (saved && ["bearer", "admin"].includes(saved.kind) && typeof saved.value === "string") {
@@ -120,6 +128,7 @@
     stopModelPolling();
     state.modelDetails = null;
     resetSettingsAccess();
+    resetPersonalData();
     renderModel();
     connection("Требуется вход", "warning");
     showError("Для входа в Harness войдите в портал или укажите ключ доступа к порталу.");
@@ -174,10 +183,14 @@
     const sandbox = value.sandbox || {};
     return {
       repositories: (Array.isArray(value.repositories) ? value.repositories : []).map((item) => ({
-        ...resource(item), ref: String(item.ref || "HEAD").trim(),
+        ...resource(item), ref: String(item.ref || "HEAD").trim(), ssh_key_id: String(item.ssh_key_id || "").trim(),
       })),
       connections: (Array.isArray(value.connections) ? value.connections : []).map((item) => ({
         ...resource(item), kind: item.kind === "a2a" ? "a2a" : "mcp", allowed_tools: strings(item.allowed_tools),
+      })),
+      sandbox_profiles: (Array.isArray(value.sandbox_profiles) ? value.sandbox_profiles : []).map((item) => ({
+        id: String(item.id || ""), name: String(item.name || "").trim(), image: String(item.image || "").trim(),
+        enabled: item.enabled !== false, allowed_owners: strings(item.allowed_owners),
       })),
       sandbox: {
         enabled: sandbox.enabled === true, image: String(sandbox.image || "harness-sandbox:local").trim(),
@@ -194,9 +207,21 @@
     Object.assign(settingsState, { canManage: false, checked: false, config: null, saved: "", dirty: false,
       busy: null, controller: null, message: "" });
     settingsState.probes.clear();
+    clearSshEditor();
+    clearTlsEditor();
+    modelConnectionState.controller?.abort(); tlsState.controller?.abort();
+    Object.assign(modelConnectionState, { settings: null, saved: "", controller: null, busy: false, dirty: false });
+    Object.assign(tlsState, { credentials: [], controller: null, busy: false });
+    for (const id of ["direct-model-url", "direct-model-name", "direct-model-token"]) $(id).value = "";
+    $("model-provider").value = "gigacode"; $("direct-model-timeout").value = "60"; fillTlsSelect("");
+    for (const id of ["ssh-feedback", "tls-feedback", "model-connection-feedback"]) $(id).textContent = "";
+    updateModelConnection();
+    if (sshState.controller) sshState.controller.abort();
+    Object.assign(sshState, { credentials: [], controller: null, busy: false });
+    sshState.generation += 1;
     $("settings-open").hidden = true;
     if ($("settings-dialog").open) $("settings-dialog").close();
-    for (const id of ["settings-repositories", "settings-connections", "settings-sandbox"]) $(id).replaceChildren();
+    for (const id of ["settings-repositories", "settings-connections", "settings-sandbox", "settings-sandbox-profiles", "ssh-list", "tls-list", "settings-discoveries"]) $(id).replaceChildren();
     settingsError();
     updateSettingsChrome();
   }
@@ -210,6 +235,7 @@
     $("settings-save").textContent = settingsState.busy === "saving" ? "Сохраняем…" : "Сохранить";
     $("settings-add-repository").disabled = (settingsState.config?.repositories.length || 0) >= 100;
     $("settings-add-connection").disabled = (settingsState.config?.connections.length || 0) >= 100;
+    $("settings-add-sandbox-profile").disabled = (settingsState.config?.sandbox_profiles.length || 0) >= 20;
     $("settings-fields").querySelectorAll("[data-probe]").forEach((button) => {
       button.disabled = busy || settingsState.dirty;
       button.title = settingsState.dirty ? "Сначала сохраните изменения" : "Проверить сохранённые настройки";
@@ -217,6 +243,11 @@
     const busyText = { loading: "Загружаем настройки…", saving: "Сохраняем настройки…", probing: "Проверяем подключение…" };
     $("settings-feedback").textContent = busyText[settingsState.busy] || (settingsState.dirty ?
       "Есть изменения. Сохраните их перед проверкой подключений." : settingsState.message || "Настройки сохраняются на сервере.");
+    const integrationTab = ["repositories", "connections", "sandbox"].includes(settingsState.activeTab);
+    $("settings-save").hidden = !integrationTab;
+    $("settings-discard").hidden = !integrationTab;
+    if (!integrationTab && !settingsState.busy) $("settings-feedback").textContent = settingsState.dirty ?
+      "В других разделах остались несохранённые изменения подключений." : "Изменения в этом разделе сохраняются отдельно.";
   }
   function markSettingsChanged() {
     settingsState.dirty = JSON.stringify(settingsState.config) !== settingsState.saved;
@@ -225,7 +256,7 @@
     updateSettingsChrome();
   }
   function selectSettingsTab(name, focus = false) {
-    if (!["repositories", "connections", "sandbox"].includes(name)) return;
+    if (!SETTINGS_TABS.includes(name)) return;
     settingsState.activeTab = name;
     for (const tab of document.querySelectorAll("[data-settings-tab]")) {
       const active = tab.dataset.settingsTab === name;
@@ -234,6 +265,10 @@
       $("settings-panel-" + tab.dataset.settingsTab).hidden = !active;
       if (active && focus) tab.focus();
     }
+    if (name === "ssh" && $("settings-dialog").open) loadSshKeys();
+    if (name === "discoveries" && $("settings-dialog").open) loadAdminDiscoveries();
+    if (name === "model" && $("settings-dialog").open) loadModelConnection();
+    updateSettingsChrome();
   }
   function settingField(label, value, onInput, options = {}) {
     const wrapper = element("label", "settings-field" + (options.wide ? " wide" : ""));
@@ -273,12 +308,13 @@
     const key = kind + ":" + (entry?.id || "");
     const wrapper = element("div", "settings-probe");
     const actions = element("div", "settings-probe-actions");
-    const button = element("button", "secondary-button", kind === "sandbox" ? "Проверить песочницу" : "Проверить подключение");
+    const button = element("button", "secondary-button", kind === "sandbox" ? "Проверить песочницу" : kind === "sandbox_profile" ? "Проверить среду" : "Проверить подключение");
     button.type = "button";
     button.dataset.probe = key;
     button.addEventListener("click", () => probeSettings(kind, entry?.id));
     actions.append(button);
     if (kind === "repository") actions.append(element("p", "settings-probe-note", "Проверим адрес и готовность песочницы. Репозиторий будет загружен при исследовании."));
+    if (kind === "sandbox_profile") actions.append(element("p", "settings-probe-note", "Проверим готовность выбранного образа на сервере."));
     wrapper.append(actions);
     const result = settingsState.probes.get(key);
     if (result) {
@@ -354,10 +390,22 @@
       label.append(element("span", "settings-field-label", "Тип подключения"), kindSelect);
       fields.append(label);
     } else fields.append(settingField("Ветка, тег или commit", entry.ref, (value) => { entry.ref = value; }, { required: true, maxLength: 200, placeholder: "HEAD" }).wrapper);
-    fields.append(settingField(repository ? "HTTPS-адрес репозитория" : "Адрес сервера", entry.url, (value) => { entry.url = value; }, {
-      type: "url", required: true, maxLength: 2000, wide: true,
-      help: "Адрес без токена, логина, пароля и параметров. Для передачи токена используйте переменную на сервере.",
+    fields.append(settingField(repository ? "Адрес репозитория · HTTPS или SSH" : "Адрес сервера", entry.url, (value) => { entry.url = value; }, {
+      type: repository ? "text" : "url", required: true, maxLength: 2000, wide: true,
+      placeholder: repository ? "git@git.example.ru:team/service.git" : "https://service.example.ru/mcp",
+      help: repository ? "HTTPS, ssh://git@host/team/repo.git или git@host:team/repo.git. Не вставляйте токены и пароли в адрес." :
+        "Адрес без токена, логина, пароля и параметров. Для передачи токена используйте переменную на сервере.",
     }).wrapper);
+    if (repository) {
+      const key = element("label", "settings-field wide");
+      const select = document.createElement("select");
+      select.dataset.sshKey = entry.id;
+      fillSshSelect(select, entry.ssh_key_id);
+      select.addEventListener("change", () => { entry.ssh_key_id = select.value; markSettingsChanged(); });
+      key.append(element("span", "settings-field-label", "SSH-ключ для клонирования"), select,
+        element("small", "settings-field-help", "Для SSH выберите ключ из раздела «SSH-ключи». Для HTTPS оставьте «Не использовать»."));
+      fields.append(key);
+    }
     fields.append(settingField("Имя переменной с токеном на сервере", entry.credential_env, (value) => { entry.credential_env = value; }, {
       wide: true, pattern: "[A-Z][A-Z0-9_]{0,127}", maxLength: 128, placeholder: "Например, GIT_ACCESS_TOKEN",
       help: "Только имя переменной. Сам токен вводить сюда не нужно.",
@@ -409,8 +457,40 @@
     }).wrapper);
     card.append(fields, settingProbeArea("sandbox"));
     $("settings-sandbox").replaceChildren(card);
+    $("settings-sandbox-profiles").replaceChildren(...settingsState.config.sandbox_profiles.map(renderSandboxProfile));
+    $("settings-sandbox-profiles-empty").hidden = settingsState.config.sandbox_profiles.length > 0;
     selectSettingsTab(settingsState.activeTab);
     updateSettingsChrome();
+  }
+  function renderSandboxProfile(profile, index) {
+    const card = element("article", "settings-resource"), heading = element("div", "settings-resource-heading");
+    const title = element("h4", "", profile.name || "Среда " + (index + 1));
+    const controls = element("div", "settings-resource-controls");
+    controls.append(settingSwitch(profile.enabled, (enabled) => { profile.enabled = enabled; }, profile.name || "Среда выполнения"));
+    const remove = element("button", "text-button", "Удалить"); remove.type = "button";
+    remove.addEventListener("click", () => {
+      settingsState.config.sandbox_profiles = settingsState.config.sandbox_profiles.filter((item) => item !== profile);
+      markSettingsChanged(); renderSettings(); $("settings-add-sandbox-profile").focus();
+    });
+    controls.append(remove); heading.append(title, controls);
+    const fields = element("div", "settings-grid");
+    fields.append(settingField("Название среды", profile.name, (value) => {
+      profile.name = value; title.textContent = value || "Среда " + (index + 1);
+    }, { required: true, wide: true, maxLength: 160, placeholder: "Например, Java 21" }).wrapper);
+    fields.append(settingField("Образ среды на сервере", profile.image, (value) => { profile.image = value; }, {
+      required: true, wide: true, maxLength: 251, placeholder: "harness-sandbox-java21:local",
+      help: "Образ должен быть подготовлен на сервере. Агент использует выбранную среду и не меняет её образ самостоятельно.",
+    }).wrapper);
+    fields.append(settingField("Кому доступно (ID пользователей; пусто — всем вошедшим)", profile.allowed_owners.join(", "),
+      (value) => { profile.allowed_owners = commaValues(value); }, { wide: true, help: "Несколько ID укажите через запятую." }).wrapper);
+    card.append(heading, fields, settingProbeArea("sandbox_profile", profile));
+    return card;
+  }
+  function addSandboxProfile() {
+    if (!settingsState.canManage || !settingsState.config || settingsState.busy || settingsState.config.sandbox_profiles.length >= 20) return;
+    settingsState.config.sandbox_profiles.push({ id: newResourceId("profile"), name: "", image: "", enabled: false, allowed_owners: [] });
+    markSettingsChanged(); renderSettings();
+    $("settings-sandbox-profiles").lastElementChild?.querySelector("input[type='text']")?.focus();
   }
   async function loadSettings(force = false) {
     if (state.needsAuth || settingsState.busy || (!force && settingsState.checked) || settingsState.dirty) return;
@@ -431,6 +511,7 @@
       settingsState.message = "Настройки загружены. Изменения применятся после сохранения.";
       settingsError();
       renderSettings();
+      loadSshKeys();
     } catch (error) {
       if (controller.signal.aborted || generation !== settingsState.generation || error.name === "AbortError") return;
       if ([403, 404].includes(error.status)) { resetSettingsAccess(); settingsState.checked = true; }
@@ -453,7 +534,7 @@
       Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const id = (repository ? "repo-" : "connection-") + suffix;
     settingsState.config[collection].push({ id, name: "", url: "", enabled: true, credential_env: "", allowed_owners: [],
-      ...(repository ? { ref: "HEAD" } : { kind: "mcp", allowed_tools: [] }) });
+      ...(repository ? { ref: "HEAD", ssh_key_id: "" } : { kind: "mcp", allowed_tools: [] }) });
     markSettingsChanged();
     renderSettings();
     const card = $("settings-" + collection).lastElementChild;
@@ -461,8 +542,9 @@
     appear(card);
   }
   async function saveSettings() {
-    if (!settingsState.canManage || !settingsState.dirty || settingsState.busy || state.needsAuth) return;
-    const invalid = $("settings-fields").querySelector(":invalid");
+    if (!settingsState.canManage || !settingsState.dirty || settingsState.busy || state.needsAuth ||
+        !["repositories", "connections", "sandbox"].includes(settingsState.activeTab)) return;
+    const invalid = ["repositories", "connections", "sandbox"].map((name) => $("settings-panel-" + name).querySelector(":invalid")).find(Boolean);
     if (invalid) {
       const panel = invalid.closest('[role="tabpanel"]');
       if (panel) selectSettingsTab(panel.id.replace("settings-panel-", ""));
@@ -484,6 +566,8 @@
       settingsState.probes.clear();
       settingsState.message = "Настройки сохранены. Теперь можно проверить подключения.";
       renderSettings();
+      loadAdminDiscoveries();
+      loadRunDiscoveries(true);
       loadWorkspace({ refreshModelState: false });
     } catch (error) {
       if (controller.signal.aborted || generation !== settingsState.generation || error.name === "AbortError") return;
@@ -521,6 +605,534 @@
       if (settingsState.controller === controller) { settingsState.controller = null; settingsState.busy = null; updateSettingsChrome(); }
     }
   }
+  function newResourceId(prefix) {
+    return prefix + "-" + (typeof globalThis.crypto?.randomUUID === "function" ? crypto.randomUUID().slice(0, 12) :
+      Date.now().toString(36) + Math.random().toString(36).slice(2, 7));
+  }
+  function modelConnectionValue() {
+    return { provider: $("model-provider").value, base_url: $("direct-model-url").value.trim(), model: $("direct-model-name").value.trim(),
+      api_key_env: $("direct-model-token").value.trim(), tls_bundle_id: $("direct-model-tls").value, timeout_seconds: Number($("direct-model-timeout").value) || 60 };
+  }
+  function updateModelConnection() {
+    const direct = $("model-provider").value === "openai";
+    $("direct-model-fields").hidden = !direct;
+    modelConnectionState.dirty = Boolean(modelConnectionState.saved) && JSON.stringify(modelConnectionValue()) !== modelConnectionState.saved;
+    $("model-connection-save").disabled = modelConnectionState.busy || !modelConnectionState.settings || !modelConnectionState.dirty;
+    $("model-connection-probe").disabled = modelConnectionState.busy || !modelConnectionState.settings || modelConnectionState.dirty;
+    $("model-connection-probe").title = modelConnectionState.dirty ? "Сначала сохраните подключение" : "Проверить сохранённое подключение";
+    $("settings-panel-model").querySelectorAll(".model-connection-fields input, .model-connection-fields select").forEach((input) => { input.disabled = modelConnectionState.busy; });
+  }
+  function fillTlsSelect(value) {
+    const select = $("direct-model-tls");
+    const option = element("option", "", "Системные доверенные сертификаты"); option.value = ""; select.replaceChildren(option);
+    for (const bundle of tlsState.credentials) { const item = element("option", "", bundle.name || bundle.id); item.value = bundle.id; select.append(item); }
+    if (value && !tlsState.credentials.some((item) => item.id === value)) { const item = element("option", "", "Недоступный набор · " + value); item.value = value; select.append(item); }
+    select.value = value || "";
+  }
+  function applyModelConnection(settings) {
+    modelConnectionState.settings = settings;
+    $("model-provider").value = settings.provider === "openai" ? "openai" : "gigacode";
+    $("direct-model-url").value = settings.base_url || ""; $("direct-model-name").value = settings.model || "";
+    $("direct-model-token").value = settings.api_key_env || ""; $("direct-model-timeout").value = settings.timeout_seconds || 60;
+    fillTlsSelect(settings.tls_bundle_id);
+    modelConnectionState.saved = JSON.stringify(modelConnectionValue()); modelConnectionState.dirty = false;
+    updateModelConnection();
+  }
+  async function loadModelConnection() {
+    if (!settingsState.canManage || modelConnectionState.busy || modelConnectionState.dirty || state.needsAuth) return;
+    modelConnectionState.controller?.abort();
+    const controller = new AbortController(), epoch = state.identityEpoch; modelConnectionState.controller = controller;
+    modelConnectionState.busy = true; updateModelConnection();
+    try {
+      const response = await api("model/connection", { signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch || !settingsState.canManage) return;
+      tlsState.credentials = Array.isArray(response.tls_bundles) ? response.tls_bundles : [];
+      applyModelConnection(response.settings || {}); renderTlsBundles();
+    } catch (error) { if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) $("model-connection-feedback").textContent = errorMessage(error); }
+    finally { if (modelConnectionState.controller === controller) { modelConnectionState.controller = null; modelConnectionState.busy = false; updateModelConnection(); } }
+  }
+  async function changeModelConnection(probe = false) {
+    if (modelConnectionState.busy || !settingsState.canManage || state.needsAuth || (probe && modelConnectionState.dirty)) return;
+    const config = modelConnectionValue();
+    if (!probe && config.provider === "openai") {
+      if (!config.base_url || !config.model) { $("model-connection-feedback").textContent = "Укажите HTTPS-адрес API и название модели."; return; }
+      for (const input of $("direct-model-fields").querySelectorAll("input")) { if (!input.checkValidity()) { input.reportValidity(); return; } }
+    }
+    const controller = new AbortController(), epoch = state.identityEpoch;
+    modelConnectionState.controller = controller; modelConnectionState.busy = true; updateModelConnection();
+    $("model-connection-feedback").textContent = probe ? "Проверяем сохранённое подключение…" : "Сохраняем подключение…";
+    try {
+      const response = await api("model/connection" + (probe ? "/probe" : ""), { method: probe ? "POST" : "PUT", body: probe ? {} : config, signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch) return;
+      if (probe) $("model-connection-feedback").textContent = response.message || (response.available ? "Подключение готово." : "Подключение пока недоступно.");
+      else {
+        if (Array.isArray(response.tls_bundles)) tlsState.credentials = response.tls_bundles;
+        applyModelConnection(response.settings || config);
+        $("model-connection-feedback").textContent = "Подключение сохранено. Новые запросы будут использовать выбранную модель.";
+      }
+      state.modelEndpointAvailable = null; state.modelDetails = null; state.modelError = "";
+      loadWorkspace();
+    } catch (error) { if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) $("model-connection-feedback").textContent = errorMessage(error); }
+    finally { if (modelConnectionState.controller === controller) { modelConnectionState.controller = null; modelConnectionState.busy = false; updateModelConnection(); } }
+  }
+  function clearTlsEditor() {
+    tlsState.generation += 1; tlsState.editingId = null;
+    for (const id of ["tls-name", "tls-ca", "tls-cert", "tls-key", "tls-ca-file", "tls-cert-file", "tls-key-file"]) $(id).value = "";
+    $("tls-editor").hidden = true;
+  }
+  function openTlsEditor(bundle = null) {
+    if (tlsState.busy) return;
+    clearTlsEditor(); tlsState.editingId = bundle?.id || null;
+    $("tls-name").value = bundle?.name || "";
+    $("tls-editor-title").textContent = bundle ? "Заменить сертификаты" : "Набор сертификатов";
+    $("tls-editor").hidden = false; $("tls-name").focus();
+  }
+  function renderTlsBundles() {
+    $("tls-list").replaceChildren(...tlsState.credentials.map((bundle) => {
+      const card = element("article", "settings-resource"), heading = element("div", "settings-resource-heading");
+      heading.append(element("h4", "", bundle.name || bundle.id));
+      const actions = element("div", "resource-actions");
+      const replace = element("button", "text-button", "Заменить"); replace.type = "button"; replace.addEventListener("click", () => openTlsEditor(bundle));
+      const remove = element("button", "text-button", "Удалить"); remove.type = "button"; remove.addEventListener("click", () => openDeletion("tls", bundle));
+      remove.disabled = modelConnectionState.settings?.tls_bundle_id === bundle.id || $("direct-model-tls").value === bundle.id;
+      if (remove.disabled) remove.title = "Сначала выберите другие сертификаты в подключении модели и сохраните его";
+      actions.append(replace, remove); heading.append(actions);
+      card.append(heading, element("p", "settings-field-help", bundle.has_client_certificate ? "С клиентским сертификатом · mTLS" : "Сертификаты доверенного центра"));
+      if (bundle.expires_at) card.append(element("p", "settings-field-help", "Действует до: " + dateLabel(bundle.expires_at)));
+      return card;
+    }));
+    $("tls-empty").hidden = tlsState.credentials.length > 0;
+  }
+  async function loadTlsBundles() {
+    if (!settingsState.canManage || tlsState.busy || state.needsAuth) return;
+    tlsState.controller?.abort();
+    const controller = new AbortController(), epoch = state.identityEpoch; tlsState.controller = controller;
+    try {
+      const response = await api("credentials/tls", { signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch || !settingsState.canManage) return;
+      const selected = $("direct-model-tls").value;
+      tlsState.credentials = Array.isArray(response.credentials) ? response.credentials : [];
+      fillTlsSelect(selected); renderTlsBundles();
+    } catch (error) { if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) $("tls-feedback").textContent = errorMessage(error); }
+    finally { if (tlsState.controller === controller) tlsState.controller = null; }
+  }
+  async function saveTlsBundle() {
+    if (tlsState.busy || !settingsState.canManage || state.needsAuth) return;
+    const body = { id: tlsState.editingId || newResourceId("tls"), name: $("tls-name").value.trim(), ca_certificate: $("tls-ca").value.trim(),
+      client_certificate: $("tls-cert").value.trim(), client_key: $("tls-key").value.trim() };
+    if (!body.name || (!body.ca_certificate && !body.client_certificate) || Boolean(body.client_certificate) !== Boolean(body.client_key)) {
+      $("tls-feedback").textContent = "Укажите название и CA-сертификат или клиентский сертификат вместе с его приватным ключом."; return;
+    }
+    const controller = new AbortController(), epoch = state.identityEpoch; tlsState.controller?.abort(); tlsState.controller = controller; tlsState.busy = true;
+    $("tls-save").disabled = true; $("tls-new").disabled = true; $("tls-feedback").textContent = "Сохраняем сертификаты…";
+    const request = api("credentials/tls", { method: "POST", body, signal: controller.signal });
+    body.client_key = ""; body.client_certificate = ""; body.ca_certificate = ""; clearTlsEditor();
+    try {
+      await request;
+      if (controller.signal.aborted || epoch !== state.identityEpoch) return;
+      $("tls-feedback").textContent = "Сертификаты сохранены. Выберите их в подключении модели.";
+    } catch (error) { if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) $("tls-feedback").textContent = errorMessage(error) + " Поля сертификатов очищены."; }
+    finally { if (tlsState.controller === controller) { tlsState.controller = null; tlsState.busy = false; $("tls-save").disabled = false; $("tls-new").disabled = false; if (epoch === state.identityEpoch && !controller.signal.aborted) loadTlsBundles(); } }
+  }
+  function fillSshSelect(select, value) {
+    const empty = element("option", "", "Не использовать"); empty.value = "";
+    select.replaceChildren(empty);
+    for (const key of sshState.credentials) {
+      const option = element("option", "", key.name || key.id); option.value = key.id; select.append(option);
+    }
+    if (value && !sshState.credentials.some((key) => key.id === value)) {
+      const option = element("option", "", "Недоступный ключ · " + value); option.value = value; select.append(option);
+    }
+    select.value = value || "";
+  }
+  function clearSshEditor() {
+    sshState.generation += 1;
+    sshState.editingId = null;
+    for (const id of ["ssh-name", "ssh-file", "ssh-private-key", "ssh-known-hosts"]) $(id).value = "";
+    $("ssh-editor").hidden = true;
+  }
+  function openSshEditor(key = null) {
+    if (sshState.busy) return;
+    clearSshEditor();
+    sshState.editingId = key?.id || null;
+    $("ssh-name").value = key?.name || "";
+    $("ssh-editor-title").textContent = key ? "Заменить SSH-ключ" : "Новый SSH-ключ";
+    $("ssh-editor").hidden = false;
+    $("ssh-name").focus();
+  }
+  function renderSshKeys() {
+    $("ssh-list").replaceChildren(...sshState.credentials.map((key) => {
+      const card = element("article", "settings-resource");
+      const heading = element("div", "settings-resource-heading");
+      heading.append(element("h4", "", key.name || key.id));
+      const actions = element("div", "resource-actions");
+      const replace = element("button", "text-button", "Заменить ключ"); replace.type = "button";
+      replace.addEventListener("click", () => openSshEditor(key));
+      const remove = element("button", "text-button", "Удалить"); remove.type = "button";
+      remove.addEventListener("click", () => openDeletion("ssh", key));
+      const referenced = settingsState.config?.repositories.some((repo) => repo.ssh_key_id === key.id);
+      remove.disabled = Boolean(referenced);
+      if (referenced) remove.title = "Сначала удалите ключ из настроек репозиториев и сохраните изменения";
+      actions.append(replace, remove); heading.append(actions);
+      card.append(heading, element("p", "credential-fingerprint", key.fingerprint || ""),
+        element("p", "settings-field-help", [key.key_type, key.host_count ? "Проверенных серверов: " + key.host_count : "", dateLabel(key.created_at)].filter(Boolean).join(" · ")));
+      return card;
+    }));
+    $("ssh-empty").hidden = sshState.credentials.length > 0;
+    for (const select of document.querySelectorAll("select[data-ssh-key]")) {
+      const entry = settingsState.config?.repositories.find((repo) => repo.id === select.dataset.sshKey);
+      if (entry) fillSshSelect(select, entry.ssh_key_id);
+    }
+  }
+  async function loadSshKeys() {
+    if (!settingsState.canManage || sshState.busy || state.needsAuth) return;
+    const controller = new AbortController(), epoch = state.identityEpoch;
+    sshState.controller?.abort(); sshState.controller = controller;
+    try {
+      const result = await api("credentials/ssh", { signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch || !settingsState.canManage) return;
+      sshState.credentials = Array.isArray(result.credentials) ? result.credentials : [];
+      renderSshKeys();
+    } catch (error) {
+      if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) $("ssh-feedback").textContent = errorMessage(error);
+    } finally { if (sshState.controller === controller) sshState.controller = null; }
+  }
+  async function saveSshKey() {
+    if (sshState.busy || !settingsState.canManage || state.needsAuth) return;
+    const name = $("ssh-name").value.trim(), knownHosts = $("ssh-known-hosts").value.trim();
+    let privateKey = $("ssh-private-key").value.trim();
+    if (!name || !privateKey || !knownHosts) { $("ssh-feedback").textContent = "Укажите название, приватный ключ и проверенные записи known_hosts."; return; }
+    const controller = new AbortController(), epoch = state.identityEpoch;
+    sshState.controller?.abort(); sshState.controller = controller; sshState.busy = true;
+    $("ssh-save").disabled = true; $("ssh-new").disabled = true;
+    $("ssh-feedback").textContent = "Сохраняем ключ…";
+    const request = api("credentials/ssh", { method: "POST", signal: controller.signal,
+      body: { id: sshState.editingId || newResourceId("ssh"), name, private_key: privateKey, known_hosts: knownHosts } });
+    privateKey = "";
+    clearSshEditor();
+    try {
+      await request;
+      if (controller.signal.aborted || epoch !== state.identityEpoch) return;
+      $("ssh-feedback").textContent = "Ключ сохранён. Теперь выберите его у нужного репозитория.";
+    } catch (error) {
+      if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) $("ssh-feedback").textContent = errorMessage(error) + " Поля ключа очищены; при повторе загрузите его снова.";
+    } finally {
+      if (sshState.controller === controller) {
+        sshState.controller = null; sshState.busy = false;
+        $("ssh-save").disabled = false; $("ssh-new").disabled = false;
+        if (!controller.signal.aborted && epoch === state.identityEpoch) loadSshKeys();
+      }
+    }
+  }
+  function discoveryCard(item, admin = false) {
+    const card = element("article", admin ? "settings-resource" : "discovery-item");
+    const labels = { repository: "Репозиторий", mcp: "MCP", a2a: "A2A", web: "Ссылка" };
+    const statuses = { discovered: "Обнаружено", requested: "Доступ запрошен", configured: "Настроено", dismissed: "Скрыто" };
+    card.append(element("p", "discovery-meta", (labels[item.kind] || "Ресурс") + " · " + (statuses[item.status] || "Обнаружено")),
+      element(admin ? "h4" : "h3", "discovery-name", item.name || item.url));
+    const url = element(safeUrl(item.url) ? "a" : "p", "discovery-url", item.url);
+    if (url.tagName === "A") link(url, item.url);
+    card.append(url);
+    if (admin && item.owner_id) card.append(element("p", "settings-field-help", "Запрос от: " + item.owner_id));
+    if (item.kind === "web") card.append(element("p", "settings-field-help", "Обычная ссылка. Чтобы использовать сервис как инструмент, нужен его адрес MCP или A2A."));
+    const actions = element("div", "resource-actions");
+    if (item.status !== "configured" && item.status !== "dismissed") {
+      if (admin && item.kind !== "web") {
+        const configure = element("button", "secondary-button", "Настроить подключение"); configure.type = "button";
+        configure.addEventListener("click", () => configureDiscovery(item)); actions.append(configure);
+      } else if (item.status !== "requested") {
+        const request = element("button", "text-button", "Запросить доступ"); request.type = "button";
+        request.disabled = discoveryState.busy.has(item.id);
+        request.addEventListener("click", () => changeDiscovery(item, "request")); actions.append(request);
+      }
+      const dismiss = element("button", "text-button", "Скрыть"); dismiss.type = "button";
+      dismiss.disabled = discoveryState.busy.has(item.id);
+      dismiss.addEventListener("click", () => changeDiscovery(item, "dismiss")); actions.append(dismiss);
+    }
+    if (item.status === "configured") card.append(element("p", "settings-field-help", "Подключение сохранено в настройках. Для исследования его нужно включить и выбрать в области поиска."));
+    card.append(actions);
+    return card;
+  }
+  function renderDiscoveries() {
+    const items = discoveryState.current.filter((item) => item.status !== "dismissed");
+    $("run-discoveries").replaceChildren(...items.map((item) => discoveryCard(item, settingsState.canManage)));
+    $("discoveries-count").textContent = String(items.length);
+    $("discoveries-card").hidden = !state.current || !items.length;
+    const all = discoveryState.all.filter((item) => item.status !== "dismissed");
+    $("settings-discoveries").replaceChildren(...all.map((item) => discoveryCard(item, true)));
+    $("settings-discoveries-empty").hidden = all.length > 0;
+  }
+  async function loadRunDiscoveries(force = false) {
+    if (!state.current || state.needsAuth) return;
+    const runId = idOf(state.current), epoch = state.identityEpoch;
+    const signature = JSON.stringify([runId, state.current.status, state.current.phase, state.current.evidence?.length]);
+    if (!force && discoveryState.signature === signature) return;
+    discoveryState.signature = signature;
+    discoveryState.controller?.abort();
+    const controller = new AbortController(); discoveryState.controller = controller;
+    try {
+      const result = await api("discoveries?run_id=" + encodeURIComponent(runId), { signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch || runId !== idOf(state.current)) return;
+      discoveryState.current = Array.isArray(result.discoveries) ? result.discoveries : [];
+      renderDiscoveries();
+    } catch (error) {
+      if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) {
+        discoveryState.signature = null;
+        $("discovery-feedback").textContent = error.status === 404 ? "" : errorMessage(error);
+      }
+    } finally { if (discoveryState.controller === controller) discoveryState.controller = null; }
+  }
+  async function loadAdminDiscoveries() {
+    if (!settingsState.canManage || state.needsAuth) return;
+    discoveryState.adminController?.abort();
+    const controller = new AbortController(), epoch = state.identityEpoch;
+    discoveryState.adminController = controller;
+    try {
+      const result = await api("discoveries?scope=all", { signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch || !settingsState.canManage) return;
+      discoveryState.all = Array.isArray(result.discoveries) ? result.discoveries : [];
+      renderDiscoveries();
+    } catch (error) {
+      if (error.name !== "AbortError" && ![401, 404].includes(error.status) && epoch === state.identityEpoch && settingsState.activeTab === "discoveries") settingsError(errorMessage(error));
+    } finally { if (discoveryState.adminController === controller) discoveryState.adminController = null; }
+  }
+  async function changeDiscovery(item, action) {
+    if (discoveryState.busy.has(item.id) || state.needsAuth) return;
+    const epoch = state.identityEpoch;
+    discoveryState.busy.add(item.id); renderDiscoveries();
+    try {
+      await api("discoveries/" + encodeURIComponent(item.id) + "/" + action, { method: "POST", body: {} });
+      if (epoch !== state.identityEpoch) return;
+      $("discovery-feedback").textContent = action === "request" ? "Запрос появился у администратора в разделе «Обнаруженные»." : "Ресурс скрыт.";
+      await Promise.all([loadRunDiscoveries(true), loadAdminDiscoveries()]);
+    } catch (error) {
+      if (error.status !== 401 && epoch === state.identityEpoch) { $("discovery-feedback").textContent = errorMessage(error); if ($("settings-dialog").open) settingsError(errorMessage(error)); }
+    } finally { if (epoch === state.identityEpoch) { discoveryState.busy.delete(item.id); renderDiscoveries(); } }
+  }
+  function configureDiscovery(item) {
+    if (!settingsState.canManage || !settingsState.config || settingsState.busy) return;
+    const repository = item.kind === "repository", collection = repository ? "repositories" : "connections";
+    if (!repository && !["mcp", "a2a"].includes(item.kind)) return;
+    if (settingsState.config[collection].length >= 100) { settingsError("Достигнут лимит подключений."); return; }
+    const duplicate = settingsState.config[collection].find((entry) => entry.url === item.url);
+    if (!duplicate) {
+      settingsState.config[collection].push({ id: newResourceId(repository ? "repo" : "connection"), name: (item.name || item.url).slice(0, 160),
+        url: item.url, enabled: false, credential_env: "", allowed_owners: item.owner_id ? [item.owner_id] : [],
+        ...(repository ? { ref: "HEAD", ssh_key_id: "" } : { kind: item.kind, allowed_tools: [] }) });
+      markSettingsChanged();
+    }
+    if (!$("settings-dialog").open) $("settings-dialog").showModal();
+    settingsState.activeTab = collection; renderSettings();
+    settingsState.message = "Проверьте адрес, настройте доступ и включите подключение. Затем сохраните изменения.";
+    updateSettingsChrome();
+    const entries = [...$("settings-" + collection).children];
+    const index = duplicate ? settingsState.config[collection].indexOf(duplicate) : entries.length - 1;
+    entries[index]?.querySelector("input")?.focus();
+  }
+  function memoryError(message = "") {
+    $("memory-error").textContent = message; $("memory-error").hidden = !message;
+  }
+  function clearMemoryEditor() {
+    memoryState.editing = null;
+    $("memory-editor").reset(); $("memory-editor").hidden = true;
+    $("memory-sources").replaceChildren();
+  }
+  function renderMemory() {
+    $("memory-open").hidden = !memoryState.available || state.needsAuth;
+    $("memory-enabled").checked = memoryState.enabled;
+    $("memory-enabled").disabled = memoryState.busy;
+    $("memory-new").disabled = memoryState.busy;
+    $("memory-list").replaceChildren(...memoryState.memories.map((record) => {
+      const card = element("article", "settings-resource");
+      const heading = element("div", "settings-resource-heading");
+      heading.append(element("h4", "", record.title));
+      const actions = element("div", "resource-actions");
+      const edit = element("button", "text-button", record.status === "draft" ? "Проверить и подтвердить" : "Изменить"); edit.type = "button";
+      edit.addEventListener("click", () => editMemory(record));
+      const remove = element("button", "text-button", "Удалить"); remove.type = "button";
+      remove.addEventListener("click", () => openDeletion("memory", record)); actions.append(edit, remove); heading.append(actions);
+      const kind = { note: "Заметка", correction: "Уточнение", lesson: "Урок из ошибки" }[record.kind] || "Заметка";
+      card.append(heading, element("p", "discovery-meta", kind + " · " + (record.status === "active" ? "Подтверждено" : "Черновик")),
+        element("p", "memory-record-text", record.text), element("p", "settings-field-help", "Источники: " + (record.index_ids || []).map(sourceName).join(", ")));
+      return card;
+    }));
+    $("memory-empty").hidden = memoryState.memories.length > 0;
+    $("remember-run").hidden = !memoryState.available || !state.current || ACTIVE.has(state.current.status);
+  }
+  async function loadMemory() {
+    if (state.needsAuth || memoryState.busy) return;
+    memoryState.controller?.abort();
+    const controller = new AbortController(), epoch = state.identityEpoch; memoryState.controller = controller;
+    try {
+      const result = await api("memory", { signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch) return;
+      memoryState.available = true; memoryState.enabled = result.enabled !== false;
+      memoryState.memories = Array.isArray(result.memories) ? result.memories : [];
+      renderMemory();
+    } catch (error) {
+      if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) {
+        if (error.status === 404) { memoryState.available = false; renderMemory(); }
+        else if ($("memory-dialog").open) memoryError(errorMessage(error));
+      }
+    } finally { if (memoryState.controller === controller) memoryState.controller = null; }
+  }
+  function openMemory() {
+    if (!memoryState.available || state.needsAuth) return;
+    if (!$("memory-dialog").open) $("memory-dialog").showModal();
+    loadMemory();
+  }
+  function editMemory(record = null, run = null) {
+    if (memoryState.busy) return;
+    if (run && !Array.isArray(run.index_ids)) { memoryError("Запрос ещё загружается. Дождитесь его открытия и повторите сохранение уточнения."); return; }
+    clearMemoryEditor(); memoryError();
+    memoryState.editing = { id: record?.id || null, source_run_id: record?.source_run_id || (run ? idOf(run) : null) };
+    $("memory-editor-title").textContent = record ? "Изменить запись" : run ? "Запомнить уточнение к ответу" : "Новая запись";
+    $("memory-name").value = record?.title || (run?.question || "").slice(0, 160);
+    $("memory-text").value = record?.text || "";
+    $("memory-kind").value = record?.kind || (run ? "correction" : "note");
+    $("memory-confirmed").checked = record?.status === "active";
+    const selected = new Set(record?.index_ids || run?.index_ids || [...state.selected]);
+    const available = memoryState.editing.source_run_id ? [...selected].map((id) =>
+      indexes().find((source) => source.id === id) || { id, name: id }) : indexes();
+    for (const source of available) {
+      const label = element("label", "memory-source-option");
+      const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.value = source.id;
+      checkbox.checked = selected.has(source.id); checkbox.disabled = Boolean(memoryState.editing.source_run_id);
+      label.append(checkbox, element("span", "", source.name || source.id)); $("memory-sources").append(label);
+    }
+    if (memoryState.editing.source_run_id) $("memory-sources").append(element("p", "settings-field-help", "Сохраняется область поиска исходного запроса."));
+    memoryState.editing.index_ids = [...selected];
+    $("memory-editor").hidden = false;
+    $("memory-name").focus();
+  }
+  async function saveMemory(event) {
+    event.preventDefault();
+    if (memoryState.busy || !memoryState.editing || state.needsAuth) return;
+    const editing = memoryState.editing, epoch = state.identityEpoch;
+    const sourceIds = editing.source_run_id ? editing.index_ids : [...$("memory-sources").querySelectorAll("input:checked")].map((input) => input.value);
+    if (!sourceIds.length) { memoryError("Выберите хотя бы один связанный источник."); return; }
+    const controller = new AbortController(); memoryState.controller?.abort(); memoryState.controller = controller;
+    memoryState.busy = true; $("memory-save").disabled = true; renderMemory(); memoryError();
+    const body = { title: $("memory-name").value.trim(), text: $("memory-text").value.trim(), kind: $("memory-kind").value,
+      index_ids: sourceIds, confirmed: $("memory-confirmed").checked, ...(editing.source_run_id ? { source_run_id: editing.source_run_id } : {}) };
+    try {
+      await api("memory" + (editing.id ? "/" + encodeURIComponent(editing.id) : ""), { method: editing.id ? "PUT" : "POST", body, signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch) return;
+      clearMemoryEditor();
+      $("memory-feedback").textContent = body.confirmed ? "Запись сохранена и будет учитываться в похожих запросах." : "Черновик сохранён. Пока он не влияет на ответы.";
+    } catch (error) { if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) memoryError(errorMessage(error)); }
+    finally {
+      if (memoryState.controller === controller) { memoryState.controller = null; memoryState.busy = false; $("memory-save").disabled = false; renderMemory(); if (epoch === state.identityEpoch && !controller.signal.aborted) loadMemory(); }
+    }
+  }
+  async function changeMemoryPreference() {
+    if (memoryState.busy || state.needsAuth) return;
+    const enabled = $("memory-enabled").checked, epoch = state.identityEpoch;
+    memoryState.busy = true; renderMemory(); memoryError();
+    try {
+      const result = await api("memory/preferences", { method: "PUT", body: { enabled } });
+      if (epoch !== state.identityEpoch) return;
+      memoryState.enabled = result.enabled === true;
+      $("memory-feedback").textContent = memoryState.enabled ? "Подтверждённые записи будут учитываться в новых запросах." : "Память отключена для новых запросов. Записи сохранены.";
+    } catch (error) { if (error.status !== 401 && epoch === state.identityEpoch) memoryError(errorMessage(error)); }
+    finally { if (epoch === state.identityEpoch) { memoryState.busy = false; renderMemory(); } }
+  }
+  function openDeletion(kind, item) {
+    if (deletionState.controller || state.needsAuth) return;
+    const active = kind === "run" && ACTIVE.has(item.status);
+    deletionState.target = { kind, item, active };
+    $("delete-title").textContent = kind === "run" ? active ? "Сначала остановить запрос?" : "Удалить запрос?" : kind === "memory" ? "Удалить запись памяти?" : kind === "tls" ? "Удалить сертификаты?" : "Удалить SSH-ключ?";
+    $("delete-description").textContent = kind === "run" ? active ? "Исследование ещё выполняется. Остановите его, затем удалите запрос из истории." :
+      "Запрос, ответ, найденные материалы и связанные с ним записи памяти будут удалены. Восстановить их нельзя." : kind === "memory" ?
+      "Запись перестанет учитываться в новых запросах. Ранее сохранённые ответы останутся в истории." : kind === "tls" ?
+      "Сертификаты и связанный приватный ключ будут удалены с сервера. Сначала уберите этот набор из подключения модели." :
+      "Ключ будет удалён с сервера. Сначала его нужно убрать из настроек репозиториев.";
+    $("delete-confirm").textContent = active ? "Остановить запрос" : "Удалить";
+    $("delete-error").hidden = true; $("delete-confirm").disabled = false;
+    $("delete-dialog").showModal();
+  }
+  async function confirmDeletion(event) {
+    event.preventDefault();
+    const target = deletionState.target;
+    if (!target || deletionState.controller || state.needsAuth) return;
+    const epoch = state.identityEpoch, controller = new AbortController(); deletionState.controller = controller;
+    $("delete-confirm").disabled = true;
+    const id = target.kind === "run" ? idOf(target.item) : target.item.id;
+    const path = target.kind === "run" ? "runs/" + encodeURIComponent(id) + (target.active ? "/cancel" : "") :
+      target.kind === "memory" ? "memory/" + encodeURIComponent(id) : "credentials/" + (target.kind === "tls" ? "tls" : "ssh") + "/" + encodeURIComponent(id);
+    try {
+      const result = await api(path, { method: target.active ? "POST" : "DELETE", signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch) return;
+      $("delete-dialog").close();
+      if (target.kind === "run") {
+        if (target.active) { rememberRun(result); if (idOf(state.current) === id) { state.current = result; renderRun(); schedulePoll(); } }
+        else {
+          const deletedIds = new Set([id, ...(Array.isArray(result.deleted_ids) ? result.deleted_ids.filter((value) => typeof value === "string") : [])]);
+          state.refreshController?.abort();
+          state.runs = state.runs.filter((run) => !deletedIds.has(idOf(run)));
+          if (deletedIds.has(idOf(state.current))) resetWorkspace();
+          if (deletedIds.has(memoryState.editing?.source_run_id)) clearMemoryEditor();
+          renderHistory(); loadMemory();
+        }
+      } else if (target.kind === "memory") { if (memoryState.editing?.id === id) clearMemoryEditor(); loadMemory(); }
+      else if (target.kind === "tls") loadTlsBundles();
+      else loadSshKeys();
+    } catch (error) {
+      if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) { $("delete-error").textContent = errorMessage(error); $("delete-error").hidden = false; }
+    } finally { if (deletionState.controller === controller) { deletionState.controller = null; $("delete-confirm").disabled = false; } }
+  }
+  function resetPersonalData() {
+    for (const controller of [memoryState.controller, discoveryState.controller, discoveryState.adminController, deletionState.controller]) controller?.abort();
+    Object.assign(memoryState, { available: false, enabled: true, memories: [], editing: null, controller: null, busy: false });
+    Object.assign(discoveryState, { current: [], all: [], signature: null, controller: null, adminController: null, busy: new Set() });
+    Object.assign(deletionState, { target: null, controller: null });
+    if ($("memory-dialog").open) $("memory-dialog").close();
+    if ($("delete-dialog").open) $("delete-dialog").close();
+    clearMemoryEditor(); memoryError(); $("memory-feedback").textContent = ""; $("discovery-feedback").textContent = "";
+    renderMemory(); renderDiscoveries();
+    state.sandboxProfilesController?.abort(); state.sandboxProfilesController = null;
+    state.sandboxProfiles = []; state.selectedSandboxProfile = ""; renderExecutionEnvironment();
+  }
+  function sandboxProfileName(id) {
+    return state.sandboxProfiles.find((profile) => profile.id === id)?.name || (id ? id : "По умолчанию");
+  }
+  function renderExecutionEnvironment() {
+    const select = $("sandbox-profile"), selected = state.selectedSandboxProfile;
+    const option = element("option", "", "По умолчанию"); option.value = ""; select.replaceChildren(option);
+    for (const profile of state.sandboxProfiles) {
+      if (!profile.id) continue;
+      const item = element("option", "", profile.name || profile.id); item.value = profile.id; select.append(item);
+    }
+    const unavailable = selected && !state.sandboxProfiles.some((profile) => profile.id === selected);
+    if (unavailable) { const item = element("option", "", "Недоступная среда · " + selected); item.value = selected; item.disabled = true; select.append(item); }
+    select.value = selected;
+    const quick = document.querySelector('input[name="mode"]:checked').value === "quick";
+    select.disabled = quick || state.needsAuth || Boolean(state.current && !Array.isArray(state.current.index_ids));
+    $("environment-description").textContent = quick ? "Песочница используется в исследовании." : unavailable ?
+      "Выбранная среда сейчас недоступна. Выберите другую среду." : state.sandboxProfiles.length ?
+      "Подготовленная среда для запуска кода." : "Среды включаются в настройках песочниц.";
+  }
+  async function loadSandboxProfiles() {
+    if (state.needsAuth) return;
+    state.sandboxProfilesController?.abort();
+    const controller = new AbortController(), epoch = state.identityEpoch; state.sandboxProfilesController = controller;
+    try {
+      const result = await api("sandbox/profiles", { signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch) return;
+      state.sandboxProfiles = Array.isArray(result.profiles) ? result.profiles.filter((profile) => profile && typeof profile.id === "string") : [];
+      renderExecutionEnvironment();
+      if (state.current) renderRunEnvironment(state.current);
+    } catch (error) {
+      if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) {
+        state.sandboxProfiles = []; renderExecutionEnvironment();
+      }
+    } finally { if (state.sandboxProfilesController === controller) state.sandboxProfilesController = null; }
+  }
+  function renderRunEnvironment(run) {
+    $("run-environment").hidden = run.mode !== "investigate";
+    $("run-environment").textContent = "Среда выполнения: " + sandboxProfileName(run.sandbox_profile_id || "") +
+      (run.resumable ? ". Продолжение использует исходную среду. Для смены среды начните новый запрос." : ".");
+  }
   function indexes() { return Array.isArray(state.status?.indexes) ? state.status.indexes : []; }
   function sourceName(id) {
     const match = indexes().find((item) => item.id === id);
@@ -530,7 +1142,10 @@
     const disabled = state.submitting || state.needsAuth || !state.status || state.status.enabled === false;
     $("submit-question").disabled = disabled;
     $("submit-question").firstElementChild.textContent = state.submitting ? "Отправляем…" : "Отправить";
-    $("deepen-run").disabled = disabled;
+    const scopeLoading = Boolean(state.current && !Array.isArray(state.current.index_ids));
+    $("deepen-run").disabled = disabled || scopeLoading;
+    $("resume-run").disabled = disabled || scopeLoading;
+    $("remember-run").disabled = state.needsAuth || scopeLoading;
     const cancelling = state.cancelling || state.current?.status === "cancelling";
     $("cancel-run").disabled = cancelling;
     $("cancel-run").textContent = cancelling ? "Останавливаем…" : "Остановить";
@@ -607,15 +1222,17 @@
   }
   function renderModel() {
     const model = state.status?.model || {};
+    const direct = model.provider === "openai";
+    $("model-heading").textContent = direct ? model.name || "Модель" : "GigaCode";
     const current = modelState();
-    const canManage = state.modelDetails?.can_manage === true && !state.needsAuth;
+    const canManage = (direct ? settingsState.canManage : state.modelDetails?.can_manage === true) && !state.needsAuth;
     const labels = { disabled: "Выключен", starting: "Запускается", authentication_required: "Нужен вход", ready: "Готов", error: "Ошибка запуска" };
     const messages = {
-      disabled: "Подключите GigaCode, чтобы получать ответы на основе найденных материалов.",
+      disabled: direct ? "Подключите модель в настройках, чтобы получать ответы на основе найденных материалов." : "Подключите GigaCode, чтобы получать ответы на основе найденных материалов.",
       starting: "Запускаем общий исполнитель. Состояние обновится автоматически.",
       authentication_required: canManage ? "Войдите в GigaCode, чтобы завершить подключение." : "Для подключения модели администратору нужно войти в GigaCode.",
       ready: "Модель готова к работе с вашими запросами.",
-      error: "GigaCode не удалось запустить. Можно повторить подключение.",
+      error: direct ? "Модель недоступна. Проверьте подключение в настройках." : "GigaCode не удалось запустить. Можно повторить подключение.",
     };
     $("model-state-badge").textContent = state.status ? labels[current] : "Проверяем";
     $("model-state-badge").className = "model-state-badge " + (current === "ready" ? "ready" : current === "error" ? "error" : MODEL_PENDING.has(current) ? "pending" : "");
@@ -623,11 +1240,11 @@
       typeof model.message === "string" && model.message ? model.message :
       typeof model.reason === "string" && model.reason ? model.reason : messages[current];
     $("model-manager-hint").hidden = !state.status || canManage || current === "ready" || state.modelEndpointAvailable === null;
-    $("model-manager-hint").textContent = current === "authentication_required" ?
+    $("model-manager-hint").textContent = direct ? "Попросите администратора проверить подключение модели в настройках." : current === "authentication_required" ?
       "Попросите администратора завершить вход в GigaCode." : "Для включения GigaCode обратитесь к администратору.";
     $("model-error").textContent = state.modelError;
     $("model-error").hidden = !state.modelError;
-    $("model-actions").hidden = !canManage || state.modelEndpointAvailable === false;
+    $("model-actions").hidden = direct || !canManage || state.modelEndpointAvailable === false;
     const busy = Boolean(state.modelBusy);
     $("model-enable").hidden = current === "ready" || current === "authentication_required";
     $("model-enable").disabled = busy || current === "starting";
@@ -639,9 +1256,9 @@
     $("model-shared-note").hidden = $("model-disable").hidden;
     $("model-auth-link").removeAttribute("href");
     $("model-auth-link").hidden = !(canManage && current === "authentication_required" &&
-      link($("model-auth-link"), state.modelDetails.authentication_url));
+      !direct && link($("model-auth-link"), state.modelDetails?.authentication_url));
     // Privileged links and launch events never come from the public model status.
-    const events = canManage && Array.isArray(state.modelDetails.events) ? state.modelDetails.events.slice(-5) : [];
+    const events = !direct && canManage && Array.isArray(state.modelDetails?.events) ? state.modelDetails.events.slice(-5) : [];
     $("model-events").hidden = events.length === 0;
     $("model-events-list").replaceChildren(...events.filter((event) => event && typeof event.message === "string").map((event) => {
       const item = element("li");
@@ -653,7 +1270,7 @@
   function applyModelDetails(details) {
     state.modelDetails = details?.can_manage === true ? details : { can_manage: false };
     // Only copy public fields into the workspace status; never auth URLs or events.
-    if (state.status && details?.can_manage === true) {
+    if (state.status && state.status.model?.provider !== "openai" && details?.can_manage === true) {
       const model = { ...(state.status.model || {}) };
       for (const key of ["state", "enabled", "available", "message"]) {
         if (Object.prototype.hasOwnProperty.call(details, key)) model[key] = details[key];
@@ -670,11 +1287,13 @@
   function scheduleModelPoll() {
     window.clearTimeout(state.modelPollTimer);
     if (!document.hidden && !state.needsAuth && !state.modelBusy && state.status &&
+        state.status.model?.provider !== "openai" &&
         state.modelEndpointAvailable !== false && MODEL_PENDING.has(modelState())) {
       state.modelPollTimer = window.setTimeout(() => refreshModel(), 2000);
     }
   }
   async function refreshModel({ refreshPublic = true } = {}) {
+    if (state.status?.model?.provider === "openai") { renderModel(); return; }
     if (document.hidden || state.needsAuth || !state.status || state.modelPollController ||
         state.modelBusy || state.modelEndpointAvailable === false) return;
     const controller = new AbortController();
@@ -711,7 +1330,7 @@
     }
   }
   async function changeModel(action) {
-    if (state.modelDetails?.can_manage !== true || state.modelBusy || state.needsAuth ||
+    if (state.status?.model?.provider === "openai" || state.modelDetails?.can_manage !== true || state.modelBusy || state.needsAuth ||
         !["enable", "disable"].includes(action)) return;
     stopModelPolling();
     const controller = new AbortController();
@@ -755,6 +1374,7 @@
     state.historySignature = signature;
     const fragment = document.createDocumentFragment();
     for (const run of state.runs) {
+      const row = element("div", "history-row");
       const button = element("button", "history-item");
       button.type = "button";
       button.setAttribute("aria-current", String(idOf(run) === idOf(state.current)));
@@ -767,7 +1387,11 @@
       meta.append(dot, document.createTextNode(dateLabel(run.created_at) + " · " + modeLabel(run.mode)));
       button.append(element("span", "history-item-title", run.question || "Запрос"), meta);
       button.addEventListener("click", () => selectRun(run));
-      fragment.append(button);
+      const remove = element("button", "history-delete", "×"); remove.type = "button";
+      remove.setAttribute("aria-label", "Удалить запрос: " + (run.question || "Запрос"));
+      remove.title = "Удалить запрос";
+      remove.addEventListener("click", () => openDeletion("run", run));
+      row.append(button, remove); fragment.append(row);
     }
     $("history-list").replaceChildren(fragment);
     $("history-count").textContent = String(state.runs.length);
@@ -877,7 +1501,7 @@
     $("suggestions").hidden = hasRun;
     $("run-panel").hidden = !hasRun;
     $("page-label").textContent = hasRun ? modeLabel(run.mode) : "Новый запрос";
-    if (!run) { renderEvidence([]); renderHistory(); return; }
+    if (!run) { renderEvidence([]); renderHistory(); $("discoveries-card").hidden = true; return; }
     const active = ACTIVE.has(run.status);
     $("run-mode").textContent = modeLabel(run.mode) + " · Усилие: " + effortLabel(run.effort);
     $("run-date").textContent = dateLabel(run.created_at, true);
@@ -899,6 +1523,12 @@
     if ($("progress-live").textContent !== announcement) $("progress-live").textContent = announcement;
     $("cancel-run").hidden = !active;
     $("deepen-run").hidden = active || ["failed", "interrupted"].includes(run.status);
+    $("resume-run").hidden = active || run.resumable !== true;
+    $("remember-run").hidden = active || !memoryState.available;
+    const memories = Array.isArray(run.memory_used) ? run.memory_used : [];
+    $("run-memory-used").replaceChildren(element("strong", "", "Учтено из памяти"), ...memories.map((item) => element("p", "", item.title || "Сохранённая запись")));
+    $("run-memory-used").hidden = !memories.length;
+    renderRunEnvironment(run);
     const warnings = Array.isArray(run.warnings) ? run.warnings.filter((item) => typeof item === "string") : [];
     $("run-warnings").replaceChildren(...warnings.map((text) => element("p", "", text)));
     $("run-warnings").hidden = !warnings.length;
@@ -913,6 +1543,8 @@
     $("run-metrics").textContent = metrics.join(" · ");
     updateSubmit();
     renderHistory();
+    loadRunDiscoveries();
+    if (!active && newPresentation) loadMemory();
     if (newPresentation) appear($("run-panel"));
   }
   function stopPolling() {
@@ -934,7 +1566,12 @@
     try {
       const run = await api("runs/" + encodeURIComponent(id), { signal: controller.signal });
       if (generation !== state.generation || id !== idOf(state.current)) return;
+      const scopeWasLoading = !Array.isArray(state.current.index_ids);
       state.current = run;
+      if (scopeWasLoading) {
+        state.selected = new Set(run.index_ids || []); state.selectedSandboxProfile = run.sandbox_profile_id || "";
+        renderSources(); renderExecutionEnvironment();
+      }
       state.pollDelay = 1400;
       rememberRun(run);
       renderRun();
@@ -952,6 +1589,10 @@
     stopPolling();
     state.generation += 1;
     state.current = run;
+    if (Array.isArray(run.index_ids)) { state.selected = new Set(run.index_ids); renderSources(); }
+    state.selectedSandboxProfile = run.sandbox_profile_id || ""; renderExecutionEnvironment();
+    discoveryState.current = []; discoveryState.signature = null;
+    $("discovery-feedback").textContent = ""; renderDiscoveries();
     state.pollDelay = 1400;
     showError("");
     renderRun();
@@ -961,6 +1602,9 @@
     stopPolling();
     state.generation += 1;
     state.current = null;
+    state.selectedSandboxProfile = ""; renderExecutionEnvironment();
+    discoveryState.controller?.abort(); discoveryState.current = []; discoveryState.signature = null;
+    renderDiscoveries();
     showError("");
     $("question").value = "";
     updateCharacterCount();
@@ -969,6 +1613,7 @@
   }
   function resetIdentity() {
     resetSettingsAccess();
+    resetPersonalData();
     stopModelPolling();
     if (state.modelActionController) state.modelActionController.abort();
     state.modelActionController = null;
@@ -1017,6 +1662,10 @@
       index_ids: selected,
       ...(parent ? { parent_run_id: idOf(parent) } : {}),
     };
+    payload.sandbox_profile_id = payload.mode === "investigate" ? state.selectedSandboxProfile : "";
+    if (payload.sandbox_profile_id && !state.sandboxProfiles.some((profile) => profile.id === payload.sandbox_profile_id)) {
+      showError("Выбранная среда выполнения недоступна. Выберите другую среду или вариант по умолчанию."); return;
+    }
     state.submitting = true;
     const identityEpoch = state.identityEpoch;
     const generation = state.generation;
@@ -1047,6 +1696,19 @@
     } catch (error) { if (error.status !== 401 && identityEpoch === state.identityEpoch) showError(errorMessage(error)); }
     finally { if (identityEpoch === state.identityEpoch) { state.cancelling = false; updateSubmit(); schedulePoll(); } }
   }
+  async function resumeRun() {
+    if (!state.current?.resumable || state.submitting || state.needsAuth) return;
+    if (!state.selected.size) { showError("Выберите источники для продолжения исследования."); return; }
+    const epoch = state.identityEpoch, generation = state.generation, id = idOf(state.current);
+    state.submitting = true; showError(""); updateSubmit();
+    try {
+      const run = await api("runs/" + encodeURIComponent(id) + "/resume", { method: "POST", body: { index_ids: [...state.selected] } });
+      if (epoch !== state.identityEpoch) return;
+      rememberRun(run);
+      if (generation === state.generation) selectRun(run);
+    } catch (error) { if (error.status !== 401 && epoch === state.identityEpoch) showError(errorMessage(error)); }
+    finally { if (epoch === state.identityEpoch) { state.submitting = false; updateSubmit(); } }
+  }
   async function loadWorkspace({ refreshModelState = true } = {}) {
     if (state.refreshController) state.refreshController.abort();
     const controller = new AbortController();
@@ -1066,6 +1728,8 @@
       if (state.current) refreshRun(idOf(state.current), state.generation);
       if (refreshModelState) refreshModel({ refreshPublic: false });
       loadSettings();
+      loadMemory();
+      loadSandboxProfiles();
     } catch (error) {
       if (error.name !== "AbortError" && error.status !== 401) {
         showError(errorMessage(error));
@@ -1078,9 +1742,11 @@
   $("new-run").addEventListener("click", resetWorkspace);
   $("settings-open").addEventListener("click", openSettings);
   $("settings-close").addEventListener("click", () => $("settings-dialog").close());
+  $("settings-dialog").addEventListener("close", () => { clearSshEditor(); clearTlsEditor(); });
   $("settings-form").addEventListener("submit", (event) => { event.preventDefault(); saveSettings(); });
   $("settings-add-repository").addEventListener("click", () => addSettingResource("repository"));
   $("settings-add-connection").addEventListener("click", () => addSettingResource("connection"));
+  $("settings-add-sandbox-profile").addEventListener("click", addSandboxProfile);
   $("settings-discard").addEventListener("click", () => {
     if (!settingsState.saved || settingsState.busy) return;
     settingsState.config = normalizedSettings(JSON.parse(settingsState.saved));
@@ -1093,7 +1759,7 @@
   document.querySelectorAll("[data-settings-tab]").forEach((tab) => {
     tab.addEventListener("click", () => selectSettingsTab(tab.dataset.settingsTab));
     tab.addEventListener("keydown", (event) => {
-      const names = ["repositories", "connections", "sandbox"];
+      const names = SETTINGS_TABS;
       const current = names.indexOf(tab.dataset.settingsTab);
       let next;
       if (event.key === "ArrowRight") next = (current + 1) % names.length;
@@ -1103,6 +1769,52 @@
       if (next !== undefined) { event.preventDefault(); selectSettingsTab(names[next], true); }
     });
   });
+  $("ssh-new").addEventListener("click", () => openSshEditor());
+  $("ssh-cancel").addEventListener("click", clearSshEditor);
+  $("ssh-save").addEventListener("click", saveSshKey);
+  $("ssh-file").addEventListener("change", async () => {
+    const file = $("ssh-file").files?.[0], generation = sshState.generation;
+    if (!file) return;
+    $("ssh-private-key").value = "";
+    if (file.size > 24000) { $("ssh-feedback").textContent = "Файл ключа должен быть не больше 24 КБ."; $("ssh-file").value = ""; return; }
+    try {
+      const text = await file.text();
+      if (generation === sshState.generation && $("settings-dialog").open) { $("ssh-private-key").value = text; $("ssh-feedback").textContent = "Ключ прочитан из файла. Он будет отправлен только после сохранения."; }
+    } catch (_) { if (generation === sshState.generation) $("ssh-feedback").textContent = "Не удалось прочитать файл ключа."; }
+    if (generation === sshState.generation) $("ssh-file").value = "";
+  });
+  $("model-provider").addEventListener("change", updateModelConnection);
+  for (const id of ["direct-model-url", "direct-model-name", "direct-model-token", "direct-model-tls", "direct-model-timeout"]) $(id).addEventListener("input", updateModelConnection);
+  $("model-connection-save").addEventListener("click", () => changeModelConnection());
+  $("model-connection-probe").addEventListener("click", () => changeModelConnection(true));
+  $("tls-new").addEventListener("click", () => openTlsEditor());
+  $("tls-cancel").addEventListener("click", clearTlsEditor);
+  $("tls-save").addEventListener("click", saveTlsBundle);
+  for (const [fileId, targetId, maxSize] of [["tls-ca-file", "tls-ca", 24000], ["tls-cert-file", "tls-cert", 24000], ["tls-key-file", "tls-key", 16000]]) {
+    $(fileId).addEventListener("change", async () => {
+      const file = $(fileId).files?.[0], generation = tlsState.generation;
+      if (!file) return;
+      $(targetId).value = "";
+      if (file.size > maxSize) { $("tls-feedback").textContent = "Файл слишком большой. Максимум: " + Math.round(maxSize / 1000) + " КБ."; $(fileId).value = ""; return; }
+      try { const text = await file.text(); if (generation === tlsState.generation && $("settings-dialog").open) { $(targetId).value = text; $("tls-feedback").textContent = "Файл прочитан. Он будет отправлен только после сохранения сертификатов."; } }
+      catch (_) { if (generation === tlsState.generation) $("tls-feedback").textContent = "Не удалось прочитать файл."; }
+      if (generation === tlsState.generation) $(fileId).value = "";
+    });
+  }
+  $("discoveries-refresh").addEventListener("click", loadAdminDiscoveries);
+  $("memory-open").addEventListener("click", openMemory);
+  $("memory-close").addEventListener("click", () => $("memory-dialog").close());
+  $("memory-dialog").addEventListener("close", clearMemoryEditor);
+  $("memory-new").addEventListener("click", () => editMemory());
+  $("memory-cancel").addEventListener("click", clearMemoryEditor);
+  $("memory-editor").addEventListener("submit", saveMemory);
+  $("memory-enabled").addEventListener("change", changeMemoryPreference);
+  $("remember-run").addEventListener("click", () => { if (state.current) { openMemory(); editMemory(null, state.current); } });
+  $("delete-run").addEventListener("click", () => { if (state.current) openDeletion("run", state.current); });
+  $("delete-form").addEventListener("submit", confirmDeletion);
+  $("delete-close").addEventListener("click", () => $("delete-dialog").close());
+  $("delete-cancel").addEventListener("click", () => $("delete-dialog").close());
+  $("delete-dialog").addEventListener("close", () => { deletionState.target = null; });
   enhanceDisclosure($("sources-disclosure"));
   enhanceDisclosure($("model-events"));
   $("question-form").addEventListener("submit", (event) => { event.preventDefault(); submitRun(); });
@@ -1116,7 +1828,9 @@
   document.querySelectorAll('input[name="mode"]').forEach((input) => input.addEventListener("change", () => {
     $("mode-description").textContent = input.value === "investigate" ?
       "Базы знаний, код, MCP и другие агенты." : "Базы знаний, без запуска песочниц.";
+    renderExecutionEnvironment();
   }));
+  $("sandbox-profile").addEventListener("change", () => { state.selectedSandboxProfile = $("sandbox-profile").value; renderExecutionEnvironment(); });
   document.querySelectorAll("[data-question]").forEach((button) => button.addEventListener("click", () => {
     $("question").value = button.dataset.question;
     updateCharacterCount();
@@ -1131,6 +1845,7 @@
   $("model-enable").addEventListener("click", () => changeModel("enable"));
   $("model-disable").addEventListener("click", () => changeModel("disable"));
   $("cancel-run").addEventListener("click", cancelRun);
+  $("resume-run").addEventListener("click", resumeRun);
   $("deepen-run").addEventListener("click", () => { if (state.current) submitRun(state.current); });
   $("auth-open").addEventListener("click", openAuth);
   $("auth-close").addEventListener("click", () => $("auth-dialog").close());
@@ -1167,6 +1882,8 @@
     if (state.modelActionController) state.modelActionController.abort();
     if (state.refreshController) state.refreshController.abort();
     if (settingsState.controller) settingsState.controller.abort();
+    for (const controller of [sshState.controller, tlsState.controller, modelConnectionState.controller, memoryState.controller, discoveryState.controller, discoveryState.adminController, deletionState.controller, state.sandboxProfilesController]) controller?.abort();
+    clearSshEditor(); clearTlsEditor();
   });
   updateSubmit();
   renderHistory();

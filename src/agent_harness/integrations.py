@@ -11,7 +11,8 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_harness.contracts import Evidence, Principal
-from agent_harness.integrations_config import IntegrationStore
+from agent_harness.credentials import CredentialStore
+from agent_harness.integrations_config import IntegrationSettings, IntegrationStore, SandboxConfig
 
 
 class RepositoryArgs(BaseModel):
@@ -81,6 +82,7 @@ class IntegrationHub:
         authorize: Callable[[Principal], Awaitable[bool]],
     ) -> None:
         self.store, self.authorize = store, authorize
+        self.credentials = CredentialStore(store.path.parent)
         # Lazy imports keep optional connectors out of an unused portable installation.
         self._sandbox: Any = None
         self._remote: Any = None
@@ -90,7 +92,7 @@ class IntegrationHub:
         if self._sandbox is None:
             from agent_harness.sandbox import SandboxBackend
 
-            self._sandbox = SandboxBackend()
+            self._sandbox = SandboxBackend(credentials=self.credentials)
         return self._sandbox
 
     @property
@@ -106,6 +108,34 @@ class IntegrationHub:
             raise asyncio.CancelledError
         if not await self.authorize(principal):
             raise PermissionError("Доступ отозван. Войдите в Harness заново.")
+
+    async def profiles(self, principal: Principal) -> list[dict[str, str]]:
+        await self._check(principal)
+        settings = self.store.load()
+        if not settings.sandbox.enabled:
+            return []
+        return [
+            {"id": "", "name": "Базовая среда"},
+            *[
+                {"id": profile.id, "name": profile.name}
+                for profile in settings.sandbox_profiles
+                if profile.allows(principal.owner_id)
+            ],
+        ]
+
+    @staticmethod
+    def _sandbox_config(
+        settings: IntegrationSettings, principal: Principal, profile_id: str
+    ) -> SandboxConfig:
+        if not settings.sandbox.enabled:
+            raise PermissionError("Repository sandbox is disabled")
+        if not profile_id:
+            return settings.sandbox
+        profile = next((item for item in settings.sandbox_profiles if item.id == profile_id), None)
+        if profile is None or not profile.allows(principal.owner_id):
+            raise PermissionError("Sandbox profile is outside the permitted scope")
+        # All resource/security limits remain administrator-owned global settings.
+        return settings.sandbox.model_copy(update={"image": profile.image})
 
     async def indexes(self, principal: Principal) -> list[dict[str, str]]:
         await self._check(principal)
@@ -173,6 +203,7 @@ class IntegrationHub:
         run_id: str,
         index_ids: list[str],
         cancel: Event,
+        sandbox_profile_id: str = "",
     ) -> list[Evidence]:
         await self._check(principal, cancel)
         if name not in ARGUMENTS:
@@ -192,12 +223,13 @@ class IntegrationHub:
                 or not settings.sandbox.enabled
             ):
                 raise PermissionError("Repository is outside the permitted scope")
+            sandbox_config = self._sandbox_config(settings, principal, sandbox_profile_id)
             credential_env = repository.credential_env
             result = await self.sandbox.call(
                 name,
                 validated,
                 repository=repository,
-                config=settings.sandbox,
+                config=sandbox_config,
                 principal=principal,
                 run_id=run_id,
                 cancel=cancel,
@@ -228,6 +260,10 @@ class IntegrationHub:
         await self._check(principal, cancel)
         if resource_id not in {item["id"] for item in await self.indexes(principal)}:
             raise PermissionError("Resource access was revoked")
+        if "repository_id" in validated:
+            current_sandbox = self._sandbox_config(self.store.load(), principal, sandbox_profile_id)
+            if current_sandbox.image != sandbox_config.image:
+                raise PermissionError("Sandbox profile changed during the call")
         if name in {"mcp_call", "mcp_tool_schema", "a2a_ask"}:
             assert connection is not None
             current = next(
@@ -269,6 +305,16 @@ class IntegrationHub:
         try:
             if kind == "sandbox":
                 result = dict(await self.sandbox.probe(settings.sandbox))
+                result["message"] = result.get("message") or result.get("reason", "")
+                return result
+            if kind == "sandbox_profile":
+                profile = next(
+                    (item for item in settings.sandbox_profiles if item.id == resource_id), None
+                )
+                if profile is None:
+                    raise ValueError("Sandbox profile not found")
+                config = settings.sandbox.model_copy(update={"image": profile.image})
+                result = dict(await self.sandbox.probe(config))
                 result["message"] = result.get("message") or result.get("reason", "")
                 return result
             if kind == "repository":

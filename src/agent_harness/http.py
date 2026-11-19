@@ -18,9 +18,17 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from agent_harness.contracts import Principal, RunRequest
+from agent_harness.credentials_http import create_credential_routes
+from agent_harness.discovery import DiscoveryStore
+from agent_harness.discovery_http import create_discovery_routes
 from agent_harness.integrations import IntegrationHub
 from agent_harness.integrations_config import IntegrationSettings
+from agent_harness.memory_http import create_memory_routes
+from agent_harness.model_connection import ModelRouter
+from agent_harness.model_http import create_model_routes
 from agent_harness.runtime import HarnessRuntime, HarnessUnavailableError, QueueFullError
+from agent_harness.tls_credentials import TLSCredentialStore
+from agent_harness.tls_http import create_tls_routes
 
 Authenticate = Callable[[Request], Awaitable[Principal | None]]
 AuthorizeModelManager = Callable[[Request], Awaitable[bool]]
@@ -129,6 +137,11 @@ def create_app(
     host authorization; their private state is never returned to ordinary readers.
     """
 
+    discoveries = DiscoveryStore(runtime.settings.state_dir, runtime.settings.retention_days)
+    model_router = ModelRouter(runtime.settings.state_dir, runtime.model)
+    runtime.model = model_router
+    tls_credentials = TLSCredentialStore(runtime.settings.state_dir)
+
     async def principal(request: Request, *, mutate: bool = False) -> Principal:
         identity = await authenticate(request)
         if not isinstance(identity, Principal) or not identity.owner_id:
@@ -146,16 +159,46 @@ def create_app(
             }
         )
 
+    async def sandbox_profiles(request: Request) -> Response:
+        identity = await principal(request)
+        profiles = await integrations.profiles(identity) if integrations else []
+        return _json({"profiles": profiles, "default_id": ""})
+
     async def runs(request: Request) -> Response:
         identity = await principal(request, mutate=request.method == "POST")
         if request.method == "GET":
             return _json({"runs": await runtime.list_runs(identity)})
-        run = await runtime.submit(identity, await _run_request(request))
+        parsed = await _run_request(request)
+        if parsed.mode == "investigate" and parsed.sandbox_profile_id:
+            available_profiles = await integrations.profiles(identity) if integrations else []
+            if parsed.sandbox_profile_id not in {item["id"] for item in available_profiles}:
+                raise HTTPException(403, "Выбранная среда выполнения недоступна.")
+        run = await runtime.submit(identity, parsed)
         return _json(run, status=202)
 
     async def get_run(request: Request) -> Response:
-        identity = await principal(request)
-        return _json(await runtime.get(identity, _run_id(request)))
+        identity = await principal(request, mutate=request.method == "DELETE")
+        run_id = _run_id(request)
+        if request.method == "DELETE":
+            if (await _body(request)).strip() not in {b"", b"{}"}:
+                raise HTTPException(400, "Delete does not accept a request body")
+            try:
+                deleted = await runtime.delete_run(identity, run_id)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            for deleted_id in deleted["deleted_ids"]:
+                discoveries.remove_run(identity.owner_id, deleted_id)
+            return _json(deleted)
+        run = await runtime.get(identity, run_id)
+        discoveries.scan(identity.owner_id, run)
+        available = await runtime._indexes(identity)
+        run["discoveries"] = discoveries.list(
+            identity.owner_id,
+            {item["id"] for item in available},
+            integrations.store.load() if integrations else IntegrationSettings(),
+            run_id=run_id,
+        )
+        return _json(run)
 
     async def cancel_run(request: Request) -> Response:
         identity = await principal(request, mutate=True)
@@ -164,8 +207,38 @@ def create_app(
             raise HTTPException(400, "Cancel does not accept a request body")
         return _json(await runtime.cancel(identity, _run_id(request)))
 
+    async def resume_run(request: Request) -> Response:
+        identity = await principal(request, mutate=True)
+        try:
+            payload = json.loads(await _body(request))
+        except (ValueError, UnicodeError, RecursionError):
+            raise HTTPException(400, "Invalid resume request") from None
+        if (
+            not isinstance(payload, dict)
+            or set(payload) - {"index_ids"}
+            or (
+                "index_ids" in payload
+                and (
+                    not isinstance(payload["index_ids"], list)
+                    or len(payload["index_ids"]) > 1000
+                    or any(
+                        not isinstance(item, str) or len(item) > 200
+                        for item in payload["index_ids"]
+                    )
+                )
+            )
+        ):
+            raise HTTPException(400, "Invalid resume scope")
+        try:
+            run = await runtime.resume(identity, _run_id(request), payload.get("index_ids"))
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return _json(run, status=202)
+
     async def model_status(request: Request) -> Response:
         await principal(request)
+        if model_router.store.load().provider != "gigacode":
+            return _json({"can_manage": False, "provider": "openai"})
         if (
             model_control is None
             or authorize_model_manager is None
@@ -177,6 +250,10 @@ def create_app(
 
     async def model_action(request: Request) -> Response:
         await principal(request, mutate=True)
+        if model_router.store.load().provider != "gigacode":
+            raise HTTPException(
+                409, "Выбран API модели. Управление GigaCode доступно после переключения."
+            )
         if model_control is None:
             raise HTTPException(503, "Model controls are not configured")
         if authorize_model_manager is None or not await authorize_model_manager(request):
@@ -198,6 +275,10 @@ def create_app(
             and await authorize_model_manager(request)
         )
 
+    async def manager_access(request: Request) -> bool:
+        await principal(request, mutate=request.method != "GET")
+        return bool(authorize_model_manager and await authorize_model_manager(request))
+
     async def integration_settings(request: Request) -> Response:
         permitted = await settings_access(request)
         if not permitted:
@@ -212,6 +293,12 @@ def create_app(
                 raise HTTPException(
                     400, "Проверьте адреса, ID и ограничения подключений."
                 ) from None
+            key_ids = {item["id"] for item in integrations.credentials.list()}
+            if any(
+                repository.ssh_key_id and repository.ssh_key_id not in key_ids
+                for repository in parsed.repositories
+            ):
+                raise HTTPException(400, "Выбранный SSH-ключ не найден.")
             await asyncio.to_thread(integrations.store.save, parsed)
         settings = await asyncio.to_thread(integrations.store.load)
         return _json({"can_manage": True, "settings": settings.model_dump()})
@@ -228,7 +315,7 @@ def create_app(
             not isinstance(payload, dict)
             or set(payload) - {"kind", "id"}
             or not isinstance(payload.get("kind"), str)
-            or payload.get("kind") not in {"repository", "connection", "sandbox"}
+            or payload.get("kind") not in {"repository", "connection", "sandbox", "sandbox_profile"}
             or not isinstance(payload.get("id", ""), str)
         ):
             raise HTTPException(400, "Invalid probe request")
@@ -281,14 +368,53 @@ def create_app(
             Route("/assets/app.js", javascript),
             Route("/assets/styles.css", stylesheet),
             Route("/api/status", status),
+            Route("/api/sandbox/profiles", sandbox_profiles),
             Route("/api/model", model_status),
             Route("/api/model/enable", model_action, methods=["POST"]),
             Route("/api/model/disable", model_action, methods=["POST"]),
             Route("/api/settings", integration_settings, methods=["GET", "PUT"]),
             Route("/api/settings/probe", probe_integration, methods=["POST"]),
             Route("/api/runs", runs, methods=["GET", "POST"]),
-            Route("/api/runs/{run_id}", get_run),
+            Route("/api/runs/{run_id}", get_run, methods=["GET", "DELETE"]),
             Route("/api/runs/{run_id}/cancel", cancel_run, methods=["POST"]),
+            Route("/api/runs/{run_id}/resume", resume_run, methods=["POST"]),
+            *create_memory_routes(runtime, principal),
+            *create_discovery_routes(
+                runtime,
+                discoveries,
+                principal,
+                manager_access,
+                _body,
+                integrations,
+            ),
+            *create_model_routes(
+                model_router,
+                authorize=manager_access,
+                read_body=_body,
+                busy=lambda: bool(runtime._signals),
+            ),
+            *create_tls_routes(
+                tls_credentials,
+                authorize=manager_access,
+                read_body=_body,
+                in_use=lambda key_id: (
+                    ["model"] if model_router.store.load().tls_bundle_id == key_id else []
+                ),
+            ),
+            *(
+                create_credential_routes(
+                    integrations.credentials,
+                    authorize=settings_access,
+                    read_body=_body,
+                    in_use=lambda key_id: [
+                        item.id
+                        for item in integrations.store.load().repositories
+                        if item.ssh_key_id == key_id
+                    ],
+                )
+                if integrations
+                else []
+            ),
         ],
         exception_handlers={
             HTTPException: error,

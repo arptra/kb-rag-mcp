@@ -160,7 +160,7 @@ async def test_hub_rechecks_acl_and_run_scope_and_redacts_secret(
         )
     assert len(integrations._remote.calls) == 1
     assert integrations.store.path.stat().st_mode & 0o777 == 0o600
-    assert "secret-value" not in integrations.store.path.read_text()
+    assert b"secret-value" not in integrations.store.path.read_bytes()
 
 
 @pytest.mark.parametrize("tool_name", ["mcp_call", "mcp_tool_schema"])

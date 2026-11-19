@@ -15,17 +15,24 @@ from starlette.testclient import TestClient
 
 from agent_harness import __main__ as standalone
 from agent_harness import http
+from agent_harness.config import HarnessSettings
 from agent_harness.contracts import Principal, RunRequest
 from agent_harness.runtime import HarnessRuntime, HarnessUnavailableError, QueueFullError
 
 
 class FakeRuntime:
-    def __init__(self) -> None:
+    def __init__(self, state_dir: Path) -> None:
+        self.settings = HarnessSettings(state_dir=state_dir)
+        self.model = None
+        self._signals: dict[str, Any] = {}
         self.started = 0
         self.stopped = 0
         self.calls: list[tuple[str, str]] = []
         self.records: dict[str, dict[str, Any]] = {}
         self.failure: Exception | None = None
+
+    async def _indexes(self, principal: Principal) -> list[dict[str, str]]:
+        return []
 
     async def start(self) -> None:
         self.started += 1
@@ -75,7 +82,8 @@ class FakeModelControl:
             "state": self.state,
             "authentication_url": (
                 "https://login.example.test/?code=private-browser-code"
-                if self.state == "authentication_required" else None
+                if self.state == "authentication_required"
+                else None
             ),
             "events": [{"message": "private-manager-event"}],
         }
@@ -105,8 +113,8 @@ async def model_manager(request: Request) -> bool:
 
 
 @pytest.fixture
-def runtime() -> FakeRuntime:
-    return FakeRuntime()
+def runtime(tmp_path: Path) -> FakeRuntime:
+    return FakeRuntime(tmp_path)
 
 
 @pytest.fixture
@@ -125,11 +133,14 @@ def model_control() -> FakeModelControl:
 
 @pytest.fixture
 async def control_client(
-    runtime: FakeRuntime, model_control: FakeModelControl,
+    runtime: FakeRuntime,
+    model_control: FakeModelControl,
 ) -> AsyncIterator[httpx.AsyncClient]:
     app = http.create_app(
-        cast(HarnessRuntime, runtime), authenticate,
-        model_control=model_control, authorize_model_manager=model_manager,
+        cast(HarnessRuntime, runtime),
+        authenticate,
+        model_control=model_control,
+        authorize_model_manager=model_manager,
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://testserver"
@@ -151,7 +162,10 @@ async def control_client(
     ],
 )
 async def test_all_data_endpoints_authenticate_before_runtime(
-    client: httpx.AsyncClient, runtime: FakeRuntime, method: str, path: str,
+    client: httpx.AsyncClient,
+    runtime: FakeRuntime,
+    method: str,
+    path: str,
 ) -> None:
     response = await client.request(method, path)
     assert response.status_code == 401
@@ -161,7 +175,8 @@ async def test_all_data_endpoints_authenticate_before_runtime(
 
 
 async def test_model_manager_can_enable_observe_login_and_disable(
-    control_client: httpx.AsyncClient, model_control: FakeModelControl,
+    control_client: httpx.AsyncClient,
+    model_control: FakeModelControl,
 ) -> None:
     headers = {"x-test-owner": "alice", "x-test-role": "manager"}
     initial = await control_client.get("/api/model", headers=headers)
@@ -185,7 +200,8 @@ async def test_model_manager_can_enable_observe_login_and_disable(
 
 
 async def test_model_controls_recheck_privileges_without_leaking_private_state(
-    control_client: httpx.AsyncClient, model_control: FakeModelControl,
+    control_client: httpx.AsyncClient,
+    model_control: FakeModelControl,
 ) -> None:
     manager = {"x-test-owner": "alice", "x-test-role": "manager"}
     await control_client.post("/api/model/enable", headers=manager)
@@ -206,7 +222,8 @@ async def test_model_controls_recheck_privileges_without_leaking_private_state(
 
 
 async def test_model_manager_check_does_not_replace_regular_authentication(
-    control_client: httpx.AsyncClient, model_control: FakeModelControl,
+    control_client: httpx.AsyncClient,
+    model_control: FakeModelControl,
 ) -> None:
     for method, path in (
         ("GET", "/api/model"),
@@ -228,7 +245,8 @@ async def test_absent_model_control_remains_compatible(client: httpx.AsyncClient
 
 
 async def test_control_without_manager_authorizer_denies_access(
-    runtime: FakeRuntime, model_control: FakeModelControl,
+    runtime: FakeRuntime,
+    model_control: FakeModelControl,
 ) -> None:
     app = http.create_app(cast(HarnessRuntime, runtime), authenticate, model_control=model_control)
     async with httpx.AsyncClient(
@@ -242,12 +260,16 @@ async def test_control_without_manager_authorizer_denies_access(
 
 @pytest.mark.parametrize("operation", ["enable", "disable"])
 async def test_model_controls_reject_cross_origin_requests(
-    control_client: httpx.AsyncClient, model_control: FakeModelControl, operation: str,
+    control_client: httpx.AsyncClient,
+    model_control: FakeModelControl,
+    operation: str,
 ) -> None:
     response = await control_client.post(
         f"/api/model/{operation}",
         headers={
-            "x-test-owner": "alice", "x-test-role": "manager", "origin": "https://foreign.test",
+            "x-test-owner": "alice",
+            "x-test-role": "manager",
+            "origin": "https://foreign.test",
         },
     )
     assert response.status_code == 403
@@ -256,7 +278,9 @@ async def test_model_controls_reject_cross_origin_requests(
 
 @pytest.mark.parametrize("operation", ["enable", "disable"])
 async def test_model_control_body_is_bounded_and_cannot_change_configuration(
-    control_client: httpx.AsyncClient, model_control: FakeModelControl, operation: str,
+    control_client: httpx.AsyncClient,
+    model_control: FakeModelControl,
+    operation: str,
 ) -> None:
     headers = {"x-test-owner": "alice", "x-test-role": "manager"}
     path = f"/api/model/{operation}"
@@ -276,11 +300,13 @@ async def test_model_control_body_is_bounded_and_cannot_change_configuration(
 
 
 async def test_run_contract_and_identity_are_forwarded(
-    client: httpx.AsyncClient, runtime: FakeRuntime,
+    client: httpx.AsyncClient,
+    runtime: FakeRuntime,
 ) -> None:
     headers = {"x-test-owner": "alice"}
     response = await client.post(
-        "/api/runs", headers=headers,
+        "/api/runs",
+        headers=headers,
         json={"question": "  How does payment work?  ", "mode": "investigate", "effort": "high"},
     )
     assert response.status_code == 202
@@ -290,7 +316,10 @@ async def test_run_contract_and_identity_are_forwarded(
     assert run["effort"] == "high"
     listed = await client.get("/api/runs", headers=headers)
     assert listed.json() == {"runs": [run]}
-    assert (await client.get("/api/runs/run-1", headers=headers)).json() == run
+    assert (await client.get("/api/runs/run-1", headers=headers)).json() == {
+        **run,
+        "discoveries": [],
+    }
     assert (await client.get("/api/status", headers=headers)).json()["model"] == {
         "available": False
     }
@@ -314,15 +343,20 @@ async def test_foreign_and_missing_run_look_the_same(client: httpx.AsyncClient) 
 @pytest.mark.parametrize(
     "payload",
     [
-        {}, {"question": " "}, {"question": "x", "mode": "magic"},
+        {},
+        {"question": " "},
+        {"question": "x", "mode": "magic"},
         {"question": "x", "effort": "unlimited"},
         {"question": "x", "owner_id": "someone-else"},
-        {"question": "x" * 8001}, {"question": "x", "index_ids": ["a"] * 1001},
+        {"question": "x" * 8001},
+        {"question": "x", "index_ids": ["a"] * 1001},
         ["not", "an object"],
     ],
 )
 async def test_invalid_request_does_not_reach_runtime(
-    client: httpx.AsyncClient, runtime: FakeRuntime, payload: Any,
+    client: httpx.AsyncClient,
+    runtime: FakeRuntime,
+    payload: Any,
 ) -> None:
     response = await client.post("/api/runs", headers={"x-test-owner": "alice"}, json=payload)
     assert response.status_code == 400
@@ -332,7 +366,8 @@ async def test_invalid_request_does_not_reach_runtime(
 
 
 async def test_bounded_json_and_content_type(
-    client: httpx.AsyncClient, runtime: FakeRuntime,
+    client: httpx.AsyncClient,
+    runtime: FakeRuntime,
 ) -> None:
     headers = {"x-test-owner": "alice", "content-type": "application/json"}
     malformed = await client.post("/api/runs", headers=headers, content="{not json")
@@ -355,10 +390,13 @@ async def test_bounded_json_and_content_type(
 
 @pytest.mark.parametrize("origin", ["https://foreign.example", "null", "http://testserver/path"])
 async def test_cross_origin_mutations_are_rejected(
-    client: httpx.AsyncClient, runtime: FakeRuntime, origin: str,
+    client: httpx.AsyncClient,
+    runtime: FakeRuntime,
+    origin: str,
 ) -> None:
     response = await client.post(
-        "/api/runs", headers={"x-test-owner": "alice", "origin": origin},
+        "/api/runs",
+        headers={"x-test-owner": "alice", "origin": origin},
         json={"question": "x"},
     )
     assert response.status_code == 403
@@ -367,7 +405,8 @@ async def test_cross_origin_mutations_are_rejected(
 
 async def test_same_origin_default_port_is_accepted(client: httpx.AsyncClient) -> None:
     response = await client.post(
-        "/api/runs", headers={"x-test-owner": "alice", "origin": "http://testserver:80"},
+        "/api/runs",
+        headers={"x-test-owner": "alice", "origin": "http://testserver:80"},
         json={"question": "x"},
     )
     assert response.status_code == 202
@@ -378,11 +417,16 @@ async def test_same_origin_default_port_is_accepted(client: httpx.AsyncClient) -
     [(QueueFullError("Queue is full"), 429), (HarnessUnavailableError("Disabled"), 503)],
 )
 async def test_runtime_capacity_errors_are_actionable(
-    client: httpx.AsyncClient, runtime: FakeRuntime, failure: Exception, status: int,
+    client: httpx.AsyncClient,
+    runtime: FakeRuntime,
+    failure: Exception,
+    status: int,
 ) -> None:
     runtime.failure = failure
     response = await client.post(
-        "/api/runs", headers={"x-test-owner": "alice"}, json={"question": "x"},
+        "/api/runs",
+        headers={"x-test-owner": "alice"},
+        json={"question": "x"},
     )
     assert response.status_code == status
     assert response.json() == {"error": str(failure)}
@@ -398,7 +442,9 @@ def test_lifespan_ownership(runtime: FakeRuntime, manage: bool) -> None:
 
 
 async def test_static_files_are_public_and_allowlisted(
-    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(http, "_STATIC", tmp_path)
     (tmp_path / "index.html").write_text("<!doctype html><title>Harness</title>")
@@ -424,10 +470,12 @@ def test_standalone_requires_long_token() -> None:
 
 def test_standalone_starts_real_runtime_without_inventing_providers(tmp_path: Path) -> None:
     token = "standalone-smoke-token-12345678901234567890"
-    app = standalone.build_app({
-        "HARNESS_API_TOKEN": token,
-        "HARNESS_STATE_DIR": str(tmp_path),
-    })
+    app = standalone.build_app(
+        {
+            "HARNESS_API_TOKEN": token,
+            "HARNESS_STATE_DIR": str(tmp_path),
+        }
+    )
     with TestClient(app) as client:
         response = client.get("/api/status", headers={"authorization": f"Bearer {token}"})
         assert response.status_code == 200
@@ -439,10 +487,11 @@ def test_standalone_starts_real_runtime_without_inventing_providers(tmp_path: Pa
 
 
 async def test_standalone_only_bearer_auth_and_unconfigured_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     token = "a-secure-token-for-local-testing-123456789"
-    runtime = FakeRuntime()
+    runtime = FakeRuntime(tmp_path)
     constructor_arguments: dict[str, Any] = {}
 
     def make_runtime(settings: Any, **kwargs: Any) -> FakeRuntime:
@@ -455,9 +504,9 @@ async def test_standalone_only_bearer_auth_and_unconfigured_status(
         transport=httpx.ASGITransport(app=app), base_url="http://testserver"
     ) as client:
         assert (await client.get("/api/status?token=" + token)).status_code == 401
-        assert (await client.get(
-            "/api/status", headers={"x-kb-admin-password": token}
-        )).status_code == 401
+        assert (
+            await client.get("/api/status", headers={"x-kb-admin-password": token})
+        ).status_code == 401
         response = await client.get("/api/status", headers={"authorization": f"Bearer {token}"})
         assert response.status_code == 200
         assert response.json()["model"]["available"] is False

@@ -5,13 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import AsyncExitStack
 from threading import Event
 from typing import Any
 from uuid import uuid4
 
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
 from agent_harness.config import HarnessSettings
 from agent_harness.contracts import Evidence, ModelPort, Principal, RunRequest, SourcePort, ToolPort
-from agent_harness.policy import BUDGETS, QUICK_BUDGETS, SYSTEM_PROMPT, TOOLS, validate_call
+from agent_harness.graph import ExecutionContext, HarnessGraph
+from agent_harness.memory import MAX_PER_OWNER, MemoryInput, MemoryStore
+from agent_harness.policy import BUDGETS, QUICK_BUDGETS, SYSTEM_PROMPT
 from agent_harness.store import ACTIVE, RunStore, timestamp
 
 
@@ -66,6 +71,9 @@ class HarnessRuntime:
         self.settings, self.source, self.model = settings, source, model
         self.tools = tools
         self._store: RunStore | None = None
+        self._memory: MemoryStore | None = None
+        self._graph: HarnessGraph | None = None
+        self._graph_lifespan = AsyncExitStack()
         self._queues: dict[str, asyncio.Queue[tuple[Principal, str]]] = {
             lane: asyncio.Queue(maxsize=settings.queue_max) for lane in ("quick", "investigate")
         }
@@ -81,11 +89,28 @@ class HarnessRuntime:
             raise HarnessUnavailableError("Harness has not started")
         return self._store
 
+    @property
+    def memory(self) -> MemoryStore:
+        if self._memory is None:
+            raise HarnessUnavailableError("Harness has not started")
+        return self._memory
+
     async def start(self) -> None:
         if self._started or not self.settings.enabled:
             return
         self._store = RunStore(self.settings)
+        self._memory = MemoryStore(self.store)
         self.store.recover()
+        checkpoint_path = self.settings.state_dir / "checkpoints.sqlite3"
+        checkpoint_path.touch(mode=0o600, exist_ok=True)
+        checkpoint_path.chmod(0o600)
+        checkpointer = await self._graph_lifespan.enter_async_context(
+            AsyncSqliteSaver.from_conn_string(str(checkpoint_path))
+        )
+        await checkpointer.setup()
+        await checkpointer.conn.execute("PRAGMA busy_timeout=5000")
+        self._graph = HarnessGraph(self, checkpointer)
+        await self._graph.prune()
         self._started = True
         for lane, count in (
             ("quick", self.settings.quick_workers),
@@ -104,24 +129,27 @@ class HarnessRuntime:
         for queue in self._queues.values():
             while not queue.empty():
                 principal, run_id = queue.get_nowait()
-                run = self.store.get(principal.owner_id, run_id)
+                try:
+                    run = self.store.get(principal.owner_id, run_id)
+                except KeyError:
+                    queue.task_done()
+                    continue
                 if run["status"] in ACTIVE:
                     run.update(status="cancelled", phase="finished", completed_at=timestamp())
                     self.store.save(principal.owner_id, run)
                 queue.task_done()
         self._signals.clear()
         self._clocks.clear()
+        await self._graph_lifespan.aclose()
+        self._graph = None
 
     async def submit(self, principal: Principal, request: RunRequest) -> dict[str, Any]:
         if not self._started or not self.settings.enabled:
             raise HarnessUnavailableError("Harness is disabled or stopped")
         if not principal.owner_id.strip():
             raise ValueError("Principal is required")
-        parent = (
+        if request.parent_run_id:
             self.store.get(principal.owner_id, request.parent_run_id)
-            if request.parent_run_id
-            else None
-        )
         queue = self._queues[request.mode]
         if queue.full():
             raise QueueFullError("Очередь заполнена; повторите запрос позже.")
@@ -140,7 +168,11 @@ class HarnessRuntime:
             "updated_at": now,
             "started_at": None,
             "completed_at": None,
-            "parent_question": parent["question"][:2000] if parent else None,
+            "parent_question": None,
+            "memory_used": [],
+            "context_index_ids": [],
+            "resume_count": 0,
+            "resumable": False,
         }
         self.store.save(principal.owner_id, run)
         self.store.prune()
@@ -150,7 +182,137 @@ class HarnessRuntime:
 
     async def get(self, principal: Principal, run_id: str) -> dict[str, Any]:
         run = self.store.get(principal.owner_id, run_id)
+        run["resumable"] = await self._can_resume(principal, run)
         return self._visible(run, await self._indexes(principal))
+
+    async def delete_run(self, principal: Principal, run_id: str) -> dict[str, Any]:
+        deleted = self.store.delete(principal.owner_id, run_id)
+        if self._graph is not None:
+            for item in deleted:
+                await self._graph.delete(principal, item)
+        return {"deleted": True, "id": run_id, "deleted_ids": deleted}
+
+    async def _can_resume(self, principal: Principal, run: dict[str, Any]) -> bool:
+        if (
+            self._graph is None
+            or run["status"] not in {"interrupted", "timed_out", "failed", "partial", "cancelled"}
+            or run.get("resume_count", 0) >= 3
+            or not {"mode", "effort", "metrics"} <= run.keys()
+        ):
+            return False
+        budget = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
+        if run["metrics"]["model_calls"] >= budget.model_calls:
+            return False
+        if run["metrics"]["source_calls"] >= budget.source_calls:
+            return False
+        return await self._graph.has_checkpoint(principal, run["id"])
+
+    async def resume(
+        self, principal: Principal, run_id: str, index_ids: list[str] | None = None
+    ) -> dict[str, Any]:
+        if not self._started:
+            raise HarnessUnavailableError("Harness has not started")
+        run = self.store.get(principal.owner_id, run_id)
+        if not await self._can_resume(principal, run):
+            raise ValueError("Продолжение недоступно или бюджет исчерпан. Создайте новый запрос.")
+        if index_ids is not None and (not index_ids or len(index_ids) > self.settings.max_indexes):
+            raise ValueError("Выберите допустимую область источников.")
+        allowed = {item["id"] for item in await self._indexes(principal)}
+        selected = set(index_ids if index_ids is not None else run["index_ids"])
+        if not selected <= allowed:
+            raise ValueError("Доступ к одному из выбранных источников отсутствует.")
+        queue = self._queues[run["mode"]]
+        if queue.full():
+            raise QueueFullError("Очередь заполнена; повторите запрос позже.")
+        current = self.store.get(principal.owner_id, run_id)
+        if current["status"] in ACTIVE or current.get("resume_count", 0) != run.get(
+            "resume_count", 0
+        ):
+            raise ValueError("Продолжение этого исследования уже запущено.")
+        # Fail closed on hidden dependencies, including a previously used note.
+        if self._run_scope(run) - (allowed & selected):
+            run["evidence"], run["answer"], run["memory_used"] = [], "", []
+            run["context_index_ids"], run["parent_question"] = [], None
+            self._warn(run, "Область изменилась; прежние данные исключены из продолжения.")
+        run.update(
+            status="queued",
+            phase="queued",
+            completed_at=None,
+            answer="",
+            index_ids=sorted(selected),
+            resume_count=run.get("resume_count", 0) + 1,
+            resumable=False,
+            _resume_checkpoint=True,
+        )
+        self.store.save(principal.owner_id, run)
+        self._signals[run_id] = Event()
+        queue.put_nowait((principal, run_id))
+        return {key: value for key, value in run.items() if not key.startswith("_")}
+
+    async def list_memory(self, principal: Principal) -> dict[str, Any]:
+        allowed = {item["id"] for item in await self._indexes(principal)}
+        return {
+            "enabled": self.memory.enabled(principal.owner_id),
+            "memories": [
+                self.memory.public(item) for item in self.memory.list(principal.owner_id, allowed)
+            ],
+            "limits": {"max_per_owner": MAX_PER_OWNER},
+        }
+
+    async def save_memory(
+        self, principal: Principal, request: MemoryInput, memory_id: str | None = None
+    ) -> dict[str, Any]:
+        allowed = {item["id"] for item in await self._indexes(principal)}
+        question = ""
+        existing = self.memory.get(principal.owner_id, memory_id) if memory_id else None
+        # Editing never lets an old note shed a restricted source dependency.
+        scope = set(request.index_ids) | set((existing or {}).get("index_ids", []))
+        source_run_id = (existing or {}).get("source_run_id") or request.source_run_id
+        if source_run_id:
+            source = self.store.get(principal.owner_id, source_run_id)
+            if source["status"] in ACTIVE:
+                raise ValueError("Сначала дождитесь завершения исследования.")
+            scope |= self._run_scope(source)
+            question = source["question"]
+        if not scope <= allowed:
+            raise ValueError("Доступ к источникам этой записи отсутствует.")
+        request = request.model_copy(
+            update={"index_ids": sorted(scope), "source_run_id": source_run_id}
+        )
+        return self.memory.save(
+            principal.owner_id, request, memory_id=memory_id, match_question=question
+        )
+
+    async def delete_memory(self, principal: Principal, memory_id: str) -> dict[str, Any]:
+        self.memory.delete(principal.owner_id, memory_id)
+        return {"deleted": True, "id": memory_id}
+
+    async def set_memory_enabled(self, principal: Principal, enabled: bool) -> dict[str, Any]:
+        self.memory.set_enabled(principal.owner_id, enabled)
+        return {"enabled": enabled}
+
+    @staticmethod
+    def _run_scope(run: dict[str, Any]) -> set[str]:
+        return (
+            set(run["index_ids"])
+            | set(run.get("context_index_ids", []))
+            | {item["index_id"] for item in run["evidence"]}
+        )
+
+    def _parent_context(
+        self, principal: Principal, run: dict[str, Any], allowed: set[str]
+    ) -> dict[str, str] | None:
+        if not run.get("parent_run_id"):
+            return None
+        try:
+            parent = self.store.get(principal.owner_id, run["parent_run_id"])
+        except KeyError:
+            return None
+        scope = self._run_scope(parent)
+        if parent["status"] in ACTIVE or not scope <= allowed & set(run["index_ids"]):
+            return None
+        run["context_index_ids"] = sorted(set(run.get("context_index_ids", [])) | scope)
+        return {"question": parent["question"][:1000], "answer": parent["answer"][:1600]}
 
     async def list_runs(self, principal: Principal) -> list[dict[str, Any]]:
         fields = {
@@ -263,8 +425,12 @@ class HarnessRuntime:
     @staticmethod
     def _visible(run: dict[str, Any], indexes: list[dict[str, str]]) -> dict[str, Any]:
         allowed = {item["id"] for item in indexes}
-        if any(item["index_id"] not in allowed for item in run["evidence"]):
+        if (
+            any(item["index_id"] not in allowed for item in run["evidence"])
+            or set(run.get("context_index_ids", [])) - allowed
+        ):
             run["evidence"], run["answer"] = [], ""
+            run["memory_used"], run["parent_question"] = [], None
             run["warnings"].append("Результат скрыт: доступ к части источников отсутствует.")
         return run
 
@@ -292,7 +458,10 @@ class HarnessRuntime:
         while True:
             principal, run_id = await queue.get()
             try:
-                run = self.store.get(principal.owner_id, run_id)
+                try:
+                    run = self.store.get(principal.owner_id, run_id)
+                except KeyError:
+                    continue
                 if run["status"] == "queued":
                     await self._execute(principal, run)
             finally:
@@ -307,6 +476,7 @@ class HarnessRuntime:
     async def _execute(self, principal: Principal, run: dict[str, Any]) -> None:
         event = self._signals[run["id"]]
         started = time.monotonic()
+        previous_duration = run["metrics"]["duration_ms"]
         timeout = getattr(self.settings, f"{run['mode']}_timeout_seconds")
         deadline = started + timeout
         self._clocks[run["id"]] = _RunClock(
@@ -363,9 +533,13 @@ class HarnessRuntime:
             if not run["answer"]:
                 self._evidence_answer(run)
             run.update(phase="finished", completed_at=timestamp())
-            run["metrics"]["duration_ms"] = round((time.monotonic() - started) * 1000)
+            run["metrics"]["duration_ms"] = previous_duration + round(
+                (time.monotonic() - started) * 1000
+            )
             self.store.save(principal.owner_id, run)
             self.store.prune()
+            if self._graph is not None:
+                await self._graph.prune()
 
     def _now(self, run: dict[str, Any]) -> float:
         clock = self._clocks.get(run["id"])
@@ -423,153 +597,11 @@ class HarnessRuntime:
     async def _research(
         self, principal: Principal, run: dict[str, Any], event: Event, deadline: float
     ) -> None:
-        available = {
-            item["id"] for item in await self._indexes(principal, self._source_timeout(run))
-        }
-        budget = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
-        self._semaphores[run["id"]] = asyncio.Semaphore(budget.parallelism)
-        requested = list(dict.fromkeys(run["index_ids"]))
-        if set(requested) - available:
-            run["status"] = "failed"
-            run["warnings"].append("Один или несколько выбранных индексов недоступны.")
-            return
-        selected = requested or sorted(available)
-        if len(selected) > self.settings.max_indexes:
-            run["warnings"].append("Область поиска ограничена бюджетом числа индексов.")
-        run["index_ids"] = selected[: self.settings.max_indexes]
-        if not run["index_ids"]:
-            run["status"] = "partial"
-            run["warnings"].append("Нет доступных источников; состояние системы не проверено.")
-            return
-        query = run["question"]
-        if run["parent_question"]:
-            query = run["parent_question"] + "\n" + "Дополнительный вопрос: " + query
-        external = (
-            await self.tools.describe(principal, run["index_ids"])
-            if self.tools is not None and run["mode"] == "investigate"
-            else []
+        assert self._graph is not None
+        await self._graph.execute(
+            ExecutionContext(principal, run, event, deadline),
+            resume=bool(run.pop("_resume_checkpoint", False)),
         )
-        external_ids = (
-            {item["id"] for item in await self.tools.indexes(principal)}
-            if self.tools is not None
-            else set()
-        )
-        knowledge_ids = [item for item in run["index_ids"] if item not in external_ids]
-        if run["mode"] == "quick" and set(run["index_ids"]) & external_ids:
-            self._warn(run, "Быстрый ответ использует RAG. Код, MCP и A2A доступны в исследовании.")
-        search_limit = max(1, budget.source_calls // 2) if external else budget.source_calls
-        bootstrap = knowledge_ids[:search_limit] if self.source is not None else []
-        if len(bootstrap) < len(knowledge_ids):
-            self._warn(run, "Часть индексов не опрошена: исчерпан бюджет источников.")
-        await asyncio.gather(
-            *(
-                self._search(
-                    principal,
-                    run,
-                    event,
-                    index,
-                    query[:8000],
-                    deadline=deadline - self.settings.quick_timeout_seconds / 3
-                    if run["mode"] == "quick"
-                    else None,
-                )
-                for index in bootstrap
-            )
-        )
-        self.store.save(principal.owner_id, run)
-        if event.is_set():
-            return
-        model_status = await self._model_status()
-        while model_status.get("state") == "authentication_required" and not event.is_set():
-            await self._refresh_authentication(run)
-            self.store.save(principal.owner_id, run)
-            await asyncio.sleep(0.025)
-            model_status = await self._model_status()
-        if event.is_set():
-            return
-        await self._refresh_authentication(run)
-        if not model_status["available"] or (not run["evidence"] and not external):
-            run["status"] = "partial"
-            run["warnings"].append(
-                model_status["reason"]
-                if not model_status["available"]
-                else "Подтверждающие источники не найдены."
-            )
-            return
-        if run["mode"] == "quick":
-            await self._synthesize(principal, run, event)
-            return
-        reserve = min(
-            self.settings.final_reserve_seconds, self.settings.investigate_timeout_seconds / 4
-        )
-        exchange: list[dict[str, Any]] = []
-        for _ in range(budget.model_calls - 1):
-            if event.is_set() or self._now(run) >= deadline - reserve:
-                break
-            if run["metrics"]["tool_calls"] >= budget.tool_calls:
-                break
-            if run["metrics"]["source_calls"] >= budget.source_calls:
-                break
-            run["phase"] = "investigating"
-            self.store.save(principal.owner_id, run)
-            try:
-                tool_catalog = [*(TOOLS if knowledge_ids else []), *external]
-                decision = await self._decide(
-                    run, event, tool_catalog, exchange, deadline - reserve
-                )
-            except _AuthenticationTimeout:
-                raise
-            except TimeoutError:
-                self._warn(run, "Время поиска исчерпано; зарезервирован итоговый ответ.")
-                break
-            calls = decision.get("tool_calls", [])
-            if not calls:
-                if self._answer(run, decision):
-                    return
-                break
-            exchange = []
-            for call in calls[: budget.tool_calls - run["metrics"]["tool_calls"]]:
-                if event.is_set() or self._now(run) >= deadline - reserve:
-                    break
-                if run["metrics"]["source_calls"] >= budget.source_calls:
-                    break
-                run["metrics"]["tool_calls"] += 1
-                if not isinstance(call, dict):
-                    self._warn(run, "Некорректный формат вызова инструмента отклонён.")
-                    continue
-                name, args = str(call.get("name", "")), call.get("args", {})
-                try:
-                    if name in {item["function"]["name"] for item in external}:
-                        result = await self._external_tool(
-                            principal,
-                            run,
-                            event,
-                            name,
-                            args,
-                            deadline - reserve,
-                        )
-                        exchange.append({"name": name, "result": result})
-                        continue
-                    validated = validate_call(name, args, set(knowledge_ids))
-                    if name == "search_knowledge":
-                        result = await self._search(
-                            principal,
-                            run,
-                            event,
-                            validated["index_id"],
-                            validated["query"],
-                            validated["limit"],
-                        )
-                    else:
-                        result = await self._read(principal, run, event, validated)
-                except (ValueError, TypeError):
-                    result = "Вызов отклонён: недопустимый инструмент, аргументы или индекс."
-                    self._warn(run, result)
-                exchange.append({"name": name, "result": result})
-            self.store.save(principal.owner_id, run)
-        if not event.is_set():
-            self._warn(run, "Исследование ограничено бюджетом; итог по собранным источникам.")
-            await self._synthesize(principal, run, event)
 
     async def _external_tool(
         self,
@@ -584,6 +616,11 @@ class HarnessRuntime:
         run["metrics"]["source_calls"] += 1
         try:
             timeout = min(600, max(0.01, deadline - self._now(run)))
+            environment = (
+                {"sandbox_profile_id": run["sandbox_profile_id"]}
+                if run.get("sandbox_profile_id")
+                else {}
+            )
             items = await asyncio.wait_for(
                 self.tools.call(
                     name,
@@ -592,6 +629,7 @@ class HarnessRuntime:
                     run_id=run["id"],
                     index_ids=run["index_ids"],
                     cancel=event,
+                    **environment,
                 ),
                 timeout,
             )
@@ -604,6 +642,9 @@ class HarnessRuntime:
         except Exception as exc:
             message = f"Инструмент {name} недоступен ({type(exc).__name__})."
             self._warn(run, message)
+            self.memory.record_failure(
+                principal.owner_id, run, operation="external", index_ids=run["index_ids"]
+            )
             return message
         finally:
             self._checkpoint(principal, run, event)
@@ -652,6 +693,9 @@ class HarnessRuntime:
         except Exception as exc:
             outcome = f"Поиск в {index_id} недоступен ({type(exc).__name__})."
             self._warn(run, outcome)
+            self.memory.record_failure(
+                principal.owner_id, run, operation="search", index_ids=run["index_ids"]
+            )
             return outcome
         finally:
             self._checkpoint(principal, run, event)
@@ -675,6 +719,9 @@ class HarnessRuntime:
         except Exception as exc:
             outcome = f"Чтение документа недоступно ({type(exc).__name__})."
             self._warn(run, outcome)
+            self.memory.record_failure(
+                principal.owner_id, run, operation="read", index_ids=run["index_ids"]
+            )
             return outcome
         finally:
             self._checkpoint(principal, run, event)
@@ -719,6 +766,7 @@ class HarnessRuntime:
 
     async def _decide(
         self,
+        principal: Principal,
         run: dict[str, Any],
         event: Event,
         tools: list[dict[str, Any]],
@@ -731,13 +779,27 @@ class HarnessRuntime:
             12_000,
             int(getattr(self.settings, f"{run['mode']}_context_chars") * profile.context_ratio),
         )
+        allowed = {item["id"] for item in await self._indexes(principal)}
+        memories = self.memory.retrieve(
+            principal.owner_id, run["question"], allowed, set(run["index_ids"])
+        )
+        parent = self._parent_context(principal, run, allowed)
+        if set(run.get("context_index_ids", [])) - allowed or any(
+            item["index_id"] not in allowed for item in run["evidence"]
+        ):
+            raise ValueError("Source access changed during the investigation")
         context: dict[str, Any] = {
+            "sandbox_profile_id": run.get("sandbox_profile_id", ""),
             "allowed_indexes": [],
             "selected_index_count": len(run["index_ids"]),
             "index_catalog_truncated": False,
             "evidence": [],
             "prior_tool_attempts": exchange or [],
-            "history_question_not_evidence": run["parent_question"],
+            "history_question_not_evidence": parent["question"] if parent else None,
+            "history_answer_not_evidence": parent["answer"] if parent else None,
+            "private_notes_not_evidence": [
+                {key: item[key] for key in ("id", "title", "text", "kind")} for item in memories
+            ],
         }
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -776,6 +838,13 @@ class HarnessRuntime:
         messages.append({"role": "user", "content": json.dumps(context, ensure_ascii=False)})
         if len(json.dumps(messages, ensure_ascii=False)) > maximum - tool_reserve + 500:
             raise ValueError("Input context budget exceeded")
+        used = {item["id"]: item for item in run.get("memory_used", [])}
+        for item in memories:
+            used[item["id"]] = {"id": item["id"], "title": item["title"]}
+            run["context_index_ids"] = sorted(
+                set(run.get("context_index_ids", [])) | set(item["index_ids"])
+            )
+        run["memory_used"] = list(used.values())[:12]
         run["metrics"]["model_calls"] += 1
         # Model cancellation is separate from user cancellation so an exhausted
         # authentication/decision budget retains its timed_out outcome.
@@ -814,7 +883,7 @@ class HarnessRuntime:
     async def _synthesize(self, principal: Principal, run: dict[str, Any], event: Event) -> None:
         run["phase"] = "synthesizing"
         self._checkpoint(principal, run, event)
-        decision = await self._decide(run, event, [])
+        decision = await self._decide(principal, run, event, [])
         if decision.get("tool_calls"):
             self._warn(
                 run, "Модель запросила инструменты на этапе итогового ответа; вызов отклонён."

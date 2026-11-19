@@ -1,5 +1,8 @@
 """Private persisted runs with explicit restart semantics and bounded retention."""
 
+from __future__ import annotations
+
+import builtins
 import json
 import sqlite3
 from collections.abc import Iterator
@@ -21,16 +24,24 @@ class RunStore:
         self.settings = settings
         settings.state_dir.mkdir(parents=True, exist_ok=True)
         self.path = settings.state_dir / "runs.sqlite3"
+        self.path.touch(mode=0o600, exist_ok=True)
+        self.path.chmod(0o600)
         with self._connect() as db:
+            db.execute("PRAGMA journal_mode=WAL")
             db.execute(
                 "CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, owner TEXT NOT NULL, "
                 "status TEXT NOT NULL, created TEXT NOT NULL, data TEXT NOT NULL)"
             )
             db.execute("CREATE INDEX IF NOT EXISTS runs_owner ON runs(owner, created)")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS deleted_runs "
+                "(id TEXT PRIMARY KEY, owner TEXT NOT NULL, deleted TEXT NOT NULL)"
+            )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         db = sqlite3.connect(self.path, timeout=5)
+        db.execute("PRAGMA busy_timeout=5000")
         try:
             with db:
                 yield db
@@ -40,6 +51,8 @@ class RunStore:
     def save(self, owner: str, run: dict[str, Any]) -> None:
         run["updated_at"] = timestamp()
         with self._connect() as db:
+            if db.execute("SELECT 1 FROM deleted_runs WHERE id=?", (run["id"],)).fetchone():
+                return
             db.execute(
                 "INSERT INTO runs VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
                 "status=excluded.status, data=excluded.data WHERE runs.owner=excluded.owner",
@@ -61,13 +74,47 @@ class RunStore:
             raise KeyError("Run not found")
         return dict(json.loads(row[0]))
 
-    def list(self, owner: str) -> list[dict[str, Any]]:
+    def list(self, owner: str) -> builtins.list[dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute(
                 "SELECT data FROM runs WHERE owner=? ORDER BY created DESC LIMIT ?",
                 (owner, self.settings.max_runs_per_owner),
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def run_ids(self) -> set[str]:
+        with self._connect() as db:
+            return {str(row[0]) for row in db.execute("SELECT id FROM runs")}
+
+    def delete(self, owner: str, run_id: str) -> builtins.list[str]:
+        """Delete a conversation and descendants atomically; active work cannot disappear."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT id,data FROM runs WHERE owner=?", (owner,)).fetchall()
+            runs = {str(key): json.loads(data) for key, data in rows}
+            if run_id not in runs:
+                raise KeyError("Run not found")
+            deleted = {run_id}
+            while True:
+                children = {key for key, run in runs.items() if run.get("parent_run_id") in deleted}
+                if children <= deleted:
+                    break
+                deleted |= children
+            if any(runs[key]["status"] in ACTIVE for key in deleted):
+                raise ValueError("Сначала остановите все активные запросы этого чата.")
+            for key in deleted:
+                db.execute(
+                    "INSERT OR IGNORE INTO deleted_runs VALUES (?,?,?)", (key, owner, timestamp())
+                )
+                db.execute("DELETE FROM runs WHERE id=? AND owner=?", (key, owner))
+            # Memory has the same connection/owner boundary. Its schema is optional
+            # for standalone users of RunStore and for migrations from older versions.
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='memories'").fetchone():
+                db.executemany(
+                    "DELETE FROM memories WHERE source_run_id=? AND owner=?",
+                    [(key, owner) for key in deleted],
+                )
+        return sorted(deleted)
 
     def recover(self) -> None:
         with self._connect() as db:
@@ -106,3 +153,10 @@ class RunStore:
                 "LIMIT -1 OFFSET ?)",
                 (self.settings.max_total_runs,),
             )
+            db.execute("DELETE FROM deleted_runs WHERE deleted<?", (cutoff,))
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='memories'").fetchone():
+                db.execute(
+                    "DELETE FROM memories WHERE source_run_id IS NOT NULL AND NOT EXISTS "
+                    "(SELECT 1 FROM runs WHERE runs.id=memories.source_run_id "
+                    "AND runs.owner=memories.owner)"
+                )

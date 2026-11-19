@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import os
+import re
+import sqlite3
 from pathlib import Path
 from threading import RLock
 from typing import Literal, Self
 from urllib.parse import urlsplit
-from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -60,11 +60,52 @@ class ResourceConfig(BaseModel):
 
 class RepositoryConfig(ResourceConfig):
     ref: str = Field(default="HEAD", min_length=1, max_length=200, pattern=r"^[^\s~^:?*\[\\]+$")
+    ssh_key_id: str = Field(default="", pattern=r"^([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})?$")
+
+    @field_validator("url")
+    @classmethod
+    def endpoint(cls, value: str) -> str:
+        # Override the general HTTP endpoint validator. SCP syntax is canonicalized.
+        if any(c.isspace() or ord(c) < 32 for c in value):
+            raise ValueError("Repository address contains invalid characters")
+        match = re.fullmatch(
+            r"([a-zA-Z0-9_][a-zA-Z0-9_.-]*)@([a-zA-Z0-9][a-zA-Z0-9.-]*):(.+)", value
+        )
+        if match:
+            original = value
+            value = f"ssh://{match[1]}@{match[2]}/{match[3]}"
+        if value.startswith("https://"):
+            return super().endpoint(value)
+        try:
+            parsed = urlsplit(value)
+            valid = (
+                parsed.scheme == "ssh"
+                and parsed.hostname
+                and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.:-]*", parsed.hostname)
+                and parsed.username
+                and re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_.-]*", parsed.username)
+                and not parsed.password
+                and not parsed.query
+                and not parsed.fragment
+                and re.fullmatch(r"/[a-zA-Z0-9_][a-zA-Z0-9_./-]*", parsed.path)
+                and all(part not in {".", ".."} for part in parsed.path.split("/"))
+            )
+            _ = parsed.port
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("Use HTTPS or ssh://user@host/path without credentials or options")
+        return original if match else value
 
     @model_validator(mode="after")
     def safe_git_source(self) -> Self:
-        if urlsplit(self.url).scheme != "https" or self.ref.startswith("-"):
-            raise ValueError("Repositories require HTTPS and a branch, tag or commit")
+        if self.ref.startswith("-"):
+            raise ValueError("Repositories require a branch, tag or commit")
+        if not self.url.startswith("https://"):
+            if self.credential_env:
+                raise ValueError("SSH repositories use an SSH key, not an HTTP token")
+        elif self.ssh_key_id:
+            raise ValueError("SSH keys can only be used with SSH repository addresses")
         return self
 
 
@@ -86,6 +127,11 @@ class ConnectionConfig(ResourceConfig):
         return self
 
 
+def normalize_repository_url(value: str) -> str:
+    """Validate a repository address without requiring an assigned SSH key yet."""
+    return RepositoryConfig.endpoint(value)
+
+
 class SandboxConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False
@@ -101,15 +147,45 @@ class SandboxConfig(BaseModel):
     max_parallel: int = Field(default=2, ge=1, le=8)
 
 
+class SandboxProfileConfig(BaseModel):
+    """An administrator-built image; requesters can choose only an allowed profile ID."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+    id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+    name: str = Field(min_length=1, max_length=160)
+    image: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,250}$")
+    enabled: bool = True
+    allowed_owners: list[str] = Field(default_factory=list, max_length=1000)
+
+    @field_validator("allowed_owners")
+    @classmethod
+    def owners(cls, values: list[str]) -> list[str]:
+        return ResourceConfig.owners(values)
+
+    def allows(self, owner_id: str) -> bool:
+        return (
+            bool(owner_id)
+            and self.enabled
+            and (not self.allowed_owners or owner_id in self.allowed_owners)
+        )
+
+
+def _default_sandbox_profiles() -> list[SandboxProfileConfig]:
+    return [SandboxProfileConfig(id="java21", name="Java 21", image="harness-sandbox-java21:local")]
+
+
 class IntegrationSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     repositories: list[RepositoryConfig] = Field(default_factory=list, max_length=100)
     connections: list[ConnectionConfig] = Field(default_factory=list, max_length=100)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    sandbox_profiles: list[SandboxProfileConfig] = Field(
+        default_factory=_default_sandbox_profiles, max_length=20
+    )
 
     @model_validator(mode="after")
     def unique_ids(self) -> Self:
-        for items in (self.repositories, self.connections):
+        for items in (self.repositories, self.connections, self.sandbox_profiles):
             if len({item.id for item in items}) != len(items):
                 raise ValueError("Resource IDs must be unique")
         return self
@@ -117,26 +193,49 @@ class IntegrationSettings(BaseModel):
 
 class IntegrationStore:
     def __init__(self, state_dir: Path) -> None:
-        self.path = state_dir / "integrations.json"
+        self.path = state_dir / "configuration.sqlite3"
+        self.legacy_path = state_dir / "integrations.json"
         self._lock = RLock()
+        state_dir.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(self.path, timeout=5)
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            with db:
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS integrations (id INTEGER PRIMARY KEY, data TEXT)"
+                )
+                if (
+                    db.execute("SELECT 1 FROM integrations WHERE id=1").fetchone() is None
+                    and self.legacy_path.exists()
+                ):
+                    legacy = IntegrationSettings.model_validate_json(self.legacy_path.read_bytes())
+                    db.execute("INSERT INTO integrations VALUES(1,?)", (legacy.model_dump_json(),))
+        finally:
+            db.close()
+        self.path.chmod(0o600)
 
     def load(self) -> IntegrationSettings:
         with self._lock:
-            if not self.path.exists():
-                return IntegrationSettings()
-            return IntegrationSettings.model_validate_json(self.path.read_bytes())
+            db = sqlite3.connect(self.path, timeout=5)
+            try:
+                row = db.execute("SELECT data FROM integrations WHERE id=1").fetchone()
+                return (
+                    IntegrationSettings.model_validate_json(row[0])
+                    if row
+                    else IntegrationSettings()
+                )
+            finally:
+                db.close()
 
     def save(self, settings: IntegrationSettings) -> None:
-        data = settings.model_dump_json(indent=2).encode()
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_name(f".integrations-{uuid4().hex}.tmp")
+            db = sqlite3.connect(self.path, timeout=5)
             try:
-                with temporary.open("xb") as stream:
-                    os.chmod(temporary, 0o600)
-                    stream.write(data)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, self.path)
+                with db:
+                    db.execute(
+                        "INSERT INTO integrations VALUES(1,?) "
+                        "ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                        (settings.model_dump_json(),),
+                    )
             finally:
-                temporary.unlink(missing_ok=True)
+                db.close()

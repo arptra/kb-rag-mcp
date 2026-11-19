@@ -23,6 +23,7 @@ class RunRequest(BaseModel):
     effort: Literal["low", "medium", "high"] = "medium"
     index_ids: list[str] = Field(default_factory=list, max_length=1000)
     parent_run_id: str | None = Field(default=None, max_length=80)
+    sandbox_profile_id: str = Field(default="", pattern=r"^([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})?$")
 
     @field_validator("question")
     @classmethod
@@ -101,6 +102,7 @@ class ToolPort(Protocol):
         run_id: str,
         index_ids: list[str],
         cancel: Event,
+        sandbox_profile_id: str = "",
     ) -> list[Evidence]: ...
 
     async def close_run(self, run_id: str) -> None: ...
