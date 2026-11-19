@@ -12,17 +12,27 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from corporate_kb.a2a.service import PROTOCOL_VERSION, A2AService, RpcError
+from corporate_kb.a2a.compat import LEGACY_METHOD_MAP, legacy_card, legacy_request, legacy_result
+from corporate_kb.a2a.service import (
+    PROTOCOL_VERSION,
+    SUPPORTED_METHODS,
+    A2AService,
+    RpcError,
+    connection_contract,
+    method_not_found,
+)
 from corporate_kb.config import Settings
 
 Authorization = Callable[[Request], Awaitable[bool]]
 
 
-def response(payload: object, status: int = 200) -> JSONResponse:
+def response(
+    payload: object, status: int = 200, *, version: str = PROTOCOL_VERSION
+) -> JSONResponse:
     return JSONResponse(
         payload,
         status_code=status,
-        headers={"Cache-Control": "no-store", "A2A-Version": PROTOCOL_VERSION},
+        headers={"Cache-Control": "no-store", "A2A-Version": version},
     )
 
 
@@ -55,6 +65,8 @@ def register_a2a_routes(
         return {
             "enabled": True,
             "protocol_version": PROTOCOL_VERSION,
+            "supported_protocol_versions": ["1.0", "0.3"],
+            "supported_methods": list(SUPPORTED_METHODS),
             "endpoint": base + settings.a2a_path,
             "agent_card_url": base + "/.well-known/agent-card.json",
         }
@@ -64,11 +76,14 @@ def register_a2a_routes(
             **payload,
             **info(request),
             "config": {
+                **connection_contract(),
                 "url": info(request)["endpoint"],
                 "agentCardUrl": info(request)["agent_card_url"],
+                "legacyAgentCardUrl": info(request)["agent_card_url"] + "?A2A-Version=0.3",
                 "protocolBinding": "JSONRPC",
                 "headers": {
                     "Authorization": "Bearer " + payload["token"],
+                    "Content-Type": "application/json",
                     "A2A-Version": PROTOCOL_VERSION,
                 },
             },
@@ -76,7 +91,41 @@ def register_a2a_routes(
 
     @server.custom_route("/.well-known/agent-card.json", methods=["GET"], include_in_schema=False)
     async def card(request: Request) -> JSONResponse:
+        version = request.headers.get("a2a-version") or request.query_params.get("A2A-Version")
+        if version in {"0.3", "0.3.0"}:
+            return response(legacy_card(engine.card(info(request)["endpoint"])), version="0.3")
+        if version and version != PROTOCOL_VERSION:
+            return response({"error": "Supported A2A versions: 1.0, 0.3"}, 400)
         return response(engine.card(info(request)["endpoint"]))
+
+    @server.custom_route("/.well-known/agent.json", methods=["GET"], include_in_schema=False)
+    async def legacy_discovery(request: Request) -> JSONResponse:
+        return response(legacy_card(engine.card(info(request)["endpoint"])), version="0.3")
+
+    @server.custom_route(settings.a2a_path, methods=["GET"], include_in_schema=False)
+    async def connection_help(request: Request) -> JSONResponse:
+        # An agent given only URL/token can discover the request contract instead
+        # of guessing RPC method names. This contains no credentials or index data.
+        version = request.headers.get("a2a-version") or request.query_params.get("A2A-Version")
+        if version not in {None, "", "1.0", "0.3", "0.3.0"}:
+            return response({"error": "Supported A2A versions: 1.0, 0.3"}, 400)
+        selected = "0.3" if version in {"0.3", "0.3.0"} else "1.0"
+        return response(
+            {
+                **connection_contract(selected),
+                "url": info(request)["endpoint"],
+                "agentCardUrl": info(request)["agent_card_url"]
+                + ("?A2A-Version=0.3" if selected == "0.3" else ""),
+                "protocolBinding": "JSONRPC",
+                "httpMethod": "POST",
+                "headers": {
+                    "Authorization": "Bearer <agent-token>",
+                    "Content-Type": "application/json",
+                    "A2A-Version": selected,
+                },
+            },
+            version=selected,
+        )
 
     @server.custom_route(settings.a2a_path, methods=["POST"], include_in_schema=False)
     async def rpc(request: Request) -> Response:
@@ -95,12 +144,10 @@ def register_a2a_routes(
                 headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
             )
         method, request_id, summary = "unknown", None, {}
+        wire_version = PROTOCOL_VERSION
         error: RpcError | None = None
         result: dict[str, Any] | None = None
         try:
-            version = request.headers.get("a2a-version") or request.query_params.get("A2A-Version")
-            if version != PROTOCOL_VERSION:
-                raise RpcError(-32009, "Set A2A-Version: 1.0")
             if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
                 raise RpcError(-32005, "Content-Type must be application/json")
             try:
@@ -122,7 +169,28 @@ def register_a2a_routes(
             params = payload.get("params", {})
             if not isinstance(params, dict):
                 raise RpcError(-32602, "params must be an object")
-            if method == "SendMessage":
+            # Decode the envelope before version checks so failed calls retain
+            # their actual method/id in the operation journal and JSON-RPC error.
+            version = request.headers.get("a2a-version") or request.query_params.get("A2A-Version")
+            if not version and method in SUPPORTED_METHODS:
+                raise RpcError(-32009, "Set A2A-Version: 1.0", connection_contract())
+            if version not in {None, "", "1.0", "0.3", "0.3.0"}:
+                raise RpcError(-32009, "Supported A2A versions: 1.0, 0.3", connection_contract())
+            wire_version = "1.0" if version == "1.0" else "0.3"
+            dispatch_method = method
+            if wire_version == "0.3":
+                if method in SUPPORTED_METHODS:
+                    raise RpcError(
+                        -32601, "A2A 1.0 method requires A2A-Version: 1.0. "
+                        "For 0.3 use message/send, tasks/get or tasks/cancel.",
+                        connection_contract(),
+                    )
+                if method not in LEGACY_METHOD_MAP:
+                    raise method_not_found(method, version="0.3")
+                dispatch_method, params = legacy_request(method, params)
+            elif method in LEGACY_METHOD_MAP:
+                raise method_not_found(method)
+            if dispatch_method == "SendMessage":
                 command, _, _ = engine.command(params)
                 summary = {
                     key: command[key]
@@ -136,7 +204,7 @@ def register_a2a_routes(
             agent = await asyncio.to_thread(engine.store.authenticate, token)
             if agent is None:
                 return response({"error": "A2A access is no longer active"}, 401)
-            result = await asyncio.to_thread(engine.dispatch, agent, method, params)
+            result = await asyncio.to_thread(engine.dispatch, agent, dispatch_method, params)
             if result.get("task", {}).get("id"):
                 summary["task_id"] = result["task"]["id"]
         except json.JSONDecodeError:
@@ -168,10 +236,18 @@ def register_a2a_routes(
                 {
                     "jsonrpc": "2.0",
                     "id": request_id,
-                    "error": {"code": error.code, "message": str(error)},
-                }
+                    "error": {
+                        "code": error.code, "message": str(error),
+                        **({"data": error.data} if error.data is not None else {}),
+                    },
+                },
+                version=wire_version,
             )
-        return response({"jsonrpc": "2.0", "id": request_id, "result": result})
+        if wire_version == "0.3" and result is not None:
+            result = legacy_result(method, result)
+        return response(
+            {"jsonrpc": "2.0", "id": request_id, "result": result}, version=wire_version
+        )
 
     @server.custom_route("/auth/a2a/status", methods=["GET"], include_in_schema=False)
     async def status(request: Request) -> JSONResponse:
