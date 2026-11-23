@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from contextlib import AsyncExitStack
 from threading import Event
@@ -13,9 +14,18 @@ from uuid import uuid4
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from agent_harness.config import HarnessSettings
-from agent_harness.contracts import Evidence, ModelPort, Principal, RunRequest, SourcePort, ToolPort
+from agent_harness.contracts import (
+    Evidence,
+    ModelDecisionError,
+    ModelPort,
+    Principal,
+    RunRequest,
+    SourcePort,
+    ToolPort,
+)
 from agent_harness.graph import ExecutionContext, HarnessGraph
-from agent_harness.memory import MAX_PER_OWNER, MemoryInput, MemoryStore
+from agent_harness.memory import MAX_PER_OWNER, MemoryFeedback, MemoryInput, MemoryStore
+from agent_harness.model_connection import ModelConnectionError
 from agent_harness.policy import BUDGETS, QUICK_BUDGETS, SYSTEM_PROMPT
 from agent_harness.store import ACTIVE, RunStore, timestamp
 
@@ -81,6 +91,8 @@ class HarnessRuntime:
         self._signals: dict[str, Event] = {}
         self._semaphores: dict[str, asyncio.Semaphore] = {}
         self._clocks: dict[str, _RunClock] = {}
+        self._last_checkpoints: dict[str, float] = {}
+        self._checkpoint_evidence_counts: dict[str, int] = {}
         self._started = False
 
     @property
@@ -163,7 +175,8 @@ class HarnessRuntime:
             "answer": "",
             "evidence": [],
             "warnings": [],
-            "metrics": {"model_calls": 0, "source_calls": 0, "tool_calls": 0, "duration_ms": 0},
+            "metrics": {"model_calls": 0, "source_calls": 0, "bootstrap_calls": 0,
+                        "document_reads": 0, "tool_calls": 0, "duration_ms": 0},
             "created_at": now,
             "updated_at": now,
             "started_at": None,
@@ -173,6 +186,8 @@ class HarnessRuntime:
             "context_index_ids": [],
             "resume_count": 0,
             "resumable": False,
+            "coverage": {},
+            "research_trace": [],
         }
         self.store.save(principal.owner_id, run)
         self.store.prune()
@@ -203,7 +218,7 @@ class HarnessRuntime:
         budget = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
         if run["metrics"]["model_calls"] >= budget.model_calls:
             return False
-        if run["metrics"]["source_calls"] >= budget.source_calls:
+        if run["mode"] == "investigate" and self._followup_calls(run) >= budget.source_calls:
             return False
         return await self._graph.has_checkpoint(principal, run["id"])
 
@@ -233,6 +248,7 @@ class HarnessRuntime:
         if self._run_scope(run) - (allowed & selected):
             run["evidence"], run["answer"], run["memory_used"] = [], "", []
             run["context_index_ids"], run["parent_question"] = [], None
+            run["research_trace"], run["coverage"], run["context_summary"] = [], {}, {}
             self._warn(run, "Область изменилась; прежние данные исключены из продолжения.")
         run.update(
             status="queued",
@@ -291,10 +307,28 @@ class HarnessRuntime:
         self.memory.set_enabled(principal.owner_id, enabled)
         return {"enabled": enabled}
 
+    async def set_run_feedback(
+        self, principal: Principal, run_id: str, request: MemoryFeedback
+    ) -> dict[str, Any]:
+        run = self.store.get(principal.owner_id, run_id)
+        if run["status"] in ACTIVE:
+            raise ValueError("Дождитесь завершения ответа, чтобы оценить результат.")
+        allowed = {item["id"] for item in await self._indexes(principal)}
+        scope = self._run_scope(run)
+        if not scope <= allowed:
+            raise ValueError("Доступ к источникам этого ответа отсутствует.")
+        run["feedback"] = request.model_dump()
+        self.store.save(principal.owner_id, run)
+        memory = self.memory.record_feedback(
+            principal.owner_id, run, rating=request.rating, comment=request.comment,
+            index_ids=sorted(scope),
+        )
+        return {"feedback": run["feedback"], "memory": memory}
+
     @staticmethod
     def _run_scope(run: dict[str, Any]) -> set[str]:
         return (
-            set(run["index_ids"])
+            set(run.get("index_ids", []))
             | set(run.get("context_index_ids", []))
             | {item["index_id"] for item in run["evidence"]}
         )
@@ -376,7 +410,11 @@ class HarnessRuntime:
                     mode: {
                         effort: {
                             "source_calls": profile.source_calls,
+                            "initial_search": "all_selected_indexes",
                             "model_calls": profile.model_calls,
+                            "document_reads": profile.document_reads,
+                            "timeout_seconds": getattr(self.settings, f"{mode}_timeout_seconds")
+                            * profile.time_ratio,
                             "context_chars": max(
                                 12_000,
                                 int(
@@ -425,12 +463,10 @@ class HarnessRuntime:
     @staticmethod
     def _visible(run: dict[str, Any], indexes: list[dict[str, str]]) -> dict[str, Any]:
         allowed = {item["id"] for item in indexes}
-        if (
-            any(item["index_id"] not in allowed for item in run["evidence"])
-            or set(run.get("context_index_ids", [])) - allowed
-        ):
+        if HarnessRuntime._run_scope(run) - allowed:
             run["evidence"], run["answer"] = [], ""
             run["memory_used"], run["parent_question"] = [], None
+            run["research_trace"], run["coverage"], run["context_summary"] = [], {}, {}
             run["warnings"].append("Результат скрыт: доступ к части источников отсутствует.")
         return run
 
@@ -467,6 +503,8 @@ class HarnessRuntime:
             finally:
                 self._signals.pop(run_id, None)
                 self._semaphores.pop(run_id, None)
+                self._last_checkpoints.pop(run_id, None)
+                self._checkpoint_evidence_counts.pop(run_id, None)
                 clock = self._clocks.pop(run_id, None)
                 if clock is not None and clock.probe is not None:
                     clock.probe.cancel()
@@ -477,7 +515,7 @@ class HarnessRuntime:
         event = self._signals[run["id"]]
         started = time.monotonic()
         previous_duration = run["metrics"]["duration_ms"]
-        timeout = getattr(self.settings, f"{run['mode']}_timeout_seconds")
+        timeout = self._run_timeout(run)
         deadline = started + timeout
         self._clocks[run["id"]] = _RunClock(
             self.settings.authentication_timeout_seconds,
@@ -516,6 +554,9 @@ class HarnessRuntime:
             current = asyncio.current_task()
             if current is not None and current.cancelling():
                 raise
+        except ModelConnectionError as exc:
+            terminal = "partial" if run["evidence"] else "failed"
+            self._warn(run, str(exc))
         except Exception as exc:
             terminal = "partial" if run["evidence"] else "failed"
             run["warnings"].append(f"Исследование не завершено ({type(exc).__name__}).")
@@ -537,9 +578,32 @@ class HarnessRuntime:
                 (time.monotonic() - started) * 1000
             )
             self.store.save(principal.owner_id, run)
+            self.memory.record_outcome(
+                principal.owner_id, run, index_ids=sorted(self._run_scope(run))
+            )
             self.store.prune()
             if self._graph is not None:
                 await self._graph.prune()
+
+    def _run_timeout(self, run: dict[str, Any]) -> float:
+        profile = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
+        return float(getattr(self.settings, f"{run['mode']}_timeout_seconds") * profile.time_ratio)
+
+    @staticmethod
+    def _followup_calls(run: dict[str, Any]) -> int:
+        return max(0, int(run["metrics"]["source_calls"])
+                   - int(run["metrics"].get("bootstrap_calls", 0)))
+
+    @staticmethod
+    def _trace(run: dict[str, Any], name: str, args: Any, result: str) -> None:
+        # Store only identification fields. Shell commands, tokens and arbitrary
+        # remote tool arguments must not be copied into persistent diagnostics.
+        identifiers = {key: str(args[key])[:1000] for key in
+                       ("index_id", "document_id", "connection_id", "repository_id")
+                       if isinstance(args, dict) and key in args}
+        run["research_trace"] = [*run.get("research_trace", []), {
+            "name": name, "args": identifiers, "result": result[:1000],
+        }][-50:]
 
     def _now(self, run: dict[str, Any]) -> float:
         clock = self._clocks.get(run["id"])
@@ -637,7 +701,7 @@ class HarnessRuntime:
             for item in items:
                 if item.index_id not in run["index_ids"]:
                     raise ValueError("Tool evidence is outside run scope")
-                accepted += self._add_evidence(run, item, item.index_id)
+                accepted += self._add_evidence(run, item, item.index_id, fresh=True)
             return f"Получено подтверждений: {accepted}."
         except Exception as exc:
             message = f"Инструмент {name} недоступен ({type(exc).__name__})."
@@ -658,6 +722,7 @@ class HarnessRuntime:
         query: str,
         limit: int | None = None,
         deadline: float | None = None,
+        initial: bool = False,
     ) -> str:
         if event.is_set() or self.source is None:
             return "Вызов отменён либо источник отключён."
@@ -678,6 +743,8 @@ class HarnessRuntime:
                     self._warn(run, "Время поиска исчерпано; зарезервирован итоговый ответ.")
                     return "Время поиска исчерпано."
                 run["metrics"]["source_calls"] += 1
+                if initial:
+                    run["metrics"]["bootstrap_calls"] = run["metrics"].get("bootstrap_calls", 0) + 1
                 items = await asyncio.wait_for(
                     self.source.search(
                         query=query,
@@ -688,48 +755,71 @@ class HarnessRuntime:
                     ),
                     timeout,
                 )
-            accepted = sum(self._add_evidence(run, item, index_id) for item in items[:count])
+            accepted = sum(self._add_evidence(run, item, index_id, fresh=not initial)
+                           for item in items[:count])
+            if initial:
+                run.setdefault("coverage", {})[index_id] = {
+                    "status": "searched" if items else "empty", "count": len(items[:count]),
+                }
             return f"Получено подтверждений: {accepted}."
         except Exception as exc:
+            if initial:
+                run.setdefault("coverage", {})[index_id] = {"status": "failed", "count": 0}
             outcome = f"Поиск в {index_id} недоступен ({type(exc).__name__})."
             self._warn(run, outcome)
             self.memory.record_failure(
-                principal.owner_id, run, operation="search", index_ids=run["index_ids"]
+                principal.owner_id, run, operation="search", index_ids=[index_id]
             )
             return outcome
         finally:
-            self._checkpoint(principal, run, event)
+            self._checkpoint(principal, run, event, minimum_interval=0.15 if initial else 0)
 
     async def _read(
-        self, principal: Principal, run: dict[str, Any], event: Event, args: dict[str, Any]
+        self, principal: Principal, run: dict[str, Any], event: Event, args: dict[str, Any],
+        deadline: float | None = None,
     ) -> str:
         if event.is_set() or self.source is None:
             return "Вызов отменён либо источник отключён."
         run["metrics"]["source_calls"] += 1
         try:
+            timeout = self._source_timeout(run)
+            if deadline is not None:
+                timeout = min(timeout, max(0, deadline - self._now(run)))
             item = await asyncio.wait_for(
                 self.source.read(**args, principal=principal, cancel=event),
-                self._source_timeout(run),
+                timeout,
             )
+            run["metrics"]["document_reads"] = run["metrics"].get("document_reads", 0) + 1
             return (
                 "Документ прочитан; подтверждение включено в контекст."
-                if self._add_evidence(run, item, args["index_id"])
+                if self._add_evidence(run, item, args["index_id"], document=True)
                 else "Документ не включён: ограничение области доступа или бюджета."
             )
         except Exception as exc:
             outcome = f"Чтение документа недоступно ({type(exc).__name__})."
             self._warn(run, outcome)
             self.memory.record_failure(
-                principal.owner_id, run, operation="read", index_ids=run["index_ids"]
+                principal.owner_id, run, operation="read", index_ids=[args["index_id"]]
             )
             return outcome
         finally:
             self._checkpoint(principal, run, event)
 
-    def _checkpoint(self, principal: Principal, run: dict[str, Any], event: Event) -> None:
+    def _checkpoint(
+        self, principal: Principal, run: dict[str, Any], event: Event,
+        *, minimum_interval: float = 0,
+    ) -> None:
         if event.is_set() and run["status"] in ACTIVE:
             run["status"] = "cancelling"
+        now = time.monotonic()
+        first_evidence = bool(run["evidence"]) and not self._checkpoint_evidence_counts.get(
+            run["id"]
+        )
+        if not first_evidence and now - self._last_checkpoints.get(run["id"], 0) < minimum_interval:
+            return
         self.store.save(principal.owner_id, run)
+        self._last_checkpoints[run["id"]] = now
+        self._checkpoint_evidence_counts[run["id"]] = len(run["evidence"])
 
     def _source_timeout(self, run: dict[str, Any]) -> float:
         return (
@@ -738,7 +828,10 @@ class HarnessRuntime:
             else self.settings.source_timeout_seconds
         )
 
-    def _add_evidence(self, run: dict[str, Any], item: Evidence, index_id: str) -> bool:
+    def _add_evidence(
+        self, run: dict[str, Any], item: Evidence, index_id: str, *, document: bool = False,
+        fresh: bool = False,
+    ) -> bool:
         item = Evidence.model_validate(item)
         if item.index_id != index_id:
             self._warn(run, "Источник вернул evidence за пределами запрошенного индекса.")
@@ -746,8 +839,9 @@ class HarnessRuntime:
         payload = item.model_dump()
         profile = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
         text_limit = (
-            min(8000, self.settings.investigate_context_chars // 3)
+            min(32_000, self.settings.investigate_context_chars // 3)
             if item.kind == "tool_metadata"
+            else profile.document_chars if document
             else min(self.settings.evidence_chars, profile.evidence_chars)
         )
         payload["text"] = payload["text"][:text_limit]
@@ -755,14 +849,55 @@ class HarnessRuntime:
         payload["id"] = payload["id"][:1000]
         payload["url"] = payload["url"][:2000] if payload["url"] else None
         payload["revision"] = payload["revision"][:200] if payload["revision"] else None
+        if document:
+            payload["read_document"] = True
+            payload["text_truncated"] = len(item.text) > text_limit
         for i, existing in enumerate(run["evidence"]):
             if (existing["id"], existing["index_id"]) == (payload["id"], index_id):
+                if existing.get("read_document") and not document:
+                    return True
                 run["evidence"][i] = payload
                 return True
         if len(run["evidence"]) < self.settings.max_evidence:
             run["evidence"].append(payload)
             return True
+        counts: dict[str, int] = {}
+        for entry in run["evidence"]:
+            counts[entry["index_id"]] = counts.get(entry["index_id"], 0) + 1
+        # Do not let fast sources occupy every slot. Preserve at least one
+        # fragment per index when possible, and prioritize an explicitly read doc.
+        for i in range(len(run["evidence"]) - 1, -1, -1):
+            entry = run["evidence"][i]
+            if (index_id not in counts and counts[entry["index_id"]] > 1) or (
+                document and not entry.get("read_document") and entry["index_id"] == index_id
+            ) or (
+                fresh and entry["index_id"] == index_id and not entry.get("read_document")
+            ):
+                run["evidence"][i] = payload
+                return True
         return False
+
+    @staticmethod
+    def _ranked_evidence(run: dict[str, Any]) -> list[dict[str, Any]]:
+        words = set(re.findall(r"[\w-]{3,}", run["question"].casefold()))
+
+        def relevance(item: dict[str, Any]) -> int:
+            title = set(re.findall(r"[\w-]{3,}", item["title"].casefold()))
+            body = set(re.findall(r"[\w-]{3,}", item["text"].casefold()))
+            return len(words & title) * 4 + len(words & body)
+
+        ranked = sorted(run["evidence"],
+                        key=lambda item: (item.get("kind") == "tool_metadata",
+                                          bool(item.get("read_document")), relevance(item)),
+                        reverse=True)
+        first, remaining, indexes = [], [], set()
+        for item in ranked:
+            if item["index_id"] in indexes:
+                remaining.append(item)
+            else:
+                first.append(item)
+                indexes.add(item["index_id"])
+        return first + remaining
 
     async def _decide(
         self,
@@ -781,66 +916,134 @@ class HarnessRuntime:
         )
         allowed = {item["id"] for item in await self._indexes(principal)}
         memories = self.memory.retrieve(
-            principal.owner_id, run["question"], allowed, set(run["index_ids"])
+            principal.owner_id, run["question"], allowed, set(run["index_ids"]),
+            exclude_run_id=run["id"],
         )
         parent = self._parent_context(principal, run, allowed)
         if set(run.get("context_index_ids", [])) - allowed or any(
             item["index_id"] not in allowed for item in run["evidence"]
         ):
             raise ValueError("Source access changed during the investigation")
+        coverage = run.get("coverage", {})
         context: dict[str, Any] = {
+            "mode": run["mode"], "effort": run["effort"],
+            "stage": run["phase"],
             "sandbox_profile_id": run.get("sandbox_profile_id", ""),
             "allowed_indexes": [],
             "selected_index_count": len(run["index_ids"]),
             "index_catalog_truncated": False,
+            "coverage": {status: sum(item["status"] == status for item in coverage.values())
+                         for status in ("searched", "empty", "failed", "pending")},
             "evidence": [],
-            "prior_tool_attempts": exchange or [],
-            "history_question_not_evidence": parent["question"] if parent else None,
-            "history_answer_not_evidence": parent["answer"] if parent else None,
-            "private_notes_not_evidence": [
-                {key: item[key] for key in ("id", "title", "text", "kind")} for item in memories
-            ],
+            "evidence_total": len(run["evidence"]),
+            "prior_tool_attempts": [],
+            "history_question_not_evidence": None,
+            "history_answer_not_evidence": None,
+            "private_notes_not_evidence": [],
+            "remaining_followup_calls": max(0, profile.source_calls - self._followup_calls(run)),
         }
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": run["question"]},
         ]
-        tool_reserve = max(4500, len(json.dumps(tools, ensure_ascii=False)) + 1000)
-        remaining = maximum - len(json.dumps(messages, ensure_ascii=False)) - tool_reserve
-        for item in run["evidence"]:
-            catalog = list(dict.fromkeys([*context["allowed_indexes"], item["index_id"]]))
-            candidate = {
-                **context,
-                "allowed_indexes": catalog,
-                "evidence": [*context["evidence"], item],
-            }
-            if len(json.dumps(candidate, ensure_ascii=False)) > remaining:
-                self._warn(run, "Часть evidence не помещается в контекст модели.")
-                continue
-            context = candidate
-        catalog_budget = min(4000, max(0, remaining // 3))
-        for index_id in run["index_ids"]:
-            if index_id in context["allowed_indexes"]:
-                continue
-            catalog = [*context["allowed_indexes"], index_id]
-            candidate = {**context, "allowed_indexes": catalog}
-            if len(json.dumps(catalog, ensure_ascii=False)) > catalog_budget:
-                continue
-            if len(json.dumps(candidate, ensure_ascii=False)) <= remaining:
+        # Measure the actual serialized envelope, including a JSON context string
+        # nested in messages. Source code contains many quotes and newlines.
+        # Leave room for GigaCode/API adapter instructions and framing.
+        adapter_reserve = 1500
+        maximum = max(maximum, len(json.dumps(messages, ensure_ascii=False)) + 6500)
+        selected_tools: list[dict[str, Any]] = []
+
+        def fits(candidate: dict[str, Any], catalog: list[dict[str, Any]] | None = None) -> bool:
+            envelope = {"messages": [*messages, {
+                "role": "user", "content": json.dumps(candidate, ensure_ascii=False),
+            }], "tools": selected_tools if catalog is None else catalog}
+            return len(json.dumps(envelope, ensure_ascii=False)) + adapter_reserve <= maximum
+
+        for tool in tools:
+            proposed = [*selected_tools, tool]
+            if (len(json.dumps(proposed, ensure_ascii=False)) <= maximum // 3
+                    and fits(context, proposed)):
+                selected_tools = proposed
+        if len(selected_tools) < len(tools):
+            self._warn(run, "Часть описаний инструментов не помещается в контекст модели.")
+        tools = selected_tools
+        # Keep source routing before evidence; the model must be able to target
+        # sources with no initial hits, not only sources already present in context.
+        for index in run["index_ids"]:
+            candidate = {**context, "allowed_indexes": [*context["allowed_indexes"], index]}
+            if (len(json.dumps(candidate["allowed_indexes"], ensure_ascii=False)) <= maximum // 5
+                    and fits(candidate)):
                 context = candidate
-        if len(context["allowed_indexes"]) < len(run["index_ids"]):
-            context["index_catalog_truncated"] = True
-            self._warn(
-                run,
-                "Каталог индексов для модели ограничен контекстом; "
-                "полная выбранная область сохранена в запуске.",
-            )
-        messages.append({"role": "user", "content": json.dumps(context, ensure_ascii=False)})
-        if len(json.dumps(messages, ensure_ascii=False)) > maximum - tool_reserve + 500:
-            raise ValueError("Input context budget exceeded")
-        used = {item["id"]: item for item in run.get("memory_used", [])}
+        context["index_catalog_truncated"] = len(context["allowed_indexes"]) < len(run["index_ids"])
+        if parent:
+            candidate = {**context, "history_question_not_evidence": parent["question"],
+                         "history_answer_not_evidence": parent["answer"]}
+            if fits(candidate):
+                context = candidate
+        included_memories = []
         for item in memories:
-            used[item["id"]] = {"id": item["id"], "title": item["title"]}
+            note = {key: item.get(key) for key in
+                    ("id", "title", "text", "kind", "status", "origin", "feedback", "outcome")}
+            candidate = {**context, "private_notes_not_evidence": [
+                *context["private_notes_not_evidence"], note,
+            ]}
+            if fits(candidate):
+                context = candidate
+                included_memories.append(item)
+        # Final synthesis receives previous failures too. Preserve the latest
+        # diagnostics first when a large tool history must be compacted.
+        attempts = run.get("research_trace", []) or exchange or []
+        for item in reversed(attempts[-30:]):
+            candidate = {**context, "prior_tool_attempts": [item, *context["prior_tool_attempts"]]}
+            if (len(json.dumps(candidate["prior_tool_attempts"], ensure_ascii=False))
+                    <= maximum // 6
+                    and fits(candidate)):
+                context = candidate
+        # First represent the most relevant documents across different indexes,
+        # then expand their text. Arrival order must not decide what the model sees.
+        ranked = self._ranked_evidence(run)
+        originals: list[dict[str, Any]] = []
+        for item in ranked:
+            metadata = item.get("kind") == "tool_metadata"
+            compact = {**item, "text": item["text"] if metadata else item["text"][:500]}
+            compact["context_truncated"] = len(compact["text"]) < len(item["text"])
+            candidate = {**context, "evidence": [*context["evidence"], compact]}
+            if ((metadata or len(json.dumps(candidate["evidence"], ensure_ascii=False))
+                 < maximum // 2)
+                    and fits(candidate)):
+                context = candidate
+                originals.append(item)
+        for position, item in enumerate(originals):
+            small = context["evidence"][position]
+            low, high = len(small["text"]), len(item["text"])
+            # Binary-search the exact fit rather than discarding a long document.
+            while low < high:
+                length = (low + high + 1) // 2
+                expanded = {**item, "text": item["text"][:length],
+                            "context_truncated": length < len(item["text"])}
+                evidence = list(context["evidence"])
+                evidence[position] = expanded
+                if fits({**context, "evidence": evidence}):
+                    low = length
+                else:
+                    high = length - 1
+            context["evidence"][position] = {**item, "text": item["text"][:low]}
+            if low < len(item["text"]):
+                context["evidence"][position]["context_truncated"] = True
+        run["context_summary"] = {
+            "evidence_available": len(run["evidence"]),
+            "evidence_included": len(context["evidence"]),
+            "documents_shortened": sum(
+                bool(item.get("context_truncated")) for item in context["evidence"]
+            ),
+            "tools_available": len(tools),
+        }
+        messages.append({"role": "user", "content": json.dumps(context, ensure_ascii=False)})
+        used = {item["id"]: item for item in run.get("memory_used", [])}
+        for item in included_memories:
+            used[item["id"]] = {
+                key: item.get(key) for key in ("id", "title", "status", "origin", "feedback")
+            }
             run["context_index_ids"] = sorted(
                 set(run.get("context_index_ids", [])) | set(item["index_ids"])
             )
@@ -876,8 +1079,13 @@ class HarnessRuntime:
             signal.set()
             await self._cleanup(operation, run)
             raise
+        except ValueError:
+            raise ModelDecisionError("Модель вернула некорректный формат решения.") from None
         if not isinstance(result, dict) or not isinstance(result.get("tool_calls", []), list):
-            raise ValueError("Invalid model decision")
+            raise ModelDecisionError("Модель вернула некорректный формат решения.")
+        self.memory.record_usage(
+            principal.owner_id, [item["id"] for item in included_memories], run["id"]
+        )
         return result
 
     async def _synthesize(self, principal: Principal, run: dict[str, Any], event: Event) -> None:

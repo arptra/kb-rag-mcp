@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import ssl
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -19,6 +21,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from agent_harness.model_connection import ModelConnection, ModelRouter
 from agent_harness.tls_credentials import TLSCredentialStore, TLSCredentialUpload
 from agent_harness.tls_http import create_tls_routes
 
@@ -215,3 +218,93 @@ async def test_tls_http_manager_only_safe_metadata_and_in_use_delete(
         assert (await client.delete("/api/credentials/tls/gateway")).status_code == 409
         referenced.clear()
         assert (await client.delete("/api/credentials/tls/gateway")).status_code == 200
+
+
+def test_uploaded_root_first_client_chain_is_reordered_for_openssl(
+    tmp_path: Path, materials: dict[str, str]
+) -> None:
+    store = TLSCredentialStore(tmp_path)
+    value = upload(materials).model_copy(
+        update={"client_certificate": materials["ca_certificate"] + materials["client_certificate"]}
+    )
+    store.save(value)
+    persisted = json.loads((store.directory / "gateway.json").read_text())
+    assert persisted["client_certificate"].startswith(materials["client_certificate"])
+    assert store.ssl_context("gateway").check_hostname
+
+
+async def test_keyless_model_probe_and_completion_perform_real_mutual_tls_requests(
+    tmp_path: Path, materials: dict[str, str], monkeypatch: Any
+) -> None:
+    store = TLSCredentialStore(tmp_path)
+    store.save(upload(materials))
+    cert, key = tmp_path / "server.pem", tmp_path / "server-key.pem"
+    cert.write_text(materials["server_certificate"])
+    key.write_text(materials["server_key"])
+    key.chmod(0o600)
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(cert, key)
+    server_context.load_verify_locations(cadata=materials["ca_certificate"])
+    server_context.verify_mode = ssl.CERT_REQUIRED
+    requests: list[tuple[bytes, dict[str, Any]]] = []
+
+    async def gateway(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            headers = await reader.readuntil(b"\r\n\r\n")
+            assert writer.get_extra_info("peercert")
+            assert b"authorization:" not in headers.lower()
+            assert headers.startswith(b"POST /v1/chat/completions HTTP/1.1")
+            content_length = next(
+                int(line.split(b":", 1)[1])
+                for line in headers.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            )
+            body = json.loads(await reader.readexactly(content_length))
+            assert "model" not in body
+            requests.append((headers, body))
+            response = json.dumps({"choices": [{"message": {"content": "OK"}}]}).encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                + str(len(response)).encode()
+                + b"\r\nConnection: close\r\n\r\n"
+                + response
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
+    server = await asyncio.start_server(gateway, "127.0.0.1", 0, ssl=server_context)
+    async with server:
+        port = server.sockets[0].getsockname()[1]
+        router = ModelRouter(tmp_path, None)
+        settings = ModelConnection(
+            provider="openai",
+            base_url=f"https://localhost:{port}/v1/chat/completions",
+            tls_bundle_id="gateway",
+            timeout_seconds=5,
+        )
+        router.store.save(settings)
+        assert (await router.probe())["available"] is True
+        assert (
+            await router.decide(
+                messages=[{"role": "user", "content": "Explain the system"}],
+                tools=[],
+                cancel=Event(),
+                max_input_chars=10000,
+            )
+        )["content"] == "OK"
+        assert len(requests) == 2
+        assert requests[0][1]["messages"] == [{"role": "user", "content": "Reply with OK."}]
+        assert requests[1][1]["messages"][0]["content"] == "Explain the system"
+
+        # An uploaded CA alone cannot authenticate to the corporate mTLS gateway.
+        store.save(
+            TLSCredentialUpload(
+                id="ca-only", name="Trust only", ca_certificate=materials["ca_certificate"]
+            )
+        )
+        result = await router.probe(settings.model_copy(update={"tls_bundle_id": "ca-only"}))
+        assert result["available"] is False
+        assert len(requests) == 2

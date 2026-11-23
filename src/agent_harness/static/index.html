@@ -60,6 +60,7 @@
                   <label class="effort-select" for="effort">Усилие <select id="effort" name="effort"><option value="low">Низкое</option><option value="medium" selected>Обычное</option><option value="high">Высокое</option></select></label>
                 </div>
                 <div class="composer-environment"><label class="environment-select" for="sandbox-profile">Среда выполнения<select id="sandbox-profile" name="sandbox_profile_id" disabled><option value="">По умолчанию</option></select></label><p id="environment-description">Песочница используется в исследовании.</p></div>
+                <p id="effort-description" class="effort-description">Проверяем все выбранные базы знаний. Усилие определяет глубину разбора.</p>
                 <div class="composer-footer"><p id="mode-description">Базы знаний, без запуска песочниц.</p><button id="submit-question" class="primary-button" type="submit"><span>Отправить</span><span aria-hidden="true">↗</span></button></div>
               </form>
               <div class="composer-hint"><span>⌘ / Ctrl + Enter — отправить</span><span id="character-count">0 / 8 000</span></div>
@@ -79,11 +80,18 @@
                 <button id="cancel-run" class="text-button" type="button" hidden>Остановить</button>
               </div>
               <div id="progress-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+              <p id="run-coverage" class="run-coverage" hidden></p>
               <div id="run-warnings" class="run-warnings" hidden></div>
               <div id="answer" class="answer"></div>
               <div id="answer-placeholder" class="answer-placeholder" hidden><p>Сведения появятся здесь.<br><span>Найденные материалы доступны в блоке подтверждений уже во время работы.</span></p></div>
               <div id="run-memory-used" class="run-memory-used" hidden></div>
               <p id="run-environment" class="run-environment" hidden></p>
+              <section id="run-feedback" class="run-feedback" aria-labelledby="run-feedback-title" hidden>
+                <h3 id="run-feedback-title">Ответ помог?</h3>
+                <label class="settings-field"><span class="settings-field-label">Комментарий · необязательно</span><textarea id="run-feedback-comment" rows="2" maxlength="1000" placeholder="Что получилось или что нужно исправить?"></textarea></label>
+                <div class="resource-actions"><button id="feedback-helpful" class="secondary-button" type="button" aria-pressed="false">Помогло</button><button id="feedback-unhelpful" class="secondary-button" type="button" aria-pressed="false">Не помогло</button></div>
+                <p id="run-feedback-status" class="settings-field-help" role="status" aria-live="polite"></p>
+              </section>
               <div class="run-footer"><span id="run-metrics" class="muted"></span><div class="run-actions"><button id="remember-run" class="text-button" type="button" hidden>Запомнить уточнение</button><button id="resume-run" class="secondary-button" type="button" hidden>Продолжить с выбранными источниками</button><button id="deepen-run" class="secondary-button" type="button" hidden>Исследовать глубже <span aria-hidden="true">↗</span></button><button id="delete-run" class="text-button" type="button">Удалить запрос</button></div></div>
             </section>
           </div>
@@ -191,14 +199,14 @@
                 <div class="settings-grid model-connection-fields">
                   <label class="settings-field wide"><span class="settings-field-label">Способ подключения</span><select id="model-provider"><option value="gigacode">GigaCode · исполнитель</option><option value="openai">Напрямую · OpenAI-совместимый API</option></select></label>
                   <div id="direct-model-fields" class="settings-grid wide" hidden>
-                    <label class="settings-field wide"><span class="settings-field-label">Базовый адрес API</span><input id="direct-model-url" type="url" maxlength="2000" autocomplete="off" placeholder="https://model.example.ru/v1"><small class="settings-field-help">HTTPS-адрес без токена и пароля.</small></label>
-                    <label class="settings-field wide"><span class="settings-field-label">Название модели в API</span><input id="direct-model-name" maxlength="200" autocomplete="off" placeholder="model-name"></label>
-                    <label class="settings-field wide"><span class="settings-field-label">Имя переменной с API-ключом на сервере</span><input id="direct-model-token" maxlength="128" pattern="[A-Z][A-Z0-9_]{0,127}" autocomplete="off" placeholder="MODEL_API_KEY"><small class="settings-field-help">Только имя переменной. Сам API-ключ здесь не сохраняется.</small></label>
+                    <label class="settings-field wide"><span class="settings-field-label">Адрес API модели</span><input id="direct-model-url" type="url" maxlength="2000" autocomplete="off" placeholder="https://model.example.ru/v1/chat/completions"><small class="settings-field-help">Полный HTTPS-адрес запроса /chat/completions или базовый адрес /v1. Проверка отправит простой запрос модели по этому адресу.</small></label>
+                    <label class="settings-field wide"><span class="settings-field-label">Название модели · необязательно</span><input id="direct-model-name" maxlength="200" autocomplete="off" placeholder="Если модель уже выбрана адресом, оставьте пустым"></label>
+                    <label class="settings-field wide"><span class="settings-field-label">Переменная с API-ключом · необязательно</span><input id="direct-model-token" maxlength="128" pattern="[A-Z][A-Z0-9_]{0,127}" autocomplete="off" placeholder="Для доступа только по сертификатам оставьте пустым"><small class="settings-field-help">Нужно только для API с ключом. Укажите имя переменной на сервере, например MODEL_API_KEY.</small></label>
                     <label class="settings-field wide"><span class="settings-field-label">Сертификаты подключения</span><select id="direct-model-tls"><option value="">Системные доверенные сертификаты</option></select></label>
                     <label class="settings-field"><span class="settings-field-label">Ожидание ответа, секунды</span><input id="direct-model-timeout" type="number" min="5" max="300" value="60"></label>
                   </div>
                 </div>
-                <div class="resource-actions"><button id="model-connection-save" class="secondary-button" type="button">Сохранить подключение</button><button id="model-connection-probe" class="text-button" type="button">Проверить подключение</button></div>
+                <div class="resource-actions"><button id="model-connection-probe" class="secondary-button" type="button">Проверить запросом</button><button id="model-connection-save" class="text-button" type="button">Сохранить подключение</button></div>
                 <p id="model-connection-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
               </div>
               <div class="settings-section-heading tls-section-heading"><div><h3>Сертификаты TLS</h3><p>Корпоративный центр сертификации и клиентская пара для mTLS, если сервер модели их требует.</p></div><button id="tls-new" class="secondary-button" type="button">Добавить сертификаты</button></div>
@@ -224,16 +232,17 @@
     </dialog>
 
     <dialog id="memory-dialog" class="memory-dialog" aria-labelledby="memory-title">
-      <header class="dialog-heading"><div><h2 id="memory-title">Память Harness</h2><p>Ваши уточнения помогают в следующих похожих запросах. Источники проверяются заново.</p></div><button id="memory-close" class="icon-button" type="button" aria-label="Закрыть память">×</button></header>
+      <header class="dialog-heading"><div><h2 id="memory-title">Память Harness</h2><p>После запросов здесь автоматически появляются опыт и уроки. Они помогают разбирать похожие вопросы, а источники проверяются заново.</p></div><button id="memory-close" class="icon-button" type="button" aria-label="Закрыть память">×</button></header>
       <div class="memory-toolbar"><label class="settings-switch"><input id="memory-enabled" type="checkbox" role="switch"><span>Использовать мою память</span></label><button id="memory-new" class="secondary-button" type="button">Добавить запись</button></div>
-      <p class="settings-field-help">Это сохранённые подсказки, а не обучение модели. Предложения после ошибок остаются черновиками, пока вы их не подтвердите.</p>
+      <p class="settings-field-help">Автоматический опыт учитывается как неподтверждённая подсказка. Оценки «Помогло» и «Не помогло» уточняют, что использовать в будущем. Проверенные заметки можно подтвердить вручную. Счётчик показывает, сколько раз запись использовалась в других запросах.</p>
+      <p id="memory-summary" class="memory-summary"></p>
       <p id="memory-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
       <div id="memory-error" class="settings-error" role="alert" hidden></div>
       <form id="memory-editor" class="settings-resource memory-editor" hidden>
         <h3 id="memory-editor-title">Новая запись</h3>
         <div class="settings-grid">
           <label class="settings-field wide"><span class="settings-field-label">Название</span><input id="memory-name" maxlength="160" required autocomplete="off"></label>
-          <label class="settings-field"><span class="settings-field-label">Тип записи</span><select id="memory-kind"><option value="note">Заметка</option><option value="correction">Уточнение ответа</option><option value="lesson">Урок из ошибки</option></select></label>
+          <label class="settings-field"><span class="settings-field-label">Тип записи</span><select id="memory-kind"><option value="note">Заметка</option><option value="correction">Уточнение ответа</option><option value="lesson">Урок из ошибки</option><option value="case">Опыт решения</option></select></label>
           <label class="settings-field wide"><span class="settings-field-label">Что нужно учитывать в будущем</span><textarea id="memory-text" rows="5" maxlength="2400" required placeholder="Укажите проверенное уточнение, рабочий способ или причину ошибки."></textarea></label>
           <fieldset class="memory-sources wide"><legend>Связанные источники</legend><div id="memory-sources" class="memory-source-list"></div><p class="settings-field-help">Запись используется только в доступной вам области поиска.</p></fieldset>
           <label class="memory-confirm wide"><input id="memory-confirmed" type="checkbox"><span>Подтверждаю запись: использовать её в похожих запросах<small>Без подтверждения запись сохранится как черновик.</small></span></label>
@@ -241,7 +250,7 @@
         <div class="resource-actions"><button id="memory-cancel" class="text-button" type="button">Отмена</button><button id="memory-save" class="secondary-button" type="submit">Сохранить запись</button></div>
       </form>
       <div id="memory-list" class="settings-items"></div>
-      <p id="memory-empty" class="settings-empty">Пока ничего не запомнено. Можно добавить запись или сохранить уточнение к ответу.</p>
+      <p id="memory-empty" class="settings-empty">Память появится автоматически после завершения запроса. Вы также можете добавить проверенную заметку.</p>
     </dialog>
 
     <dialog id="delete-dialog" class="auth-dialog" aria-labelledby="delete-title">

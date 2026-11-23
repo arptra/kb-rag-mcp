@@ -37,13 +37,17 @@ def create_model_routes(
                 parsed = ModelConnection.model_validate_json(await read_body(request))
             except (ValueError, ValidationError):
                 raise HTTPException(
-                    400, "Проверьте адрес API, имя модели и настройки подключения."
+                    400, "Проверьте HTTPS-адрес API и настройки подключения."
                 ) from None
             if parsed.tls_bundle_id:
                 try:
-                    await asyncio.to_thread(certificates.get, parsed.tls_bundle_id)
+                    await asyncio.to_thread(certificates.ssl_context, parsed.tls_bundle_id)
                 except KeyError:
                     raise HTTPException(400, "Выбранный сертификат не найден.") from None
+                except (ValueError, OSError):
+                    raise HTTPException(
+                        400, "Ошибка загрузки выбранных TLS-сертификатов. Проверьте набор."
+                    ) from None
             # Keep final busy check and config commit in one event-loop turn. A run
             # must not enter between the check and publication of a new endpoint.
             if busy():
@@ -59,9 +63,18 @@ def create_model_routes(
 
     async def probe(request: Request) -> Response:
         await access(request)
-        if (await read_body(request)).strip() not in {b"", b"{}"}:
-            raise HTTPException(400, "Probe uses saved settings only")
-        return JSONResponse(await router.probe(), headers={"Cache-Control": "no-store"})
+        body = (await read_body(request)).strip()
+        candidate = None
+        if body not in {b"", b"{}"}:
+            try:
+                candidate = ModelConnection.model_validate_json(body)
+            except (ValueError, ValidationError):
+                raise HTTPException(
+                    400, "Проверьте HTTPS-адрес API и настройки подключения."
+                ) from None
+        # Testing a candidate must neither replace the active model nor interrupt
+        # investigations. Empty bodies retain the previous saved-settings contract.
+        return JSONResponse(await router.probe(candidate), headers={"Cache-Control": "no-store"})
 
     return [
         Route("/api/model/connection", settings, methods=["GET", "PUT"]),

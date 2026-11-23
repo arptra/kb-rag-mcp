@@ -244,3 +244,141 @@ async def test_api_token_echo_in_tool_argument_keys_is_redacted(
     )
     assert "secret-value" not in json.dumps(result)
     assert result["tool_calls"][0]["args"] == {"[redacted]": "safe"}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://models.test/v1",
+        "https://models.test/v1/",
+        "https://models.test/v1/chat/completions",
+        "https://models.test/v1/chat/completions/",
+    ],
+)
+async def test_keyless_gateway_accepts_base_or_complete_endpoint_without_model_name(
+    tmp_path: Path, url: str
+) -> None:
+    router = ModelRouter(tmp_path, None)
+    settings = ModelConnection(provider="openai", base_url=" " + url + " ")
+    seen = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.method == "POST"
+        assert request.url == "https://models.test/v1/chat/completions"
+        assert "authorization" not in request.headers
+        payload = json.loads(request.content)
+        assert "model" not in payload
+        assert payload["messages"] == [{"role": "user", "content": "Reply with OK."}]
+        assert payload["stream"] is False
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]})
+
+    router.transport = httpx.MockTransport(upstream)
+    assert (await router.probe(settings))["available"] is True
+    assert router.store.load().provider == "gigacode"
+    assert len(seen) == 1
+
+
+def test_model_probe_uses_unsaved_settings_without_switching_active_connection(
+    tmp_path: Path,
+) -> None:
+    async def authenticate(request: Request) -> Principal:
+        return Principal(request.headers.get("x-user", "reader"))
+
+    async def manager(request: Request) -> bool:
+        return request.headers.get("x-user") == "admin"
+
+    runtime = HarnessRuntime(HarnessSettings(enabled=True, state_dir=tmp_path), model=Runner())
+    app = create_app(runtime, authenticate, authorize_model_manager=manager)
+    assert isinstance(runtime.model, ModelRouter)
+    seen = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.url == "https://models.test/v1/chat/completions"
+        assert "authorization" not in request.headers
+        assert "tools" not in json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]})
+
+    runtime.model.transport = httpx.MockTransport(upstream)
+    payload = {"provider": "openai", "base_url": "https://models.test/v1/chat/completions"}
+    endpoint = "/api/model/connection/probe"
+    with TestClient(app) as client:
+        assert client.post(endpoint, json=payload).status_code == 403
+        admin = {"x-user": "admin"}
+        assert (
+            client.post(endpoint, json=payload, headers={**admin, "origin": "https://evil.test"})
+        ).status_code == 403
+        runtime._signals["busy-run"] = Event()
+        response = client.post(endpoint, json=payload, headers=admin)
+        runtime._signals.clear()
+        assert response.status_code == 200 and response.json()["available"] is True
+        assert runtime.model.store.load().provider == "gigacode"
+        assert len(seen) == 1
+        assert client.put("/api/model/connection", json=payload, headers=admin).status_code == 200
+        assert client.post(endpoint, json={}, headers=admin).json()["available"] is True
+        assert len(seen) == 2
+        assert (
+            client.post(endpoint, json={"base_url": "file:///private"}, headers=admin).status_code
+            == 400
+        )
+
+
+@pytest.mark.parametrize(
+    "error, message",
+    [
+        (httpx.ConnectError("SECRET network credentials"), "Соединение не установлено"),
+        (httpx.ProxyError("SECRET proxy credentials"), "HTTPS_PROXY"),
+        (httpx.ReadTimeout("SECRET upstream"), "не ответил вовремя"),
+    ],
+)
+async def test_probe_reports_safe_actionable_network_errors(
+    tmp_path: Path, error: httpx.HTTPError, message: str
+) -> None:
+    router = ModelRouter(tmp_path, None)
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        raise error
+
+    router.transport = httpx.MockTransport(upstream)
+    result = await router.probe(
+        ModelConnection(provider="openai", base_url="https://model.test/v1")
+    )
+    assert result["available"] is False
+    assert message in result["message"]
+    assert "SECRET" not in json.dumps(result)
+
+
+async def test_missing_tls_identity_is_not_reported_as_invalid_model_response(
+    tmp_path: Path,
+) -> None:
+    router = ModelRouter(tmp_path, None)
+    router.store.save(
+        ModelConnection(
+            provider="openai", base_url="https://model.test/v1", tls_bundle_id="missing"
+        )
+    )
+    result = await router.probe()
+    assert not result["available"] and "сертификат" in result["message"]
+    with pytest.raises(ModelConnectionError, match="сертификат"):
+        await router.decide(messages=[], tools=[], cancel=Event(), max_input_chars=10000)
+
+
+async def test_model_uses_environment_proxy_configuration(tmp_path: Path, monkeypatch: Any) -> None:
+    router = ModelRouter(tmp_path, None)
+    captured = []
+    real_client = httpx.AsyncClient
+
+    def client(**kwargs: Any) -> httpx.AsyncClient:
+        captured.append(kwargs)
+        return real_client(**kwargs)
+
+    monkeypatch.setattr("agent_harness.model_connection.httpx.AsyncClient", client)
+    router.transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"choices": [{"message": {"content": "OK"}}]})
+    )
+    assert (
+        await router.probe(ModelConnection(provider="openai", base_url="https://model.test/v1"))
+    )["available"]
+    assert captured[0]["trust_env"] is True
+    assert captured[0]["verify"].verify_mode == ssl.CERT_REQUIRED

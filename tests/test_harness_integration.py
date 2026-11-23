@@ -275,3 +275,50 @@ def test_portable_package_has_no_host_imports() -> None:
                 assert all(alias.name.split(".")[0] not in forbidden for alias in node.names), path
             elif isinstance(node, ast.ImportFrom) and node.module:
                 assert node.module.split(".")[0] not in forbidden, path
+
+
+async def test_harness_reads_original_document_beyond_portal_excerpt(settings_factory: Any) -> None:
+    from types import SimpleNamespace
+
+    from agent_harness.contracts import Principal
+    from corporate_kb.harness_integration import CatalogSource
+    from corporate_kb.mcp.tools import KnowledgeTools
+
+    settings, service = _service(settings_factory)
+    full_text = '# Deep payments\n\n' + ('Payment operation and checks.\n' * 500)
+    full_text += '\nTAIL_VERIFIED_BEHAVIOR: rollback after a rejected transaction.\n'
+    (settings.knowledge_dir / 'deep.md').write_text(full_text, encoding='utf-8')
+    service.build_index(force=True)
+    documents = service.search('TAIL_VERIFIED_BEHAVIOR rollback', top_k=10)
+    document_id = next(item.document_id for item in documents if item.title == 'Deep payments')
+    tools = KnowledgeTools(service)
+    compressed = tools.get_document(document_id=document_id)
+    assert len(compressed['content']) < len(full_text)
+    authorized = True
+
+    async def check(principal: Principal) -> bool:
+        return authorized
+
+    catalog = SimpleNamespace(service_for=lambda index: service, tools_for=lambda index: tools)
+    source = CatalogSource(catalog, check)
+    actual = await source.read(document_id=document_id, index_id='main',
+                               principal=Principal('alice'), cancel=Event())
+    assert 'TAIL_VERIFIED_BEHAVIOR' in actual.text
+    assert len(actual.text) > 12_000
+    authorized = False
+    with pytest.raises(PermissionError):
+        await source.read(document_id=document_id, index_id='main',
+                          principal=Principal('alice'), cancel=Event())
+
+
+def test_distinct_search_chunks_keep_document_id_for_reading() -> None:
+    from corporate_kb.harness_integration import CatalogSource
+
+    first = CatalogSource._evidence({
+        'document_id': 'doc', 'chunk_id': 'chunk-1', 'excerpt': 'First relevant section',
+    }, 'main')
+    second = CatalogSource._evidence({
+        'document_id': 'doc', 'chunk_id': 'chunk-2', 'excerpt': 'Second relevant section',
+    }, 'main')
+    assert first.id != second.id
+    assert first.document_id == second.document_id == 'doc'

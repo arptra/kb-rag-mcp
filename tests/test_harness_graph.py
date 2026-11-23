@@ -112,6 +112,7 @@ async def test_real_langgraph_nodes_checkpoints_and_delete(tmp_path: Path) -> No
             "__start__",
             "prepare",
             "collect",
+            "inspect",
             "decide",
             "tools",
             "synthesize",
@@ -185,7 +186,7 @@ async def test_resume_rechecks_access_and_never_resets_exhausted_budget(tmp_path
         with pytest.raises(ValueError, match="Доступ"):
             await second.resume(OWNER, run["id"])
         record = second.store.get(OWNER.owner_id, run["id"])
-        record["metrics"]["model_calls"] = 3
+        record["metrics"]["model_calls"] = 4
         second.store.save(OWNER.owner_id, record)
         with pytest.raises(ValueError, match="бюджет"):
             await second.resume(OWNER, run["id"], ["connection:test"])

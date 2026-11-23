@@ -14,7 +14,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
-from agent_harness.contracts import Principal
+from agent_harness.contracts import ModelDecisionError, Principal
 from agent_harness.policy import BUDGETS, QUICK_BUDGETS, TOOLS, validate_call
 
 if TYPE_CHECKING:
@@ -46,16 +46,18 @@ class HarnessGraph:
         builder = StateGraph(GraphState, context_schema=ExecutionContext)
         builder.add_node("prepare", self.prepare)
         builder.add_node("collect", self.collect)
+        builder.add_node("inspect", self.inspect)
         builder.add_node("decide", self.decide)
         builder.add_node("tools", self.tools)
         builder.add_node("synthesize", self.synthesize)
         builder.add_edge(START, "prepare")
-        for name in ("prepare", "collect", "decide", "tools"):
+        for name in ("prepare", "collect", "inspect", "decide", "tools"):
             builder.add_conditional_edges(
                 name,
                 self.route,
                 {
                     "collect": "collect",
+                    "inspect": "inspect",
                     "decide": "decide",
                     "tools": "tools",
                     "synthesize": "synthesize",
@@ -150,7 +152,7 @@ class HarnessGraph:
     def _reserve_deadline(self, context: ExecutionContext) -> float:
         settings = self.engine.settings
         return context.deadline - min(
-            settings.final_reserve_seconds, settings.investigate_timeout_seconds / 4
+            settings.final_reserve_seconds, self.engine._run_timeout(context.run) / 4
         )
 
     async def prepare(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
@@ -202,13 +204,8 @@ class HarnessGraph:
             engine._warn(
                 run, "Быстрый ответ использует RAG. Код, MCP и A2A доступны в исследовании."
             )
-        remaining = max(0, budget.source_calls - run["metrics"]["source_calls"])
-        limit = min(
-            remaining, max(1, budget.source_calls // 2) if external else budget.source_calls
-        )
-        bootstrap = knowledge[:limit] if engine.source else []
-        if len(bootstrap) < len(knowledge):
-            engine._warn(run, "Часть индексов не опрошена: исчерпан бюджет источников.")
+        bootstrap = knowledge if engine.source else []
+        run["coverage"] = {index: {"status": "pending", "count": 0} for index in knowledge}
         await asyncio.gather(
             *(
                 engine._search(
@@ -217,9 +214,10 @@ class HarnessGraph:
                     event,
                     index,
                     query[:8000],
-                    deadline=context.deadline - engine.settings.quick_timeout_seconds / 3
+                    deadline=context.deadline - engine.settings.quick_timeout_seconds * 2 / 3
                     if run["mode"] == "quick"
-                    else None,
+                    else self._reserve_deadline(context),
+                    initial=True,
                 )
                 for index in bootstrap
             )
@@ -235,7 +233,9 @@ class HarnessGraph:
         if event.is_set():
             return self._result(context, "done")
         await engine._refresh_authentication(run)
-        if not model["available"] or (not run["evidence"] and not external):
+        if not model["available"] or (
+            not run["evidence"] and not external and run["mode"] == "quick"
+        ):
             run["status"] = "partial"
             engine._warn(
                 run,
@@ -246,12 +246,38 @@ class HarnessGraph:
             return self._result(context, "done")
         return self._result(
             context,
-            "synthesize" if run["mode"] == "quick" else "decide",
+            "synthesize" if run["mode"] == "quick" else "inspect",
             external=external,
             knowledge_ids=knowledge,
             exchange=[],
             calls=[],
         )
+
+    async def inspect(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
+        """Open promising documents before accepting a snippet-only conclusion."""
+        context = self._context(state, runtime)
+        engine, run = self.engine, context.run
+        run["phase"] = "reading"
+        budget = BUDGETS[run["effort"]]
+        candidates = engine._ranked_evidence(run)
+        count = 0
+        for item in candidates:
+            if (count >= budget.document_reads or context.cancel.is_set()
+                    or engine._now(run) >= self._reserve_deadline(context)
+                    or engine._followup_calls(run) >= budget.source_calls):
+                break
+            if item["index_id"] not in state.get("knowledge_ids", []) or item.get("read_document"):
+                continue
+            args = {"document_id": item.get("document_id") or item["id"],
+                    "index_id": item["index_id"]}
+            if any(entry.get("read_document") and entry["id"] == args["document_id"]
+                   and entry["index_id"] == args["index_id"] for entry in run["evidence"]):
+                continue
+            result = await engine._read(context.principal, run, context.cancel, args,
+                                        deadline=self._reserve_deadline(context))
+            engine._trace(run, "read_document", args, result)
+            count += 1
+        return self._result(context, "decide")
 
     async def decide(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
         context = self._context(state, runtime)
@@ -263,7 +289,7 @@ class HarnessGraph:
             engine._now(run) >= self._reserve_deadline(context)
             or run["metrics"]["model_calls"] >= budget.model_calls - 1
             or run["metrics"]["tool_calls"] >= budget.tool_calls
-            or run["metrics"]["source_calls"] >= budget.source_calls
+            or engine._followup_calls(run) >= budget.source_calls
         ):
             engine._warn(run, "Исследование ограничено бюджетом; итог по собранным источникам.")
             return self._result(context, "synthesize")
@@ -285,6 +311,15 @@ class HarnessGraph:
                 raise
             engine._warn(run, "Время поиска исчерпано; зарезервирован итоговый ответ.")
             return self._result(context, "synthesize")
+        except ModelDecisionError:
+            run["metrics"]["decision_errors"] = run["metrics"].get("decision_errors", 0) + 1
+            engine._trace(run, "model_response", {},
+                          "Некорректный формат предыдущего решения. Верните content и tool_calls; "
+                          "используйте только перечисленные инструменты и их схемы аргументов.")
+            if run["metrics"]["decision_errors"] <= 2:
+                return self._result(context, "decide")
+            engine._warn(run, "Модель не смогла сформировать корректные действия; готовим итог.")
+            return self._result(context, "synthesize")
         calls = decision.get("tool_calls", [])
         if not calls:
             return self._result(context, "done" if engine._answer(run, decision) else "synthesize")
@@ -292,7 +327,7 @@ class HarnessGraph:
             context,
             "tools",
             calls=calls[: budget.tool_calls - run["metrics"]["tool_calls"]],
-            exchange=[],
+            exchange=state.get("exchange", []),
         )
 
     async def tools(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
@@ -306,7 +341,7 @@ class HarnessGraph:
             not calls
             or engine._now(run) >= self._reserve_deadline(context)
             or run["metrics"]["tool_calls"] >= budget.tool_calls
-            or run["metrics"]["source_calls"] >= budget.source_calls
+            or engine._followup_calls(run) >= budget.source_calls
         ):
             return self._result(context, "decide", calls=[])
         call = calls.pop(0)
@@ -330,9 +365,11 @@ class HarnessGraph:
                         validated["index_id"],
                         validated["query"],
                         validated["limit"],
+                        deadline=self._reserve_deadline(context),
                     )
                     if name == "search_knowledge"
-                    else await engine._read(principal, run, event, validated)
+                    else await engine._read(principal, run, event, validated,
+                                            deadline=self._reserve_deadline(context))
                 )
         except (ValueError, TypeError):
             result = "Вызов отклонён: недопустимый инструмент, аргументы или индекс."
@@ -340,11 +377,12 @@ class HarnessGraph:
             engine.memory.record_failure(
                 principal.owner_id, run, operation="invalid", index_ids=run["index_ids"]
             )
+        engine._trace(run, name, args, result)
         return self._result(
             context,
             "tools" if calls else "decide",
             calls=calls,
-            exchange=[*state.get("exchange", []), {"name": name, "result": result}],
+            exchange=[*state.get("exchange", []), {"name": name, "result": result}][-50:],
         )
 
     async def synthesize(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:

@@ -11,7 +11,7 @@ from starlette.responses import Response
 from starlette.routing import Route
 
 from agent_harness.contracts import Principal
-from agent_harness.memory import MemoryInput, MemoryPreferences
+from agent_harness.memory import MemoryFeedback, MemoryInput, MemoryPreferences
 from agent_harness.runtime import HarnessRuntime
 
 
@@ -54,8 +54,22 @@ def create_memory_routes(runtime: HarnessRuntime, principal: PrincipalResolver) 
             raise HTTPException(400, "Укажите, включена ли память.") from None
         return _json(await runtime.set_memory_enabled(identity, payload.enabled))
 
+    async def feedback(request: Request) -> Response:
+        identity = await principal(request, mutate=True)
+        run_id = str(request.path_params["run_id"])
+        if len(run_id) > 80:
+            raise HTTPException(404, "Run not found")
+        try:
+            payload = MemoryFeedback.model_validate_json(await _body(request))
+        except (ValidationError, ValueError):
+            raise HTTPException(
+                400, "Укажите оценку ответа и, при необходимости, комментарий."
+            ) from None
+        return _json(await runtime.set_run_feedback(identity, run_id, payload))
+
     return [
         Route("/api/memory", memories, methods=["GET", "POST"]),
         Route("/api/memory/preferences", preferences, methods=["PUT"]),
         Route("/api/memory/{memory_id}", memory, methods=["PUT", "DELETE"]),
+        Route("/api/runs/{run_id}/feedback", feedback, methods=["PUT"]),
     ]

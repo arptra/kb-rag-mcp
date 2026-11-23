@@ -9,6 +9,10 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+class ModelDecisionError(ValueError):
+    """A model reply can be corrected without restarting the model connection."""
+
+
 @dataclass(frozen=True)
 class Principal:
     owner_id: str
@@ -38,6 +42,7 @@ class Evidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
+    document_id: str | None = None
     title: str
     text: str
     index_id: str

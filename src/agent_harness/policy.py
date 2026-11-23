@@ -15,17 +15,21 @@ class Budget:
     context_ratio: float
     evidence_per_index: int
     evidence_chars: int
+    document_reads: int = 0
+    document_chars: int = 12_000
+    time_ratio: float = 1
 
 
 BUDGETS = {
-    "low": Budget(3, 6, 6, 2, 0.5, 1, 1000),
-    "medium": Budget(6, 12, 12, 2, 0.75, 2, 1500),
-    "high": Budget(12, 24, 24, 3, 1, 3, 2000),
+    # Source calls are FOLLOW-UP reads/searches, never the initial index sweep.
+    "low": Budget(4, 12, 12, 8, 0.5, 2, 2000, 1, 12_000, 0.5),
+    "medium": Budget(8, 24, 24, 12, 0.75, 3, 3000, 3, 20_000),
+    "high": Budget(16, 48, 48, 16, 1, 5, 4000, 6, 32_000, 2),
 }
 QUICK_BUDGETS = {
-    "low": Budget(1, 2, 0, 2, 2 / 3, 1, 1000),
-    "medium": Budget(1, 4, 0, 2, 5 / 6, 2, 1500),
-    "high": Budget(1, 6, 0, 3, 1, 3, 2000),
+    "low": Budget(1, 0, 0, 8, 2 / 3, 1, 1000),
+    "medium": Budget(1, 0, 0, 12, 5 / 6, 2, 1500),
+    "high": Budget(1, 0, 0, 16, 1, 3, 2000),
 }
 
 
@@ -83,5 +87,17 @@ SYSTEM_PROMPT = (
     "Distinguish confirmed facts, hypotheses and missing information. Source HEAD is not "
     "deployed production state. Do not assert an incident cause without supporting evidence. "
     "Cite evidence ids in square brackets. Never invent sources or results. When tools are "
-    "unavailable, synthesize the evidence already collected and state its limitations."
+    "unavailable, synthesize the evidence already collected and state its limitations. "
+    "In investigation mode, use tools to resolve gaps: read relevant documents, trace "
+    "calls and data across services, search alternative terms, compare documentation, "
+    "code and incident evidence where available. A search snippet is only a lead. "
+    "Do not end with a generic summary when a concrete dependency or failure can be "
+    "checked. Before answering, check contradictions and distinguish actual findings "
+    "from missing access. For a system question explain the request/data flow, component "
+    "responsibilities and relevant conditions; for a complaint give the observed symptom, "
+    "verified chain, competing hypotheses and the next discriminating check. "
+    "Use prior_tool_attempts to avoid repeating an unchanged failed operation. "
+    "Source coverage describes searches, not proof that every document was read. "
+    "Automatic experiences are unverified past outcomes, not current facts. Respect "
+    "negative feedback: do not repeat the rejected conclusion without fresh evidence."
 )

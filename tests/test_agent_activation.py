@@ -284,10 +284,13 @@ def test_decision_schema_tools_and_context_are_enforced(settings_factory):
 def test_invalid_model_output_never_reaches_runtime(settings_factory, decision, tools):
     controller, runner = activated(settings_factory)
     runner.decision = decision
-    with pytest.raises(RuntimeError, match="decision failed") as exc:
+    with pytest.raises(ValueError, match="invalid tool decision") as exc:
         asyncio.run(decide(controller, tools=tools))
     assert "private" not in str(exc.value)
     assert "private" not in json.dumps(controller.status())
+    assert controller.status()["available"]
+    runner.decision = {"content": "Corrected answer", "tool_calls": []}
+    assert asyncio.run(decide(controller))["content"] == "Corrected answer"
     controller.stop()
 
 

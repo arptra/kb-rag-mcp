@@ -50,7 +50,8 @@ class CatalogSource:
     @staticmethod
     def _evidence(item: dict[str, Any], index_id: str) -> Evidence:
         return Evidence(
-            id=str(item["document_id"]),
+            id=str(item.get("chunk_id") or item["document_id"]),
+            document_id=str(item["document_id"]),
             title=str(item.get("title", item["document_id"])),
             text=str(item.get("excerpt") or item.get("text") or item.get("content") or ""),
             index_id=index_id,
@@ -82,8 +83,12 @@ class CatalogSource:
         cancel: Event,
     ) -> Evidence:
         await self._check(principal, cancel)
-        tool = self.catalog.tools_for(index_id)
-        result = await asyncio.to_thread(tool.get_document, document_id=document_id)
+        # The portal's MCP get_document deliberately compresses to 800 tokens.
+        # Harness owns its own read/context budget and needs the original content
+        # for an investigation, rather than another search-sized excerpt.
+        service = self.catalog.service_for(index_id)
+        document = await asyncio.to_thread(service.get_document, document_id)
+        result = document.model_dump(mode="json")
         await self._check(principal, cancel)
         return self._evidence(result, index_id)
 

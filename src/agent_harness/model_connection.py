@@ -15,7 +15,7 @@ from typing import Any, Literal, Self
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agent_harness.contracts import ModelPort
 
@@ -28,6 +28,11 @@ class ModelConnection(BaseModel):
     api_key_env: str = Field(default="", pattern=r"^([A-Z][A-Z0-9_]{0,127})?$")
     tls_bundle_id: str = Field(default="", pattern=r"^([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})?$")
     timeout_seconds: int = Field(default=60, ge=5, le=300)
+
+    @field_validator("base_url", "model", "api_key_env", "tls_bundle_id", mode="before")
+    @classmethod
+    def trim_fields(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
 
     @model_validator(mode="after")
     def valid_endpoint(self) -> Self:
@@ -48,9 +53,17 @@ class ModelConnection(BaseModel):
                 valid = False
             if not valid:
                 raise ValueError("Model endpoint must be HTTPS without credentials or query")
-        if self.provider == "openai" and (not self.base_url or not self.model.strip()):
-            raise ValueError("Model endpoint and model name are required")
+        if self.provider == "openai" and not self.base_url:
+            raise ValueError("Model endpoint is required")
         return self
+
+    @property
+    def completion_url(self) -> str:
+        """Accept either an API base or the complete chat endpoint copied by an operator."""
+        endpoint = self.base_url.rstrip("/")
+        if urlsplit(endpoint).path.endswith("/chat/completions"):
+            return endpoint
+        return endpoint + "/chat/completions"
 
 
 class ModelConnectionStore:
@@ -129,7 +142,7 @@ class ModelRouter:
         except (ValueError, KeyError, OSError):
             reason, available = "Сертификаты модели недоступны или некорректны.", False
         return {
-            "name": settings.model,
+            "name": settings.model or "API модели",
             "provider": "openai",
             "available": available,
             "enabled": True,
@@ -190,33 +203,59 @@ class ModelRouter:
                 raise ModelConnectionError("Ключ API не задан на сервере.")
             headers["Authorization"] = "Bearer " + secret
         payload: dict[str, Any] = {
-            "model": settings.model,
             "messages": messages,
             "stream": False,
-            "max_tokens": 16 if probe else 4096,
+            "max_tokens": 128 if probe else 4096,
         }
+        # Some corporate gateways select the model from the URL. Do not send an
+        # empty name; endpoints requiring one will report it during the probe.
+        if settings.model:
+            payload["model"] = settings.model
         if tools:
             payload.update(tools=tools, tool_choice="auto")
         try:
+            context = self._ssl(settings)
+        except (ValueError, KeyError, OSError):
+            raise ModelConnectionError(
+                "Ошибка загрузки сертификатов модели. Проверьте выбранный набор, "
+                "срок действия сертификатов и приватный ключ клиента."
+            ) from None
+        try:
             async with (
                 httpx.AsyncClient(
-                    verify=self._ssl(settings),
-                    trust_env=False,
+                    verify=context,
+                    # Corporate networks often require HTTPS_PROXY/NO_PROXY. The
+                    # same verified TLS context is used by probes and real runs.
+                    trust_env=True,
                     follow_redirects=False,
                     timeout=settings.timeout_seconds,
                     transport=self.transport,
                 ) as client,
                 client.stream(
                     "POST",
-                    settings.base_url.rstrip("/") + "/chat/completions",
+                    settings.completion_url,
                     headers=headers,
                     json=payload,
                 ) as response,
             ):
                 if response.status_code in {401, 403}:
-                    raise ModelConnectionError("API отклонил доступ. Проверьте ключ и сертификат.")
+                    raise ModelConnectionError(
+                        "API отклонил доступ. Проверьте клиентский сертификат и права на модель. "
+                        "API-ключ нужен только по требованию сервера."
+                    )
                 if response.status_code == 429:
                     raise ModelConnectionError("API модели ограничил частоту запросов.")
+                if response.status_code == 404:
+                    raise ModelConnectionError(
+                        "API вернул HTTP 404. Укажите базовый адрес API или полный адрес "
+                        "/chat/completions и проверьте название модели."
+                    )
+                if response.status_code in {400, 422}:
+                    raise ModelConnectionError(
+                        f"API модели вернул HTTP {response.status_code}: запрос не принят. "
+                        "Проверьте OpenAI-совместимость API и название модели; "
+                        "название обязательно, если сервер требует явный выбор модели."
+                    )
                 if response.status_code != 200:
                     raise ModelConnectionError(f"API модели вернул HTTP {response.status_code}.")
                 data = bytearray()
@@ -255,17 +294,29 @@ class ModelRouter:
             return {"content": redact(content[:50000]), "tool_calls": redact(parsed_calls)}
         except ModelConnectionError:
             raise
-        except httpx.HTTPError as exc:
+        except httpx.TimeoutException:
             raise ModelConnectionError(
-                "Соединение не установлено. Проверьте адрес API, сеть и сертификаты."
-            ) from exc
+                "API модели не ответил вовремя. Проверьте сеть или увеличьте время ожидания."
+            ) from None
+        except httpx.ProxyError:
+            raise ModelConnectionError(
+                "Ошибка подключения через прокси. Проверьте HTTPS_PROXY и NO_PROXY на сервере."
+            ) from None
+        except httpx.HTTPError:
+            raise ModelConnectionError(
+                "Соединение не установлено. Проверьте адрес API, сеть, прокси и сертификаты."
+            ) from None
         except (ValueError, KeyError, TypeError, IndexError, AttributeError):
             raise ModelConnectionError("API вернул несовместимый ответ модели.") from None
 
-    async def probe(self) -> dict[str, Any]:
-        settings = self.store.load()
+    async def probe(self, settings: ModelConnection | None = None) -> dict[str, Any]:
+        settings = settings if settings is not None else self.store.load()
         if settings.provider == "gigacode":
-            status = await asyncio.to_thread(self.status)
+            status = (
+                await asyncio.to_thread(self.fallback.status)
+                if self.fallback is not None
+                else {"available": False, "reason": "GigaCode не подключён."}
+            )
             return {"available": bool(status.get("available")), "message": status.get("reason", "")}
         try:
             async with asyncio.timeout(settings.timeout_seconds):

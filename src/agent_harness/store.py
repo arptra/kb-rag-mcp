@@ -114,6 +114,16 @@ class RunStore:
                     "DELETE FROM memories WHERE source_run_id=? AND owner=?",
                     [(key, owner) for key in deleted],
                 )
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='memory_usages'").fetchone():
+                db.executemany(
+                    "DELETE FROM memory_usages WHERE run_id=? AND owner=?",
+                    [(key, owner) for key in deleted],
+                )
+                db.execute(
+                    "DELETE FROM memory_usages WHERE NOT EXISTS "
+                    "(SELECT 1 FROM memories WHERE memories.id=memory_usages.memory_id "
+                    "AND memories.owner=memory_usages.owner)"
+                )
         return sorted(deleted)
 
     def recover(self) -> None:
@@ -159,4 +169,12 @@ class RunStore:
                     "DELETE FROM memories WHERE source_run_id IS NOT NULL AND NOT EXISTS "
                     "(SELECT 1 FROM runs WHERE runs.id=memories.source_run_id "
                     "AND runs.owner=memories.owner)"
+                )
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='memory_usages'").fetchone():
+                db.execute(
+                    "DELETE FROM memory_usages WHERE NOT EXISTS "
+                    "(SELECT 1 FROM memories WHERE memories.id=memory_usages.memory_id "
+                    "AND memories.owner=memory_usages.owner) OR NOT EXISTS "
+                    "(SELECT 1 FROM runs WHERE runs.id=memory_usages.run_id "
+                    "AND runs.owner=memory_usages.owner)"
                 )

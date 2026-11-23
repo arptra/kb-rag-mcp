@@ -12,6 +12,7 @@
   };
   const PHASE_LABELS = {
     queued: "Ожидаем свободное место для запуска.", searching: "Ищем подтверждения в выбранных источниках.",
+    reading: "Читаем документы и проверяем подробности за пределами поисковых фрагментов.",
     investigating: "Проверяем связи и уточняем найденные сведения.",
     synthesizing: "Сопоставляем материалы и готовим ответ.", finished: "",
   };
@@ -24,6 +25,7 @@
     modelDetails: null, modelEndpointAvailable: null, modelError: "", modelBusy: null,
     modelPollTimer: null, modelPollController: null, modelActionController: null,
     sandboxProfiles: [], selectedSandboxProfile: "", sandboxProfilesController: null,
+    memoryRunSignature: null,
   };
   const settingsState = {
     canManage: false, checked: false, config: null, saved: "", dirty: false, busy: null,
@@ -33,6 +35,7 @@
   const memoryState = { available: false, enabled: true, memories: [], editing: null, controller: null, busy: false };
   const discoveryState = { current: [], all: [], signature: null, controller: null, adminController: null, busy: new Set() };
   const deletionState = { target: null, controller: null };
+  const feedbackState = { controller: null, busy: false, runId: null, message: "" };
   const modelConnectionState = { settings: null, saved: "", controller: null, busy: false, dirty: false };
   const tlsState = { credentials: [], controller: null, busy: false, editingId: null, generation: 0 };
   try {
@@ -618,8 +621,8 @@
     $("direct-model-fields").hidden = !direct;
     modelConnectionState.dirty = Boolean(modelConnectionState.saved) && JSON.stringify(modelConnectionValue()) !== modelConnectionState.saved;
     $("model-connection-save").disabled = modelConnectionState.busy || !modelConnectionState.settings || !modelConnectionState.dirty;
-    $("model-connection-probe").disabled = modelConnectionState.busy || !modelConnectionState.settings || modelConnectionState.dirty;
-    $("model-connection-probe").title = modelConnectionState.dirty ? "Сначала сохраните подключение" : "Проверить сохранённое подключение";
+    $("model-connection-probe").disabled = modelConnectionState.busy || !modelConnectionState.settings;
+    $("model-connection-probe").title = "Отправить простой запрос с текущими настройками, не сохраняя их";
     $("settings-panel-model").querySelectorAll(".model-connection-fields input, .model-connection-fields select").forEach((input) => { input.disabled = modelConnectionState.busy; });
   }
   function fillTlsSelect(value) {
@@ -652,26 +655,29 @@
     finally { if (modelConnectionState.controller === controller) { modelConnectionState.controller = null; modelConnectionState.busy = false; updateModelConnection(); } }
   }
   async function changeModelConnection(probe = false) {
-    if (modelConnectionState.busy || !settingsState.canManage || state.needsAuth || (probe && modelConnectionState.dirty)) return;
+    if (modelConnectionState.busy || !settingsState.canManage || state.needsAuth) return;
     const config = modelConnectionValue();
-    if (!probe && config.provider === "openai") {
-      if (!config.base_url || !config.model) { $("model-connection-feedback").textContent = "Укажите HTTPS-адрес API и название модели."; return; }
+    if (config.provider === "openai") {
+      if (!config.base_url) { $("model-connection-feedback").textContent = "Укажите HTTPS-адрес API модели. Название модели и ключ необязательны."; return; }
       for (const input of $("direct-model-fields").querySelectorAll("input")) { if (!input.checkValidity()) { input.reportValidity(); return; } }
     }
     const controller = new AbortController(), epoch = state.identityEpoch;
     modelConnectionState.controller = controller; modelConnectionState.busy = true; updateModelConnection();
-    $("model-connection-feedback").textContent = probe ? "Проверяем сохранённое подключение…" : "Сохраняем подключение…";
+    $("model-connection-feedback").textContent = probe ? "Отправляем простой запрос модели с текущими настройками…" : "Сохраняем подключение…";
     try {
-      const response = await api("model/connection" + (probe ? "/probe" : ""), { method: probe ? "POST" : "PUT", body: probe ? {} : config, signal: controller.signal });
+      const response = await api("model/connection" + (probe ? "/probe" : ""), { method: probe ? "POST" : "PUT", body: config, signal: controller.signal });
       if (controller.signal.aborted || epoch !== state.identityEpoch) return;
-      if (probe) $("model-connection-feedback").textContent = response.message || (response.available ? "Подключение готово." : "Подключение пока недоступно.");
+      if (probe) $("model-connection-feedback").textContent = (response.message || (response.available ? "Модель ответила на проверочный запрос." : "Подключение пока недоступно.")) +
+        (modelConnectionState.dirty ? " Настройки ещё не сохранены." : "");
       else {
         if (Array.isArray(response.tls_bundles)) tlsState.credentials = response.tls_bundles;
         applyModelConnection(response.settings || config);
         $("model-connection-feedback").textContent = "Подключение сохранено. Новые запросы будут использовать выбранную модель.";
       }
-      state.modelEndpointAvailable = null; state.modelDetails = null; state.modelError = "";
-      loadWorkspace();
+      if (!probe) {
+        state.modelEndpointAvailable = null; state.modelDetails = null; state.modelError = "";
+        loadWorkspace();
+      }
     } catch (error) { if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) $("model-connection-feedback").textContent = errorMessage(error); }
     finally { if (modelConnectionState.controller === controller) { modelConnectionState.controller = null; modelConnectionState.busy = false; updateModelConnection(); } }
   }
@@ -942,18 +948,29 @@
     $("memory-enabled").checked = memoryState.enabled;
     $("memory-enabled").disabled = memoryState.busy;
     $("memory-new").disabled = memoryState.busy;
+    const automaticCount = memoryState.memories.filter((record) => record.status === "experience").length;
+    const confirmedCount = memoryState.memories.filter((record) => record.status === "active").length;
+    $("memory-summary").textContent = "Автоматический опыт: " + automaticCount + " · Подтверждённые записи: " + confirmedCount;
     $("memory-list").replaceChildren(...memoryState.memories.map((record) => {
       const card = element("article", "settings-resource");
       const heading = element("div", "settings-resource-heading");
       heading.append(element("h4", "", record.title));
       const actions = element("div", "resource-actions");
-      const edit = element("button", "text-button", record.status === "draft" ? "Проверить и подтвердить" : "Изменить"); edit.type = "button";
+      const edit = element("button", "text-button", record.status !== "active" ? "Проверить и подтвердить" : "Изменить"); edit.type = "button";
       edit.addEventListener("click", () => editMemory(record));
       const remove = element("button", "text-button", "Удалить"); remove.type = "button";
       remove.addEventListener("click", () => openDeletion("memory", record)); actions.append(edit, remove); heading.append(actions);
-      const kind = { note: "Заметка", correction: "Уточнение", lesson: "Урок из ошибки" }[record.kind] || "Заметка";
-      card.append(heading, element("p", "discovery-meta", kind + " · " + (record.status === "active" ? "Подтверждено" : "Черновик")),
+      edit.disabled = memoryState.busy; remove.disabled = memoryState.busy;
+      const kind = { note: "Заметка", correction: "Уточнение", lesson: "Урок из ошибки", case: "Опыт решения" }[record.kind] || "Заметка";
+      const status = record.status === "active" ? "Подтверждено вами" : record.status === "experience" ? "Автоматически · требует повторной проверки" : "Черновик · не используется";
+      card.append(heading, element("p", "discovery-meta", kind + " · " + status),
         element("p", "memory-record-text", record.text), element("p", "settings-field-help", "Источники: " + (record.index_ids || []).map(sourceName).join(", ")));
+      const details = [];
+      if (record.outcome) details.push("Исход запроса: " + (STATUS_LABELS[record.outcome] || record.outcome));
+      if (record.feedback?.rating) details.push("Ваша оценка: " + (record.feedback.rating === "helpful" ? "помогло" : "не помогло"));
+      details.push("Использовано в запросах: " + Math.max(0, Number(record.usage_count) || 0));
+      if (record.last_used_at) details.push("Последний раз: " + dateLabel(record.last_used_at, true));
+      card.append(element("p", "memory-usage", details.join(" · ")));
       return card;
     }));
     $("memory-empty").hidden = memoryState.memories.length > 0;
@@ -1033,7 +1050,7 @@
       const result = await api("memory/preferences", { method: "PUT", body: { enabled } });
       if (epoch !== state.identityEpoch) return;
       memoryState.enabled = result.enabled === true;
-      $("memory-feedback").textContent = memoryState.enabled ? "Подтверждённые записи будут учитываться в новых запросах." : "Память отключена для новых запросов. Записи сохранены.";
+      $("memory-feedback").textContent = memoryState.enabled ? "Опыт и подтверждённые записи будут учитываться в похожих запросах." : "Память отключена для новых запросов. Записи сохранены.";
     } catch (error) { if (error.status !== 401 && epoch === state.identityEpoch) memoryError(errorMessage(error)); }
     finally { if (epoch === state.identityEpoch) { memoryState.busy = false; renderMemory(); } }
   }
@@ -1082,6 +1099,8 @@
     } finally { if (deletionState.controller === controller) { deletionState.controller = null; $("delete-confirm").disabled = false; } }
   }
   function resetPersonalData() {
+    resetRunFeedback();
+    state.memoryRunSignature = null;
     for (const controller of [memoryState.controller, discoveryState.controller, discoveryState.adminController, deletionState.controller]) controller?.abort();
     Object.assign(memoryState, { available: false, enabled: true, memories: [], editing: null, controller: null, busy: false });
     Object.assign(discoveryState, { current: [], all: [], signature: null, controller: null, adminController: null, busy: new Set() });
@@ -1134,6 +1153,18 @@
       (run.resumable ? ". Продолжение использует исходную среду. Для смены среды начните новый запрос." : ".");
   }
   function indexes() { return Array.isArray(state.status?.indexes) ? state.status.indexes : []; }
+  function renderEffortDescription() {
+    const mode = document.querySelector('input[name="mode"]:checked')?.value || "quick";
+    const policy = state.status?.limits?.effort_policy?.[mode]?.[$("effort").value];
+    $("mode-description").textContent = mode === "investigate" ?
+      "Базы знаний, код, MCP и другие агенты." : "Базы знаний, без запуска песочниц.";
+    const parts = [mode === "investigate" ? "Сначала обходим все выбранные базы знаний." : "Все выбранные базы знаний и один итоговый ответ."];
+    if (policy && mode === "investigate") {
+      parts.push("Чтение документов: до " + policy.document_reads + ". Уточняющих обращений: до " + policy.source_calls + ".");
+    } else if (mode === "quick") parts.push("Усилие определяет объём найденных материалов для ответа.");
+    if (Number(policy?.timeout_seconds) > 0) parts.push("Время работы: до " + Math.ceil(policy.timeout_seconds / 60) + " мин.");
+    $("effort-description").textContent = parts.join(" ");
+  }
   function sourceName(id) {
     const match = indexes().find((item) => item.id === id);
     return match?.name || "Источник";
@@ -1212,6 +1243,7 @@
     }
     $("portal-link").hidden = !link($("portal-link"), portalUrl);
     if (refreshSources) renderSources();
+    renderEffortDescription();
     renderModel();
     updateSubmit();
   }
@@ -1492,6 +1524,58 @@
     $("answer").replaceChildren(fragment);
     if (text) appear($("answer"));
   }
+  function resetRunFeedback() {
+    feedbackState.controller?.abort();
+    Object.assign(feedbackState, { controller: null, busy: false, runId: null, message: "" });
+    $("run-feedback-comment").value = "";
+    $("run-feedback-status").textContent = "";
+    $("run-feedback").hidden = true;
+  }
+  function renderRunFeedback(run) {
+    const visible = Boolean(run && !ACTIVE.has(run.status) && run.answer && Array.isArray(run.index_ids));
+    $("run-feedback").hidden = !visible || state.needsAuth;
+    if (!visible) return;
+    if (feedbackState.runId !== idOf(run)) {
+      feedbackState.runId = idOf(run);
+      feedbackState.message = "";
+      $("run-feedback-comment").value = run.feedback?.comment || "";
+    }
+    for (const rating of ["helpful", "unhelpful"]) {
+      const button = $("feedback-" + rating);
+      button.disabled = feedbackState.busy || state.needsAuth;
+      button.setAttribute("aria-pressed", String(run.feedback?.rating === rating));
+    }
+    $("run-feedback-comment").disabled = feedbackState.busy;
+    $("run-feedback-status").textContent = feedbackState.busy ? "Сохраняем оценку…" : feedbackState.message ||
+      (run.feedback?.rating ? "Ваша оценка: «" + (run.feedback.rating === "helpful" ? "Помогло" : "Не помогло") + "». Можно изменить оценку или добавить комментарий." :
+        "Оценка уточнит сохранённый опыт для следующих похожих запросов.");
+  }
+  async function saveRunFeedback(rating) {
+    const run = state.current;
+    if (!run || ACTIVE.has(run.status) || feedbackState.busy || state.needsAuth) return;
+    const id = idOf(run), epoch = state.identityEpoch;
+    // A response fetched before this mutation must not replace the saved rating.
+    stopPolling();
+    const generation = ++state.generation;
+    const controller = new AbortController();
+    feedbackState.controller = controller; feedbackState.busy = true; feedbackState.message = "";
+    const body = { rating, comment: $("run-feedback-comment").value.trim() };
+    renderRunFeedback(run);
+    try {
+      const response = await api("runs/" + encodeURIComponent(id) + "/feedback", { method: "PUT", body, signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch || generation !== state.generation || id !== idOf(state.current)) return;
+      state.current.feedback = response.feedback;
+      feedbackState.message = response.memory ? "Оценка сохранена. Опыт в памяти обновлён." : "Оценка сохранена.";
+      loadMemory();
+    } catch (error) {
+      if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch && generation === state.generation && id === idOf(state.current)) feedbackState.message = errorMessage(error);
+    } finally {
+      if (feedbackState.controller === controller) {
+        feedbackState.controller = null; feedbackState.busy = false;
+        if (epoch === state.identityEpoch && generation === state.generation) renderRunFeedback(state.current);
+      }
+    }
+  }
   function renderRun() {
     const run = state.current;
     const hasRun = Boolean(run);
@@ -1501,7 +1585,7 @@
     $("suggestions").hidden = hasRun;
     $("run-panel").hidden = !hasRun;
     $("page-label").textContent = hasRun ? modeLabel(run.mode) : "Новый запрос";
-    if (!run) { renderEvidence([]); renderHistory(); $("discoveries-card").hidden = true; return; }
+    if (!run) { renderEvidence([]); renderHistory(); $("discoveries-card").hidden = true; renderRunFeedback(null); return; }
     const active = ACTIVE.has(run.status);
     $("run-mode").textContent = modeLabel(run.mode) + " · Усилие: " + effortLabel(run.effort);
     $("run-date").textContent = dateLabel(run.created_at, true);
@@ -1519,6 +1603,13 @@
     $("run-phase").textContent = phase;
     $("run-phase").hidden = !phase;
     $("run-status-dot").className = "run-status-dot " + (active ? "active" : run.status === "completed" ? "completed" : ["failed", "timed_out"].includes(run.status) ? "failed" : "");
+    const coverage = run.coverage && typeof run.coverage === "object" ? Object.values(run.coverage) : [];
+    const searched = coverage.filter((item) => item && ["searched", "empty"].includes(item.status)).length;
+    const failed = coverage.filter((item) => item?.status === "failed").length;
+    const pending = coverage.filter((item) => item?.status === "pending").length;
+    $("run-coverage").hidden = !coverage.length;
+    $("run-coverage").textContent = "Поиск по базам знаний: " + searched + " / " + coverage.length +
+      (failed ? " · Недоступно: " + failed : "") + (pending ? " · Ещё не проверено: " + pending : "");
     const announcement = [status, phase, "Найдено подтверждений: " + evidenceCount].filter(Boolean).join(". ");
     if ($("progress-live").textContent !== announcement) $("progress-live").textContent = announcement;
     $("cancel-run").hidden = !active;
@@ -1526,7 +1617,7 @@
     $("resume-run").hidden = active || run.resumable !== true;
     $("remember-run").hidden = active || !memoryState.available;
     const memories = Array.isArray(run.memory_used) ? run.memory_used : [];
-    $("run-memory-used").replaceChildren(element("strong", "", "Учтено из памяти"), ...memories.map((item) => element("p", "", item.title || "Сохранённая запись")));
+    $("run-memory-used").replaceChildren(element("strong", "", "Учтено из памяти: " + memories.length), ...memories.map((item) => element("p", "", item.title || "Сохранённая запись")));
     $("run-memory-used").hidden = !memories.length;
     renderRunEnvironment(run);
     const warnings = Array.isArray(run.warnings) ? run.warnings.filter((item) => typeof item === "string") : [];
@@ -1540,11 +1631,16 @@
     const metrics = [];
     if (Number.isFinite(milliseconds) && milliseconds > 0) metrics.push(Math.max(1, Math.round(milliseconds / 1000)) + " сек.");
     metrics.push("Подтверждений: " + evidenceCount);
+    if (run.metrics?.document_reads !== undefined) metrics.push("Документов прочитано: " + run.metrics.document_reads);
+    if (run.metrics?.tool_calls) metrics.push("Вызовов инструментов: " + run.metrics.tool_calls);
+    if (memories.length) metrics.push("Из памяти: " + memories.length);
     $("run-metrics").textContent = metrics.join(" · ");
+    renderRunFeedback(run);
     updateSubmit();
     renderHistory();
     loadRunDiscoveries();
-    if (!active && newPresentation) loadMemory();
+    const memorySignature = idOf(run) + ":" + run.status;
+    if (!active && state.memoryRunSignature !== memorySignature) { state.memoryRunSignature = memorySignature; loadMemory(); }
     if (newPresentation) appear($("run-panel"));
   }
   function stopPolling() {
@@ -1561,11 +1657,11 @@
   }
   async function refreshRun(id, generation) {
     if (state.pollController || document.hidden) return;
-    const controller = new AbortController();
+    const controller = new AbortController(), epoch = state.identityEpoch;
     state.pollController = controller;
     try {
       const run = await api("runs/" + encodeURIComponent(id), { signal: controller.signal });
-      if (generation !== state.generation || id !== idOf(state.current)) return;
+      if (controller.signal.aborted || epoch !== state.identityEpoch || generation !== state.generation || id !== idOf(state.current)) return;
       const scopeWasLoading = !Array.isArray(state.current.index_ids);
       state.current = run;
       if (scopeWasLoading) {
@@ -1587,6 +1683,7 @@
   }
   function selectRun(run) {
     stopPolling();
+    resetRunFeedback();
     state.generation += 1;
     state.current = run;
     if (Array.isArray(run.index_ids)) { state.selected = new Set(run.index_ids); renderSources(); }
@@ -1600,6 +1697,7 @@
   }
   function resetWorkspace() {
     stopPolling();
+    resetRunFeedback();
     state.generation += 1;
     state.current = null;
     state.selectedSandboxProfile = ""; renderExecutionEnvironment();
@@ -1809,6 +1907,8 @@
   $("memory-cancel").addEventListener("click", clearMemoryEditor);
   $("memory-editor").addEventListener("submit", saveMemory);
   $("memory-enabled").addEventListener("change", changeMemoryPreference);
+  $("feedback-helpful").addEventListener("click", () => saveRunFeedback("helpful"));
+  $("feedback-unhelpful").addEventListener("click", () => saveRunFeedback("unhelpful"));
   $("remember-run").addEventListener("click", () => { if (state.current) { openMemory(); editMemory(null, state.current); } });
   $("delete-run").addEventListener("click", () => { if (state.current) openDeletion("run", state.current); });
   $("delete-form").addEventListener("submit", confirmDeletion);
@@ -1826,10 +1926,10 @@
     }
   });
   document.querySelectorAll('input[name="mode"]').forEach((input) => input.addEventListener("change", () => {
-    $("mode-description").textContent = input.value === "investigate" ?
-      "Базы знаний, код, MCP и другие агенты." : "Базы знаний, без запуска песочниц.";
+    renderEffortDescription();
     renderExecutionEnvironment();
   }));
+  $("effort").addEventListener("change", renderEffortDescription);
   $("sandbox-profile").addEventListener("change", () => { state.selectedSandboxProfile = $("sandbox-profile").value; renderExecutionEnvironment(); });
   document.querySelectorAll("[data-question]").forEach((button) => button.addEventListener("click", () => {
     $("question").value = button.dataset.question;
@@ -1882,7 +1982,7 @@
     if (state.modelActionController) state.modelActionController.abort();
     if (state.refreshController) state.refreshController.abort();
     if (settingsState.controller) settingsState.controller.abort();
-    for (const controller of [sshState.controller, tlsState.controller, modelConnectionState.controller, memoryState.controller, discoveryState.controller, discoveryState.adminController, deletionState.controller, state.sandboxProfilesController]) controller?.abort();
+    for (const controller of [sshState.controller, tlsState.controller, modelConnectionState.controller, memoryState.controller, discoveryState.controller, discoveryState.adminController, deletionState.controller, feedbackState.controller, state.sandboxProfilesController]) controller?.abort();
     clearSshEditor(); clearTlsEditor();
   });
   updateSubmit();

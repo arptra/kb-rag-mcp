@@ -84,6 +84,10 @@ class _CancellationGroup:
         return any(signal.is_set() for signal in self._signals)
 
 
+class GigaCodeDecisionError(ValueError):
+    """A malformed model reply does not invalidate the authenticated CLI session."""
+
+
 class GigaCodeAgentController:
     """One activation generation; serialized CLI calls with cancellable waiting.
 
@@ -366,10 +370,15 @@ class GigaCodeAgentController:
                     if validator is None:
                         raise ValueError("GigaCode requested an unavailable tool")
                     validator.validate(call["args"])
-            except (ValidationError, TypeError, KeyError):
-                raise ValueError("GigaCode returned an invalid tool decision") from None
+            except (ValidationError, ValueError, TypeError, KeyError):
+                raise GigaCodeDecisionError("GigaCode returned an invalid tool decision") from None
             self._update(generation, "ready", "GigaCode готов. Агент может исследовать документы.")
             return decision
+        except GigaCodeDecisionError:
+            self._update(
+                generation, "ready", "Некорректный ответ модели. GigaCode готов к повтору."
+            )
+            raise
         except GigaCodeCancelled:
             with self._lock:
                 if self._current(generation):

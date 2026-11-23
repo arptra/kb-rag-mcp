@@ -67,15 +67,26 @@ def _validate(upload: TLSCredentialUpload) -> tuple[dict[str, Any], dict[str, st
             public = key.public_key().public_bytes(
                 serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
             )
-            expected = (
-                clients[0]
-                .public_key()
-                .public_bytes(
+            matching = [
+                certificate
+                for certificate in clients
+                if certificate.public_key().public_bytes(
                     serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
                 )
-            )
-            if public != expected:
+                == public
+            ]
+            if not matching:
                 raise ValueError("Ключ не соответствует клиентскому сертификату.")
+            # Exported certificate bundles may list the root first. OpenSSL needs
+            # the certificate matching the client key first, followed by issuers.
+            chain, remaining = [matching[0]], [c for c in clients if c != matching[0]]
+            while remaining:
+                issuer = next((c for c in remaining if c.subject == chain[-1].issuer), None)
+                if issuer is None:
+                    raise ValueError("Некорректная цепочка клиентского сертификата.")
+                chain.append(issuer)
+                remaining.remove(issuer)
+            clients = chain
             private = key.private_bytes(
                 serialization.Encoding.PEM,
                 serialization.PrivateFormat.PKCS8,
@@ -183,8 +194,10 @@ class TLSCredentialStore:
             context = ssl.create_default_context()
             try:
                 if data["ca_certificate"]:
+                    _certificates(data["ca_certificate"], ca=True)
                     context.load_verify_locations(cadata=data["ca_certificate"])
                 if data["client_certificate"]:
+                    _certificates(data["client_certificate"], ca=False)
                     with tempfile.TemporaryDirectory(
                         prefix=".tls-", dir=self.directory
                     ) as directory:

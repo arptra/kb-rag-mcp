@@ -313,10 +313,11 @@ async def test_investigation_tool_validation_and_reserved_final_call(tmp_path: P
         )
         run = await finished(runtime, submitted["id"])
         assert run["status"] == "partial"
-        assert len(source.calls) == 1
-        assert run["metrics"]["tool_calls"] == 6
+        assert len(source.calls) == 2  # Initial search and an allowed document read.
+        assert all(call["index_id"] == "a" for call in source.calls)
+        assert run["metrics"]["tool_calls"] == 9
         assert model.requests[-1]["tools"] == [] and run["answer"]
-        assert len(model.requests) <= 3
+        assert len(model.requests) <= 4
         for request in model.requests:
             assert len(json.dumps(request["messages"], ensure_ascii=False)) <= 48_000
     finally:
@@ -333,8 +334,8 @@ async def test_repeated_tools_have_global_budget(tmp_path: Path) -> None:
             OWNER, RunRequest(question="Loop", mode="investigate", effort="low", index_ids=["a"])
         )
         run = await finished(runtime, submitted["id"])
-        assert run["metrics"]["model_calls"] == 3
-        assert run["metrics"]["source_calls"] == 3
+        assert run["metrics"]["model_calls"] == 4
+        assert run["metrics"]["source_calls"] == 5
         assert model.requests[-1]["tools"] == []
     finally:
         await runtime.stop()
@@ -414,9 +415,9 @@ async def test_restart_and_retention(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("effort", "expected", "parallelism"), [("low", 2, 2), ("medium", 4, 2), ("high", 6, 3)]
+    ("effort", "expected", "parallelism"), [("low", 8, 8), ("medium", 8, 8), ("high", 8, 8)]
 )
-async def test_quick_effort_bounds_all_source_calls(
+async def test_quick_effort_searches_all_selected_sources(
     tmp_path: Path, effort: str, expected: int, parallelism: int
 ) -> None:
     source = Source()
@@ -502,7 +503,7 @@ async def test_forbidden_final_tools_discard_model_content(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_counts_towards_investigation_budget(tmp_path: Path) -> None:
+async def test_bootstrap_does_not_consume_followup_budget(tmp_path: Path) -> None:
     source = Source()
     source.allowed = list("abcdefgh")
     model = Model([{"name": "search_knowledge", "args": {"index_id": "a", "query": "loop"}}])
@@ -513,9 +514,10 @@ async def test_bootstrap_counts_towards_investigation_budget(tmp_path: Path) -> 
             OWNER, RunRequest(question="All sources", mode="investigate", effort="low")
         )
         run = await finished(runtime, submitted["id"])
-        assert run["metrics"]["source_calls"] == 6
-        assert len(model.requests) == 1 and model.requests[0]["tools"] == []
-        assert source.peak == 2
+        assert run["metrics"]["bootstrap_calls"] == 8
+        assert run["metrics"]["source_calls"] > 8
+        assert len(model.requests) == 4 and model.requests[0]["tools"]
+        assert source.peak == 8
     finally:
         await runtime.stop()
 
@@ -615,5 +617,32 @@ async def test_quick_slow_source_does_not_spend_synthesis_reserve(tmp_path: Path
         assert run["status"] == "partial" and "Explanation" in run["answer"]
         assert len(model.requests) == 1
         assert any("TimeoutError" in warning for warning in run["warnings"])
+    finally:
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_invalid_model_decision_is_corrected_without_losing_research(tmp_path: Path) -> None:
+    class RecoveringModel(Model):
+        async def decide(self, **kwargs: Any) -> dict[str, Any]:
+            self.requests.append(kwargs)
+            if len(self.requests) == 1:
+                raise ValueError('Untrusted provider output must not appear in the trace')
+            context = json.loads(kwargs['messages'][-1]['content'])
+            assert any(item['name'] == 'model_response' for item in context['prior_tool_attempts'])
+            assert 'Untrusted provider output' not in json.dumps(context)
+            assert context['evidence']
+            return {'content': 'Corrected investigation [a].', 'tool_calls': []}
+
+    model = RecoveringModel()
+    runtime = HarnessRuntime(settings(tmp_path), Source(), model)
+    await runtime.start()
+    try:
+        run = await runtime.submit(OWNER, RunRequest(question='Investigate', mode='investigate'))
+        result = await finished(runtime, run['id'])
+        assert result['status'] == 'completed'
+        assert result['answer'] == 'Corrected investigation [a].'
+        assert result['metrics']['decision_errors'] == 1
+        assert result['metrics']['model_calls'] == 2
     finally:
         await runtime.stop()
