@@ -64,7 +64,9 @@ class Model:
                     }
                 ],
             }
-        return {"content": "Дневной лимит — 500. Проверены найденные источники.", "tool_calls": []}
+        item = next(item for item in context["evidence"] if "500" in item["text"])
+        source = item.get("citation") or f"[{item['id']}]"
+        return {"content": f"Дневной лимит — 500 {source}.", "tool_calls": []}
 
 
 @pytest.fixture

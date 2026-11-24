@@ -7,8 +7,8 @@ from typing import Any
 import pytest
 
 from agent_harness.config import HarnessSettings
+from agent_harness.context import _SUMMARY_INSTRUCTIONS
 from agent_harness.contracts import Evidence, Principal, RunRequest
-from agent_harness.policy import SYSTEM_PROMPT
 from agent_harness.runtime import HarnessRuntime
 from agent_harness.store import timestamp
 
@@ -38,7 +38,7 @@ class Model:
 
     async def decide(self, **kwargs: Any) -> dict[str, Any]:
         messages = kwargs["messages"]
-        if messages[0]["content"] != SYSTEM_PROMPT:
+        if messages[0]["content"].startswith(_SUMMARY_INSTRUCTIONS):
             self.summaries.append(kwargs)
             if self.fail_summary:
                 return {"content": "", "tool_calls": []}
@@ -136,7 +136,7 @@ async def test_access_revoked_during_summary_stops_the_next_model_call(tmp_path:
     class RevokingModel(Model):
         async def decide(self, **kwargs: Any) -> dict[str, Any]:
             result = await super().decide(**kwargs)
-            if kwargs["messages"][0]["content"] != SYSTEM_PROMPT:
+            if kwargs["messages"][0]["content"].startswith(_SUMMARY_INSTRUCTIONS):
                 source.allowed = False
             return result
 

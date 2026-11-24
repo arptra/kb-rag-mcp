@@ -2,7 +2,7 @@
 (() => {
   const $ = (id) => document.getElementById(id), AUTH_KEY = "agent-harness.auth.v1";
   const ACTIVE = new Set(["queued", "running", "cancelling"]);
-  const MODES = { quick: "Быстро", investigate: "Исследовать", autonomous: "Автопилот" };
+  const MODES = { search: "Поиск без модели", quick: "Быстрый ответ", investigate: "Исследование", autonomous: "Автопилот" };
   const STATUSES = { queued: "В очереди", running: "В работе", cancelling: "Останавливается", completed: "Готово", partial: "С ограничениями", cancelled: "Остановлен", timed_out: "Истекло время", failed: "Ошибка", interrupted: "Прерван" };
   const STOP_REASONS = { completed: "Ответ завершён", time_limit: "Исчерпано время", cancelled: "Остановлено", failed: "Ошибка выполнения", interrupted: "Прервано перезапуском", budget_ceiling: "Потолок бюджета", context_limit: "Ограничение контекста", no_new_evidence: "Нет новых материалов", partial: "Ответ с ограничениями", active: "Выполняется" };
   const LABELS = {

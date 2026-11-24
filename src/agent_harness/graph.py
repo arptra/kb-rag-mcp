@@ -49,6 +49,7 @@ from agent_harness.research import (
     simple_service_count_question,
     update_plan,
 )
+from agent_harness.search_results import render_search_results
 from agent_harness.store import timestamp
 
 if TYPE_CHECKING:
@@ -241,23 +242,28 @@ class HarnessGraph:
     async def prepare(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
         context = self._context(state, runtime)
         run, principal = context.run, context.principal
-        available = {
-            item["id"]
-            for item in await self.engine._indexes(principal, self.engine._source_timeout(run))
-        }
+        catalog = await self.engine._indexes(principal, self.engine._source_timeout(run))
+        available = {item["id"] for item in catalog}
         requested = list(dict.fromkeys(run["index_ids"]))
         if set(requested) - available:
             run["status"] = "failed"
             self.engine._warn(run, "Один или несколько выбранных индексов недоступны.")
             return self._result(context, "done")
-        selected = requested or sorted(available)
+        direct = run["mode"] == "search"
+        selected = requested or sorted(
+            item["id"] for item in catalog if not direct or item["direct_search"]
+        )
         if len(selected) > self.engine._runtime_limits(run).max_indexes:
             self.engine._warn(run, "Область поиска ограничена бюджетом числа индексов.")
         run["index_ids"] = selected[: self.engine._runtime_limits(run).max_indexes]
         if not run["index_ids"]:
             run["status"] = "partial"
+            if run["mode"] == "search":
+                run.update(answer_kind="search_results", answer="Нет доступных источников поиска.")
             self.engine._warn(run, "Нет доступных источников; состояние системы не проверено.")
             return self._result(context, "done")
+        if run["mode"] == "search":
+            return self._result(context, "collect")
         return self._result(context, "plan", calls=[], exchange=[])
 
     async def plan(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
@@ -275,22 +281,20 @@ class HarnessGraph:
         engine._checkpoint(principal, run, event)
         budget = engine._budget(run)
         engine._semaphores[run["id"]] = asyncio.Semaphore(budget.parallelism)
-        available = {item["id"] for item in await engine._indexes(principal)}
+        catalog = await engine._indexes(principal)
+        available = {item["id"] for item in catalog}
         if set(run["index_ids"]) - available:
             raise ValueError("Source access changed during the investigation")
-        parent = engine._parent_context(principal, run, available)
+        direct = run["mode"] == "search"
+        parent = None if direct else engine._parent_context(principal, run, available)
         run["parent_question"] = parent["question"] if parent else None
-        query = initial_search_query(run)
+        query = run["question"] if direct else initial_search_query(run)
         external = (
             await engine.tools.describe(principal, run["index_ids"])
-            if engine.tools and run["mode"] != "quick"
+            if engine.tools and run["mode"] in {"investigate", "autonomous"}
             else []
         )
-        external_ids = (
-            {item["id"] for item in await engine.tools.indexes(principal)}
-            if engine.tools
-            else set()
-        )
+        external_ids = {item["id"] for item in catalog if not item["direct_search"]}
         knowledge = [item for item in run["index_ids"] if item not in external_ids]
         if run["mode"] == "quick" and set(run["index_ids"]) & external_ids:
             engine._warn(
@@ -299,12 +303,22 @@ class HarnessGraph:
         pending_only = bool(run.pop("_collect_pending", False))
         if not pending_only:
             run["coverage"] = {index: {"status": "pending", "count": 0} for index in knowledge}
+        if direct:
+            skipped = [index for index in run["index_ids"] if index in external_ids]
+            for index in skipped:
+                run["coverage"][index] = {"status": "skipped", "count": 0}
+            if skipped:
+                engine._warn(run, "Для поиска по коду, MCP и A2A выберите «Исследование».")
         bootstrap = [index for index in knowledge if not pending_only
                      or run["coverage"].get(index, {}).get("status") == "pending"] \
             if engine.source else []
-        sweep_deadline = (self._deadline(context) - engine._run_timeout(run) * 2 / 3
-                          if run["mode"] == "quick" else self._reserve_deadline(context))
-        if ("graph:system" in bootstrap and not run.get("parent_run_id")
+        if direct:
+            sweep_deadline = self._deadline(context)
+        elif run["mode"] == "quick":
+            sweep_deadline = self._deadline(context) - engine._run_timeout(run) * 2 / 3
+        else:
+            sweep_deadline = self._reserve_deadline(context)
+        if (not direct and "graph:system" in bootstrap and not run.get("parent_run_id")
                 and not run.get("resume_count") and simple_service_count_question(query)):
             bootstrap.remove("graph:system")
             await engine._search(principal, run, event, "graph:system", query,
@@ -333,6 +347,13 @@ class HarnessGraph:
                       f"Начальный поиск завершён: источников {len(bootstrap)}.")
         engine._checkpoint(principal, run, event)
         if event.is_set():
+            return self._result(context, "done")
+        if direct:
+            run["answer_kind"] = "search_results"
+            run["answer"] = render_search_results(
+                run, max_chars=engine._runtime_limits(run).answer_chars,
+            )
+            run["status"] = "partial" if run["warnings"] else "completed"
             return self._result(context, "done")
         model = await engine._model_status()
         while model.get("state") == "authentication_required" and not event.is_set():

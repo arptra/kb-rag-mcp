@@ -179,7 +179,7 @@ def create_app(
         if request.method == "GET":
             return _json({"runs": await runtime.list_runs(identity)})
         parsed = await _run_request(request)
-        if parsed.mode != "quick" and parsed.sandbox_profile_id:
+        if parsed.mode in {"investigate", "autonomous"} and parsed.sandbox_profile_id:
             available_profiles = await integrations.profiles(identity) if integrations else []
             if parsed.sandbox_profile_id not in {item["id"] for item in available_profiles}:
                 raise HTTPException(403, "Выбранная среда выполнения недоступна.")

@@ -34,8 +34,10 @@ class Node {
     this.children = []; this.text = ""; this.append(...nodes);
   }
   setAttribute(key, value) { this.attributes[key] = value; }
+  getAttribute(key) { return this.attributes[key] ?? null; }
   removeAttribute(key) { delete this.attributes[key]; }
   addEventListener(type, callback) { this.listeners[type] = callback; }
+  click() { this.listeners.click?.({ preventDefault() {} }); }
   querySelectorAll() { return []; }
   querySelector() { return new Node(); }
   contains(node) { return node === this || this.children.some((child) => child.contains(node)); }
@@ -51,11 +53,12 @@ function fixture(t, handler = () => ({}), { session = () => ({ ok: false, status
     .matchAll(/\bid="([^"]+)"/g)].map((match) => [match[1], new Node()]));
   nodes.get("submit-question").append(new Node("span"));
   nodes.get("effort").value = "medium";
+  nodes.get("response-mode").value = "quick";
   const timers = new Set();
   const document = {
     baseURI, hidden: false, activeElement: null,
     getElementById(id) { assert(nodes.has(id), "Missing DOM element: " + id); return nodes.get(id); },
-    createElement: (tag) => new Node(tag), createDocumentFragment: () => new Node("fragment"),
+    createElement: (tag) => Object.assign(new Node(tag), { ownerDocument: document }), createDocumentFragment: () => new Node("fragment"),
     createTextNode(text) { const node = new Node("text"); node.textContent = text; return node; },
     querySelector: () => ({ value: "quick" }), querySelectorAll: () => [], addEventListener() {},
   };
@@ -289,6 +292,110 @@ test("deepening an autonomous run preserves the mode and selected sandbox", asyn
   assert.equal(submitted.mode, "autonomous");
   assert.equal(submitted.sandbox_profile_id, "java");
   assert.equal(submitted.parent_run_id, "first");
+});
+
+test("visible search mode sends only searchable sources through the form without a model or an execution environment", async (t) => {
+  const html = fs.readFileSync(path.join(staticPath, "index.html"), "utf8");
+  const composer = html.match(/<form id="question-form"[^>]*>([\s\S]*?)<\/form>/)[1];
+  assert(composer.indexOf("</details>") < composer.indexOf('id="response-mode"'));
+  let submitted;
+  const { ui, nodes } = fixture(t, ({ path: route, method, body }) => {
+    if (route === "runs" && method === "POST") {
+      submitted = JSON.parse(body); return run("found", { ...submitted });
+    }
+    return run("found", { ...submitted });
+  });
+  const choose = (value) => { nodes.get("response-mode").value = value; nodes.get("response-mode").listeners.change(); };
+  ui.state.status.model = { available: false, state: "disabled" };
+  const sources = [
+    { id: "wiki", direct_search: true }, { id: "graph:system", direct_search: true },
+    { id: "private-adapter", direct_search: false }, { id: "connection:jira" }, { id: "repo:billing" },
+  ];
+  ui.state.status.indexes = sources;
+  ui.state.selectedSandboxProfile = "removed-profile";
+  ui.renderStatus();
+  choose("search");
+  assert.equal(nodes.get("submit-question").disabled, false);
+  assert.equal(nodes.get("submit-question").firstElementChild.textContent, "Найти");
+  assert.equal(nodes.get("notice").hidden, true);
+  assert.equal(nodes.get("composer-environment").hidden, true);
+  assert.equal(nodes.get("source-count").textContent, "2 / 2");
+  assert.deepEqual(nodes.get("source-list").children.map((row) => row.firstElementChild.value), ["wiki", "graph:system"]);
+  nodes.get("select-all-sources").checked = false; nodes.get("select-all-sources").listeners.change();
+  assert.equal(nodes.get("source-count").textContent, "0 / 2");
+  choose("investigate");
+  assert.equal(nodes.get("source-count").textContent, "3 / 5");
+  assert.equal(nodes.get("composer-environment").hidden, false);
+  choose("search");
+  nodes.get("question").value = "Порядок оплаты";
+  nodes.get("question-form").listeners.submit({ preventDefault() {} });
+  assert.equal(submitted, undefined);
+  assert.match(nodes.get("error-banner").textContent, /базу знаний или граф/);
+  nodes.get("select-all-sources").checked = true; nodes.get("select-all-sources").listeners.change();
+  nodes.get("question-form").listeners.submit({ preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(submitted.mode, "search");
+  assert.equal(submitted.question, "Порядок оплаты");
+  assert.deepEqual(submitted.index_ids, ["wiki", "graph:system"]);
+  assert.equal(submitted.sandbox_profile_id, "");
+  assert.match(nodes.get("conversation-messages").textContent, /Результаты поиска/);
+});
+
+test("opening a search chat restores its mode and sends a search follow-up to its latest turn", async (t) => {
+  const last = run("searched", { mode: "search", effort: "low" });
+  let submitted;
+  const { ui, nodes } = fixture(t, ({ path: route, method, body }) => {
+    if (route.startsWith("conversations/chat?")) return { runs: [last], total_runs: 1 };
+    if (route === "runs" && method === "POST") submitted = JSON.parse(body);
+    return run("next", { ...submitted });
+  });
+  await ui.loadConversation({ id: "chat" });
+  assert.equal(nodes.get("response-mode").value, "search");
+  assert.equal(nodes.get("effort").value, "low");
+  nodes.get("question").value = "Где лимиты?";
+  await ui.submitRun();
+  assert.equal(submitted.mode, "search");
+  assert.equal(submitted.parent_run_id, "searched");
+  assert.equal(submitted.effort, "low");
+});
+
+test("opening sources on an older answer selects its materials and expands the panel without starting a search", async (t) => {
+  const old = run("old", { evidence: [{ id: "s1", index_id: "a", title: "Путь платежа", text: "Маршрут A" }] });
+  const latest = run("latest", { mode: "investigate", answer_kind: "search_results",
+    evidence: [{ id: "s2", index_id: "a", title: "Другая запись", text: "Маршрут B" }] });
+  const { ui, nodes, document, requests } = fixture(t, ({ path: route }) => route === "runs/old" ? old : latest);
+  ui.conversationState.id = "chat"; ui.conversationState.runs = [old, latest];
+  ui.state.current = latest; ui.setPanelCollapsed("context", true); ui.renderRun();
+  const [previousTurn, lastTurn] = nodes.get("conversation-messages").children;
+  assert.match(lastTurn.textContent, /Результаты поиска/);
+  assert.doesNotMatch(lastTurn.textContent, /Источники ·/);
+  const button = previousTurn.children[1].children[0].children.find((item) => item.attributes["aria-controls"] === "evidence-list");
+  assert.equal(button.textContent, "Источники · 1");
+  button.click(); await new Promise(setImmediate);
+  assert.equal(ui.state.current.id, "old");
+  assert.equal(nodes.get("context-content").hidden, false);
+  assert.equal(document.activeElement, nodes.get("evidence-list"));
+  assert.match(nodes.get("evidence-list").textContent, /Маршрут A/);
+  assert.doesNotMatch(nodes.get("evidence-list").textContent, /Маршрут B/);
+  assert(!requests.some((item) => item.method === "POST"));
+});
+
+test("long source IDs become links to their own cards and quoted or unknown IDs remain literal", (t) => {
+  const { ui, nodes, document } = fixture(t);
+  const hash = "a".repeat(64), missing = "b".repeat(64);
+  const result = run("one", { mode: "search", answer_kind: "search_results",
+    answer: `**Результаты поиска**\n\n**Заголовок**\n\nАС [${hash}]\n\n> Образец [${hash}]\n\nАС [${missing}]`,
+    evidence: [{ id: "other", index_id: "a", text: "Другая запись" }, { id: hash, index_id: "a", text: "Образец" }] });
+  ui.conversationState.id = "chat"; ui.conversationState.runs = [result];
+  ui.state.current = result; ui.setPanelCollapsed("context", true); ui.renderRun();
+  const content = nodes.get("answer");
+  const link = content.children[1].children.find((node) => node.tagName === "button");
+  assert.equal(link.textContent, "[2]"); assert.equal(link.title, hash);
+  assert(content.textContent.includes("Образец [" + hash + "]"));
+  assert(content.textContent.includes(missing)); assert(!content.textContent.includes("Результаты поиска"));
+  link.click();
+  assert.equal(document.activeElement, nodes.get("evidence-list").children[1]);
+  assert.equal(nodes.get("context-content").hidden, false);
 });
 
 test("budget UI separates main and summary calls and shows actual grants", (t) => {

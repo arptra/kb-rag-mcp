@@ -103,11 +103,12 @@ def inventory_source_score(item: dict[str, Any]) -> int:
 def inventory_citation_issue(run: dict[str, Any], content: str) -> str | None:
     from agent_harness.answer_quality import cited_evidence_ids
 
-    if run["mode"] != "autonomous" or not service_inventory_question(run["question"]):
+    if not service_inventory_question(run["question"]):
         return None
-    citations = cited_evidence_ids(content, run["evidence"])
+    citations = cited_evidence_ids(content, run["evidence"], question=run["question"])
     relevant = [item for item in run["evidence"] if item["id"] in citations
-                and (item.get("checked_with") or item.get("read_document"))
+                and (run["mode"] != "autonomous" or item.get("checked_with")
+                     or item.get("read_document"))
                 and inventory_source_score(item) >= 2]
     if not relevant:
         return "Для ответа о составе сервисов нужен проверенный реестр, список или итог."

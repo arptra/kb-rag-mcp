@@ -68,6 +68,9 @@ class CatalogSource:
             title=str(item.get("title", item["document_id"])),
             text=str(item.get("excerpt") or item.get("text") or item.get("content") or ""),
             index_id=index_id,
+            rank=item.get("rank"),
+            heading_path=item.get("heading_path") or None,
+            source_path=item.get("source_path") or None,
             url=item.get("source_url") or None,
             revision=str(item.get("source_version") or item.get("revision_id") or "") or None,
         )

@@ -154,7 +154,9 @@ def _source_choices(run: dict[str, Any]) -> list[dict[str, Any]]:
     if not candidates:
         return []
     if run["status"] == "completed":
-        cited = cited_evidence_ids(run.get("answer", ""), evidence)
+        cited = cited_evidence_ids(
+            run.get("answer", ""), evidence, question=run.get("question", ""),
+        )
         counts = Counter(item.get("id") for item in evidence)
         candidates = [(item, origin) for item, origin in candidates
                       if item["id"] in cited and counts[item["id"]] == 1]

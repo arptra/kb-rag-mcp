@@ -87,7 +87,9 @@ class ResearchModel:
                 }
             )
             return {"content": "", "tool_calls": [{"name": self.tool, "args": args}]}
-        return {"content": "FINAL: подтверждённое описание системы.", "tool_calls": []}
+        context = json.loads(kwargs["messages"][-1]["content"])
+        source = context["evidence"][0]
+        return {"content": f"FINAL: {source['text'][:90]} [{source['id']}]", "tool_calls": []}
 
 
 def settings(tmp_path: Path) -> HarnessSettings:

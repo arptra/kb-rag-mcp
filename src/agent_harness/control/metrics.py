@@ -81,7 +81,7 @@ def _safe_run(run: dict[str, Any]) -> dict[str, Any]:
         "id": str(run.get("id", "")),
         "created_at": str(run.get("created_at", "")),
         "mode": run.get("mode")
-        if run.get("mode") in {"quick", "investigate", "autonomous"}
+        if run.get("mode") in {"quick", "investigate", "autonomous", "search"}
         else "unknown",
         "effort": run.get("effort")
         if run.get("effort") in {"low", "medium", "high"}
@@ -183,7 +183,7 @@ def collect_metrics(
         "series": series,
         "modes": [
             {"mode": mode, **_aggregate([run for run in runs if run["mode"] == mode])}
-            for mode in ("quick", "investigate", "autonomous")
+            for mode in ("quick", "investigate", "autonomous", "search")
         ],
         "stop_reasons": [
             {"reason": key, "label": STOP_LABELS[key], "count": value}

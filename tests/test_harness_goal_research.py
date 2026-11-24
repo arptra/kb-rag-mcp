@@ -195,7 +195,7 @@ async def test_empty_final_answer_gets_one_bounded_repair(tmp_path: Path, recove
 async def test_long_or_incomplete_answer_is_never_silently_presented_as_complete(
     tmp_path: Path, limit: int | None, finish_reason: str,
 ) -> None:
-    content = "A" * 13000
+    content = "Payment requests arrive here [entry]. " + "A" * 13000
     model = Model([{"content": content, "tool_calls": [], "finish_reason": finish_reason}])
     runtime = app(tmp_path, model, **({"answer_chars": limit} if limit else {}))
     await runtime.start()

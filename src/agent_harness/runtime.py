@@ -17,11 +17,15 @@ from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from agent_harness.answer_quality import (
+    InvalidWriterAnswer,
     answer_quality_issue,
+    decode_writer_answer,
     format_source_reference,
     is_answer_source,
+    named_values,
     quote_options,
     render_quoted_findings,
+    requested_json,
     selected_quotes,
 )
 from agent_harness.budgets import BUDGET_TOOL, apply_request
@@ -44,7 +48,13 @@ from agent_harness.contracts import (
     ToolPort,
     tool_failure_reason,
 )
-from agent_harness.control.settings import ControlSettings, ControlStore, RunLimits, RuntimeLimits
+from agent_harness.control.settings import (
+    ControlSettings,
+    ControlStore,
+    RunLimits,
+    RuntimeLimits,
+    SearchLimits,
+)
 from agent_harness.graph import ExecutionContext, HarnessGraph
 from agent_harness.mcp_catalog import PREFLIGHT_FAILURES
 from agent_harness.memory import LIST_LIMIT, MemoryFeedback, MemoryInput, MemoryStore
@@ -70,7 +80,10 @@ from agent_harness.policy import (
     AUTOPILOT_PLANNING_PROMPT,
     AUTOPILOT_QUOTE_PROMPT,
     AUTOPILOT_SELECT_PROMPT,
+    INVESTIGATION_ANSWER_PROMPT,
+    QUICK_ANSWER_PROMPT,
     SYSTEM_PROMPT,
+    WRITER_ANSWER_PROMPT,
 )
 from agent_harness.research import (
     initial_search_query,
@@ -78,6 +91,7 @@ from agent_harness.research import (
     needs_source_check,
     simple_service_count_question,
 )
+from agent_harness.search_results import render_search_results, source_passage
 from agent_harness.store import ACTIVE, RunStore, timestamp
 
 _LOG = logging.getLogger(__name__)
@@ -240,7 +254,7 @@ class HarnessRuntime:
         controls = self.control_store.load()
         if request.mode == "autonomous" and not controls.autonomy.enabled:
             raise ValueError("Режим «Автопилот» отключён администратором.")
-        queue = self._queues["quick" if request.mode == "quick" else "investigate"]
+        queue = self._queues["quick" if request.mode in {"quick", "search"} else "investigate"]
         if queue.full():
             raise QueueFullError("Очередь заполнена; повторите запрос позже.")
         run_id, now = uuid4().hex, timestamp()
@@ -295,7 +309,9 @@ class HarnessRuntime:
             context_capacity = max(256, context_capacity - min(
                 8192, controls.context.window_tokens // 32,
             ))
-        initial = controls.profiles[run["mode"]][run["effort"]].model_dump()
+        profile = (controls.search_limits(run["effort"]) if run["mode"] == "search"
+                   else controls.profiles[run["mode"]][run["effort"]])
+        initial = profile.model_dump()
         ceiling = (controls.autonomy.caps.model_dump()
                    if run["mode"] == "autonomous" else dict(initial))
         for limits in (initial, ceiling):
@@ -312,7 +328,8 @@ class HarnessRuntime:
     def _budget(self, run: dict[str, Any]) -> RunLimits:
         if "budget" not in run:
             self._initialize_budget(run, self.control_store.load())
-        return RunLimits.model_validate(run["budget"]["current"])
+        schema = SearchLimits if run["mode"] == "search" else RunLimits
+        return schema.model_validate(run["budget"]["current"])
 
     def _runtime_limits(self, run: dict[str, Any]) -> RuntimeLimits:
         self._budget(run)
@@ -409,9 +426,10 @@ class HarnessRuntime:
         ):
             return False
         budget = self._budget(run)
-        if self._decision_calls(run) >= budget.model_calls:
+        if run["mode"] != "search" and self._decision_calls(run) >= budget.model_calls:
             return False
-        if run["mode"] != "quick" and self._followup_calls(run) >= budget.source_calls:
+        if (run["mode"] not in {"quick", "search"}
+                and self._followup_calls(run) >= budget.source_calls):
             return False
         return await self._graph.has_checkpoint(principal, run["id"])
 
@@ -431,7 +449,7 @@ class HarnessRuntime:
         selected = set(index_ids if index_ids is not None else run["index_ids"])
         if not selected <= allowed:
             raise ValueError("Доступ к одному из выбранных источников отсутствует.")
-        queue = self._queues["quick" if run["mode"] == "quick" else "investigate"]
+        queue = self._queues["quick" if run["mode"] in {"quick", "search"} else "investigate"]
         if queue.full():
             raise QueueFullError("Очередь заполнена; повторите запрос позже.")
         current = self.store.get(principal.owner_id, run_id)
@@ -455,6 +473,12 @@ class HarnessRuntime:
             ):
                 run.pop(key, None)
             self._warn(run, "Область изменилась; прежние данные исключены из продолжения.")
+        if run["mode"] == "search":
+            # The retry queries every selected index again. A document returned
+            # only by the old query must not survive as a current search hit.
+            run.update(evidence=[], coverage={}, warnings=[])
+            run.pop("_pending_source_checks", None)
+            run.pop("stop_reason", None)
         run.update(
             status="queued",
             phase="queued",
@@ -739,6 +763,10 @@ class HarnessRuntime:
         indexes = await self._indexes(principal)
         model = await self._model_status()
         controls = self.control_store.load()
+        mode_profiles = dict(controls.profiles)
+        mode_profiles["search"] = {
+            effort: controls.search_limits(effort) for effort in controls.profiles["quick"]
+        }
         return {
             "enabled": self.settings.enabled,
             "control_enabled": self.settings.control_enabled,
@@ -773,14 +801,14 @@ class HarnessRuntime:
                         }
                         for effort, profile in profiles.items()
                     }
-                    for mode, profiles in controls.profiles.items()
+                    for mode, profiles in mode_profiles.items()
                 },
             },
         }
 
     async def _indexes(
         self, principal: Principal, timeout: float | None = None
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         async def catalog(provider: SourcePort | ToolPort) -> list[dict[str, str]]:
             try:
                 return await asyncio.wait_for(
@@ -790,13 +818,13 @@ class HarnessRuntime:
             except Exception:
                 return []
 
-        catalogs = await asyncio.gather(
-            *(catalog(provider) for provider in (self.source, self.tools) if provider is not None)
-        )
+        providers = [provider for provider in (self.source, self.tools) if provider is not None]
+        catalogs = await asyncio.gather(*(catalog(provider) for provider in providers))
         return list(
             {
-                str(item["id"]): {"id": str(item["id"]), "name": str(item.get("name", item["id"]))}
-                for items in catalogs
+                str(item["id"]): {"id": str(item["id"]), "name": str(item.get("name", item["id"])),
+                                  "direct_search": provider is self.source}
+                for provider, items in zip(providers, catalogs, strict=True)
                 for item in items
                 if item.get("id")
             }.values()
@@ -945,7 +973,7 @@ class HarnessRuntime:
             terminal = "partial" if run["evidence"] else "failed"
             run["warnings"].append(f"Исследование не завершено ({type(exc).__name__}).")
         finally:
-            if self.tools is not None:
+            if self.tools is not None and run["mode"] != "search":
                 try:
                     closing = asyncio.create_task(self.tools.close_run(run["id"]))
                     await self._cleanup(closing, run)
@@ -982,6 +1010,10 @@ class HarnessRuntime:
                 _LOG.warning("Harness retention deferred (%s)", type(exc).__name__)
 
     def _record_run_outcome(self, owner: str, run: dict[str, Any]) -> None:
+        if run.get("mode") == "search":
+            # Retrieval alone does not confirm an answer or a successful route.
+            # Explicit feedback can still teach the shared memory about this run.
+            return
         try:
             contribution = self.memory.record_outcome(
                 owner, run, index_ids=sorted(self._run_scope(run)),
@@ -1072,7 +1104,7 @@ class HarnessRuntime:
 
     async def _refresh_authentication(self, run: dict[str, Any]) -> None:
         clock = self._clocks.get(run["id"])
-        if clock is None or self.model is None:
+        if run.get("mode") == "search" or clock is None or self.model is None:
             return
         async with clock.lock:
             now = time.monotonic()
@@ -1483,7 +1515,14 @@ class HarnessRuntime:
             self._warn(run, "Источник вернул evidence за пределами запрошенного индекса.")
             return False
         payload = item.model_dump(exclude={"tool_outcome", "remote_tool", "service_inventory",
-                                           "mcp_catalog_revision"})
+                                           "mcp_catalog_revision", "rank", "heading_path",
+                                           "source_path"})
+        if item.rank is not None:
+            payload["rank"] = item.rank
+        if item.heading_path:
+            payload["heading_path"] = item.heading_path[:500]
+        if item.source_path:
+            payload["source_path"] = item.source_path[:1000]
         if item.mcp_catalog_revision and index_id.startswith("connection:"):
             payload["mcp_catalog_revision"] = item.mcp_catalog_revision
         if (item.service_inventory is not None and index_id == "graph:system"
@@ -1498,7 +1537,11 @@ class HarnessRuntime:
             else profile.document_chars if document
             else min(self._runtime_limits(run).evidence_chars, profile.evidence_chars)
         )
-        payload["text"] = payload["text"][:text_limit]
+        if (not document and item.kind == "source"
+                and run.get("mode") in {"quick", "investigate", "search"}):
+            payload["text"] = source_passage(item.text, run["question"], text_limit)
+        else:
+            payload["text"] = payload["text"][:text_limit]
         if recovery and checked_with:
             # An automatic read/search can confirm a finding only if its retained
             # text actually adds detail. A new hit id can wrap an identical snippet.
@@ -1522,6 +1565,7 @@ class HarnessRuntime:
         payload["revision"] = payload["revision"][:200] if payload["revision"] else None
         if document:
             payload["read_document"] = True
+        if document or len(item.text) > text_limit:
             payload["text_truncated"] = len(item.text) > text_limit
         for i, existing in enumerate(run["evidence"]):
             if (existing["id"], existing["index_id"]) == (payload["id"], index_id):
@@ -1677,15 +1721,21 @@ class HarnessRuntime:
             and (raw_plan.get("current_branch") or {}).get("status") != "open"
         )
         system_prompt = SYSTEM_PROMPT
-        reporting = run["mode"] == "autonomous" and not tools and run["phase"] == "synthesizing"
-        source_quotes = reporting and run.get("_final_quality_issue") and any(
+        reporting = not tools and run["phase"] == "synthesizing"
+        source_quotes = reporting and run["mode"] == "autonomous" and run.get(
+            "_final_quality_issue"
+        ) and any(
             is_answer_source(item) and (item.get("read_document") or item.get("checked_with"))
             for item in run["evidence"]
         )
         if planning:
             system_prompt = AUTOPILOT_PLANNING_PROMPT
         elif reporting:
-            system_prompt = AUTOPILOT_QUOTE_PROMPT if source_quotes else AUTOPILOT_ANSWER_PROMPT
+            system_prompt = {
+                "quick": QUICK_ANSWER_PROMPT,
+                "investigate": INVESTIGATION_ANSWER_PROMPT,
+                "autonomous": AUTOPILOT_QUOTE_PROMPT if source_quotes else AUTOPILOT_ANSWER_PROMPT,
+            }[run["mode"]]
             if issue := run.get("_final_quality_issue"):
                 context["answer_correction"] = issue
         messages = [
@@ -1799,7 +1849,9 @@ class HarnessRuntime:
         # then expand their text. Arrival order must not decide what the model sees.
         ranked = planning_evidence(run, exchange or []) if planning else self._ranked_evidence(run)
         if reporting:
-            ranked = [{**item, "citation": "[" + item["id"] + "]"} for item in ranked
+            ordinals = {(e["index_id"], e["id"]): n for n, e in enumerate(run["evidence"], 1)}
+            ranked = [{**item, "citation_number": ordinals[(item["index_id"], item["id"])],
+                       "citation": "[" + item["id"] + "]"} for item in ranked
                       if is_answer_source(item) and (
                           not source_quotes or item.get("read_document") or item.get("checked_with")
                       )]
@@ -1908,6 +1960,60 @@ class HarnessRuntime:
             else:
                 context["answer_correction"] = run["_final_quality_issue"]
             included_memories = []
+        writer_refs: dict[int, str] = {}
+        if reporting and run["mode"] in {"quick", "investigate"} and isinstance(
+            self.model, ModelRouter,
+        ):
+            # The writer needs facts and their references. Keep routing state in the
+            # graph and use the same short numbers the user sees in the evidence panel.
+            ids = {entry["id"] for entry in run["evidence"]}
+            excerpts = []
+            for item in context["evidence"]:
+                number = item["citation_number"]
+                ref = item["id"] if str(number) in ids else str(number)
+                excerpts.append({
+                    "number": number, "citation": f"[{ref}]", "title": item["title"],
+                    "text": item["text"],
+                    **{k: item[k] for k in (
+                        "heading_path", "revision", "context_truncated", "service_inventory",
+                    ) if item.get(k)},
+                })
+                if not re.search(r"[\[\]\r\n]", ref):
+                    writer_refs[number] = ref
+            if requested_json(run["question"]):
+                writer_refs.clear()  # Respect the user's requested data format.
+            names = named_values(run["question"], context["evidence"]) if writer_refs else {}
+            numbers = {item["id"]: item["citation_number"] for item in context["evidence"]}
+            if writer_refs:
+                instruction = WRITER_ANSWER_PROMPT
+                if names:
+                    instruction += (
+                        " Пользователь спрашивает точное название. Если оно подтверждено, "
+                        "скопируй название дословно в answer и номер документа в sources."
+                    )
+                elif run["mode"] == "investigate":
+                    instruction += (
+                        " Опиши результаты выполненных проверок. Для жалобы отдели "
+                        "установленную причину от возможных объяснений."
+                    )
+                messages[0] = {"role": "system", "content": instruction}
+            gaps = context.get("open_questions") or context.get("research_plan", {}).get("gaps", [])
+            context = {
+                "question": run["question"], "stage": run["phase"],
+                "allowed_indexes": context.get("allowed_indexes", []),
+                "evidence": excerpts,
+                **({"open_questions": gaps} if gaps else {}),
+                **{k: context[k] for k in (
+                    "source_gaps", "answer_correction",
+                    "history_question_not_evidence", "history_answer_not_evidence",
+                    "shared_memory_not_evidence",
+                ) if context.get(k)},
+            }
+            if 0 < len(names) <= 24:
+                options = {name: [numbers[ref] for ref in refs] for name, refs in names.items()}
+                candidate = {**context, "names_in_sources": options}
+                if fits(candidate):
+                    context = candidate
         messages.append({"role": "user", "content": json.dumps(context, ensure_ascii=False)})
         used = {item["id"]: item for item in run.get("memory_used", [])}
         for item in included_memories:
@@ -1924,6 +2030,15 @@ class HarnessRuntime:
             principal, run, event, messages, tools, deadline=deadline,
             included_memory_ids=[item["id"] for item in included_memories],
         )
+        if (writer_refs and not decision.get("tool_calls")
+                and isinstance(decision.get("content"), str)):
+            try:
+                answer = decode_writer_answer(decision["content"], writer_refs)
+            except InvalidWriterAnswer as exc:
+                if decision.get("finish_reason") in RETRYABLE_FINISH_REASONS:
+                    raise ModelDecisionError(str(exc)) from None
+                raise
+            return {**decision, "content": answer}
         if choices and (calls := decision.get("tool_calls")):
             if len(calls) == 1 and calls[0].get("name") == "select_passages":
                 numbers = calls[0].get("args", {}).get("numbers")
@@ -2079,7 +2194,7 @@ class HarnessRuntime:
                     else "Модель ответила; проверяем результат и следующий шаг.")
         if not isinstance(result, dict) or not isinstance(result.get("tool_calls", []), list):
             raise ModelDecisionError("Модель вернула некорректный формат решения.")
-        if (not summary and run["mode"] == "autonomous" and not result.get("tool_calls")
+        if (not summary and not result.get("tool_calls")
                 and isinstance(result.get("content"), str)):
             result = {**result, "content": format_source_reference(run, result["content"])}
         if result.get("incomplete_tool_calls"):
@@ -2127,9 +2242,18 @@ class HarnessRuntime:
                         return
                     if run.get("_final_quality_issue"):
                         self._checkpoint(principal, run, event)
+                        if run["mode"] == "quick":
+                            # The user already has search hits. Don't wait for another
+                            # generation just to replace an empty or ungrounded draft.
+                            break
             except ConversationUnavailable:
                 run["status"] = "partial"
                 return
+            except InvalidWriterAnswer as exc:
+                run["_final_quality_issue"] = str(exc)
+                self._trace(run, "answer_quality_rejected", {}, str(exc))
+                if run["mode"] == "quick":
+                    break
             except ModelDecisionError:
                 run["metrics"]["decision_errors"] = run["metrics"].get("decision_errors", 0) + 1
             except ModelTransientError as exc:
@@ -2202,26 +2326,10 @@ class HarnessRuntime:
             run["warnings"].append(message)
 
     def _evidence_answer(self, run: dict[str, Any]) -> None:
-        if run.get("_final_quality_issue") or run.get("stop_reason") == "answer_quality":
-            # Keep source excerpts literal. A model failure is not permission to invent
-            # a conclusion, render source markup or disclose administrative diagnostics.
-            parts = ["Получить подтверждённый ответ на вопрос не удалось."]
-            sources = [item for item in HarnessRuntime._ranked_evidence(run)
-                       if is_answer_source(item)]
-            if sources:
-                parts.append("**Что удалось найти**")
-                for source in sources[:3]:
-                    excerpt = " ".join(source["text"].split())
-                    title = " ".join(source["title"].split())
-                    parts.append("    " + title[:120] + " [" + " ".join(source["id"].split())[:160]
-                                 + "]\n    " + excerpt[:320] + ("…" if len(excerpt) > 320 else ""))
-            else:
-                parts.append("Среди выбранных источников нет материала для подтверждения вывода.")
-            run["answer"] = "\n\n".join(parts)[:self._runtime_limits(run).answer_chars]
-            return
-        run["answer"] = (
-            "Найдены фрагменты источников. Объяснение системы не сформировано; "
-            "проверьте найденные подтверждения и ограничения ниже."
-            if any(is_answer_source(item) for item in run["evidence"])
-            else "Подтверждённых данных для ответа пока нет."
-        )
+        if run["mode"] == "search" or any(is_answer_source(item) for item in run["evidence"]):
+            run["answer"] = render_search_results(
+                run, max_chars=self._runtime_limits(run).answer_chars,
+            )
+            run["answer_kind"] = "search_results"
+        else:
+            run["answer"] = "Подтверждённых данных для ответа пока нет."

@@ -161,7 +161,10 @@
       day: "numeric", month: "short", ...(full ? { hour: "2-digit", minute: "2-digit" } : {}),
     }).format(date);
   }
-  function modeLabel(value) { return { quick: "Быстрый ответ", investigate: "Исследование", autonomous: "Автопилот" }[value] || "Запрос"; }
+  const MODE_LABELS = { search: "Поиск без модели", quick: "Быстрый ответ", investigate: "Исследование", autonomous: "Автопилот" };
+  function modeLabel(value) { return MODE_LABELS[value] || "Запрос"; }
+  function composerMode() { return $("response-mode").value || "quick"; }
+  function usesTools(mode) { return mode === "investigate" || mode === "autonomous"; }
   function effortLabel(value) { return { low: "низкое", medium: "обычное", high: "высокое" }[value] || "не указано"; }
   function showError(message) {
     $("error-banner").textContent = message || "";
@@ -1350,9 +1353,10 @@
     const unavailable = selected && !state.sandboxProfiles.some((profile) => profile.id === selected);
     if (unavailable) { const item = element("option", "", "Недоступная среда · " + selected); item.value = selected; item.disabled = true; select.append(item); }
     select.value = selected;
-    const quick = document.querySelector('input[name="mode"]:checked').value === "quick";
-    select.disabled = quick || state.needsAuth || Boolean(state.current && !Array.isArray(state.current.index_ids));
-    $("environment-description").textContent = quick ? "Песочница используется в исследовании." : unavailable ?
+    const withTools = usesTools(composerMode());
+    $("composer-environment").hidden = !withTools;
+    select.disabled = !withTools || state.needsAuth || Boolean(state.current && !Array.isArray(state.current.index_ids));
+    $("environment-description").textContent = unavailable ?
       "Выбранная среда сейчас недоступна. Выберите другую среду." : state.sandboxProfiles.length ?
       "Подготовленная среда для запуска кода." : "Среды включаются в настройках песочниц.";
   }
@@ -1373,23 +1377,34 @@
     } finally { if (state.sandboxProfilesController === controller) state.sandboxProfilesController = null; }
   }
   function renderRunEnvironment(run) {
-    $("run-environment").hidden = run.mode === "quick";
+    $("run-environment").hidden = !usesTools(run.mode);
     $("run-environment").textContent = "Среда выполнения: " + sandboxProfileName(run.sandbox_profile_id || "") +
       (run.resumable ? ". Продолжение использует исходную среду. Для смены среды начните новый запрос." : ".");
   }
   function indexes() { return Array.isArray(state.status?.indexes) ? state.status.indexes : []; }
+  function supportsDirectSearch(item) { return item.direct_search ?? !/^(repo|connection):/.test(item.id); }
+  function modeIndexes(mode) {
+    return mode === "search" ? indexes().filter(supportsDirectSearch) : indexes();
+  }
   function renderEffortDescription() {
-    const mode = document.querySelector('input[name="mode"]:checked')?.value || "quick";
+    $("mode-autonomous").disabled = state.status?.limits?.autonomous_enabled === false;
+    if ($("mode-autonomous").disabled && composerMode() === "autonomous") $("response-mode").value = "investigate";
+    const mode = composerMode();
     const policy = state.status?.limits?.effort_policy?.[mode]?.[$("effort").value];
-    $("mode-description").textContent = mode !== "quick" ?
-      "Базы знаний, код, MCP и другие агенты." : "Базы знаний, без запуска песочниц.";
-    const parts = [mode !== "quick" ? "Сначала обходим все выбранные базы знаний." : "Все выбранные базы знаний и один итоговый ответ."];
+    $("mode-description").textContent = {
+      search: "Фрагменты из баз знаний и графа.",
+      quick: "Краткий ответ по источникам.",
+      investigate: "Проверка по документам, коду и инструментам.",
+      autonomous: "Агент выбирает и проверяет следующие шаги.",
+    }[mode];
+    const parts = [mode === "search" ? "Усилие задаёт время поиска и число параллельных обращений к индексам."
+      : usesTools(mode) ? "Сначала обходим все выбранные базы знаний." : "Все выбранные базы знаний и один итоговый ответ."];
+    if (mode === "search" && policy?.evidence_per_index) parts.push("Материалов из каждого индекса: до " + policy.evidence_per_index + ".");
     if (mode === "autonomous") parts.push("Агент сам запрашивает дополнительные ресурсы в пределах потолков администратора. Все расширения видны в чате.");
-    if (policy && mode !== "quick") {
+    if (policy && usesTools(mode)) {
       parts.push("Чтение документов: до " + policy.document_reads + ". Уточняющих обращений: до " + policy.source_calls + ".");
     } else if (mode === "quick") parts.push("Усилие определяет объём найденных материалов для ответа.");
     if (Number(policy?.timeout_seconds) > 0) parts.push((mode === "autonomous" ? "Стартовое время: " : "Время работы: до ") + Math.ceil(policy.timeout_seconds / 60) + " мин.");
-    $("mode-autonomous").disabled = state.status?.limits?.autonomous_enabled === false;
     $("effort-description").textContent = parts.join(" ");
   }
   function sourceName(id) {
@@ -1399,7 +1414,7 @@
   function updateSubmit() {
     const disabled = state.submitting || state.needsAuth || !state.status || state.status.enabled === false || conversationState.loading || Boolean(activeConversationRun());
     $("submit-question").disabled = disabled;
-    $("submit-question").firstElementChild.textContent = state.submitting ? "Отправляем…" : "Отправить";
+    $("submit-question").firstElementChild.textContent = state.submitting ? "Отправляем…" : composerMode() === "search" ? "Найти" : "Отправить";
     const scopeLoading = Boolean(state.current && !Array.isArray(state.current.index_ids));
     $("deepen-run").disabled = disabled || scopeLoading;
     $("resume-run").disabled = disabled || scopeLoading;
@@ -1409,10 +1424,10 @@
     $("cancel-run").textContent = cancelling ? "Останавливаем…" : "Остановить";
   }
   function renderSources() {
-    const available = indexes();
-    const known = new Set(available.map((item) => item.id));
+    const available = modeIndexes(composerMode());
+    const known = new Set(indexes().map((item) => item.id));
     if (!state.sourcesInitialized) {
-      state.selected = new Set(available.map((item) => item.id));
+      state.selected = known;
       state.sourcesInitialized = true;
     } else state.selected = new Set([...state.selected].filter((id) => known.has(id)));
     const fragment = document.createDocumentFragment();
@@ -1431,14 +1446,17 @@
     }
     $("source-list").replaceChildren(fragment);
     $("sources-empty").hidden = available.length > 0;
-    $("sources-empty").textContent = "Доступные базы знаний пока не подключены.";
+    $("sources-empty").textContent = composerMode() === "search" ?
+      "Для прямого поиска нужна база знаний или граф. Для подключений и репозиториев выберите «Исследование»." :
+      "Доступные источники пока не подключены.";
     updateSourceCount();
   }
   function updateSourceCount() {
-    const total = indexes().length;
-    $("source-count").textContent = state.selected.size + " / " + total;
-    $("select-all-sources").checked = total > 0 && state.selected.size === total;
-    $("select-all-sources").indeterminate = state.selected.size > 0 && state.selected.size < total;
+    const available = modeIndexes(composerMode()), total = available.length;
+    const count = available.filter((item) => state.selected.has(item.id)).length;
+    $("source-count").textContent = count + " / " + total;
+    $("select-all-sources").checked = total > 0 && count === total;
+    $("select-all-sources").indeterminate = count > 0 && count < total;
     $("select-all-sources").setAttribute("aria-checked", $("select-all-sources").indeterminate ? "mixed" : String($("select-all-sources").checked));
     $("select-all-sources").disabled = total === 0;
   }
@@ -1457,8 +1475,8 @@
       notice = "Источники пока недоступны. Запрос не сможет получить подтверждения, пока доступ не восстановлен.";
       connection("Нет источников", "warning");
     } else if (!status.model?.available) {
-      notice = "Модель сейчас недоступна. Можно найти и прочитать источники; готовый ответ по ним не будет сгенерирован.";
-      connection("Поиск по источникам", "warning");
+      if (composerMode() !== "search") notice = "Модель сейчас недоступна. «Поиск без модели» показывает найденные фрагменты и источники.";
+      connection("Поиск по источникам", "ready");
     } else connection("Готов к работе", "ready");
     $("notice").textContent = notice;
     $("notice").hidden = !notice;
@@ -1467,8 +1485,8 @@
       try { portalUrl = new URL(status.portal_url, document.baseURI).href; } catch (_) { /* Invalid link. */ }
     }
     $("portal-link").hidden = !link($("portal-link"), portalUrl);
-    if (refreshSources) renderSources();
     renderEffortDescription();
+    if (refreshSources) renderSources();
     renderModel();
     updateSubmit();
   }
@@ -1724,8 +1742,7 @@
         state.current = conversationState.runs.find((run) => idOf(run) === selectedId) || conversationState.runs.at(-1) || null;
         if (!sameConversation) {
           const latest = conversationState.runs.at(-1);
-          const modeInput = latest && ["quick", "investigate", "autonomous"].includes(latest.mode) ? document.querySelector('input[name="mode"][value="' + latest.mode + '"]') : null;
-          if (modeInput) modeInput.checked = true;
+          if (latest && Object.hasOwn(MODE_LABELS, latest.mode)) $("response-mode").value = latest.mode;
           if (latest?.effort) $("effort").value = latest.effort;
           renderEffortDescription();
         }
@@ -1757,7 +1774,7 @@
     $("refresh-conversation").disabled = conversationState.loading;
     $("composer-section").classList.toggle("in-conversation", hasConversation);
     $("question").placeholder = hasConversation ? "Уточните вопрос или продолжите исследование…" : "Что хотите узнать о системе?";
-    const signature = JSON.stringify([idOf(state.current), conversationState.runs.map((run) => [idOf(run), run.question, run.answer, run.phase, run.status, run.stop_reason, run.evidence?.length, run.research_plan, run.memory_used, run.current_action, run.research_trace?.at(-1)])]);
+    const signature = JSON.stringify([idOf(state.current), conversationState.runs.map((run) => [idOf(run), run.question, run.mode, run.answer_kind, run.answer, run.phase, run.status, run.stop_reason, run.evidence?.length, run.research_plan, run.memory_used, run.current_action, run.research_trace?.at(-1)])]);
     if (signature === conversationState.signature) return;
     conversationState.signature = signature;
     const fragment = document.createDocumentFragment();
@@ -1767,12 +1784,20 @@
       user.append(element("span", "chat-role", "Вы"), element("p", "chat-user-text", run.question || "Сообщение"));
       const assistant = element("div", "chat-assistant");
       const heading = element("div", "chat-assistant-heading");
-      heading.append(element("span", "chat-role", "Ответ Harness"), element("span", "chat-status" + (ACTIVE.has(run.status) ? " is-active" : ""), runStatusLabel(run)));
+      const searchResults = run.mode === "search" || run.answer_kind === "search_results";
+      heading.append(element("span", "chat-role", searchResults ? "Результаты поиска" : "Ответ Harness"),
+        element("span", "chat-status" + (ACTIVE.has(run.status) ? " is-active" : ""), runStatusLabel(run)));
+      if (!searchResults && run.answer && run.evidence?.length && !ACTIVE.has(run.status)) {
+        const sources = element("button", "chat-sources", "Источники · " + run.evidence.length);
+        sources.type = "button"; sources.setAttribute("aria-controls", "evidence-list");
+        sources.addEventListener("click", () => showRunSources(run));
+        heading.append(sources);
+      }
       assistant.append(heading);
       if (idOf(run) === idOf(state.current)) assistant.append(panel);
       else {
         if (ACTIVE.has(run.status)) assistant.append(element("p", "chat-turn-status", actionDescription(run.current_action) || PHASE_LABELS[run.phase] || STATUS_LABELS[run.status]));
-        const answer = element("div", "answer chat-answer"); renderAnswer(typeof run.answer === "string" ? run.answer : "", answer); assistant.append(answer);
+        const answer = element("div", "answer chat-answer"); renderAnswer(typeof run.answer === "string" ? run.answer : "", answer, run); assistant.append(answer);
         const inspect = element("button", "text-button chat-inspect", "Показать ход работы и материалы"); inspect.type = "button";
         inspect.addEventListener("click", () => selectRun(run)); assistant.append(inspect);
       }
@@ -1783,6 +1808,14 @@
     if (wasAtBottom && hasConversation) scrollChatToLatest();
     else scroll.scrollTop = previousTop;
   }
+  function showRunSources(run, position = null) {
+    if (idOf(run) !== idOf(state.current)) selectRun(run);
+    setPanelCollapsed("context", false);
+    const list = $("evidence-list"), card = position === null ? null : list.children[position];
+    if (!card) list.scrollTop = 0;
+    (card || $("evidence-card")).scrollIntoView({ block: "nearest" });
+    (card || list).focus({ preventScroll: true });
+  }
   function renderEvidence(evidence) {
     const items = Array.isArray(evidence) ? evidence : [];
     const signature = JSON.stringify(items);
@@ -1791,7 +1824,7 @@
     const openIds = new Set([...$("evidence-list").querySelectorAll("details[open]")].map((item) => item.dataset.id));
     const fragment = document.createDocumentFragment();
     items.forEach((item, index) => {
-      const card = element("article", "evidence-item");
+      const card = element("article", "evidence-item"); card.tabIndex = -1;
       const label = element("div", "evidence-label");
       label.append(element("span", "evidence-number", String(index + 1)), document.createTextNode(sourceName(item.index_id)));
       const title = element(safeUrl(item.url) ? "a" : "div", "evidence-title", item.title || "Материал");
@@ -1824,6 +1857,14 @@
     for (const token of tokens) {
       const parent = stack[stack.length - 1];
       if (token.type === "inline") { appendMarkdown(parent, token.children || []); continue; }
+      if (token.type === "harness_citation") {
+        const citation = element("button", "answer-citation", "[" + (token.position + 1) + "]");
+        citation.type = "button"; citation.title = token.id;
+        citation.setAttribute("aria-label", "Открыть источник " + (token.position + 1));
+        citation.setAttribute("aria-controls", "evidence-list");
+        citation.addEventListener("click", () => showRunSources(token.run, token.position));
+        parent.append(citation); continue;
+      }
       if (token.type === "text" || token.type === "html_inline" || token.type === "html_block") { parent.append(document.createTextNode(token.content)); continue; }
       if (token.type === "softbreak" || token.type === "hardbreak") { parent.append(token.type === "hardbreak" ? element("br") : document.createTextNode("\n")); continue; }
       if (token.type === "code_inline") { parent.append(element("code", "", token.content)); continue; }
@@ -1859,13 +1900,33 @@
       }
     }
   }
-  function renderAnswer(text, target = $("answer")) {
+  function renderAnswer(text, target = $("answer"), run = state.current) {
     const selected = target === $("answer");
-    if (selected && text === state.answerSignature) return;
-    if (selected) state.answerSignature = text;
+    const search = run?.answer_kind === "search_results" || run?.mode === "search";
+    const signature = search ? JSON.stringify([idOf(run), text, run.evidence?.map((item) => item.id)]) : text;
+    if (selected && signature === state.answerSignature) return;
+    if (selected) state.answerSignature = signature;
     const fragment = document.createDocumentFragment();
-    if (markdown) appendMarkdown(fragment, markdown.parse(text, {}));
-    else fragment.append(element("p", "answer-plain", text));
+    const body = search ? text.replace(/^\*\*Результаты поиска\*\*\n\n/, "") : text;
+    if (markdown) {
+      const tokens = markdown.parse(body, {});
+      if (search) {
+        const positions = new Map();
+        (run.evidence || []).forEach((item, i) => positions.set(item.id, positions.has(item.id) ? -1 : i));
+        // A direct-search card ends its source line with the retained ID. Leave
+        // quoted document contents, links and ambiguous IDs exactly as returned.
+        for (const token of tokens) {
+          if (token.type !== "inline" || token.level !== 1) continue;
+          const tail = token.children?.at(-1);
+          const match = tail?.type === "text" && /\[([\da-f]{64})\]$/i.exec(tail.content);
+          const position = match ? positions.get(match[1]) : null;
+          if (position == null || position < 0) continue;
+          tail.content = tail.content.slice(0, match.index);
+          token.children.push({ type: "harness_citation", run, id: match[1], position });
+        }
+      }
+      appendMarkdown(fragment, tokens);
+    } else fragment.append(element("p", "answer-plain", body));
     target.replaceChildren(fragment);
     if (selected && text) appear(target);
   }
@@ -2094,7 +2155,7 @@
     $("run-last-step").textContent = lastStep ? "Последнее действие: " + actionDescription(lastStep) + (lastStep.result ? " · " + String(lastStep.result).slice(0, 180) : "") : "";
     if (newPresentation || $("run-details").dataset.active !== String(active)) $("run-details").open = false;
     $("run-details").dataset.active = String(active);
-    $("run-details-label").textContent = active ? "План и ход исследования" : "Как получен ответ";
+    $("run-details-label").textContent = run.mode === "search" ? "Ход поиска" : active ? "План и ход исследования" : "Как получен ответ";
     $("run-details-summary").textContent = "Подтверждений: " + evidenceCount + (run.metrics?.tool_calls ? " · Действий: " + run.metrics.tool_calls : "");
     const phase = run.status === "cancelling" ? "Ожидаем завершения текущего действия." :
       active ? (PHASE_LABELS[run.phase] || "Ожидаем обновления от сервера.") :
@@ -2280,9 +2341,11 @@
     const followup = parent || conversationState.runs.at(-1) || null;
     const question = parent ? parent.question : $("question").value.trim();
     if (!question) { $("question").focus(); return; }
-    const selected = parent ? (Array.isArray(parent.index_ids) ? parent.index_ids : []) : [...state.selected];
-    if (!parent && indexes().length && !selected.length) {
-      showError("Выберите хотя бы один источник в области поиска.");
+    const mode = parent ? (parent.mode === "autonomous" ? "autonomous" : "investigate") : composerMode();
+    const selected = parent ? (Array.isArray(parent.index_ids) ? parent.index_ids : [])
+      : modeIndexes(mode).filter((item) => state.selected.has(item.id)).map((item) => item.id);
+    if (!parent && (indexes().length || mode === "search") && !selected.length) {
+      showError(mode === "search" ? "Для поиска выберите базу знаний или граф в области поиска." : "Выберите хотя бы один источник в области поиска.");
       setPanelCollapsed("context", false);
       const summary = $("sources-disclosure").querySelector("summary");
       if (summary.getAttribute("aria-expanded") !== "true") summary.click();
@@ -2291,13 +2354,13 @@
     }
     const payload = {
       question,
-      mode: parent ? (parent.mode === "autonomous" ? "autonomous" : "investigate") : document.querySelector('input[name="mode"]:checked').value,
+      mode,
       effort: parent ? "high" : $("effort").value,
       index_ids: selected,
       ...(followup ? { parent_run_id: idOf(followup) } : {}),
     };
     if (payload.mode === "autonomous" && state.status?.limits?.autonomous_enabled === false) { showError("Автопилот отключён администратором. Выберите другой режим."); return; }
-    payload.sandbox_profile_id = payload.mode !== "quick" ? state.selectedSandboxProfile : "";
+    payload.sandbox_profile_id = usesTools(mode) ? state.selectedSandboxProfile : "";
     if (payload.sandbox_profile_id && !state.sandboxProfiles.some((profile) => profile.id === payload.sandbox_profile_id)) {
       showError("Выбранная среда выполнения недоступна. Выберите другую среду или вариант по умолчанию."); return;
     }
@@ -2311,6 +2374,10 @@
       if (identityEpoch !== state.identityEpoch) return;
       rememberRun(run);
       if (generation !== state.generation) return;
+      if (parent) {
+        $("response-mode").value = mode; $("effort").value = payload.effort;
+        renderEffortDescription();
+      }
       selectRun(run);
       $("composer-options").open = false;
       $("question").value = "";
@@ -2340,11 +2407,13 @@
   }
   async function resumeRun() {
     if (!state.current?.resumable || state.submitting || state.needsAuth) return;
-    if (!state.selected.size) { showError("Выберите источники для продолжения исследования."); setPanelCollapsed("context", false); return; }
+    const scopeMode = state.current.mode === "search" ? "search" : composerMode();
+    const selected = modeIndexes(scopeMode).filter((item) => state.selected.has(item.id)).map((item) => item.id);
+    if (!selected.length) { showError("Выберите источники для продолжения."); setPanelCollapsed("context", false); return; }
     const epoch = state.identityEpoch, generation = state.generation, id = idOf(state.current);
     state.submitting = true; showError(""); updateSubmit();
     try {
-      const run = await api("runs/" + encodeURIComponent(id) + "/resume", { method: "POST", body: { index_ids: [...state.selected] } });
+      const run = await api("runs/" + encodeURIComponent(id) + "/resume", { method: "POST", body: { index_ids: selected } });
       if (epoch !== state.identityEpoch) return;
       rememberRun(run);
       if (generation === state.generation) selectRun(run);
@@ -2483,10 +2552,11 @@
       if (!$("submit-question").disabled) $("question-form").requestSubmit();
     }
   });
-  document.querySelectorAll('input[name="mode"]').forEach((input) => input.addEventListener("change", () => {
-    renderEffortDescription();
+  $("response-mode").addEventListener("change", () => {
+    if (state.status) renderStatus();
+    else renderEffortDescription();
     renderExecutionEnvironment();
-  }));
+  });
   $("effort").addEventListener("change", renderEffortDescription);
   $("sandbox-profile").addEventListener("change", () => { state.selectedSandboxProfile = $("sandbox-profile").value; renderExecutionEnvironment(); });
   document.querySelectorAll("[data-question]").forEach((button) => button.addEventListener("click", () => {
@@ -2496,7 +2566,9 @@
   }));
   $("select-all-sources").addEventListener("change", () => {
     const selected = $("select-all-sources").checked;
-    state.selected = selected ? new Set(indexes().map((item) => item.id)) : new Set();
+    for (const item of modeIndexes(composerMode())) {
+      if (selected) state.selected.add(item.id); else state.selected.delete(item.id);
+    }
     $("source-list").querySelectorAll('input[type="checkbox"]').forEach((checkbox) => { checkbox.checked = selected; });
     updateSourceCount();
   });

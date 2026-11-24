@@ -40,6 +40,10 @@ class RunLimits(StrictSettings):
     )
 
 
+class SearchLimits(RunLimits):
+    model_calls: Literal[0] = 0
+
+
 class AutonomySettings(StrictSettings):
     enabled: bool = True
     max_extensions: int = Field(default=4, ge=0, le=100)
@@ -118,6 +122,16 @@ class ControlSettings(StrictSettings):
     autonomy: AutonomySettings
     context: ContextSettings = Field(default_factory=ContextSettings)
     runtime: RuntimeLimits = Field(default_factory=RuntimeLimits)
+
+    def search_limits(self, effort: str) -> SearchLimits:
+        # Use the fast queue's I/O limits and the operator's direct retrieval
+        # limits. Older control databases need no additional editable profile.
+        return SearchLimits.model_validate({
+            **self.profiles["quick"][effort].model_dump(),
+            "model_calls": 0, "summary_calls": 0, "document_reads": 0,
+            "evidence_per_index": self.runtime.results_per_index,
+            "evidence_chars": self.runtime.evidence_chars,
+        })
 
     @model_validator(mode="after")
     def complete_profiles(self) -> Self:

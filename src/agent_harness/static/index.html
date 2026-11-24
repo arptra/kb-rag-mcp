@@ -124,20 +124,26 @@
               <form id="question-form" class="composer">
                 <label class="sr-only" for="question">Вопрос или задача</label>
                 <textarea id="question" name="question" placeholder="Что хотите узнать о системе?" rows="2" maxlength="8000" required></textarea>
-                <details id="composer-options" class="composer-options"><summary>Режим и глубина исследования</summary>
+                <details id="composer-options" class="composer-options"><summary>Параметры</summary>
                 <div class="composer-settings">
-                  <fieldset class="mode-options">
-                    <legend class="sr-only">Режим работы</legend>
-                    <label class="mode-option"><input type="radio" name="mode" value="quick" checked><span><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m11.5 2-7 9h5L8.5 18l7-10h-5z"/></svg>Быстро</span></label>
-                    <label class="mode-option"><input type="radio" name="mode" value="investigate"><span><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="m13 7-2 4-4 2 2-4z"/></svg>Исследовать</span></label>
-                    <label class="mode-option"><input id="mode-autonomous" type="radio" name="mode" value="autonomous"><span>Автопилот</span></label>
-                  </fieldset>
                   <label class="effort-select" for="effort">Усилие <select id="effort" name="effort"><option value="low">Низкое</option><option value="medium" selected>Обычное</option><option value="high">Высокое</option></select></label>
                 </div>
-                <div class="composer-environment"><label class="environment-select" for="sandbox-profile">Среда выполнения<select id="sandbox-profile" name="sandbox_profile_id" disabled><option value="">По умолчанию</option></select></label><p id="environment-description">Песочница используется в исследовании.</p></div>
+                <div id="composer-environment" class="composer-environment" hidden><label class="environment-select" for="sandbox-profile">Среда выполнения<select id="sandbox-profile" name="sandbox_profile_id" disabled><option value="">По умолчанию</option></select></label><p id="environment-description"></p></div>
                 <p id="effort-description" class="effort-description">Проверяем все выбранные базы знаний. Усилие определяет глубину разбора.</p>
                 </details>
-                <div class="composer-footer"><p id="mode-description">Базы знаний, без запуска песочниц.</p><button id="submit-question" class="primary-button" type="submit"><span>Отправить</span><span aria-hidden="true">↗</span></button></div>
+                <div class="composer-footer">
+                  <div class="composer-mode">
+                    <label class="sr-only" for="response-mode">Режим ответа</label>
+                    <select id="response-mode" name="mode" aria-describedby="mode-description">
+                      <option value="search">Поиск без модели</option>
+                      <option value="quick" selected>Быстрый ответ</option>
+                      <option value="investigate">Исследование</option>
+                      <option id="mode-autonomous" value="autonomous">Автопилот</option>
+                    </select>
+                    <p id="mode-description">Краткий ответ по источникам.</p>
+                  </div>
+                  <button id="submit-question" class="primary-button" type="submit"><span>Отправить</span><span aria-hidden="true">↗</span></button>
+                </div>
               </form>
               <div class="composer-hint"><span>Enter — отправить · Shift + Enter — новая строка</span><span id="character-count">0 / 8 000</span></div>
             </section>
