@@ -112,6 +112,11 @@ class RepositoryConfig(ResourceConfig):
 class ConnectionConfig(ResourceConfig):
     kind: Literal["mcp", "a2a"]
     allowed_tools: list[str] = Field(default_factory=list, max_length=100)
+    include_read_only_tools: bool = False
+
+    @property
+    def has_tools(self) -> bool:
+        return bool(self.allowed_tools) or self.include_read_only_tools
 
     @field_validator("allowed_tools")
     @classmethod

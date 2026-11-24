@@ -5,10 +5,48 @@ from typing import Any
 
 import pytest
 
-from agent_harness.answer_quality import answer_quality_issue
+from agent_harness.answer_quality import (
+    answer_quality_issue,
+    format_source_reference,
+    render_quoted_findings,
+)
 
 DOCUMENT = "Pay/ops:v2.5+current#L14"
 CHECKOUT = "api/ref123/checkout"
+
+
+def test_explicit_reference_or_exact_source_sentence_can_be_formatted() -> None:
+    doc = {"id": "conf:104", "title": "Relay", "read_document": True, "index_id": "kb",
+           "text": "Получатель ждёт две секунды. Далее запрос отменяется."}
+    run = {"mode": "autonomous", "evidence": [doc]}
+    for text in ("Таймаут указан в карточке 'Relay'.", "Далее запрос отменяется."):
+        result = format_source_reference(run, text)
+        assert "[conf:104]" in result
+        assert not answer_quality_issue(run, result)
+    for text in ("Таймаут указан в карточке 'Other'.", "Далее запрос продолжается.",
+                 "Таймаут указан в карточке 'Relay' [absent]."):
+        assert format_source_reference(run, text) == text
+    ambiguous = "Сведения приведены в карточке «Relay»."
+    for evidence in ([doc, {**doc, "id": "second"}], [{**doc, "read_document": False}]):
+        assert format_source_reference({**run, "evidence": evidence}, ambiguous) == ambiguous
+
+
+def test_structured_answer_matches_only_literals_in_read_documents() -> None:
+    import json
+
+    evidence = {"id": "ref", "index_id": "kb", "kind": "source", "read_document": True,
+                "text": "Лимит на один запрос — десять записей."}
+    finding = {"source_id": "ref", "quote": evidence["text"]}
+    run = {"evidence": [evidence]}
+    assert render_quoted_findings(run, json.dumps({"findings": [finding]})) == (
+        evidence["text"] + " [ref]"
+    )
+    for invalid in ({**finding, "source_id": "absent"}, {**finding, "quote": "Сорок записей."}):
+        assert render_quoted_findings(run, json.dumps({"findings": [finding, invalid]})) is None
+    for source in ({**evidence, "read_document": False}, {**evidence, "kind": "tool_metadata"}):
+        assert render_quoted_findings({"evidence": [source]}, json.dumps({"findings": [
+            finding,
+        ]})) is None
 
 
 @pytest.fixture

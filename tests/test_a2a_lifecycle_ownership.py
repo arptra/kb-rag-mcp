@@ -115,7 +115,7 @@ def test_a2a_shutdown_preserves_default_controller_ownership(settings_factory):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("count", "length"), [(40, 10), (1000, 180)])
-async def test_large_selection_keeps_scope_with_bounded_search_and_model_context(
+async def test_large_selection_searches_every_index_with_bounded_model_context(
     tmp_path, count, length
 ):
     selected = [f"index-{number:04d}-" + "x" * length for number in range(count)]
@@ -134,18 +134,26 @@ async def test_large_selection_keeps_scope_with_bounded_search_and_model_context
                     break
                 await asyncio.sleep(0.01)
         assert run["index_ids"] == selected
-        assert len(source.calls) == 2 and len(model.requests) == 1
-        assert run["status"] == "partial" and run["answer"]
-        assert any("Часть индексов" in warning for warning in run["warnings"])
+        assert sorted(source.calls) == selected
+        assert run["coverage"] == {index: {"status": "searched", "count": 1} for index in selected}
+        assert run["metrics"]["bootstrap_calls"] == count
+        assert len(model.requests) == 1
+        assert run["status"] == "completed" and "[doc-0]" in run["answer"]
         invocation = model.requests[0]
         assert len(json.dumps(invocation["messages"], ensure_ascii=False)) <= (
             invocation["max_input_chars"] - 4000
         )
         context = json.loads(invocation["messages"][-1]["content"])
-        assert {item["index_id"] for item in context["evidence"]} <= set(context["allowed_indexes"])
+        catalog = set(context["allowed_indexes"])
+        evidence = {(item["index_id"], item["id"]) for item in context["evidence"]}
+        assert evidence
+        assert evidence <= {(item["index_id"], item["id"]) for item in run["evidence"]}
+        assert {index for index, _ in evidence} <= catalog <= set(selected)
         assert context["selected_index_count"] == count
+        assert context["coverage"] == {"searched": count, "empty": 0, "failed": 0, "pending": 0}
         if count == 1000:
-            assert context["index_catalog_truncated"] and len(context["allowed_indexes"]) < count
-            assert any("Каталог индексов" in warning for warning in run["warnings"])
+            assert context["index_catalog_truncated"] and len(catalog) < count
+        else:
+            assert not context["index_catalog_truncated"] and catalog == set(selected)
     finally:
         await runtime.stop()

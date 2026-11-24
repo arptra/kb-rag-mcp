@@ -269,7 +269,7 @@ class RunStore:
                     )
                 elif status == "draft":
                     db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-        for table in ("memory_usages", "memory_outcomes"):
+        for table in ("memory_usages", "memory_outcomes", "memory_route_reuses"):
             if not db.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
                 continue
             if not has_memories:

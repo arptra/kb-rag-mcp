@@ -116,7 +116,7 @@ def test_auto_without_uv_installs_runtime_only_through_pip(setup_harness_project
     installs = _pip_installs(calls)
     assert len(installs) == 1
     assert installs[0]["executable"] == str(project / ".venv/bin/python")
-    assert installs[0]["args"] == ["-m", "pip", "install", "--upgrade", str(project)]
+    assert installs[0]["args"] == ["-m", "pip", "install", "--upgrade", f"{project}[agents]"]
     assert not _tool_calls(calls, "uv")
     assert not _tool_calls(calls, "docker")
 
@@ -148,7 +148,7 @@ def test_explicit_pip_ignores_uv_and_preserves_network_configuration(
     assert not _tool_calls(calls, "uv")
     installs = _pip_installs(calls)
     assert len(installs) == 1
-    assert installs[0]["args"] == ["-m", "pip", "install", "--upgrade", str(project)]
+    assert installs[0]["args"] == ["-m", "pip", "install", "--upgrade", f"{project}[agents]"]
     assert all(installs[0]["environment"][key] == value for key, value in configuration.items())
 
 
@@ -276,6 +276,8 @@ def test_available_uv_syncs_locked_dependencies_into_checkout(
         "--locked",
         "--inexact",
         "--no-dev",
+        "--extra",
+        "agents",
     ]
     assert call["environment"]["UV_PROJECT_ENVIRONMENT"] == str(project / ".venv")
     assert call["environment"]["UV_CACHE_DIR"] == str(project / ".uv-cache")

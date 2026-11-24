@@ -22,7 +22,12 @@ from threading import Event
 from typing import Any, Literal
 from uuid import uuid4
 
-from agent_harness.contracts import Evidence, Principal
+from agent_harness.contracts import (
+    ANALYSIS_FILENAME,
+    MAX_ANALYSIS_SOURCE_BYTES,
+    Evidence,
+    Principal,
+)
 from agent_harness.credentials import CredentialStore
 from agent_harness.integrations_config import RepositoryConfig, SandboxConfig
 
@@ -83,6 +88,32 @@ execute(["checkout", "--detach", "--force", "FETCH_HEAD"], "repo")
 print(json.dumps({"commit": execute(["rev-parse", "HEAD"], "repo")}))
 if not url.startswith("https://"):
     shutil.rmtree("/tmp/harness-ssh")
+"""
+
+WRITE_ANALYSIS_SCRIPT = r"""
+import os, secrets, sys
+workspace, name = sys.argv[1:]
+if not name or name in (".", "..") or name != os.path.basename(name):
+    sys.exit(2)
+directory_flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_RDONLY
+root = os.open(workspace, directory_flags)
+try:
+    os.mkdir("analysis", mode=0o700, dir_fd=root)
+except FileExistsError:
+    pass
+directory = os.open("analysis", directory_flags, dir_fd=root)
+temporary = ".write-" + secrets.token_hex(16)
+fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY,
+             0o600, dir_fd=directory)
+try:
+    with os.fdopen(fd, "wb") as output:
+        output.write(sys.stdin.buffer.read())
+    os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+finally:
+    try:
+        os.unlink(temporary, dir_fd=directory)
+    except FileNotFoundError:
+        pass
 """
 
 READ_SCRIPT = r"""
@@ -394,6 +425,7 @@ class SandboxBackend:
             "clone_repository": {"repository_id"},
             "search_repository": {"repository_id", "query"},
             "read_repository": {"repository_id", "path", "start_line", "end_line"},
+            "write_analysis_script": {"repository_id", "filename", "source"},
             "run_in_sandbox": {"repository_id", "command"},
         }
         if name not in expected or set(args) - expected[name]:
@@ -431,6 +463,15 @@ class SandboxBackend:
                 or last - first >= 400
             ):
                 raise ValueError("Read at most 400 lines using positive line numbers")
+        if name == "write_analysis_script":
+            filename, source = args.get("filename"), args.get("source")
+            if not isinstance(filename, str) or not re.fullmatch(ANALYSIS_FILENAME, filename):
+                raise ValueError("Choose a simple .py or .java filename")
+            if (
+                not isinstance(source, str) or not source.strip() or "\0" in source
+                or len(source.encode("utf-8")) > MAX_ANALYSIS_SOURCE_BYTES
+            ):
+                raise ValueError("Provide nonempty UTF-8 source of at most 24 KiB")
         if name == "run_in_sandbox":
             command = args.get("command")
             if (
@@ -704,6 +745,21 @@ class SandboxBackend:
         tool_outcome: Literal["empty", "failed"] | None = None
         if name == "clone_repository":
             text = f"Repository {repository.name}; ref {repository.ref}; commit {checkout.commit}."
+        elif name == "write_analysis_script":
+            filename = args["filename"]
+            writer = ["python", "-I", "-S", "-c", WRITE_ANALYSIS_SCRIPT, "/workspace", filename]
+            output = await self._container(
+                config, checkout, writer, cancel=cancel, run=run, deadline=deadline,
+                stdin_data=args["source"].encode("utf-8"),
+            )
+            if output.code:
+                raise SandboxError("Could not write the analysis file in this run's workspace")
+            suffix = "analysis/" + filename
+            path = "/workspace/" + suffix
+            command = ["python", "-I", path] if filename.endswith(".py") else ["java", path]
+            text = "Analysis file ready. Call run_in_sandbox with " + json.dumps({
+                "repository_id": repository.id, "command": command,
+            })
         elif name == "run_in_sandbox":
             # Commands can edit the volume even if their exit status is nonzero.
             checkout.dirty = True
@@ -767,6 +823,7 @@ class SandboxBackend:
                 text=text[: config.max_output_chars],
                 url=repository.url,
                 revision=revision,
+                kind="tool_metadata" if name == "write_analysis_script" else "source",
                 tool_outcome=tool_outcome,
             )
         ]

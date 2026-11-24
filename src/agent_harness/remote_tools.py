@@ -21,9 +21,12 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import httpx
+from jsonschema.exceptions import ValidationError
 from jsonschema.validators import validator_for
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import McpError
+from mcp.types import INVALID_PARAMS, METHOD_NOT_FOUND
 from referencing import Registry
 
 from .contracts import Evidence, Principal, ToolExecutionFailure, tool_failure_reason
@@ -42,6 +45,12 @@ class RemoteToolError(ToolExecutionFailure):
 
 class _PeerFailure(ValueError):
     """The remote invocation explicitly reported a failed result."""
+
+
+def _revision(definition: dict[str, Any], secret: str) -> str:
+    payload = json.dumps(_redact_tree(definition, secret), ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 class _LimitedStream(httpx.AsyncByteStream):
@@ -98,6 +107,8 @@ def _error_cause(error: BaseException) -> BaseException:
 
 def _error_kind(error: BaseException) -> str:
     cause = _error_cause(error)
+    if isinstance(cause, ToolExecutionFailure) and cause.reason == "mcp_input_mismatch":
+        return "ValidationError"
     return "ValueError" if isinstance(cause, _PeerFailure) else type(cause).__name__
 
 
@@ -243,11 +254,16 @@ class RemoteTools:
         run_id: str,
         cancel: Event,
     ) -> list[Evidence]:
+        observed_catalog: list[str] = []
         try:
             if not connection.allows(principal.owner_id):
                 raise PermissionError("Connection is unavailable to this user")
             if not isinstance(args, dict) or args.get("connection_id") != connection.id:
                 raise ValueError("Invalid connection arguments")
+            if name in {"mcp_list_tools", "mcp_tool_schema"} and "refresh" in args:
+                if type(args["refresh"]) is not bool:
+                    raise ValueError("Invalid MCP refresh flag")
+                args = {key: value for key, value in args.items() if key != "refresh"}
             if len(_json(args).encode()) > _MAX_ARGUMENT_BYTES:
                 raise ValueError("Arguments exceed the byte limit")
             if name == "mcp_list_tools" and connection.kind == "mcp":
@@ -255,11 +271,12 @@ class RemoteTools:
                 if (set(args) - {"connection_id", "query"}
                         or not isinstance(query, str) or len(query) > 200):
                     raise ValueError("Invalid MCP discovery arguments")
-                if not connection.allowed_tools:
+                if not connection.has_tools:
                     raise PermissionError("No tools are allowed on this connection")
                 secret = self._credential(connection)
                 text = await self._bounded(
-                    lambda: self._call_mcp(connection, None, None, secret, query=query), cancel,
+                    lambda: self._call_mcp(connection, None, None, secret, query=query,
+                                           observed_catalog=observed_catalog), cancel,
                 )
                 title = f"{connection.name}: доступные инструменты"
             elif name in {"mcp_call", "mcp_tool_schema"} and connection.kind == "mcp":
@@ -267,18 +284,20 @@ class RemoteTools:
                 arguments = args.get("arguments", {}) if name == "mcp_call" else None
                 fields = {"connection_id", "tool"}
                 if name == "mcp_call":
-                    fields.add("arguments")
+                    fields.update({"arguments", "schema_revision"})
                 if (
                     set(args) - fields
                     or not isinstance(tool, str)
                     or (name == "mcp_call" and not isinstance(arguments, dict))
                 ):
                     raise ValueError("Invalid MCP arguments")
-                if tool not in connection.allowed_tools:
+                if tool not in connection.allowed_tools and not connection.include_read_only_tools:
                     raise PermissionError("Tool is not in the explicit allowlist")
                 secret = self._credential(connection)
                 text = await self._bounded(
-                    lambda: self._call_mcp(connection, tool, arguments, secret),
+                    lambda: self._call_mcp(connection, tool, arguments, secret,
+                                           expected_revision=args.get("schema_revision"),
+                                           observed_catalog=observed_catalog),
                     cancel,
                 )
                 title = f"{connection.name}: {tool}"
@@ -307,6 +326,7 @@ class RemoteTools:
                     title=_redact(title, secret)[:300],
                     text=_redact(text, secret)[:_MAX_CHARS],
                     url=connection.url,
+                    mcp_catalog_revision=observed_catalog[0] if observed_catalog else None,
                     tool_outcome="empty" if name == "mcp_call" and not text.strip() else None,
                     kind="tool_metadata"
                     if name in {"mcp_list_tools", "mcp_tool_schema"} else "source",
@@ -330,14 +350,25 @@ class RemoteTools:
 
     async def _tools(
         self, session: ClientSession, allowed_names: set[str] | None = None,
+        *, include_read_only: bool = False, name: str | None = None, query: str = "",
     ) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
         cursor = None
         seen = set()
+        terms = query.casefold().split()
         for _ in range(8):
             page = await session.list_tools(cursor=cursor)
             for tool in page.tools:
+                if name is not None and tool.name != name:
+                    continue
                 if allowed_names is not None and tool.name not in allowed_names:
+                    annotations = tool.annotations
+                    if not (include_read_only and annotations is not None
+                            and annotations.readOnlyHint is True
+                            and annotations.destructiveHint is not True):
+                        continue
+                if terms and not all(term in (tool.name + " " + (tool.description or "")).casefold()
+                                     for term in terms):
                     continue
                 tools.append(
                     {
@@ -391,6 +422,8 @@ class RemoteTools:
         secret: str,
         *,
         query: str = "",
+        expected_revision: str | None = None,
+        observed_catalog: list[str] | None = None,
     ) -> str:
         async with (
             self._client(secret) as client,
@@ -402,7 +435,25 @@ class RemoteTools:
             ) as session,
         ):
             await session.initialize()
-            definitions = await self._tools(session, set(connection.allowed_tools))
+            definitions = await self._tools(
+                session, set(connection.allowed_tools),
+                include_read_only=connection.include_read_only_tools,
+            )
+            for item in definitions:
+                item["revision"] = _revision(item, secret)
+            if observed_catalog is not None:
+                revisions = sorted(item["revision"] for item in definitions)
+                observed_catalog.append(hashlib.sha256(_json(revisions).encode()).hexdigest())
+            if len(definitions) >= _MAX_TOOLS and (tool or query):
+                # A capped manifest cannot establish that a particular authorized
+                # tool disappeared. Filter on the paginated SDK results before
+                # applying the cap to this specific lookup.
+                definitions = await self._tools(
+                    session, set(connection.allowed_tools), name=tool, query=query,
+                    include_read_only=connection.include_read_only_tools,
+                )
+                for item in definitions:
+                    item["revision"] = _revision(item, secret)
             if tool is None:
                 terms = query.casefold().split()
                 matches = [item for item in definitions if all(
@@ -411,13 +462,14 @@ class RemoteTools:
                 )]
                 catalog: dict[str, Any] = {
                     "kind": "tool_catalog_not_system_evidence", "tools": [],
-                    "matched_count": len(matches), "truncated": False,
+                    "matched_count": len(matches), "truncated": len(definitions) >= _MAX_TOOLS,
                     "next_action": "Read mcp_tool_schema for a selected tool before calling it. "
                     "If truncated, repeat mcp_list_tools with a more specific query.",
                 }
                 for item in matches:
                     catalog["tools"].append(_redact_tree({
                         "name": item["name"], "description": item["description"][:500],
+                        "revision": item["revision"],
                     }, secret))
                     if len(_json(catalog)) > _MAX_CHARS:
                         catalog["tools"].pop()
@@ -425,14 +477,18 @@ class RemoteTools:
                         break
                 return _json(catalog)
             matches = [item for item in definitions if item["name"] == tool]
+            if not matches:
+                raise ToolExecutionFailure("Tool not listed", reason="mcp_tool_missing")
             if len(matches) != 1:
-                raise ValueError("Remote tool is missing or ambiguous")
+                raise ToolExecutionFailure("Duplicate tool name", reason="mcp_tool_ambiguous")
+            revision = matches[0]["revision"]
             if arguments is None:
                 schema_result = _redact_tree(
                     {
                         "kind": "tool_schema_not_system_evidence",
                         **matches[0],
                         "truncated": False,
+                        "revision": revision,
                     },
                     secret,
                 )
@@ -447,8 +503,25 @@ class RemoteTools:
                         }
                     )
                 return _json(schema_result)
-            _validate_schema(matches[0]["inputSchema"], arguments)
-            result = await session.call_tool(tool, arguments)
+            if expected_revision and expected_revision != revision:
+                raise ToolExecutionFailure("Contract changed", reason="mcp_schema_changed")
+            try:
+                _validate_schema(matches[0]["inputSchema"], arguments)
+            except ValidationError:
+                raise ToolExecutionFailure(
+                    "Invalid arguments", reason="mcp_input_mismatch",
+                ) from None
+            try:
+                result = await session.call_tool(tool, arguments)
+            except McpError as exc:
+                conflict = {INVALID_PARAMS: "mcp_dispatch_invalid_args",
+                            METHOD_NOT_FOUND: "mcp_dispatch_unknown_tool"}.get(exc.error.code)
+                if conflict is None:
+                    raise
+                # This response arrived after dispatch; even a schema-looking
+                # JSON-RPC error is not proof that the action had no effects.
+                raise ToolExecutionFailure("Contract conflict after dispatch",
+                                           reason=conflict) from None
             if result.isError:
                 raise _PeerFailure("Remote tool reported a failure")
             parts = [part.model_dump(mode="json") for part in result.content]

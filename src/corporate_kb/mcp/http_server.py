@@ -420,7 +420,8 @@ def create_http_server(
 
         extension_apps.append(("/harness", create_embedded_harness(
             settings, catalog, access=access, authorized=integration_reader_authorized,
-            manager_authorized=integration_manager_authorized, controller=agent_controller,
+            manager_authorized=integration_manager_authorized,
+            graph_authorized=dashboard_authorized, controller=agent_controller,
         )))
 
     a2a: A2AService | None = None

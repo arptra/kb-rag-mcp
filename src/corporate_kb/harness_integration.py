@@ -18,13 +18,14 @@ from agent_harness.contracts import Evidence, Principal
 from agent_harness.http import create_app
 from agent_harness.integrations import IntegrationHub
 from agent_harness.integrations_config import IntegrationStore
-from agent_harness.model_connection import ModelPolicyStop
+from agent_harness.model_connection import ModelPolicyStop, ModelTransientError
 from agent_harness.runtime import HarnessRuntime
 from corporate_kb.access.http import AccessControl
 from corporate_kb.agents.activation import GigaCodeAgentController
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
-from corporate_kb.gigacode_runner import GigaCodePolicyStop
+from corporate_kb.gigacode_runner import GigaCodePolicyStop, GigaCodeTimedOut
+from corporate_kb.harness_graph import GRAPH_INDEX, read_graph, search_graph
 
 
 class CatalogSource:
@@ -34,9 +35,11 @@ class CatalogSource:
         self,
         catalog: RagCatalog,
         authorize: Callable[[Principal], Awaitable[bool]],
+        authorize_graph: Callable[[Principal], Awaitable[bool]] | None = None,
     ) -> None:
         self.catalog = catalog
         self.authorize = authorize
+        self.authorize_graph = authorize_graph
 
     async def _check(self, principal: Principal, cancel: Event | None = None) -> None:
         if cancel is not None and cancel.is_set():
@@ -47,7 +50,15 @@ class CatalogSource:
     async def indexes(self, principal: Principal) -> list[dict[str, str]]:
         await self._check(principal)
         payload = await asyncio.to_thread(self.catalog.payload)
-        return [{"id": item["id"], "name": item["name"]} for item in payload["indexes"]]
+        indexes = [{"id": item["id"], "name": item["name"]} for item in payload["indexes"]]
+        if self.authorize_graph is not None and await self.authorize_graph(principal):
+            indexes.append({"id": GRAPH_INDEX, "name": "Граф сервисов"})
+        return indexes
+
+    async def _check_graph(self, principal: Principal, cancel: Event) -> None:
+        await self._check(principal, cancel)
+        if self.authorize_graph is None or not await self.authorize_graph(principal):
+            raise PermissionError("Доступ к графу сервисов отозван.")
 
     @staticmethod
     def _evidence(item: dict[str, Any], index_id: str) -> Evidence:
@@ -70,6 +81,13 @@ class CatalogSource:
         principal: Principal,
         cancel: Event,
     ) -> list[Evidence]:
+        if index_id == GRAPH_INDEX:
+            await self._check_graph(principal, cancel)
+            items = await asyncio.to_thread(
+                search_graph, self.catalog, query, min(20, max(1, limit)),
+            )
+            await self._check_graph(principal, cancel)
+            return items
         await self._check(principal, cancel)
         tool = self.catalog.tools_for(index_id)
         result = await asyncio.to_thread(tool.search, query=query, top_k=min(20, max(1, limit)))
@@ -84,6 +102,11 @@ class CatalogSource:
         principal: Principal,
         cancel: Event,
     ) -> Evidence:
+        if index_id == GRAPH_INDEX:
+            await self._check_graph(principal, cancel)
+            item = await asyncio.to_thread(read_graph, self.catalog, document_id)
+            await self._check_graph(principal, cancel)
+            return item
         await self._check(principal, cancel)
         # The portal's MCP get_document deliberately compresses to 800 tokens.
         # Harness owns its own read/context budget and needs the original content
@@ -129,7 +152,9 @@ class GigaCodeDecisionModel:
                 messages=messages, tools=tools, cancel=cancel, max_input_chars=max_input_chars,
             )
         except GigaCodePolicyStop:
-            raise ModelPolicyStop("refusal") from None
+            raise ModelPolicyStop("refusal", field="GigaCode") from None
+        except GigaCodeTimedOut:
+            raise ModelTransientError("GigaCode не успел ответить на этот шаг.") from None
 
 
 def build_model(
@@ -150,6 +175,7 @@ def create_embedded_harness(
     access: AccessControl | None,
     authorized: Callable[[Request], Awaitable[bool]],
     manager_authorized: Callable[[Request], Awaitable[bool]],
+    graph_authorized: Callable[[Request], Awaitable[bool]] | None = None,
     controller: GigaCodeAgentController | None = None,
 ) -> Starlette:
     # Grants remain in this adapter, not in portable state or model prompts. Recheck
@@ -164,6 +190,13 @@ def create_embedded_harness(
             return Principal("user:" + str(user["id"]))
         if not await authorized(request):
             return None
+        # A request presenting both credentials must never cache dashboard privileges
+        # under the shared reader's identity.
+        password = settings.admin_password
+        expected = password.get_secret_value() if password else ""
+        supplied = request.headers.get("x-kb-admin-password", "")
+        if len(expected) >= 16 and supplied and secrets.compare_digest(supplied, expected):
+            return Principal("shared-admin:" + hashlib.sha256(supplied.encode()).hexdigest(), True)
         scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
         token = settings.mcp_http_bearer_token
         if (
@@ -172,10 +205,6 @@ def create_embedded_harness(
             and secrets.compare_digest(supplied, token.get_secret_value())
         ):
             return Principal("shared-token:" + hashlib.sha256(supplied.encode()).hexdigest(), True)
-        password = settings.admin_password
-        supplied = request.headers.get("x-kb-admin-password", "")
-        if password and supplied and secrets.compare_digest(supplied, password.get_secret_value()):
-            return Principal("shared-admin:" + hashlib.sha256(supplied.encode()).hexdigest(), True)
         if (token and token.get_secret_value()) or (password and password.get_secret_value()):
             return None
         # Password-free development is a single local workspace, never a personal
@@ -196,6 +225,11 @@ def create_embedded_harness(
         original = grants.get(principal.owner_id)
         return original is not None and await identity(original) == principal
 
+    async def check_graph(principal: Principal) -> bool:
+        original = grants.get(principal.owner_id)
+        return (original is not None and graph_authorized is not None
+                and await graph_authorized(original))
+
     async def control_authorized(request: Request) -> bool:
         # Control-plane authority is explicit even in legacy reader/development
         # deployments. A shared RAG token is never an administrator credential.
@@ -214,7 +248,7 @@ def create_embedded_harness(
             state_dir=settings.harness_state_dir,
             authentication_timeout_seconds=settings.gigacode_auth_timeout_seconds,
         ),
-        source=CatalogSource(catalog, check),
+        source=CatalogSource(catalog, check, check_graph),
         model=model,
         tools=integrations,
     )

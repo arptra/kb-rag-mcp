@@ -16,7 +16,14 @@ from langchain_core.messages import HumanMessage
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from agent_harness.answer_quality import answer_quality_issue, is_answer_source
+from agent_harness.answer_quality import (
+    answer_quality_issue,
+    format_source_reference,
+    is_answer_source,
+    quote_options,
+    render_quoted_findings,
+    selected_quotes,
+)
 from agent_harness.budgets import BUDGET_TOOL, apply_request
 from agent_harness.config import HarnessSettings
 from agent_harness.context import (
@@ -39,19 +46,38 @@ from agent_harness.contracts import (
 )
 from agent_harness.control.settings import ControlSettings, ControlStore, RunLimits, RuntimeLimits
 from agent_harness.graph import ExecutionContext, HarnessGraph
+from agent_harness.mcp_catalog import PREFLIGHT_FAILURES
 from agent_harness.memory import LIST_LIMIT, MemoryFeedback, MemoryInput, MemoryStore
 from agent_harness.model_connection import (
     INCOMPLETE_FINISH_REASONS,
     RETRYABLE_FINISH_REASONS,
     ModelConnectionError,
+    ModelContextTooLarge,
     ModelPolicyStop,
     ModelRouter,
     ModelTransientError,
     check_model_policy,
 )
 from agent_harness.model_profiles import DEEPSEEK_CONTEXT_WINDOW_TOKENS
-from agent_harness.policy import SYSTEM_PROMPT
-from agent_harness.research import initial_search_query, needs_source_check
+from agent_harness.planning_context import (
+    archive_excerpts,
+    discovery_connection,
+    new_read,
+    planning_evidence,
+)
+from agent_harness.policy import (
+    AUTOPILOT_ANSWER_PROMPT,
+    AUTOPILOT_PLANNING_PROMPT,
+    AUTOPILOT_QUOTE_PROMPT,
+    AUTOPILOT_SELECT_PROMPT,
+    SYSTEM_PROMPT,
+)
+from agent_harness.research import (
+    initial_search_query,
+    inventory_citation_issue,
+    needs_source_check,
+    simple_service_count_question,
+)
 from agent_harness.store import ACTIVE, RunStore, timestamp
 
 _LOG = logging.getLogger(__name__)
@@ -59,6 +85,8 @@ _ANSWER_TRUNCATED = "\n\n[Ответ сокращён по ограничени�
 _TOOL_FAILURE_MESSAGES = {
     "permission": "нет доступа", "timeout": "истекло время ожидания",
     "remote_error": "удалённый инструмент вернул ошибку",
+    "mcp_dispatch_invalid_args": "сервер отклонил параметры после отправки вызова",
+    "mcp_dispatch_unknown_tool": "сервер отклонил имя инструмента после отправки вызова",
 }
 
 
@@ -291,7 +319,8 @@ class HarnessRuntime:
         return RuntimeLimits.model_validate(run["_control"]["runtime"])
 
     def _input_tokens(self, run: dict[str, Any]) -> int:
-        return self._budget(run).context_tokens
+        configured = self._budget(run).context_tokens
+        return min(configured, int(run.get("_gateway_input_limit", configured)))
 
     def _count_tokens(self, run: dict[str, Any], value: Any) -> int:
         context = run["_control"]["context"]
@@ -412,6 +441,7 @@ class HarnessRuntime:
             raise ValueError("Продолжение этого исследования уже запущено.")
         # Fail closed on hidden dependencies, including a previously used note.
         if self._run_scope(run) - (allowed & selected):
+            run.pop("provider_diagnostic", None)
             run["evidence"], run["answer"], run["memory_used"] = [], "", []
             run["context_index_ids"], run["parent_question"] = [], None
             run["research_trace"], run["coverage"], run["context_summary"] = [], {}, {}
@@ -419,6 +449,9 @@ class HarnessRuntime:
             run["budget"]["events"] = []
             for key in (
                 "_seen_tool_calls", "_round_evidence", "_stalled_rounds", "_gap_review_requested",
+                "_pending_source_checks",
+                "_mcp_metadata_refs", "_mcp_catalog_revisions", "_mcp_schema_revisions",
+                "_mcp_contract_repairs", "_initial_mcp_route",
             ):
                 run.pop(key, None)
             self._warn(run, "Область изменилась; прежние данные исключены из продолжения.")
@@ -773,6 +806,7 @@ class HarnessRuntime:
     def _visible(run: dict[str, Any], indexes: list[dict[str, str]]) -> dict[str, Any]:
         allowed = {item["id"] for item in indexes}
         if HarnessRuntime._run_scope(run) - allowed:
+            run.pop("provider_diagnostic", None)
             run["evidence"], run["answer"] = [], ""
             run["memory_used"], run["parent_question"] = [], None
             run["research_trace"], run["coverage"], run["context_summary"] = [], {}, {}
@@ -892,9 +926,16 @@ class HarnessRuntime:
             model_stop = exc.stop_reason
             message = str(exc)
             run["answer"] = (
-                message + " Исследование остановлено. Администратор в настройках модели "
-                "может проверить простой запрос и выбор инструмента."
+                message + " Модель не завершила этот шаг."
             )
+            searched = sum(row.get("status") in {"searched", "empty"}
+                           for row in run.get("coverage", {}).values())
+            if searched or run["evidence"]:
+                run["answer"] += (f" До остановки опрошено индексов — {searched}, "
+                                  f"сохранено материалов — {len(run['evidence'])}. "
+                                  "Они доступны в разделе «Источники».")
+            run["answer"] += (" Диагностика в ходе исследования поможет найти "
+                              "событие в журнале шлюза.")
             self._warn(run, message)
             self._trace(run, model_stop, {}, message)
         except ModelConnectionError as exc:
@@ -977,6 +1018,34 @@ class HarnessRuntime:
                                        reason=reason)
         except Exception as exc:
             self._memory_problem(run, "Сбой инструмента не записан в общую память.", exc)
+
+    def _source_issue(
+        self, run: dict[str, Any], tool: str, target: dict[str, str], warning: str,
+    ) -> None:
+        pending = run.setdefault("_pending_source_checks", [])
+        issue = {"tool": tool, "target": target, "warning": warning}
+        # Older checkpoints lack the target of a warning. A new read cannot
+        # prove which earlier document failed when their messages happen to match.
+        tracked = warning not in run["warnings"] or any(i["warning"] == warning for i in pending)
+        if tracked and issue not in pending:
+            pending.append(issue)
+        self._warn(run, warning)
+        self._trace(run, tool, target, warning)
+
+    def _source_recovered(self, run: dict[str, Any], tool: str, target: dict[str, str]) -> bool:
+        pending = run.get("_pending_source_checks", [])
+        recovered = [i for i in pending if i["tool"] == tool and i["target"] == target]
+        if not recovered:
+            return False
+        remaining = [i for i in pending if i not in recovered]
+        run["_pending_source_checks"] = remaining
+        resolved = {i["warning"] for i in recovered} - {i["warning"] for i in remaining}
+        run["warnings"] = [warning for warning in run["warnings"] if warning not in resolved]
+        # A previously full warning list may now have room for other unresolved checks.
+        for issue in remaining:
+            self._warn(run, issue["warning"])
+        self._trace(run, tool, target, "Повторная проверка получила материал источника.")
+        return True
 
     def _run_timeout(self, run: dict[str, Any]) -> float:
         return self._budget(run).timeout_seconds
@@ -1080,6 +1149,28 @@ class HarnessRuntime:
             resume=bool(run.pop("_resume_checkpoint", False)),
         )
 
+    def _answer_snapshot_count(self, run: dict[str, Any]) -> bool:
+        if (run.get("parent_run_id") or run.get("resume_count")
+                or not simple_service_count_question(run["question"])):
+            return False
+        for item in run["evidence"]:
+            snapshot = item.get("service_inventory")
+            if (item["index_id"] != "graph:system" or item["id"] != "graph:inventory"
+                    or not snapshot or snapshot["analysis_mode"] == "partial"):
+                continue
+            self._trace(run, "graph_inventory", {"index_id": item["index_id"]},
+                        "Прочитан счётчик сервисов в опубликованном снимке графа.")
+            item["checked_with"] = "search_knowledge"
+            run["answer"] = (f"Количество сервисов в графе — **{snapshot['service_count']}**. "
+                             f"Снимок от {snapshot['generated_at']} [graph:inventory].")
+            run.update(status="completed", stop_reason="completed")
+            run["research_plan"].update(
+                ready_to_answer=True, gaps=[], completed=["Проверен состав опубликованного графа."],
+                completion_reason="Количество получено из снимка графа сервисов.",
+            )
+            return True
+        return False
+
     async def _external_tool(
         self,
         principal: Principal,
@@ -1122,7 +1213,9 @@ class HarnessRuntime:
             accepted = 0
             failed = False
             # Catalogs, schemas and checkout receipts describe available tools or code.
-            setup_only = name in {"clone_repository", "mcp_list_tools", "mcp_tool_schema"}
+            setup_only = name in {
+                "clone_repository", "write_analysis_script", "mcp_list_tools", "mcp_tool_schema",
+            }
             for item in items:
                 if item.index_id not in run["index_ids"]:
                     raise ValueError("Tool evidence is outside run scope")
@@ -1142,6 +1235,14 @@ class HarnessRuntime:
             return f"Получено подтверждений: {accepted}."
         except Exception as exc:
             reason = tool_failure_reason(exc)
+            if name in {"mcp_call", "mcp_tool_schema"} and reason in PREFLIGHT_FAILURES:
+                run["_mcp_preflight_failure"] = reason
+                return f"Вызов не отправлен. {PREFLIGHT_FAILURES[reason]}. Проверяем определение."
+            if name == "mcp_call" and reason in {"mcp_dispatch_invalid_args",
+                                                 "mcp_dispatch_unknown_tool"}:
+                run["_mcp_dispatch_conflict"] = reason
+            if name in {"mcp_call", "a2a_ask", "run_in_sandbox"}:
+                run["_uncertain_tool_call"] = True
             detail = _TOOL_FAILURE_MESSAGES.get(reason or "", type(exc).__name__)
             message = f"Инструмент {name} недоступен ({detail})."
             self._warn(run, message)
@@ -1205,13 +1306,19 @@ class HarnessRuntime:
                 same_query = query.casefold().split() == initial_terms
                 if not same_query or previous_status not in {"searched", "empty"}:
                     check = "search_knowledge"
-            accepted = sum(
-                self._add_evidence(run, item, index_id, fresh=not initial,
-                                   checked_with=check, recovery=recovery,
-                                   origin_tool="search_knowledge")
-                for item in items[:count]
-            )
-            if initial:
+            accepted = 0
+            recovered = False
+            target = {"index_id": index_id}
+            for item in items[:count]:
+                if self._add_evidence(run, item, index_id, fresh=not initial,
+                                      checked_with=check, recovery=recovery,
+                                      origin_tool="search_knowledge"):
+                    accepted += 1
+                    if (not recovered and run.get("_pending_source_checks")
+                            and is_answer_source(item.model_dump())):
+                        recovered = self._source_recovered(run, "search_knowledge", target)
+            previous_coverage = run.get("coverage", {}).get(index_id, {}).get("status")
+            if initial or (recovered and previous_coverage == "failed"):
                 run.setdefault("coverage", {})[index_id] = {
                     "status": "searched" if items else "empty", "count": len(items[:count]),
                 }
@@ -1220,7 +1327,7 @@ class HarnessRuntime:
             if initial:
                 run.setdefault("coverage", {})[index_id] = {"status": "failed", "count": 0}
             outcome = f"Поиск в {index_id} недоступен ({type(exc).__name__})."
-            self._warn(run, outcome)
+            self._source_issue(run, "search_knowledge", {"index_id": index_id}, outcome)
             self._record_tool_failure(
                 principal, run, operation="search", index_ids=[index_id], tool="search_knowledge",
                 reason=tool_failure_reason(exc),
@@ -1228,6 +1335,66 @@ class HarnessRuntime:
             return outcome
         finally:
             self._checkpoint(principal, run, event, minimum_interval=0.15 if initial else 0)
+
+    def _relevant_memories(
+        self, principal: Principal, run: dict[str, Any], allowed: set[str],
+    ) -> list[dict[str, Any]]:
+        try:
+            return self.memory.retrieve(
+                principal.owner_id, run["question"], allowed, set(run["index_ids"]),
+                exclude_run_id=run["id"],
+            )
+        except Exception as exc:
+            self._memory_problem(run, "Общая память недоступна для подбора опыта к вопросу.", exc)
+            return []
+
+    async def _initial_routes(
+        self, principal: Principal, run: dict[str, Any], knowledge: set[str], *, mcp: bool,
+    ) -> dict[str, tuple[dict[str, str], str]]:
+        """Choose the initial document read and one relevant MCP discovery step."""
+        routes: dict[str, tuple[dict[str, str], str]] = {}
+        if run["mode"] != "autonomous" or not (knowledge or mcp):
+            return routes
+        sources = {item["id"]: item["name"] for item in await self._indexes(principal)}
+        allowed = set(sources)
+        if not self._run_scope(run) <= allowed:
+            raise ValueError("Source access changed during the investigation")
+        memories = self._relevant_memories(principal, run, allowed)
+        permissions = getattr(self.tools, "allowed_mcp_tools", None) if mcp else None
+        permitted = {}
+        if permissions:
+            try:
+                permitted = await asyncio.wait_for(
+                    permissions(principal, run["index_ids"]), self._source_timeout(run),
+                )
+            except Exception as exc:
+                self._memory_problem(run, "Список разрешённых инструментов MCP недоступен.", exc)
+        for item in memories:
+            if item.get("learning_state") in {"mixed", "needs_review"}:
+                continue
+            for choice in item.get("strategy", {}).get("successful_tools", []):
+                index = choice.get("index_id")
+                if (choice.get("tool") == "read_document" and index in knowledge
+                        and "read_document" not in routes):
+                    for ref in choice.get("evidence_ids", []):
+                        document = choice.get("documents", {}).get(ref, ref)
+                        if isinstance(document, str) and 0 < len(document) <= 1000:
+                            routes["read_document"] = ({"index_id": index, "document_id": document},
+                                                       item["id"])
+                            break
+                remote = choice.get("remote_tool")
+                if (choice.get("tool") == "mcp_call" and remote in permitted.get(index, set())
+                        and "mcp_tool_schema" not in routes):
+                    routes["mcp_tool_schema"] = (
+                        {"connection_id": index.removeprefix("connection:"), "tool": remote},
+                        item["id"],
+                    )
+        if "mcp_tool_schema" not in routes:
+            index = discovery_connection(run["question"], run["index_ids"], sources, permitted)
+            if index:
+                args = {"connection_id": index.removeprefix("connection:")}
+                routes["mcp_list_tools"] = (args, "")
+        return routes
 
     async def _read(
         self, principal: Principal, run: dict[str, Any], event: Event, args: dict[str, Any],
@@ -1250,17 +1417,30 @@ class HarnessRuntime:
                 timeout,
             )
             run["metrics"]["document_reads"] = run["metrics"].get("document_reads", 0) + 1
-            return (
-                "Документ прочитан; подтверждение включено в контекст."
-                if self._add_evidence(run, item, args["index_id"], document=True,
+            if not self._add_evidence(run, item, args["index_id"], document=True,
                                       checked_with="read_document"
                                       if model_requested or recovery else None, recovery=recovery,
-                                      origin_tool="read_document")
-                else "Документ не включён: ограничение области доступа или бюджета."
-            )
+                                      origin_tool="read_document"):
+                return "Документ не включён: ограничение области доступа или бюджета."
+            if (run.get("_pending_source_checks")
+                    and args["document_id"] in {item.id, item.document_id}
+                    and is_answer_source(item.model_dump())):
+                self._source_recovered(run, "read_document", args)
+            return "Документ прочитан; подтверждение включено в контекст."
         except Exception as exc:
             outcome = f"Чтение документа недоступно ({type(exc).__name__})."
-            self._warn(run, outcome)
+            known_id = any(
+                item["index_id"] == args["index_id"]
+                and args["document_id"] in {item["id"], item.get("document_id")}
+                for item in run["evidence"]
+            )
+            guessed_id = (isinstance(exc, KeyError) and model_requested
+                          and run["mode"] == "autonomous"
+                          and args["document_id"] not in run["question"] and not known_id)
+            if guessed_id:
+                outcome = "Идентификатор отсутствует. Уточняем поиском."
+            else:
+                self._source_issue(run, "read_document", args, outcome)
             self._record_tool_failure(
                 principal, run, operation="read", index_ids=[args["index_id"]],
                 tool="read_document", reason=tool_failure_reason(exc),
@@ -1302,7 +1482,13 @@ class HarnessRuntime:
         if item.index_id != index_id:
             self._warn(run, "Источник вернул evidence за пределами запрошенного индекса.")
             return False
-        payload = item.model_dump(exclude={"tool_outcome", "remote_tool"})
+        payload = item.model_dump(exclude={"tool_outcome", "remote_tool", "service_inventory",
+                                           "mcp_catalog_revision"})
+        if item.mcp_catalog_revision and index_id.startswith("connection:"):
+            payload["mcp_catalog_revision"] = item.mcp_catalog_revision
+        if (item.service_inventory is not None and index_id == "graph:system"
+                and item.id == "graph:inventory"):
+            payload["service_inventory"] = item.service_inventory.model_dump(mode="json")
         if item.tool_outcome:
             payload["tool_outcome"] = item.tool_outcome
         profile = self._budget(run)
@@ -1395,6 +1581,27 @@ class HarnessRuntime:
         return first + remaining
 
     async def _decide(
+        self, principal: Principal, run: dict[str, Any], event: Event,
+        tools: list[dict[str, Any]], exchange: list[dict[str, Any]] | None = None,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return await self._decide_once(principal, run, event, tools, exchange, deadline)
+        except ModelContextTooLarge:
+            previous = run.pop("_rejected_input_tokens", 0)
+            calls = self._budget(run).model_calls
+            if run.get("phase") == "synthesizing":
+                calls += self._runtime_limits(run).max_answer_retries
+            if ("_gateway_input_limit" in run or previous < 2000 or event.is_set()
+                    or (deadline is not None and self._now(run) >= deadline)
+                    or self._decision_calls(run) >= calls):
+                raise
+            run["_gateway_input_limit"] = previous // 2
+            self._trace(run, "context_resize", {},
+                        "Шлюз отклонил размер запроса. Собираю меньшую подборку материалов.")
+            return await self._decide_once(principal, run, event, tools, exchange, deadline)
+
+    async def _decide_once(
         self,
         principal: Principal,
         run: dict[str, Any],
@@ -1408,14 +1615,7 @@ class HarnessRuntime:
         maximum_tokens = self._input_tokens(run)
         maximum = int(maximum_tokens * run["_control"]["context"]["chars_per_token"])
         allowed = {item["id"] for item in await self._indexes(principal)}
-        try:
-            memories = self.memory.retrieve(
-                principal.owner_id, run["question"], allowed, set(run["index_ids"]),
-                exclude_run_id=run["id"],
-            )
-        except Exception as exc:
-            self._memory_problem(run, "Общая память недоступна для подбора опыта к вопросу.", exc)
-            memories = []
+        memories = self._relevant_memories(principal, run, allowed)
         self._parent_context(principal, run, allowed)
         for attempt in range(2):
             try:
@@ -1470,8 +1670,26 @@ class HarnessRuntime:
                 "extensions": run["budget"]["extensions"],
             },
         }
+        raw_plan = run.get("research_plan", {})
+        planning = run["mode"] == "autonomous" and bool(tools) and not (
+            raw_plan.get("model_updated") and raw_plan.get("ready_to_answer")
+            and not raw_plan.get("gaps") and not needs_source_check(run)
+            and (raw_plan.get("current_branch") or {}).get("status") != "open"
+        )
+        system_prompt = SYSTEM_PROMPT
+        reporting = run["mode"] == "autonomous" and not tools and run["phase"] == "synthesizing"
+        source_quotes = reporting and run.get("_final_quality_issue") and any(
+            is_answer_source(item) and (item.get("read_document") or item.get("checked_with"))
+            for item in run["evidence"]
+        )
+        if planning:
+            system_prompt = AUTOPILOT_PLANNING_PROMPT
+        elif reporting:
+            system_prompt = AUTOPILOT_QUOTE_PROMPT if source_quotes else AUTOPILOT_ANSWER_PROMPT
+            if issue := run.get("_final_quality_issue"):
+                context["answer_correction"] = issue
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             *[{key: item[key] for key in ("role", "content")}
               for item in conversation["messages"]],
         ]
@@ -1494,10 +1712,23 @@ class HarnessRuntime:
         if len(selected_tools) < len(tools):
             self._warn(run, "Часть описаний инструментов не помещается в контекст модели.")
         tools = selected_tools
+        if planning:
+            selected = allowed.intersection(run["index_ids"])
+            retained = {(item["index_id"], item["id"]) for item in run["evidence"]}
+            observations = [
+                {"tool": step["name"], "result": step["model_observation"][:300],
+                 "sources": [ref for ref in step.get("evidence_refs", [])[:4]
+                             if ref[0] in selected and tuple(ref) in retained]}
+                for step in (exchange or [])[-3:] if "model_observation" in step
+            ]
+            if observations and fits({**context, "last_tool_observations": observations}):
+                context["last_tool_observations"] = observations
+            matches = archive_excerpts(run, exchange or [], selected)
+            if matches and fits({**context, "archive_matches": matches}):
+                context["archive_matches"] = matches
         # Plans are model output too: escaped strings can exceed the entire
         # request budget. Fit each public field before reserving room for evidence.
-        raw_plan = run.get("research_plan", {})
-        for key in ("goal", "round", "ready_to_answer", "next_action", "gaps",
+        for key in ("current_branch", "goal", "round", "ready_to_answer", "next_action", "gaps",
                     "completed", "questions", "completion_reason", "model_updated"):
             if key not in raw_plan:
                 continue
@@ -1516,23 +1747,38 @@ class HarnessRuntime:
         # sources with no initial hits, not only sources already present in context.
         missing = [{"index_id": index, "status": item["status"]}
                    for index, item in coverage.items() if item["status"] in {"pending", "failed"}]
-        for item in missing:
-            candidate = {**context, "source_gaps": [*context["source_gaps"], item]}
-            if (self._count_tokens(run, candidate["source_gaps"]) <= maximum_tokens // 10
-                    and fits(candidate)):
-                context = candidate
+        def fit_routing(field: str, entries: list[Any], char_limit: int) -> None:
+            packed: list[Any] = []
+            used = 2
+            for entry in entries:
+                size = len(json.dumps(entry, ensure_ascii=False)) + (2 if packed else 0)
+                if used + size <= char_limit:
+                    packed.append(entry)
+                    used += size
+            # Most catalogs fit in one check. Very large catalogs require at
+            # most log2(n) whole-envelope estimates, irrespective of index count.
+            low, high = 0, len(packed)
+            if fits({**context, field: packed}):
+                context[field] = packed
+                return
+            while low < high:
+                count = (low + high + 1) // 2
+                if fits({**context, field: packed[:count]}):
+                    low = count
+                else:
+                    high = count - 1
+            context[field] = packed[:low]
+
+        fit_routing("source_gaps", missing, maximum // 10)
         context["source_gaps_truncated"] = len(context["source_gaps"]) < len(missing)
-        for index in run["index_ids"]:
-            candidate = {**context, "allowed_indexes": [*context["allowed_indexes"], index]}
-            if (len(json.dumps(candidate["allowed_indexes"], ensure_ascii=False)) <= maximum // 5
-                    and fits(candidate)):
-                context = candidate
+        fit_routing("allowed_indexes", run["index_ids"], maximum // 5)
         context["index_catalog_truncated"] = len(context["allowed_indexes"]) < len(run["index_ids"])
         included_memories = []
         for item in memories:
             note = {key: item.get(key) for key in
-                    ("id", "title", "text", "kind", "status", "origin", "feedback", "outcome",
-                     "quality", "learning_state", "strategy", "research_plan", "failures")}
+                    ("id", "title", "text", "kind", "index_ids", "status", "origin", "feedback",
+                     "outcome", "quality", "learning_state", "strategy", "research_plan",
+                     "failures")}
             candidate = {**context, "shared_memory_not_evidence": [
                 *context["shared_memory_not_evidence"], note,
             ]}
@@ -1542,7 +1788,8 @@ class HarnessRuntime:
         # Final synthesis receives previous failures too. Preserve the latest
         # diagnostics first when a large tool history must be compacted.
         attempts = run.get("research_trace", []) or exchange or []
-        for item in reversed(attempts[-30:]):
+        attempt_limit = 4 if reporting else 12 if planning else 30
+        for item in reversed(attempts[-attempt_limit:]):
             candidate = {**context, "prior_tool_attempts": [item, *context["prior_tool_attempts"]]}
             if (len(json.dumps(candidate["prior_tool_attempts"], ensure_ascii=False))
                     <= maximum // 6
@@ -1550,9 +1797,24 @@ class HarnessRuntime:
                 context = candidate
         # First represent the most relevant documents across different indexes,
         # then expand their text. Arrival order must not decide what the model sees.
-        ranked = self._ranked_evidence(run)
+        ranked = planning_evidence(run, exchange or []) if planning else self._ranked_evidence(run)
+        if reporting:
+            ranked = [{**item, "citation": "[" + item["id"] + "]"} for item in ranked
+                      if is_answer_source(item) and (
+                          not source_quotes or item.get("read_document") or item.get("checked_with")
+                      )]
         originals: list[dict[str, Any]] = []
+        planning_chars = 0
         for item in ranked:
+            if planning:
+                size = len(json.dumps(item, ensure_ascii=False))
+                if planning_chars + size > 32_000:
+                    continue
+                candidate = {**context, "evidence": [*context["evidence"], item]}
+                if fits(candidate):
+                    context = candidate
+                    planning_chars += size
+                continue
             metadata = item.get("kind") == "tool_metadata"
             compact = {**item, "text": item["text"] if metadata else item["text"][:500]}
             compact["context_truncated"] = len(compact["text"]) < len(item["text"])
@@ -1579,7 +1841,20 @@ class HarnessRuntime:
             context["evidence"][position] = {**item, "text": item["text"][:low]}
             if low < len(item["text"]):
                 context["evidence"][position]["context_truncated"] = True
+        if planning and (read_ref := new_read(run, exchange or [])):
+            # Opening a particular document or file requests its full retained
+            # result once. Subsequent decisions use the relevant excerpt again.
+            for position, item in enumerate(context["evidence"]):
+                if (item["index_id"], item["id"]) != read_ref or not item.get("context_truncated"):
+                    continue
+                original = next(e for e in run["evidence"] if (e["index_id"], e["id"]) == read_ref)
+                with_full_document = list(context["evidence"])
+                with_full_document[position] = original
+                if fits({**context, "evidence": with_full_document}):
+                    context["evidence"] = with_full_document
+                break
         run["context_summary"] = {
+            "evidence_view": "planning" if planning else "full",
             "evidence_available": len(run["evidence"]),
             "evidence_included": len(context["evidence"]),
             "documents_shortened": sum(
@@ -1592,22 +1867,81 @@ class HarnessRuntime:
             "conversation_truncated": conversation["history_truncated"],
             "compactions": run["metrics"].get("compactions", 0),
         }
+        choices = {}
+        if reporting and context.get("answer_correction") and context["evidence"]:
+            # On a rejected draft, give the writer the source text and citation next
+            # to one another. The planner's budgets and action journal buried the
+            # actual question for small models. Prior chat turns remain in messages.
+            context = {
+                "stage": run["phase"],
+                "evidence": context["evidence"],
+                "source_gaps": context["source_gaps"],
+                "open_questions": context["research_plan"].get("gaps", []),
+                "question": context["question"],
+            }
+            if source_quotes:
+                if isinstance(self.model, ModelRouter):
+                    choices = quote_options(context["evidence"], context["question"])
+                if choices:
+                    # Copy passages on the host. Even a small model can select one
+                    # option without reproducing a long ID or quoting text by hand.
+                    context.pop("evidence")
+                    context["passages"] = {key: val.model_dump() for key, val in choices.items()}
+                    messages[0] = {"role": "system", "content": AUTOPILOT_SELECT_PROMPT}
+                    tools = [{"type": "function", "function": {
+                        "name": "select_passages",
+                        "description": "Return matching source passages.",
+                        "parameters": {"type": "object", "properties": {
+                            "numbers": {"type": "array", "items": {"type": "string",
+                                                                   "enum": list(choices)},
+                                        "maxItems": 8}},
+                            "required": ["numbers"], "additionalProperties": False},
+                    }}]
+                    run["context_summary"].update(
+                        evidence_view="passages", tools_available=1,
+                        evidence_included=len({item.source_id for item in choices.values()}),
+                    )
+                else:
+                    context["response_schema"] = {
+                        "findings": [{"source_id": "id", "quote": "text"}],
+                    }
+            else:
+                context["answer_correction"] = run["_final_quality_issue"]
+            included_memories = []
         messages.append({"role": "user", "content": json.dumps(context, ensure_ascii=False)})
         used = {item["id"]: item for item in run.get("memory_used", [])}
         for item in included_memories:
             used[item["id"]] = {
                 key: item.get(key) for key in ("id", "title", "status", "origin", "feedback")
             }
-            if choices := item.get("strategy", {}).get("successful_tools"):
-                used[item["id"]]["successful_tools"] = choices
+            if routes := item.get("strategy", {}).get("successful_tools"):
+                used[item["id"]]["successful_tools"] = routes
             run["context_index_ids"] = sorted(
                 set(run.get("context_index_ids", [])) | set(item["index_ids"])
             )
         run["memory_used"] = list(used.values())
-        return await self._invoke_model(
+        decision = await self._invoke_model(
             principal, run, event, messages, tools, deadline=deadline,
             included_memory_ids=[item["id"] for item in included_memories],
         )
+        if choices and (calls := decision.get("tool_calls")):
+            if len(calls) == 1 and calls[0].get("name") == "select_passages":
+                numbers = calls[0].get("args", {}).get("numbers")
+                report = selected_quotes(numbers, choices)
+                if report and (verified := render_quoted_findings(run, report.model_dump_json())):
+                    self._trace(run, "select_passages", {},
+                                f"Проверено цитат: {len(report.findings)}.")
+                    return {**decision, "content": verified, "tool_calls": [],
+                            "finish_reason": "stop"}
+            raise ModelDecisionError("Модель не выбрала подтверждающий фрагмент.")
+        if (source_quotes and not decision.get("tool_calls")
+                and isinstance(decision.get("content"), str)):
+            body = decision["content"].lstrip()
+            if body.startswith(("{", "```json")):
+                if verified := render_quoted_findings(run, body):
+                    return {**decision, "content": verified}
+                raise ModelDecisionError("Цитата из итогового ответа отсутствует в источнике.")
+        return decision
 
     @staticmethod
     def _decision_calls(run: dict[str, Any]) -> int:
@@ -1622,6 +1956,31 @@ class HarnessRuntime:
     ) -> dict[str, Any]:
         assert self.model is not None
         self._budget(run)
+        retry_at = run.get("_gateway_retry_at", 0)
+        if retry_at > time.time():
+            now = self._now(run)
+            delay = retry_at - time.time()
+            run_remaining = run["_execution_started"] + self._run_timeout(run) - now
+            if delay >= run_remaining:
+                raise ModelConnectionError(
+                    "Шлюз попросил подождать дольше оставшегося времени запроса."
+                )
+            if deadline is not None and delay >= deadline - now:
+                raise ModelTransientError(
+                    "Пауза шлюза превышает оставшееся время этапа; переходим к итогу."
+                )
+            run["current_action"] = {"name": "model_retry", "started_at": timestamp()}
+            self._checkpoint(principal, run, event)
+            try:
+                while (wait := retry_at - time.time()) > 0:
+                    if event.is_set():
+                        raise asyncio.CancelledError
+                    await asyncio.sleep(min(wait, 0.1))
+            finally:
+                run["current_action"] = None
+        run.pop("_gateway_retry_at", None)
+        if event.is_set():
+            raise asyncio.CancelledError
         # Compaction may await several model calls. Recheck access immediately
         # before every provider invocation, not only before preparing history.
         allowed = {item["id"] for item in await self._indexes(principal)}
@@ -1683,6 +2042,22 @@ class HarnessRuntime:
                      "context_compaction": "Сжатие истории",
                      "model_response": "Подготовка ответа"}[action_name]
             exc.args = (f"{stage}. {exc}",)
+            run["provider_diagnostic"] = {
+                "stage": stage, "signal": exc.signal, "field": exc.field,
+                "http_status": exc.http_status, "request_id": exc.request_id,
+                "tools_offered": len(tools), "estimated_input_tokens": input_tokens,
+            }
+            raise
+        except ModelContextTooLarge:
+            if not summary:
+                run["_rejected_input_tokens"] = input_tokens
+            raise
+        except ModelTransientError as exc:
+            if exc.retry_after > 0:
+                run["_gateway_retry_at"] = time.time() + exc.retry_after
+                self._trace(run, "model_retry", {},
+                            f"Шлюз запросил паузу перед следующим вызовом, "
+                            f"секунд: {exc.retry_after:.0f}.")
             raise
         except _AuthenticationTimeout:
             signal.set()
@@ -1704,6 +2079,9 @@ class HarnessRuntime:
                     else "Модель ответила; проверяем результат и следующий шаг.")
         if not isinstance(result, dict) or not isinstance(result.get("tool_calls", []), list):
             raise ModelDecisionError("Модель вернула некорректный формат решения.")
+        if (not summary and run["mode"] == "autonomous" and not result.get("tool_calls")
+                and isinstance(result.get("content"), str)):
+            result = {**result, "content": format_source_reference(run, result["content"])}
         if result.get("incomplete_tool_calls"):
             raise ModelDecisionError("Модель не завершила описание действия.")
         if (not result.get("tool_calls") and
@@ -1778,7 +2156,7 @@ class HarnessRuntime:
         limit = self._runtime_limits(run).answer_chars
         if len(content) > limit:
             content = content[:limit - len(_ANSWER_TRUNCATED)]
-        return answer_quality_issue(run, content)
+        return answer_quality_issue(run, content) or inventory_citation_issue(run, content)
 
     def _answer(self, run: dict[str, Any], decision: dict[str, Any]) -> bool:
         content = decision.get("content")
@@ -1808,13 +2186,13 @@ class HarnessRuntime:
             self._warn(run, "План исследования содержит непроверенные вопросы.")
         elif plan.get("model_updated") and not plan.get("ready_to_answer"):
             self._warn(run, "Проверки плана не подтверждены как завершённые.")
+        if not any(is_answer_source(item) for item in run["evidence"]):
+            self._warn(run, "Ответ не подтверждён источниками; состояние системы не проверено.")
         if plan:
             plan["completion_reason"] = (
                 "Ответ подготовлен, ограничения перечислены." if run["warnings"]
                 else "Ответ подготовлен по собранным подтверждениям."
             )
-        if not any(item.get("kind", "source") == "source" for item in run["evidence"]):
-            self._warn(run, "Ответ не подтверждён источниками; состояние системы не проверено.")
         run["status"] = "partial" if run["warnings"] else "completed"
         return True
 
@@ -1844,6 +2222,6 @@ class HarnessRuntime:
         run["answer"] = (
             "Найдены фрагменты источников. Объяснение системы не сформировано; "
             "проверьте найденные подтверждения и ограничения ниже."
-            if run["evidence"]
+            if any(is_answer_source(item) for item in run["evidence"])
             else "Подтверждённых данных для ответа пока нет."
         )

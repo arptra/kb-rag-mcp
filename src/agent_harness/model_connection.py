@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
+import secrets
 import sqlite3
 import ssl
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from threading import Event
 from typing import Any, Literal, Self
@@ -158,11 +162,57 @@ class ModelConnectionError(RuntimeError):
 class ModelTransientError(ModelConnectionError):
     """A temporary upstream failure; the run may retry within its reserved budget."""
 
+    def __init__(self, message: str, *, retry_after: float = 0) -> None:
+        self.retry_after = retry_after
+        super().__init__(message)
+
+
+def _retry_after(response: httpx.Response) -> float:
+    value = response.headers.get("retry-after", "").strip()
+    if not value:
+        return 0.25 if response.status_code in {429, 503} else 0
+    if value.isascii() and value.isdigit():
+        seconds = float(value)
+        if not math.isfinite(seconds):
+            raise ModelConnectionError("Запрошенная шлюзом пауза превышает время запроса.")
+        return seconds
+    try:
+        return max(0, (parsedate_to_datetime(value) - datetime.now(UTC)).total_seconds())
+    except (ValueError, OverflowError, TypeError):
+        return 0
+
+
+def _completion_envelope(data: bytearray) -> dict[str, Any]:
+    try:
+        decoded = json.loads(data)
+    except json.JSONDecodeError as exc:
+        body = exc.doc.rstrip()
+        if not body or (body.startswith("{") and (
+            exc.pos >= len(body) - 1 or exc.msg.startswith("Unterminated string")
+        )):
+            raise ModelTransientError("Шлюз оборвал JSON-ответ модели.") from None
+        raise ModelConnectionError("API вернул несовместимый ответ модели.") from None
+    except UnicodeDecodeError as exc:
+        if exc.end == len(data) and exc.reason == "unexpected end of data":
+            raise ModelTransientError("Получен неполный ответ API модели.") from None
+        raise ModelConnectionError("API вернул несовместимую кодировку ответа.") from None
+    if not isinstance(decoded, dict):
+        raise ModelConnectionError("API вернул несовместимый ответ модели.")
+    return decoded
+
+
+class ModelContextTooLarge(ModelConnectionError):
+    """The gateway explicitly rejected the size of this model request."""
+
 
 class ModelPolicyStop(ModelConnectionError):
     """Terminal provider refusal. Only known signals and opaque trace IDs are public."""
 
-    def __init__(self, signal: str, request_id: str = "") -> None:
+    def __init__(self, signal: str, request_id: str = "", *, field: str = "") -> None:
+        self.signal = signal
+        self.field = field
+        self.request_id = ""
+        self.http_status: int | None = None
         self.stop_reason = "model_refusal_text" if signal == "text" else "model_policy_stop"
         message = (
             "Модель прислала шаблонный ответ об ограничениях или мнении. "
@@ -171,6 +221,7 @@ class ModelPolicyStop(ModelConnectionError):
         )
         if re.fullmatch(r"(?:req[-_])?(?:[0-9a-fA-F]{16,64}|[0-9a-fA-F]{8}"
                         r"(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})", request_id):
+            self.request_id = request_id
             message += f" ID запроса шлюза: {request_id}."
         super().__init__(message)
 
@@ -192,31 +243,41 @@ _REFUSAL_SENTENCE = re.compile(
 )
 
 
-def check_model_policy(message: dict[str, Any], reason: Any, request_id: str = "") -> None:
+def check_model_policy(
+    message: dict[str, Any], reason: Any, request_id: str = "", *, field: str = "finish_reason",
+) -> None:
     if isinstance(reason, str) and reason.lower() in _POLICY_SIGNALS:
-        raise ModelPolicyStop(reason.lower(), request_id)
+        raise ModelPolicyStop(reason.lower(), request_id, field=field)
     if message.get("refusal"):
-        raise ModelPolicyStop("refusal", request_id)
+        raise ModelPolicyStop("refusal", request_id, field="message.refusal")
     content = message.get("content")
     if isinstance(content, list) and any(
         isinstance(part, dict) and part.get("type") == "refusal" for part in content
     ):
-        raise ModelPolicyStop("refusal", request_id)
+        raise ModelPolicyStop("refusal", request_id, field="message.content[].type")
     # A phrase quoted inside a technical answer is not a provider refusal.
     if isinstance(content, str) and len(content) <= 1200 and not message.get("tool_calls"):
         sentences = re.split(r"(?<=[.!?…])\s+|\n+|,\s*(?:но|однако|but|however)\s+",
                              content.strip(), flags=re.I)
         if len(sentences) <= 4 and all(_REFUSAL_SENTENCE.fullmatch(s) for s in sentences):
-            raise ModelPolicyStop("text", request_id)
+            raise ModelPolicyStop("text", request_id, field="message.content")
 
 
 def _check_policy_error(body: Any, request_id: str) -> None:
     error = body.get("error") if isinstance(body, dict) else None
     if isinstance(error, dict):
-        for field in (error, error.get("innererror")):
-            if isinstance(field, dict):
+        for path, data in (("error", error), ("error.innererror", error.get("innererror"))):
+            if isinstance(data, dict):
                 for key in ("code", "type"):
-                    check_model_policy({}, field.get(key), request_id)
+                    check_model_policy({}, data.get(key), request_id, field=f"{path}.{key}")
+
+
+def _check_context_error(body: Any) -> None:
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict) and error.get("code") in (
+        "context_length_exceeded", "max_context_length_exceeded", "input_too_long",
+    ):
+        raise ModelContextTooLarge("Размер запроса превысил контекстное окно шлюза.")
 
 
 class ModelRouter:
@@ -372,25 +433,41 @@ class ModelRouter:
                 ) as response,
             ):
                 request_id = response.headers.get("x-request-id", "")
-                if response.status_code in {400, 403, 422}:
+                if response.status_code >= 400:
                     error_body = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        if len(error_body) + len(chunk) > 32768:
-                            break
-                        error_body.extend(chunk)
+                    # Preserve the actual HTTP status if the secondary error body
+                    # itself is broken, especially on an authentication failure.
+                    with suppress(httpx.HTTPError):
+                        async for chunk in response.aiter_bytes():
+                            if len(error_body) + len(chunk) > 32768:
+                                break
+                            error_body.extend(chunk)
                     # Non-JSON errors still receive the normal HTTP diagnostic.
                     with suppress(ValueError):
-                        _check_policy_error(json.loads(error_body), request_id)
+                        error_data = json.loads(error_body)
+                        _check_policy_error(error_data, request_id)
+                        choices = (error_data.get("choices")
+                                   if isinstance(error_data, dict) else None)
+                        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                            reply = choices[0].get("message")
+                            check_model_policy(reply if isinstance(reply, dict) else {},
+                                               choices[0].get("finish_reason"), request_id)
+                        if response.status_code in {400, 413, 422}:
+                            _check_context_error(error_data)
+                if response.status_code == 413:
+                    raise ModelContextTooLarge("Шлюз отклонил размер запроса (HTTP 413).")
                 if response.status_code in {401, 403}:
                     raise ModelConnectionError(
                         "API отклонил доступ. Проверьте клиентский сертификат и права на модель. "
                         "API-ключ нужен только по требованию сервера."
                     )
                 if response.status_code == 429:
-                    raise ModelTransientError("API модели ограничил частоту запросов.")
-                if response.status_code in {500, 502, 503, 504}:
+                    raise ModelTransientError("API модели ограничил частоту запросов.",
+                                              retry_after=_retry_after(response))
+                if response.status_code in {408, 425, 500, 502, 503, 504}:
                     raise ModelTransientError(
-                        f"API модели временно недоступен (HTTP {response.status_code})."
+                        f"API модели временно недоступен (HTTP {response.status_code}).",
+                        retry_after=_retry_after(response),
                     )
                 if response.status_code == 404:
                     raise ModelConnectionError(
@@ -410,12 +487,16 @@ class ModelRouter:
                     data.extend(chunk)
                     if len(data) > 8_000_000:
                         raise ModelConnectionError("Ответ API превышает допустимый размер.")
-            decoded = json.loads(data)
+            decoded = _completion_envelope(data)
             _check_policy_error(decoded, request_id)
+            if "choices" in decoded and decoded["choices"] in ([], None):
+                raise ModelTransientError("Шлюз вернул пустую выдачу модели.")
             choice = decoded["choices"][0]
             reason = choice.get("finish_reason")
             message = choice.get("message") or {}
             check_model_policy(message, reason, request_id)
+            if not message and reason in {None, "stop", "tool_calls"}:
+                raise ModelTransientError("Шлюз не передал сообщение модели.")
             if reason not in {None, "", "stop", "tool_calls", "function_call", "end_turn",
                               *RETRYABLE_FINISH_REASONS}:
                 raise ModelConnectionError(
@@ -478,6 +559,9 @@ class ModelRouter:
                 if counters:
                     decision["usage"] = counters
             return decision
+        except ModelPolicyStop as exc:
+            exc.http_status = response.status_code
+            raise
         except (ModelConnectionError, ModelDecisionError):
             raise
         except httpx.TimeoutException:
@@ -511,21 +595,30 @@ class ModelRouter:
     ) -> dict[str, Any]:
         settings = settings if settings is not None else self.store.load()
         if settings.provider == "gigacode":
-            if autopilot:
-                return {"available": False, "message":
-                        "Проверка инструментов запроса доступна для прямого API модели."}
             status = (
                 await asyncio.to_thread(self.fallback.status)
                 if self.fallback is not None
                 else {"available": False, "reason": "GigaCode не подключён."}
             )
-            return {"available": bool(status.get("available")), "message": status.get("reason", "")}
+            if not autopilot or not status.get("available"):
+                return {"available": bool(status.get("available")),
+                        "message": status.get("reason", "")}
+        cancel = Event()
+
+        async def complete(
+            messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+        ) -> dict[str, Any]:
+            if settings.provider == "gigacode" and self.fallback is not None:
+                result = await self.fallback.decide(messages=messages, tools=tools,
+                                                    max_input_chars=16_000, cancel=cancel)
+                check_model_policy(result, result.get("finish_reason"))
+                return result
+            return await self._completion(settings, messages, tools, probe=True)
+
         stage = ""
         try:
             async with asyncio.timeout(settings.timeout_seconds):
-                result = await self._completion(
-                    settings, [{"role": "user", "content": "Reply with OK."}], [], probe=True
-                )
+                result = await complete([{"role": "user", "content": "Reply with OK."}], [])
                 if result.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
                     raise ModelConnectionError("API не завершил проверочный ответ.")
                 if result["content"].strip().rstrip(".!").casefold() != "ok":
@@ -534,23 +627,78 @@ class ModelRouter:
                         "Проверьте выбранную модель и маршрут корпоративного API."
                     )
                 if autopilot:
+                    from agent_harness.library_agent import run_agent_round
+
                     stage = "Простой запрос прошёл. Проверка выбора инструмента: "
                     tool = {"type": "function", "function": {
                         "name": "read_sample", "description": "Read a synthetic sample by ID.",
                         "parameters": {"type": "object", "properties": {"id": {"type": "string"}},
                                        "required": ["id"], "additionalProperties": False},
                     }}
-                    step = await self._completion(settings, [
-                        {"role": "user", "content": "Прочитай учебный документ sample-1. "
-                         "Для этого вызови read_sample с id sample-1."},
-                    ], [tool], probe=True)
-                    if step["tool_calls"] != [{"name": "read_sample", "args": {"id": "sample-1"}}]:
+                    submission = {"type": "function", "function": {
+                        "name": "submit_sample",
+                        "description": "Submit the value and its source ID.",
+                        "parameters": {"type": "object", "properties": {
+                            "value": {"type": "string"}, "id": {"type": "string"}},
+                            "required": ["value", "id"], "additionalProperties": False},
+                    }}
+                    sample = "S-" + secrets.token_hex(4)
+                    executed = False
+
+                    async def decide(observations: list[dict[str, Any]]) -> dict[str, Any]:
+                        if observations:
+                            return await complete([
+                                {"role": "system", "content": "Вызови submit_sample. Скопируй "
+                                 "sample_value документа в value, id документа в id."},
+                                {"role": "user", "content": str(observations[-1]["result"])},
+                            ], [submission])
+                        prompt = "Вызови read_sample с id sample-1 для чтения учебного документа."
+                        return await complete([{"role": "user", "content": prompt}], [tool])
+
+                    async def dispatch(calls: list[dict[str, Any]]) -> list[str]:
+                        nonlocal executed, stage
+                        expected_call = {"name": "read_sample", "args": {"id": "sample-1"}}
+                        if executed or calls != [expected_call]:
+                            raise ModelDecisionError("Не удалось прочитать учебный документ.")
+                        executed = True
+                        stage = "Инструмент выполнен. Проверка итогового ответа: "
+                        return [json.dumps({"id": "sample-1", "sample_value": sample})]
+
+                    step = await run_agent_round(tools=[tool], decide=decide, dispatch=dispatch)
+                    if not executed:
                         raise ModelConnectionError(
                             "API не вернул ожидаемый вызов read_sample. Проверьте поддержку "
                             "tool calling и политики шлюза для запросов с инструментами."
                         )
+                    if step.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
+                        raise ModelConnectionError("Модель не завершила итоговый ответ.")
+                    missing = []
+                    if calls := step.get("tool_calls"):
+                        if (not isinstance(calls, list) or len(calls) != 1
+                                or not isinstance(calls[0], dict)
+                                or calls[0].get("name") != "submit_sample"):
+                            raise ModelConnectionError(
+                                "Ожидался один итоговый вызов submit_sample."
+                            )
+                        args = calls[0].get("args")
+                        if not isinstance(args, dict) or args.keys() - {"id", "value"}:
+                            raise ModelConnectionError("Некорректные аргументы submit_sample.")
+                        correct_value = args.get("value") == sample
+                        correct_source = args.get("id") == "sample-1"
+                    else:
+                        content = step.get("content") or ""
+                        correct_value = bool(re.search(
+                            rf"(?<![\w-]){re.escape(sample)}(?![\w-])", content,
+                        ))
+                        correct_source = "[sample-1]" in content
+                    if not correct_value:
+                        missing.append("точное значение sample_value из документа")
+                    if not correct_source:
+                        missing.append("id документа sample-1" if calls else "ссылку [sample-1]")
+                    if missing:
+                        raise ModelConnectionError("Модель не вернула " + " и ".join(missing) + ".")
                     return {"available": True, "message":
-                            "Модель ответила OK и выбрала инструмент для учебного документа."}
+                            "Агент вызвал инструмент и вернул проверенное значение из документа."}
             return {"available": True, "message": "Соединение проверено. API ответил OK."}
         except (ModelConnectionError, ModelDecisionError) as exc:
             return {"available": False, "message": stage + str(exc)}
@@ -564,3 +712,8 @@ class ModelRouter:
                 "available": False,
                 "message": "Проверка API не пройдена. Проверьте сертификаты и адрес.",
             }
+        except RuntimeError:
+            return {"available": False,
+                    "message": stage + "Модель не завершила проверочный запрос."}
+        finally:
+            cancel.set()

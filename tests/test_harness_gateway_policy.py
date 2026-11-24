@@ -3,6 +3,7 @@
 # ruff: noqa: RUF001  # Russian provider responses.
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,49 @@ from agent_harness.runtime import HarnessRuntime
 REFUSAL = "PRIVATE_PROVIDER_RESPONSE"
 REQUEST_ID = "6dbedfc8-6d39-4c3a-acab-ad4e7bb58131"
 CALL = {"function": {"name": "read_document", "arguments": "{unfinished PRIVATE"}}
+
+
+@pytest.mark.parametrize("status", [400, 413])
+async def test_overlength_rebuilds_only_the_model_request(tmp_path: Path, status: int) -> None:
+    from agent_harness.contracts import Evidence, Principal
+
+    class ManySources(Source):
+        async def indexes(self, principal: Principal) -> list[dict[str, str]]:
+            return [{"id": str(i), "name": f"Index {i}"} for i in range(12)]
+
+        async def search(self, **args: Any) -> list[Evidence]:
+            self.queries.append(args["query"])
+            idx = args["index_id"]
+            return [Evidence(id=idx, index_id=idx, title="Services", text="current data " * 500)]
+
+    source = ManySources()
+    router = ModelRouter(tmp_path, None)
+    router.store.save(ModelConnection(provider="openai", base_url="https://gateway.test"))
+    sizes = []
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        sizes.append(len(request.content))
+        payload = json.loads(request.content)
+        ctx = json.loads(payload["messages"][-1]["content"])
+        assert ctx["question"] == "Explain the service routing"
+        assert len(ctx["allowed_indexes"]) == 12
+        if len(sizes) == 1:
+            return httpx.Response(status, json={"error": {"code": "context_length_exceeded"}})
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {
+            "content": "Current routes are recorded in the index [1]."}}]})
+
+    router.transport = httpx.MockTransport(reply)
+    runtime = HarnessRuntime(HarnessSettings(enabled=True, state_dir=tmp_path), source, router)
+    await runtime.start()
+    try:
+        created = await runtime.submit(OWNER, RunRequest(question="Explain the service routing"))
+        run = await finished(runtime, created["id"])
+        assert run["status"] == "completed", run["warnings"]
+        assert len(sizes) == 2 and sizes[1] < sizes[0] * .7
+        assert len(source.queries) == 12 and run["metrics"]["model_calls"] == 2
+        assert "context_resize" in {step["name"] for step in run["research_trace"]}
+    finally:
+        await runtime.stop()
 
 
 @pytest.mark.parametrize(("code", "body", "signal"), [
@@ -69,11 +113,16 @@ async def test_policy_stops_graph_once_and_keeps_private_refusal_out_of_state(
         assert result["metrics"]["model_calls"] == calls == 1
         assert result["research_trace"][-1]["name"] == expected
         assert REQUEST_ID in result["answer"] and "Выбор следующего действия" in result["answer"]
+        diagnostic = result["provider_diagnostic"]
+        assert diagnostic["http_status"] == code and diagnostic["signal"] == signal
+        assert diagnostic["field"] and diagnostic["request_id"] == REQUEST_ID
+        assert diagnostic["tools_offered"] > 0 and diagnostic["estimated_input_tokens"] > 0
         assert not result["resumable"] and REFUSAL not in json.dumps(result)
         with pytest.raises(ValueError):
             await runtime.resume(OWNER, run["id"])
         learned = runtime.memory.retrieve(OWNER.owner_id, "Explain payments", {"a"}, {"a"})
-        assert all(REFUSAL not in item["text"] and item["kind"] != "case" for item in learned)
+        assert not learned
+        assert runtime.memory.list(OWNER.owner_id, {"a"})[0]["stop_reason"] == expected
     finally:
         await runtime.stop()
 
@@ -82,7 +131,15 @@ async def test_policy_stops_graph_once_and_keeps_private_refusal_out_of_state(
     (["Unrelated boilerplate"], False, "OK"),
     (["OK", "blocked"], False, "blacklist"),
     (["OK", "I will read the sample."], False, "tool calling"),
-    (["OK", "valid_call"], True, "инструмент"),
+    (["OK", "valid_call", "I will read it."], False, "итогового ответа"),
+    (["OK", "valid_call", "[sample-1]"], False, "точное значение sample_value из документа."),
+    (["OK", "valid_call", "value_only"], False, "не вернула ссылку [sample-1]."),
+    (["OK", "valid_call", "submit_value"], True, "инструмент"),
+    (["OK", "valid_call", "submit_wrong_id"], False, "id документа sample-1."),
+    (["OK", "valid_call", "submit_wrong_value"], False, "точное значение sample_value"),
+    (["OK", "valid_call", "submit_cutoff"], False, "не завершила итоговый ответ"),
+    (["OK", "valid_call", "submit_duplicate"], False, "один итоговый вызов"),
+    (["OK", "valid_call", "verified_value"], True, "инструмент"),
 ])
 async def test_gateway_check_distinguishes_text_and_tool_support(
     tmp_path: Path, replies: list[str], ok: bool, diagnostic: str,
@@ -97,12 +154,25 @@ async def test_gateway_check_distinguishes_text_and_tool_support(
         message: dict[str, Any] = {"content": answer}
         if len(requests) == 1:
             assert "tools" not in payload
-        else:
+        elif len(requests) == 2:
             assert [tool["function"]["name"] for tool in payload["tools"]] == ["read_sample"]
             if answer == "valid_call":
                 message = {"tool_calls": [{"function": {"name": "read_sample",
                            "arguments": json.dumps({"id": "sample-1"})}}]}
-        reason = "blacklist" if answer == "blocked" else "stop"
+        else:
+            assert [tool["function"]["name"] for tool in payload["tools"]] == ["submit_sample"]
+            match = re.search(r"S-[0-9a-f]{8}", payload["messages"][-1]["content"])
+            assert match
+            if answer == "verified_value":
+                message = {"content": f"{match.group()} [sample-1]"}
+            elif answer == "value_only":
+                message = {"content": match.group()}
+            elif answer.startswith("submit_"):
+                args = {"id": "other" if answer == "submit_wrong_id" else "sample-1",
+                        "value": "WRONG" if answer == "submit_wrong_value" else match.group()}
+                call = {"function": {"name": "submit_sample", "arguments": json.dumps(args)}}
+                message = {"tool_calls": [call, call] if answer == "submit_duplicate" else [call]}
+        reason = {"blocked": "blacklist", "submit_cutoff": "length"}.get(answer, "stop")
         choice = {"message": message, "finish_reason": reason}
         return httpx.Response(200, json={"choices": [choice]})
 

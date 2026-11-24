@@ -15,6 +15,7 @@
     queued: "Ожидаем свободное место для запуска.", searching: "Ищем подтверждения в выбранных источниках.",
     reading: "Читаем документы и проверяем подробности за пределами поисковых фрагментов.",
     planning: "Определяем, какие сведения нужны для ответа.",
+    replanning: "Ищем другой способ проверить вопрос.",
     refining: "Уточняем запросы и проверяем оставшиеся вопросы.",
     reading_code: "Изучаем код подключённых сервисов.",
     running_code: "Проверяем код в песочнице.",
@@ -278,6 +279,7 @@
       })),
       connections: (Array.isArray(value.connections) ? value.connections : []).map((item) => ({
         ...resource(item), kind: item.kind === "a2a" ? "a2a" : "mcp", allowed_tools: strings(item.allowed_tools),
+        include_read_only_tools: item.include_read_only_tools === true,
       })),
       sandbox_profiles: (Array.isArray(value.sandbox_profiles) ? value.sandbox_profiles : []).map((item) => ({
         id: String(item.id || ""), name: String(item.name || "").trim(), image: String(item.image || "").trim(),
@@ -512,13 +514,21 @@
         card.querySelectorAll(".settings-tool-choice input").forEach((checkbox) => {
           checkbox.checked = entry.allowed_tools.includes(checkbox.nextElementSibling.firstElementChild.textContent);
         });
-      }, { wide: true, help: "Имена через запятую. Пустой список запрещает все инструменты. После проверки можно выбрать инструменты из списка." });
+      }, { wide: true, help: "Укажите имена через запятую или выберите их после проверки подключения." });
       toolsInput = tools.input;
       tools.wrapper.hidden = entry.kind !== "mcp";
       fields.append(tools.wrapper);
+      const liveTools = element("label", "settings-field wide");
+      const liveInput = document.createElement("input");
+      liveInput.type = "checkbox"; liveInput.checked = entry.include_read_only_tools === true;
+      liveInput.addEventListener("change", () => { entry.include_read_only_tools = liveInput.checked; markSettingsChanged(); });
+      liveTools.append(liveInput, element("span", "", "Подключать новые инструменты чтения"),
+        element("small", "settings-field-help", "Доверять пометке «только чтение» этого MCP-сервера. Harness сверяет разрешение и параметры перед вызовом."));
+      liveTools.hidden = entry.kind !== "mcp"; fields.append(liveTools);
       kindSelect.addEventListener("change", () => {
         entry.kind = kindSelect.value;
         tools.wrapper.hidden = entry.kind !== "mcp";
+        liveTools.hidden = entry.kind !== "mcp";
         settingsState.probes.delete(kind + ":" + entry.id);
         card.querySelector(".settings-probe").replaceWith(settingProbeArea(kind, entry, toolsInput));
         markSettingsChanged();
@@ -744,8 +754,8 @@
     $("model-connection-save").disabled = modelConnectionState.busy || !modelConnectionState.settings || !modelConnectionState.dirty;
     $("model-connection-probe").disabled = modelConnectionState.busy || !modelConnectionState.settings;
     $("model-connection-probe").title = "Отправить простой запрос с текущими настройками, не сохраняя их";
-    $("model-autopilot-probe").hidden = !direct;
-    $("model-autopilot-probe").disabled = !direct || $("model-connection-probe").disabled;
+    $("model-autopilot-probe").hidden = false;
+    $("model-autopilot-probe").disabled = $("model-connection-probe").disabled;
     $("settings-panel-model").querySelectorAll(".model-connection-fields input, .model-connection-fields select").forEach((input) => { input.disabled = modelConnectionState.busy; });
   }
   function fillTlsSelect(value) {
@@ -786,7 +796,6 @@
     if (modelConnectionState.busy || !settingsState.canManage || state.needsAuth) return;
     const config = modelConnectionValue();
     const autopilot = action === "autopilot", probe = action !== "save";
-    if (autopilot && config.provider !== "openai") return;
     if (config.provider === "openai") {
       if (!config.base_url) { $("model-connection-feedback").textContent = "Укажите HTTPS-адрес API модели. Название модели и ключ необязательны."; return; }
       for (const input of $("direct-model-fields").querySelectorAll("input")) { if (!input.checkValidity()) { input.reportValidity(); return; } }
@@ -1150,6 +1159,8 @@
       if (record.outcome) details.push("Исход запроса: " + (STATUS_LABELS[record.outcome] || record.outcome));
       if (record.feedback?.rating) details.push("Оценка автора запроса: " + (record.feedback.rating === "helpful" ? "помогло" : "не помогло"));
       details.push("Использовано всеми пользователями: " + Math.max(0, Number(record.usage_count) || 0));
+      if (record.strategy?.successful_tools?.length) details.push(
+        "Повторных ответов со ссылкой на результат того же инструмента — " + (Number(record.route_reuses) || 0));
       if (record.quality && typeof record.quality === "object") {
         details.push("Помогло: " + Math.max(0, Number(record.quality.helpful) || 0));
         details.push("Не помогло: " + Math.max(0, Number(record.quality.unhelpful) || 0));
@@ -1927,6 +1938,14 @@
     goal_check: "Проверка оставшихся вопросов", answer_recovery: "Повторная подготовка ответа",
     answer_quality_check: "Проверка ответа по источникам", answer_quality_rejected: "Черновик не прошёл проверку",
     research_recovery: "Поиск дополнительных подтверждений",
+    research_branch: "Другая ветка исследования", memory_route: "Проверяем источник из общей памяти",
+    agent_round: "Агент проверяет результат инструмента",
+    select_passages: "Сверяем цитаты с источниками",
+    source_discovery: "Уточняем доступные инструменты", search_collected_materials: "Ищем в собранных материалах",
+    mcp_contract_refresh: "Перечитываем параметры инструмента", mcp_catalog_changed: "Обновился каталог инструментов",
+    graph_inventory: "Сверяем число сервисов по графу АС",
+    write_analysis_script: "Подготавливаем скрипт анализа",
+    context_resize: "Уменьшаем запрос по лимиту шлюза",
     model_policy_stop: ANSWER_STOP_LABELS.model_policy_stop, model_refusal_text: ANSWER_STOP_LABELS.model_refusal_text,
     model_planning: "Модель выбирает следующий шаг", model_budget_review: "Модель оценивает бюджет",
     model_retry: "Повторный запрос к модели", model_response: "Модель анализирует материалы и готовит ответ",
@@ -1982,6 +2001,24 @@
     $("research-next").textContent = (ACTIVE.has(run.status) ? "Следующий шаг: " : "Результат проверки: ") + next;
     $("research-next").hidden = !next;
     const blocks = [];
+    const branch = plan.current_branch;
+    if (branch && typeof branch.subquestion === "string") {
+      const section = element("section", "research-plan-group");
+      section.append(element("h4", "", "Текущая ветка"), element("p", "", branch.subquestion));
+      if (branch.reason) section.append(element("p", "muted", branch.reason));
+      blocks.push(section);
+    }
+    const diagnostic = run.provider_diagnostic;
+    if (diagnostic?.signal) {
+      const section = element("section", "research-plan-group");
+      const fields = [diagnostic.stage, diagnostic.http_status ? "HTTP " + diagnostic.http_status : "",
+        [diagnostic.field, diagnostic.signal].filter(Boolean).join(" = "),
+        "Инструментов в запросе — " + diagnostic.tools_offered,
+        "Вход — около " + diagnostic.estimated_input_tokens + " токенов",
+        diagnostic.request_id ? "ID шлюза " + diagnostic.request_id : ""];
+      section.append(element("h4", "", "Диагностика ответа модели"), element("p", "", fields.filter(Boolean).join(" · ")));
+      blocks.push(section);
+    }
     if (Number.isInteger(plan.round) && plan.round > 0) blocks.push(element("p", "research-round", "Раунд исследования: " + plan.round));
     for (const [label, values] of [["Вопросы исследования", questions], ["Проверено", completed], ["Осталось выяснить", gaps]]) {
       if (!values.length) continue;

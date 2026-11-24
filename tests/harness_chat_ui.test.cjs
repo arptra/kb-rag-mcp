@@ -375,7 +375,8 @@ test("Autopilot probe tests unsaved direct settings and keeps the simple probe a
   ui.settingsState.canManage = true;
   ui.applyModelConnection({ provider: "gigacode" });
   const probe = nodes.get("model-autopilot-probe");
-  assert(probe.hidden && probe.disabled);
+  assert.equal(probe.hidden, false);
+  assert.equal(probe.disabled, false);
   ui.applyModelConnection({ provider: "openai", base_url: "https://saved.test/v1" });
   nodes.get("direct-model-url").value = "https://draft.test/v1";
   nodes.get("direct-model-tls").value = "corp";

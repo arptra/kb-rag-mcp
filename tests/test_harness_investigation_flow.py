@@ -256,13 +256,9 @@ async def finished(
             await asyncio.sleep(0.01)
 
 
-@pytest.mark.parametrize("invalid_first", [False, True])
-async def test_autonomous_deepseek_investigates_across_rag_and_real_mcp_sdk(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_first: bool,
-) -> None:
-    events: list[str] = []
-    source, peer = CurrentKnowledge(events), MCPPeer(events)
-    model = ModelPeer(events, invalid_first=invalid_first)
+def local_endpoints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, peer: MCPPeer,
+) -> tuple[IntegrationHub, ModelRouter, list[httpx.AsyncClient]]:
     remote_app = Starlette(routes=[Route("/mcp", peer.handle, methods=["GET", "POST", "DELETE"])])
     real_client = httpx.AsyncClient
     clients: list[httpx.AsyncClient] = []
@@ -295,6 +291,67 @@ async def test_autonomous_deepseek_investigates_across_rag_and_real_mcp_sdk(
     router.store.save(ModelConnection(
         provider="openai", base_url="https://models.test/v1", profile="deepseek_v4_flash",
     ))
+    return hub, router, clients
+
+
+async def test_empty_memory_discovers_selected_mcp_before_first_http_model_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer = MCPPeer([])
+    hub, router, _ = local_endpoints(tmp_path, monkeypatch, peer)
+    turns = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal turns
+        turns += 1
+        ctx = json.loads(json.loads(request.content)["messages"][-1]["content"])
+        evidence = ctx["evidence"]
+        assert ctx["shared_memory_not_evidence"] == []
+        if turns == 1:
+            assert peer.events == ["mcp_tools_list"]
+            catalog = json.loads(evidence[0]["text"])
+            assert [tool["name"] for tool in catalog["tools"]] == [REMOTE_TOOL]
+        args: dict[str, Any] = {"connection_id": "jira"}
+        if turns == 4:
+            observed = next(e for e in evidence if e["kind"] == "source")
+            assert json.loads(observed["text"])["issue_key"] == ISSUE
+            message = {"content": f"Статус задачи {ISSUE} подтверждён [{observed['id']}]."}
+        else:
+            name = ["mcp_list_tools", "mcp_tool_schema", "mcp_call"][turns - 1]
+            if turns >= 2:
+                args["tool"] = REMOTE_TOOL
+            if turns == 3:
+                args["arguments"] = {"issue_key": ISSUE}
+            message = {"tool_calls": [{"type": "function", "function": {
+                "name": name, "arguments": json.dumps(args),
+            }}]}
+        return httpx.Response(200, json={"choices": [{"message": message}]})
+
+    router.transport = httpx.MockTransport(respond)
+    app = HarnessRuntime(HarnessSettings(_env_file=None, enabled=True, state_dir=tmp_path),
+                         CurrentKnowledge(peer.events), router, hub)
+    await app.start()
+    try:
+        created = await app.submit(OWNER, RunRequest(question=f"Проверь {ISSUE}", mode="autonomous",
+                                                    index_ids=["connection:jira"]))
+        result = await finished(app, created["id"])
+        assert result["status"] == "completed", result["warnings"]
+        assert turns == 4
+        # One list for discovery, one for the schema, one for pre-call validation.
+        assert peer.events == ["mcp_tools_list"] * 3 + ["mcp_tool_call"]
+        assert any(step["name"] == "source_discovery" for step in result["research_trace"])
+    finally:
+        await app.stop()
+
+
+@pytest.mark.parametrize("invalid_first", [False, True])
+async def test_autonomous_deepseek_investigates_across_rag_and_real_mcp_sdk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_first: bool,
+) -> None:
+    events: list[str] = []
+    source, peer = CurrentKnowledge(events), MCPPeer(events)
+    model = ModelPeer(events, invalid_first=invalid_first)
+    hub, router, clients = local_endpoints(tmp_path, monkeypatch, peer)
     router.transport = httpx.MockTransport(model.respond)
     settings = HarnessSettings(_env_file=None, enabled=True, state_dir=tmp_path)
     runtime = HarnessRuntime(settings, source, router, hub)
@@ -365,8 +422,12 @@ async def check_colleague_tool_reuse(
     route = next(h for h in hints if h["tool"] == "mcp_call")
     assert route["remote_tool"] == REMOTE_TOOL and route["index_id"] == "connection:jira"
     assert route["evidence_ids"] and "arguments" not in route
+    requests_before = len(peer.requests)
+    model_calls = 0
 
     def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal model_calls
+        model_calls += 1
         payload = json.loads(request.content)
         ctx = json.loads(payload["messages"][-1]["content"])
         saved = ctx["shared_memory_not_evidence"][0]["strategy"]["successful_tools"]
@@ -384,10 +445,13 @@ async def check_colleague_tool_reuse(
             assert json.loads(docs[0]["text"])["issue_key"] == NEXT_ISSUE
             message = {"content": f"Статус задачи {NEXT_ISSUE} подтверждён [{docs[0]['id']}]."}
         else:
+            # The current contract has already been read by the graph before
+            # this user's first model request. Reasking for it must be local.
+            assert len(remote) == 1
+            schema = json.loads(remote[0]["text"])
+            assert schema["name"] == name and schema["inputSchema"] == SCHEMA
             tool = "mcp_tool_schema"
-            if remote:
-                schema = json.loads(remote[0]["text"])
-                assert schema["name"] == name
+            if model_calls > 1:
                 current_issue = json.loads(evidence[DOCUMENT]["text"])["issue_key"]
                 assert current_issue == NEXT_ISSUE
                 args["arguments"] = {schema["inputSchema"]["required"][0]: current_issue}
@@ -406,6 +470,21 @@ async def check_colleague_tool_reuse(
     assert result["status"] == "completed", result["warnings"]
     assert NEXT_ISSUE in result["answer"]
     assert route in result["memory_used"][0]["successful_tools"]
+    trace = result["research_trace"]
+    first_model = next(i for i, step in enumerate(trace) if step["name"] == "model_response")
+    assert any(step["name"] == "mcp_tool_schema" for step in trace[:first_model])
+    assert any(step["name"] == "memory_route" and REMOTE_TOOL in step["result"]
+               for step in trace[:first_model])
+    assert sum(r["method"] == "tools/list" for r in peer.requests[requests_before:]) == 2
     calls = [r["params"] for r in peer.requests if r["method"] == "tools/call"]
     assert calls == [{"name": REMOTE_TOOL, "arguments": {"issue_key": issue}}
                      for issue in (ISSUE, NEXT_ISSUE)]
+    # The connection can stay visible while this individual tool is revoked.
+    assert isinstance(runtime.tools, IntegrationHub)
+    integration_config = runtime.tools.store.load()
+    jira = next(conn for conn in integration_config.connections if conn.id == "jira")
+    jira.allowed_tools = ["other_permitted_tool"]
+    runtime.tools.store.save(integration_config)
+    durable = runtime.store.get(COLLEAGUE.owner_id, submitted["id"])
+    routes = await runtime._initial_routes(COLLEAGUE, durable, {"knowledge"}, mcp=True)
+    assert "mcp_tool_schema" not in routes

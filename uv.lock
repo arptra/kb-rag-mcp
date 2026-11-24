@@ -294,7 +294,7 @@ dev = [
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.13,<5" },
     { name = "cryptography", specifier = ">=45,<50" },
-    { name = "deepagents", marker = "extra == 'agents'", specifier = ">=0.3,<1" },
+    { name = "deepagents", marker = "extra == 'agents'", specifier = ">=0.7.39,<1" },
     { name = "fastmcp", specifier = "==3.4.4" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "jsonschema", specifier = ">=4.25,<5" },

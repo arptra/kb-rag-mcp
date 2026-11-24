@@ -150,6 +150,33 @@ async def call(
     )
 
 
+async def test_live_read_only_permission_tracks_new_changed_and_removed_tools(peer: Any) -> None:
+    server, _ = peer
+    tools = RemoteTools()
+    config = connection(allowed_tools=[], include_read_only_tools=True)
+    args = {"connection_id": "source"}
+
+    async def catalog() -> list[str]:
+        receipt, = await call(tools, config, name="mcp_list_tools", args=args)
+        return [tool["name"] for tool in json.loads(receipt.text)["tools"]]
+
+    assert await catalog() == []
+    entry = {"name": "read_inventory", "inputSchema": server.schema,
+             "annotations": {"readOnlyHint": True}}
+    server.extra_tools.append(entry)
+    assert await catalog() == ["read_inventory"]
+    action = {**args, "tool": "read_inventory", "arguments": {"query": "services"}}
+    await call(tools, config, args=action)
+    entry["annotations"] = {"readOnlyHint": True, "destructiveHint": True}
+    assert await catalog() == []
+    with pytest.raises(remote_tools.RemoteToolError):
+        await call(tools, config, args=action)
+    server.extra_tools.clear()
+    assert await catalog() == []
+    sent = [r for r in server.requests if r["body"].get("method") == "tools/call"]
+    assert len(sent) == 1
+
+
 async def test_mcp_sdk_discovery_and_call_validate_and_preserve_provenance(peer: Any) -> None:
     server, clients = peer
     tools, config = RemoteTools(), connection()
@@ -189,7 +216,9 @@ async def test_agent_discovers_only_allowed_tools_and_can_search_a_large_catalog
     assert evidence.kind == "tool_metadata"
     assert catalog["matched_count"] == 100
     assert catalog["truncated"] is True
-    assert catalog["tools"][0] == {"name": "search", "description": "Search source"}
+    first = catalog["tools"][0]
+    assert first["name"] == "search" and first["description"] == "Search source"
+    assert len(first["revision"]) == 64
     assert "private_" not in evidence.text
     filtered = (await call(tools, config, name="mcp_list_tools", args={
         "connection_id": "source", "query": "target98",
@@ -224,13 +253,29 @@ async def test_agent_catalog_follows_pagination_past_unpermitted_tools(peer: Any
     item = (await call(RemoteTools(), connection(), name="mcp_list_tools", args={
         "connection_id": "source", "query": "incidents",
     }))[0]
-    assert json.loads(item.text)["tools"] == [
-        {"name": "search", "description": "Find incidents"},
+    assert [(t["name"], t["description"]) for t in json.loads(item.text)["tools"]] == [
+        ("search", "Find incidents"),
     ]
     requests = [item["body"] for item in server.requests
                 if item["body"].get("method") == "tools/list"]
     assert len(requests) == 2
     assert requests[-1]["params"]["cursor"] == "1"
+
+
+async def test_capped_catalog_can_still_open_a_specific_permitted_tool(
+    peer: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, _ = peer
+    monkeypatch.setattr(remote_tools, "_MAX_TOOLS", 2)
+    server.tool_pages = [
+        [{"name": name, "inputSchema": _SCHEMA} for name in ("first", "second")],
+        [{"name": "search", "description": "Find incidents", "inputSchema": _SCHEMA}],
+    ]
+    config = connection(allowed_tools=["first", "second", "search"])
+    result = await call(RemoteTools(), config, name="mcp_tool_schema",
+                        args={"connection_id": "source", "tool": "search"})
+    assert json.loads(result[0].text)["inputSchema"] == _SCHEMA
+    assert not any(r["body"].get("method") == "tools/call" for r in server.requests)
 
 
 @pytest.mark.parametrize("changes,owner", [
@@ -253,10 +298,11 @@ async def test_permission_denial_precedes_any_network(
 @pytest.mark.parametrize("arguments", [{}, {"query": 17}, {"query": "x", "write": True}])
 async def test_mcp_rejects_invalid_input_without_calling_tool(peer: Any, arguments: Any) -> None:
     server, _ = peer
-    with pytest.raises(RemoteToolError, match="ValidationError"):
+    with pytest.raises(RemoteToolError, match="ValidationError") as issue:
         await call(RemoteTools(), connection(), args={
             "connection_id": "source", "tool": "search", "arguments": arguments,
         })
+    assert issue.value.reason == "mcp_input_mismatch"
     assert not any(item["body"].get("method") == "tools/call" for item in server.requests)
 
 

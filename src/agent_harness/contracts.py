@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from threading import Event
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+ANALYSIS_FILENAME = r"^[A-Za-z][A-Za-z0-9_]{0,63}\.(py|java)$"
+MAX_ANALYSIS_SOURCE_BYTES = 24_576
 
 
 class ModelDecisionError(ValueError):
@@ -61,6 +65,23 @@ class RunRequest(BaseModel):
         return value
 
 
+class ServiceInventorySnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    service_count: int = Field(ge=0)
+    generated_at: str
+    analysis_mode: Literal["static", "static+gigacode", "partial"]
+    snapshot_id: str | None = None
+
+    @field_validator("generated_at")
+    @classmethod
+    def dated_snapshot(cls, value: str) -> str:
+        timestamp = datetime.fromisoformat(value)
+        if timestamp.utcoffset() is None:
+            raise ValueError("Graph snapshot must have a timezone")
+        return value
+
+
 class Evidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -72,9 +93,11 @@ class Evidence(BaseModel):
     url: str | None = None
     revision: str | None = None
     kind: Literal["source", "tool_metadata"] = "source"
+    service_inventory: ServiceInventorySnapshot | None = None
     # Optional adapter metadata describes the operation, independently of untrusted text.
     tool_outcome: Literal["failed", "empty"] | None = None
     remote_tool: str | None = Field(default=None, max_length=200)
+    mcp_catalog_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class SourcePort(Protocol):

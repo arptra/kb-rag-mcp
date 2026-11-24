@@ -288,6 +288,7 @@ async def test_repository_only_investigation_without_rag_and_cleanup(tmp_path: P
             "clone_repository",
             "search_repository",
             "read_repository",
+            "write_analysis_script",
             "run_in_sandbox",
         }
         changed = integrations.store.load()

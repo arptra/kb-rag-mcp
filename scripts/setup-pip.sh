@@ -7,17 +7,18 @@ project_root="$(cd -- "${script_dir}/.." && pwd)"
 venv_dir="${project_root}/.venv"
 python_bin="${PYTHON_BIN:-python3.12}"
 with_dev=true
-with_semantic=false
+extras=()
 
 show_help() {
   cat <<'EOF'
-Usage: ./scripts/setup-pip.sh [--no-dev] [--semantic]
+Usage: ./scripts/setup-pip.sh [--no-dev] [--semantic] [--agents]
 
 Create/update .venv using pip only. The global or corporate uv installation is not used.
 
 Options:
   --no-dev    Install runtime dependencies only
   --semantic  Also install the optional sentence-transformers dependencies
+  --agents    Install Deep Agents for Harness and agent research tools
 EOF
 }
 
@@ -26,8 +27,8 @@ while [[ $# -gt 0 ]]; do
     --no-dev)
       with_dev=false
       ;;
-    --semantic)
-      with_semantic=true
+    --semantic|--agents)
+      extras+=("${1#--}")
       ;;
     -h|--help)
       show_help
@@ -66,8 +67,9 @@ if ! "${venv_dir}/bin/python" -m pip --version >/dev/null 2>&1; then
 fi
 
 install_target="${project_root}"
-if [[ "${with_semantic}" == true ]]; then
-  install_target="${project_root}[semantic]"
+if ((${#extras[@]})); then
+  joined_extras="$(IFS=,; printf '%s' "${extras[*]}")"
+  install_target="${project_root}[${joined_extras}]"
 fi
 
 "${venv_dir}/bin/python" -m pip install --upgrade "${install_target}"

@@ -2,15 +2,25 @@
 
 # ruff: noqa: RUF001  # Russian prose and linguistic patterns.
 
+import json
 import re
 from typing import Any
 
 from markdown_it import MarkdownIt
+from pydantic import BaseModel, Field, ValidationError
 
 from agent_harness.model_connection import ModelPolicyStop, check_model_policy
 
 _MARKDOWN = MarkdownIt("commonmark", {"html": False})
 _REFERENCE = re.compile(r"\[([^\[\]\n]+)\]")
+_NAMED_SOURCE = re.compile(
+    r"""(?:\b(?:в|из|по|согласно|from|in|according to)\s+(?:(?:the|a)\s+)?"""
+    r"""(?:карточк[еи]|документ[еау]|файл[еау]|стать[еи]|инструкции|"""
+    r"""источнике|document|file|article|source)\s+|"""
+    r"""^\s*(?:источник|source|скачано из|получено из)\s*:\s*)"""
+    r"""(?:«([^«»\n]+)»|“([^“”\n]+)”|"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`)""",
+    re.I | re.M,
+)
 _CLAUSES = re.compile(r"\n+|(?<=[.!?;])\s+|,\s*(?:но|однако|при этом|but|however)\s+", re.I)
 _NO_FINDING = "В черновике нет результата проверки. Нужен конкретный вывод по вопросу."
 _NOTICE_ROOTS = ("модел", "мнен", "позиц", "точк", "информацию", "не могу", "model", "opinion")
@@ -56,7 +66,8 @@ _LABEL = re.compile(
 
 def is_answer_source(item: dict[str, Any]) -> bool:
     """Exclude tool descriptions, empty excerpts and repository checkout receipts."""
-    if item.get("kind", "source") != "source" or not item.get("text", "").strip():
+    if (item.get("kind", "source") != "source" or item.get("tool_outcome") in {"failed", "empty"}
+            or not item.get("text", "").strip()):
         return False
     # Retained runs predate the distinction between a checkout receipt and file content.
     index = item.get("index_id", "")
@@ -77,6 +88,103 @@ def answer_quality_issue(run: dict[str, Any], content: str) -> str | None:
         sources = {item["id"] for item in run.get("evidence", [])
                    if item.get("id") and is_answer_source(item)}
     return _draft_issue(content, sources)
+
+
+def format_source_reference(run: dict[str, Any], content: str) -> str:
+    """Resolve a writer's explicit quoted source name or a verbatim sourced answer."""
+    if (run.get("mode") != "autonomous" or "[" in content or not content.strip()
+            or content.lstrip().startswith(("{", "```"))):
+        return content
+    sources = [item for item in run.get("evidence", []) if is_answer_source(item)
+               and (item.get("checked_with") or item.get("read_document"))
+               and item.get("id") and not re.search(r"[\[\]\r\n]", item["id"])]
+
+    def resolve(match: re.Match[str]) -> str:
+        name = next(group for group in match.groups() if group is not None)
+        matches = [item for item in sources if name in (item["id"], item.get("title"))]
+        if len(matches) == 1:
+            return f"{match[0]} [{matches[0]['id']}]"
+        return match[0]
+
+    result = _NAMED_SOURCE.sub(resolve, content)
+    if result != content:
+        return result
+    # An exact complete source sentence needs no inference about which fact it supports.
+    sentence = " ".join(content.strip().split())
+    if len(sentence) >= 16:
+        matches = [item for item in sources if sentence in (
+            " ".join(part.split()) for part in re.split(r"(?<=[.!?])\s+|\n+", item["text"])
+        )]
+        if len(matches) == 1:
+            return f"{content} [{matches[0]['id']}]"
+    return content
+
+
+class SourceQuote(BaseModel):
+    source_id: str = Field(min_length=1, max_length=512)
+    quote: str = Field(min_length=8, max_length=2000)
+
+
+class QuotedFindings(BaseModel):
+    findings: list[SourceQuote] = Field(min_length=1, max_length=8)
+
+
+def render_quoted_findings(run: dict[str, Any], content: str) -> str | None:
+    """Publish only verbatim excerpts found in the unique, verified current source."""
+    body = content.strip()
+    if body.startswith("```") and body.endswith("```"):
+        body = body.partition("\n")[2].removesuffix("```").strip()
+    try:
+        report = QuotedFindings.model_validate_json(body)
+    except ValidationError:
+        return None
+    parts = []
+    for item in report.findings:
+        ref = item.source_id
+        if re.search(r"[\r\n\[\]]", ref):
+            return None
+        sources = [source for source in run["evidence"] if source["id"] == ref
+                   and is_answer_source(source)
+                   and (source.get("read_document") or source.get("checked_with"))]
+        quote = " ".join(item.quote.split())
+        if len(sources) != 1 or len(quote) < 8 or quote not in " ".join(sources[0]["text"].split()):
+            return None
+        parts.append(f"{quote} [{ref}]")
+    return "\n\n".join(parts)
+
+
+def quote_options(evidence: list[dict[str, Any]], question: str) -> dict[str, SourceQuote]:
+    """Offer bounded, contiguous source passages for an extractive final answer."""
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    split = RecursiveCharacterTextSplitter(chunk_size=540, chunk_overlap=60)
+    terms = set(re.findall(r"[\w-]{3,}", question.casefold()))
+    choices: dict[str, SourceQuote] = {}
+    for item in evidence[:8]:
+        if not 0 < len(item["id"]) <= 512 or re.search(r"[\[\]\r\n]", item["id"]):
+            continue
+        chunks = split.split_text(item["text"])
+        chunks.sort(key=lambda s: sum(term in s.casefold() for term in terms), reverse=True)
+        for chunk in chunks[:2]:
+            if len(chunk) >= 8:
+                choices[str(len(choices) + 1)] = SourceQuote(source_id=item["id"], quote=chunk)
+    return choices
+
+
+def selected_quotes(numbers: Any, choices: dict[str, SourceQuote]) -> QuotedFindings | None:
+    # Some models serialize an array argument as a string even through native
+    # tool calling. Only decimal IDs from the offered set are meaningful here.
+    if isinstance(numbers, str) and re.fullmatch(r"""[\[\]\d\s,'"]{1,128}""", numbers):
+        try:
+            numbers = json.loads(numbers.replace("'", '"'))
+        except ValueError:
+            return None
+    if type(numbers) in (str, int):
+        numbers = [numbers]
+    if (not isinstance(numbers, list) or not 0 < len(numbers) <= 8
+            or any(type(n) not in (int, str) or str(n) not in choices for n in numbers)):
+        return None
+    return QuotedFindings(findings=[choices[n] for n in dict.fromkeys(str(n) for n in numbers)])
 
 
 def answer_for_history(content: str | None) -> str:

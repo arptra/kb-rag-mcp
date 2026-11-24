@@ -7,7 +7,7 @@ show_help() {
 Подготовка Harness: ./scripts/setup-harness.sh [--deps-only] [--installer auto|pip|uv]
 
 Без флагов:
-  1. Устанавливает зависимости проекта в .venv.
+  1. Устанавливает зависимости Harness и Deep Agents в .venv.
   2. Собирает harness-sandbox:local (Git/SSH/Python/поиск).
   3. Собирает harness-sandbox-java21:local (дополнительно Java 21 и Maven).
 
@@ -114,7 +114,7 @@ if [[ "${installer}" == pip ]]; then
   fi
   echo "Устанавливаем зависимости Harness через pip из pyproject.toml (без uv.lock)…"
   echo "Используются ваши настройки pip, прокси и каталога пакетов."
-  bash "${script_dir}/setup-pip.sh" --no-dev
+  bash "${script_dir}/setup-pip.sh" --no-dev --agents
 else
   if [[ -z "${uv_bin}" ]]; then
     echo "uv не установлен. Используйте --installer pip или установите uv отдельно." >&2
@@ -129,7 +129,7 @@ else
   export UV_CACHE_DIR="${project_root}/.uv-cache"
   export UV_PYTHON_INSTALL_DIR="${project_root}/.uv-python"
   echo "Устанавливаем зависимости Harness из uv.lock…"
-  "${uv_bin}" sync --project "${project_root}" --python 3.12 --locked --inexact --no-dev
+  "${uv_bin}" sync --project "${project_root}" --python 3.12 --locked --inexact --no-dev --extra agents
 fi
 
 if [[ "${deps_only}" == true ]]; then

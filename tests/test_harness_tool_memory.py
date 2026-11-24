@@ -18,6 +18,32 @@ def sample(doc: str, index: str, tool: str, remote: str = "") -> dict[str, Any]:
                             "arguments": "PRIVATE_ARGUMENT"}}
 
 
+def test_learning_counts_only_reused_routes_cited_by_another_completed_answer(tmp_path: Path):
+    memory = store(tmp_path)
+    index = "connection:jira"
+    old = run(memory, index_ids=[index], evidence=[sample("old", index, "mcp_call", "issue")],
+              answer="The previous issue is described in [old].")
+    case = memory.record_outcome("alice", old, index_ids=[index])
+    assert case
+    new = run(memory, "second", "bob", index_ids=[index],
+              evidence=[sample("new", index, "mcp_call", "issue")],
+              answer="The current issue is described in [new].")
+    memory.record_usage("bob", [case["id"]], new["id"])
+    for _ in range(2):
+        memory.record_outcome("bob", new, index_ids=[index])
+    memory = store(tmp_path)
+    assert memory.get("alice", case["id"])["route_reuses"] == 1
+    memory.record_feedback("bob", new, rating="unhelpful", index_ids=[index])
+    assert memory.get("alice", case["id"])["route_reuses"] == 0
+    memory.record_feedback("bob", new, rating="helpful", index_ids=[index])
+    assert memory.get("alice", case["id"])["route_reuses"] == 1
+    other = run(memory, "third", "bob", index_ids=[index], answer="Evidence from [other].",
+                evidence=[sample("other", index, "mcp_call", "different_tool")])
+    memory.record_usage("bob", [case["id"]], other["id"])
+    memory.record_outcome("bob", other, index_ids=[index])
+    assert memory.get("alice", case["id"])["route_reuses"] == 1
+
+
 def test_shared_choice_credits_only_cited_source_in_retained_answer(tmp_path: Path) -> None:
     memory = store(tmp_path)
     a, b = "connection:support", "payments"

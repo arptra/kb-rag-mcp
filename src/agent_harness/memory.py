@@ -26,7 +26,9 @@ _SOURCE_TOOLS = frozenset({
     "search_knowledge", "read_document", "search_repository", "read_repository",
     "run_in_sandbox", "mcp_call", "a2a_ask",
 })
-_ATTEMPT_TOOLS = _SOURCE_TOOLS | {"clone_repository", "mcp_list_tools", "mcp_tool_schema"}
+_ATTEMPT_TOOLS = _SOURCE_TOOLS | {
+    "clone_repository", "write_analysis_script", "mcp_list_tools", "mcp_tool_schema",
+}
 _PREVIOUS_CONCLUSION = "Предыдущий вывод (не подтверждённое знание): "
 _STOP = frozenset(
     [
@@ -173,7 +175,24 @@ def _source_choices(run: dict[str, Any]) -> list[dict[str, Any]]:
         ids = choices[key]["evidence_ids"]
         if len(ids) < 3 and item["id"] not in ids:
             ids.append(item["id"])
+            if (tool == "read_document" and item.get("document_id")
+                    and item["document_id"] != item["id"]):
+                choices[key].setdefault("documents", {})[item["id"]] = item["document_id"]
     return list(choices.values())
+
+
+def _route_keys(choices: list[dict[str, Any]]) -> set[tuple[str, str, str]]:
+    keys = set()
+    for choice in choices:
+        name, index = choice.get("tool", ""), choice.get("index_id", "")
+        # A Jira lookup can resolve two different issues. For document reads the
+        # document must match too; two unrelated pages in one index prove nothing.
+        if name == "mcp_call" and choice.get("remote_tool"):
+            keys.add((name, index, choice["remote_tool"]))
+        else:
+            for ref in choice.get("evidence_ids", []):
+                keys.add((name, index, choice.get("documents", {}).get(ref, ref)))
+    return keys
 
 
 class MemoryStore:
@@ -202,6 +221,23 @@ class MemoryStore:
                 "CREATE TABLE IF NOT EXISTS memory_outcomes "
                 "(memory_id TEXT NOT NULL, run_id TEXT NOT NULL, owner TEXT NOT NULL, "
                 "status TEXT NOT NULL, rating TEXT NOT NULL, PRIMARY KEY(memory_id,run_id))"
+            )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS memory_route_reuses (memory_id TEXT NOT NULL, "
+                "run_id TEXT NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(memory_id,run_id))"
+            )
+            # Older installations recorded a partial case for every gateway block. A
+            # run's typed terminal reason lets us keep these out of future planning.
+            db.execute(
+                "UPDATE memories AS m SET data=json_set(m.data,'$.stop_reason',"
+                "json_extract(r.data,'$.stop_reason')) FROM runs AS r "
+                "WHERE m.owner=r.owner AND m.source_run_id=r.id AND m.status='experience' "
+                "AND r.status IN ('partial','failed') "
+                "AND json_valid(m.data) AND json_valid(r.data) "
+                "AND json_extract(m.data,'$.origin')='automatic' "
+                "AND json_type(m.data,'$.stop_reason') IS NULL "
+                "AND json_extract(r.data,'$.stop_reason') IN "
+                "('model_policy_stop','model_refusal_text')"
             )
         self._backfill_tool_choices()
 
@@ -338,6 +374,8 @@ class MemoryStore:
             "research_plan",
             "quality",
             "usage_count",
+            "route_reuses",
+            "stop_reason",
             "last_used_at",
             "_last_used_run_id",
         ):
@@ -379,6 +417,7 @@ class MemoryStore:
                 raise KeyError("Memory not found")
             db.execute("DELETE FROM memory_usages WHERE memory_id=?", (memory_id,))
             db.execute("DELETE FROM memory_outcomes WHERE memory_id=?", (memory_id,))
+            db.execute("DELETE FROM memory_route_reuses WHERE memory_id=?", (memory_id,))
 
     def retrieve(
         self,
@@ -399,6 +438,12 @@ class MemoryStore:
             if exclude_run_id is not None and item.get("source_run_id") == exclude_run_id:
                 continue
             if item["status"] not in {"active", "experience"}:
+                continue
+            if (item["status"] == "experience"
+                    and item.get("stop_reason") in {"model_policy_stop", "model_refusal_text"}
+                    and not item.get("feedback")):
+                # Keep the incident visible in SQLite/UI. Repeated gateway stops do not
+                # teach a search strategy and must not crowd verified routes out of retrieval.
                 continue
             if item.get("origin") == "automatic" and item["status"] == "experience":
                 preceding, marker, previous = item["text"].rpartition("\n" + _PREVIOUS_CONCLUSION)
@@ -425,7 +470,8 @@ class MemoryStore:
                 rating_bonus = max(-3, min(3, quality["helpful"] - quality["unhelpful"]))
                 ranked.append((score * 16 + priority * 2 + rating_bonus, item))
         ranked.sort(key=lambda pair: (
-            pair[0], bool(pair[1].get("strategy", {}).get("successful_tools")),
+            pair[0], min(5, pair[1].get("route_reuses", 0)),
+            bool(pair[1].get("strategy", {}).get("successful_tools")),
             pair[1]["updated_at"],
         ), reverse=True)
         policy = self.controls.load()
@@ -482,6 +528,7 @@ class MemoryStore:
                     "origin": item.get("origin", "manual"),
                     "feedback": item.get("feedback"),
                     "usage_count": item.get("usage_count", 0),
+                    "route_reuses": item.get("route_reuses", 0),
                     "last_used_at": item.get("last_used_at"),
                     "quality": quality,
                     "learning_state": self._learning_state(item),
@@ -564,6 +611,8 @@ class MemoryStore:
             return
         rating = (run.get("feedback") or {}).get("rating", "")
         rating = rating if rating in {"helpful", "unhelpful"} else ""
+        cited_routes = (_route_keys(_source_choices(run)) if status == "completed"
+                        and not run.get("_final_quality_issue") else set())
         with self.runs._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             stored = db.execute(
@@ -587,8 +636,22 @@ class MemoryStore:
                     (memory_id, run["id"]),
                 ).fetchone()
                 current_rating = rating or (previous[1] if previous is not None else "")
-                if previous is not None and tuple(previous) == (status, current_rating):
+                routes = _route_keys(item.get("strategy", {}).get("successful_tools", []))
+                if current_rating != "unhelpful" and routes & cited_routes:
+                    change = db.execute(
+                        "INSERT OR IGNORE INTO memory_route_reuses VALUES (?,?,?)",
+                        (memory_id, run["id"], owner),
+                    ).rowcount
+                else:
+                    change = -db.execute(
+                        "DELETE FROM memory_route_reuses "
+                        "WHERE memory_id=? AND run_id=? AND owner=?",
+                        (memory_id, run["id"], owner),
+                    ).rowcount
+                if (not change and previous is not None
+                        and tuple(previous) == (status, current_rating)):
                     continue
+                item["route_reuses"] = max(0, item.get("route_reuses", 0) + change)
                 quality = self._quality(item)
                 if previous is not None:
                     old_status, old_rating = previous
@@ -628,6 +691,7 @@ class MemoryStore:
             db.execute("DELETE FROM memories WHERE id=?", (key,))
             db.execute("DELETE FROM memory_usages WHERE memory_id=?", (key,))
             db.execute("DELETE FROM memory_outcomes WHERE memory_id=?", (key,))
+            db.execute("DELETE FROM memory_route_reuses WHERE memory_id=?", (key,))
         return True
 
     @staticmethod
@@ -818,6 +882,7 @@ class MemoryStore:
             "status": "experience",
             "origin": "automatic",
             "outcome": outcome,
+            "stop_reason": run.get("stop_reason"),
             "feedback": feedback,
             "failures": failures[:MAX_FAILURES],
             "sources": sources,
@@ -826,6 +891,7 @@ class MemoryStore:
             "created_at": (existing or {}).get("created_at", now),
             "updated_at": now,
             "usage_count": (existing or {}).get("usage_count", 0),
+            "route_reuses": (existing or {}).get("route_reuses", 0),
             "last_used_at": (existing or {}).get("last_used_at"),
             "quality": self._quality(existing or {}),
             "_match_question": question,

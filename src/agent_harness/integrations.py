@@ -10,7 +10,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent_harness.contracts import Evidence, Principal, ToolExecutionFailure, tool_failure_reason
+from agent_harness.contracts import (
+    ANALYSIS_FILENAME,
+    MAX_ANALYSIS_SOURCE_BYTES,
+    Evidence,
+    Principal,
+    ToolExecutionFailure,
+    tool_failure_reason,
+)
 from agent_harness.credentials import CredentialStore
 from agent_harness.integrations_config import IntegrationSettings, IntegrationStore, SandboxConfig
 
@@ -34,20 +41,34 @@ class RunSandboxArgs(RepositoryArgs):
     command: list[str] = Field(min_length=1, max_length=64)
 
 
+class WriteAnalysisScriptArgs(RepositoryArgs):
+    filename: str = Field(pattern=ANALYSIS_FILENAME, description="Simple .py or .java filename")
+    source: str = Field(
+        min_length=1, max_length=MAX_ANALYSIS_SOURCE_BYTES,
+        description="Complete UTF-8 source, up to 24 KiB",
+    )
+
+
 class MCPListArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     connection_id: str = Field(min_length=1, max_length=64)
     query: str = Field(default="", max_length=200)
+    refresh: bool = Field(default=False, description="Fetch live definitions again in this run.")
 
 
-class MCPSchemaArgs(BaseModel):
+class MCPToolArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     connection_id: str = Field(min_length=1, max_length=64)
     tool: str = Field(min_length=1, max_length=200)
 
 
-class MCPArgs(MCPSchemaArgs):
+class MCPSchemaArgs(MCPToolArgs):
+    refresh: bool = Field(default=False, description="Fetch the live input contract again.")
+
+
+class MCPArgs(MCPToolArgs):
     arguments: dict[str, Any] = Field(default_factory=dict)
+    schema_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class A2AArgs(BaseModel):
@@ -60,6 +81,7 @@ ARGUMENTS: dict[str, type[BaseModel]] = {
     "clone_repository": RepositoryArgs,
     "search_repository": SearchRepositoryArgs,
     "read_repository": ReadRepositoryArgs,
+    "write_analysis_script": WriteAnalysisScriptArgs,
     "run_in_sandbox": RunSandboxArgs,
     "mcp_list_tools": MCPListArgs,
     "mcp_call": MCPArgs,
@@ -70,13 +92,20 @@ DESCRIPTIONS = {
     "clone_repository": "Clone a configured repository into this run's sandbox.",
     "search_repository": "Search literal text in a repository; prepares its sandbox if needed.",
     "read_repository": "Read lines from a repository file inside this run's sandbox.",
+    "write_analysis_script": "Prepare a small Python or Java analysis program to answer a "
+    "specific question about the selected repository. Java requires a profile with a JDK. "
+    "The file is local to this run. "
+    "Use run_in_sandbox with the command in the receipt to obtain the actual output. "
+    "Write the same filename again to correct a failed check.",
     "run_in_sandbox": "Run a command in an isolated repository container without network access. "
     "Only for analysis, build and tests requested by the user. No host filesystem access.",
     "mcp_list_tools": "Discover the current allowed tools and their descriptions on a selected "
     "MCP connection. Use this to choose a relevant tool, then read mcp_tool_schema and call it. "
-    "Use query to filter names/descriptions if the catalog is large or truncated. "
+    "Use query to filter a large catalog. Set refresh=true if an earlier list does not show "
+    "a needed action or the connection's capabilities may have changed. "
     "The catalog is metadata, not evidence about the corporate system.",
     "mcp_tool_schema": "Read an allowed MCP tool's input schema before calling it. "
+    "Set refresh=true to recheck a previously inspected contract. "
     "This is tool metadata, not evidence of the corporate system.",
     "mcp_call": "Call an administrator-allowed MCP tool. Read mcp_tool_schema first. "
     "Do not mutate external systems unless "
@@ -160,9 +189,22 @@ class IntegrationHub:
             *[
                 {"id": "connection:" + item.id, "name": item.kind.upper() + " · " + item.name}
                 for item in settings.connections
-                if item.allows(principal.owner_id) and (item.kind == "a2a" or item.allowed_tools)
+                if item.allows(principal.owner_id) and (item.kind == "a2a" or item.has_tools)
             ],
         ]
+
+    async def allowed_mcp_tools(
+        self, principal: Principal, index_ids: list[str],
+    ) -> dict[str, set[str]]:
+        """Local allowlists for choosing a remembered route; call() rechecks at execution."""
+        await self._check(principal)
+        selected = set(index_ids)
+        return {
+            "connection:" + item.id: set(item.allowed_tools)
+            for item in self.store.load().connections
+            if item.kind == "mcp" and item.has_tools and "connection:" + item.id in selected
+            and item.allows(principal.owner_id)
+        }
 
     async def describe(
         self,
@@ -172,9 +214,13 @@ class IntegrationHub:
         available = {item["id"] for item in await self.indexes(principal)} & set(index_ids)
         settings = self.store.load()
         names: list[str] = []
-        if any(value.startswith("repo:") for value in available):
+        repository_ids = [
+            item.id for item in settings.repositories if "repo:" + item.id in available
+        ]
+        if repository_ids:
             names.extend(
-                ("clone_repository", "search_repository", "read_repository", "run_in_sandbox")
+                ("clone_repository", "search_repository", "read_repository",
+                 "write_analysis_script", "run_in_sandbox")
             )
         connections = [
             item for item in settings.connections if "connection:" + item.id in available
@@ -188,7 +234,19 @@ class IntegrationHub:
             for item in connections
             if item.kind == "mcp"
         )[:2000]
-        connection_ids = ", ".join(item.id for item in connections if item.kind == "mcp")
+        mcp_ids = [item.id for item in connections if item.kind == "mcp"]
+        a2a_ids = [item.id for item in connections if item.kind == "a2a"]
+
+        def parameters(name: str) -> dict[str, Any]:
+            schema = ARGUMENTS[name].model_json_schema()
+            if "repository_id" in schema["properties"]:
+                schema["properties"]["repository_id"]["enum"] = repository_ids
+            else:
+                schema["properties"]["connection_id"]["enum"] = (
+                    a2a_ids if name == "a2a_ask" else mcp_ids
+                )
+            return schema
+
         return [
             {
                 "type": "function",
@@ -196,12 +254,12 @@ class IntegrationHub:
                     "name": name,
                     "description": DESCRIPTIONS[name]
                     + (
-                        " Allowed connection IDs: " + connection_ids
+                        " Allowed connection IDs: " + ", ".join(mcp_ids)
                         + ". Tool name hints: " + allowed
                         if name in {"mcp_list_tools", "mcp_call", "mcp_tool_schema"}
                         else ""
                     ),
-                    "parameters": ARGUMENTS[name].model_json_schema(),
+                    "parameters": parameters(name),
                 },
             }
             for name in names
@@ -222,6 +280,11 @@ class IntegrationHub:
         if name not in ARGUMENTS:
             raise ValueError("Tool is not allowed")
         validated = ARGUMENTS[name].model_validate(args).model_dump()
+        # Refresh controls only the graph's metadata cache. The remote reader
+        # always performs a live MCP list and uses a stable evidence ID.
+        validated.pop("refresh", None)
+        if validated.get("schema_revision") is None:
+            validated.pop("schema_revision", None)
         settings = self.store.load()
         mcp_failure = None
         if "repository_id" in validated:
@@ -262,9 +325,10 @@ class IntegrationHub:
                     "mcp" if name in {"mcp_list_tools", "mcp_call", "mcp_tool_schema"} else "a2a"
                 )
                 or (connection.kind == "mcp" and (
-                    not connection.allowed_tools or (
+                    not connection.has_tools or (
                         name != "mcp_list_tools"
                         and validated["tool"] not in connection.allowed_tools
+                        and not connection.include_read_only_tools
                     )
                 ))
             ):
@@ -305,11 +369,16 @@ class IntegrationHub:
                 or not current.allows(principal.owner_id)
                 or current.kind != connection.kind
                 or current.url != connection.url
+                or current.credential_env != connection.credential_env
                 or (current.kind == "mcp" and (
+                    (connection.include_read_only_tools and not current.include_read_only_tools)
+                    or
                     (name == "mcp_list_tools" and not set(connection.allowed_tools).issubset(
                         current.allowed_tools
                     ))
-                    or (name != "mcp_list_tools" and validated["tool"] not in current.allowed_tools)
+                    or (name != "mcp_list_tools" and validated["tool"] not in current.allowed_tools
+                        and (validated["tool"] in connection.allowed_tools
+                             or not current.include_read_only_tools))
                 ))
             ):
                 raise PermissionError("Connection permission changed during the call")
@@ -318,13 +387,17 @@ class IntegrationHub:
         if remote_tool and secret and secret in remote_tool:
             remote_tool = None
         if mcp_failure is not None:
-            mcp_failure.remote_tool = remote_tool
+            # A rejected dynamic name has not necessarily been observed on the peer.
+            if connection is not None and remote_tool in connection.allowed_tools:
+                mcp_failure.remote_tool = remote_tool
             raise mcp_failure
         accepted = []
         for item in result[:10]:
             payload = Evidence.model_validate(item).model_dump()
             if payload["index_id"] != resource_id:
                 raise ValueError("Tool returned evidence outside its scope")
+            # Only the portal graph source may attest to a complete service inventory.
+            payload.pop("service_inventory", None)
             payload["remote_tool"] = remote_tool
             if secret:
                 payload = {

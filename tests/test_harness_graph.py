@@ -117,6 +117,7 @@ async def test_real_langgraph_nodes_checkpoints_and_delete(tmp_path: Path) -> No
             "decide",
             "tools",
             "reflect",
+            "replan",
             "synthesize",
             "__end__",
         }
@@ -164,6 +165,65 @@ async def test_restart_resume_does_not_replay_uncertain_tool_and_preserves_budge
         assert result["metrics"]["source_calls"] > previous["metrics"]["source_calls"]
         assert any("не повторён" in item for item in result["warnings"])
         assert "Verified answer" in result["answer"]
+    finally:
+        await second.stop()
+
+
+@pytest.mark.asyncio
+async def test_native_autopilot_batch_resumes_without_replaying_remote_calls(
+    tmp_path: Path,
+) -> None:
+    actions = [{"name": "a2a_ask", "args": {"connection_id": "test", "question": question}}
+               for question in ("Inspect summary", "Inspect receipts")]
+
+    class Remote(External):
+        async def describe(
+            self, principal: Principal, index_ids: list[str],
+        ) -> list[dict[str, Any]]:
+            return [{"type": "function", "function": {
+                "name": "a2a_ask", "parameters": {"type": "object"},
+            }}]
+
+        async def call(self, name: str, args: Any, **kwargs: Any) -> list[Evidence]:
+            if not self.calls:
+                self.calls += 1
+                return [Evidence(id="receipt", title="Summary", text="Actual remote result",
+                                 index_id="connection:test")]
+            return await super().call(name, args, **kwargs)
+
+    class Batch(Model):
+        async def decide(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls += 1
+            if self.calls == 1:
+                return {"content": "", "tool_calls": actions}
+            return {"content": "Проверен ответ агента [receipt].", "tool_calls": []}
+
+    remote = Remote()
+    first = HarnessRuntime(settings(tmp_path), Source(), Batch(), remote)
+    await first.start()
+    try:
+        run = await first.submit(OWNER, RunRequest(
+            question="Проверь платёж", mode="autonomous", index_ids=["a", "connection:test"],
+        ))
+        await asyncio.wait_for(remote.entered.wait(), 3)
+    finally:
+        await first.stop()
+    interrupted = first.store.get(OWNER.owner_id, run["id"])
+    assert interrupted["status"] == "cancelled"
+    assert len(interrupted["_completed_effects"]) == 1 and interrupted["_inflight_action"]
+    assert remote.calls == 2 and interrupted["metrics"]["agent_rounds"] == 1
+    second = HarnessRuntime(settings(tmp_path), Source(), Batch(), remote)
+    await second.start()
+    try:
+        await second.resume(OWNER, run["id"])
+        result = await finished(second, run["id"])
+        assert remote.calls == 2 and result["resume_count"] == 1
+        assert result["metrics"]["model_calls"] > interrupted["metrics"]["model_calls"]
+        receipts = [step["result"] for step in result["research_trace"]
+                    if step["name"] == "a2a_ask"]
+        assert any("до прерывания" in item for item in receipts)
+        assert any("неизвестен" in item for item in receipts)
+        assert any(e["id"] == "receipt" for e in result["evidence"])
     finally:
         await second.stop()
 
