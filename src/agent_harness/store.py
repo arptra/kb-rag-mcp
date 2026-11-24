@@ -107,24 +107,42 @@ class RunStore:
                     "INSERT OR IGNORE INTO deleted_runs VALUES (?,?,?)", (key, owner, timestamp())
                 )
                 db.execute("DELETE FROM runs WHERE id=? AND owner=?", (key, owner))
-            # Memory has the same connection/owner boundary. Its schema is optional
-            # for standalone users of RunStore and for migrations from older versions.
-            if db.execute("SELECT 1 FROM sqlite_master WHERE name='memories'").fetchone():
-                db.executemany(
-                    "DELETE FROM memories WHERE source_run_id=? AND owner=?",
-                    [(key, owner) for key in deleted],
-                )
-            if db.execute("SELECT 1 FROM sqlite_master WHERE name='memory_usages'").fetchone():
-                db.executemany(
-                    "DELETE FROM memory_usages WHERE run_id=? AND owner=?",
-                    [(key, owner) for key in deleted],
-                )
+            self._cleanup_memory_references(db)
+        return sorted(deleted)
+
+    @staticmethod
+    def _cleanup_memory_references(db: sqlite3.Connection) -> None:
+        """Retain shared knowledge after chat deletion; usage belongs to its consumer."""
+        # These tables are optional for standalone RunStore and older databases.
+        has_memories = db.execute("SELECT 1 FROM sqlite_master WHERE name='memories'").fetchone()
+        if has_memories:
+            orphaned = db.execute(
+                "SELECT id,status,data FROM memories WHERE source_run_id IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.id=memories.source_run_id "
+                "AND runs.owner=memories.owner)"
+            ).fetchall()
+            for memory_id, status, data in orphaned:
+                if status in {"active", "experience"}:
+                    item = json.loads(data)
+                    item["source_run_id"] = None
+                    db.execute(
+                        "UPDATE memories SET source_run_id=NULL,data=? WHERE id=?",
+                        (json.dumps(item, ensure_ascii=False), memory_id),
+                    )
+                elif status == "draft":
+                    db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='memory_usages'").fetchone():
+            if not has_memories:
+                db.execute("DELETE FROM memory_usages")
+            else:
+                # A memory's author and the consuming run's owner can differ. Keep
+                # historical usage_count even when individual run links expire.
                 db.execute(
                     "DELETE FROM memory_usages WHERE NOT EXISTS "
-                    "(SELECT 1 FROM memories WHERE memories.id=memory_usages.memory_id "
-                    "AND memories.owner=memory_usages.owner)"
+                    "(SELECT 1 FROM memories WHERE memories.id=memory_usages.memory_id) "
+                    "OR NOT EXISTS (SELECT 1 FROM runs WHERE runs.id=memory_usages.run_id "
+                    "AND runs.owner=memory_usages.owner)"
                 )
-        return sorted(deleted)
 
     def recover(self) -> None:
         with self._connect() as db:
@@ -164,17 +182,4 @@ class RunStore:
                 (self.settings.max_total_runs,),
             )
             db.execute("DELETE FROM deleted_runs WHERE deleted<?", (cutoff,))
-            if db.execute("SELECT 1 FROM sqlite_master WHERE name='memories'").fetchone():
-                db.execute(
-                    "DELETE FROM memories WHERE source_run_id IS NOT NULL AND NOT EXISTS "
-                    "(SELECT 1 FROM runs WHERE runs.id=memories.source_run_id "
-                    "AND runs.owner=memories.owner)"
-                )
-            if db.execute("SELECT 1 FROM sqlite_master WHERE name='memory_usages'").fetchone():
-                db.execute(
-                    "DELETE FROM memory_usages WHERE NOT EXISTS "
-                    "(SELECT 1 FROM memories WHERE memories.id=memory_usages.memory_id "
-                    "AND memories.owner=memory_usages.owner) OR NOT EXISTS "
-                    "(SELECT 1 FROM runs WHERE runs.id=memory_usages.run_id "
-                    "AND runs.owner=memory_usages.owner)"
-                )
+            self._cleanup_memory_references(db)

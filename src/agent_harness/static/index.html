@@ -29,7 +29,7 @@
           <div class="breadcrumb">История запросов <span aria-hidden="true">/</span> <strong id="page-label">Новый запрос</strong></div>
           <div class="topbar-actions">
             <span id="connection-state" class="connection-state"><span class="connection-dot" aria-hidden="true"></span><span id="connection-label">Подключаемся</span></span>
-            <button id="memory-open" class="settings-open" type="button" hidden>Память</button>
+            <button id="memory-open" class="settings-open" type="button" hidden>Общая память АС</button>
             <button id="settings-open" class="settings-open" type="button" hidden>Настройки</button>
             <button id="auth-open" class="icon-button" type="button" aria-label="Вход в Harness" title="Вход в Harness">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M16.5 9.5a4.5 4.5 0 1 0-4.4 5.5H14v3h3v-3h3v-4h-4.3"/><circle cx="8" cy="10" r="1"/></svg>
@@ -232,9 +232,10 @@
     </dialog>
 
     <dialog id="memory-dialog" class="memory-dialog" aria-labelledby="memory-title">
-      <header class="dialog-heading"><div><h2 id="memory-title">Память Harness</h2><p>После запросов здесь автоматически появляются опыт и уроки. Они помогают разбирать похожие вопросы, а источники проверяются заново.</p></div><button id="memory-close" class="icon-button" type="button" aria-label="Закрыть память">×</button></header>
-      <div class="memory-toolbar"><label class="settings-switch"><input id="memory-enabled" type="checkbox" role="switch"><span>Использовать мою память</span></label><button id="memory-new" class="secondary-button" type="button">Добавить запись</button></div>
-      <p class="settings-field-help">Автоматический опыт учитывается как неподтверждённая подсказка. Оценки «Помогло» и «Не помогло» уточняют, что использовать в будущем. Проверенные заметки можно подтвердить вручную. Счётчик показывает, сколько раз запись использовалась в других запросах.</p>
+      <header class="dialog-heading"><div><h2 id="memory-title">Общая память АС</h2><p>Опыт и уроки из запросов помогают всем пользователям с доступом к связанным источникам. Источники проверяются заново. Чаты и неподтверждённые ручные черновики остаются личными.</p></div><button id="memory-close" class="icon-button" type="button" aria-label="Закрыть память">×</button></header>
+      <div class="memory-toolbar"><label class="settings-switch"><input id="memory-enabled" type="checkbox" role="switch" aria-describedby="memory-preference-help"><span>Использовать и пополнять память в моих запросах</span></label><button id="memory-new" class="secondary-button" type="button">Добавить запись</button></div>
+      <p id="memory-preference-help" class="settings-field-help">Переключатель действует только на ваши новые запросы: использование общей памяти и автоматическое сохранение опыта. Общая память продолжает работать для остальных пользователей. Добавлять записи вручную можно при любом положении переключателя.</p>
+      <p class="settings-field-help">Автоматический опыт — неподтверждённая подсказка. Оценки «Помогло» и «Не помогло» уточняют общий опыт АС. Счётчик учитывает использование записи всеми пользователями. Изменить или удалить запись может только её автор.</p>
       <p id="memory-summary" class="memory-summary"></p>
       <p id="memory-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
       <div id="memory-error" class="settings-error" role="alert" hidden></div>
@@ -244,13 +245,14 @@
           <label class="settings-field wide"><span class="settings-field-label">Название</span><input id="memory-name" maxlength="160" required autocomplete="off"></label>
           <label class="settings-field"><span class="settings-field-label">Тип записи</span><select id="memory-kind"><option value="note">Заметка</option><option value="correction">Уточнение ответа</option><option value="lesson">Урок из ошибки</option><option value="case">Опыт решения</option></select></label>
           <label class="settings-field wide"><span class="settings-field-label">Что нужно учитывать в будущем</span><textarea id="memory-text" rows="5" maxlength="2400" required placeholder="Укажите проверенное уточнение, рабочий способ или причину ошибки."></textarea></label>
-          <fieldset class="memory-sources wide"><legend>Связанные источники</legend><div id="memory-sources" class="memory-source-list"></div><p class="settings-field-help">Запись используется только в доступной вам области поиска.</p></fieldset>
-          <label class="memory-confirm wide"><input id="memory-confirmed" type="checkbox"><span>Подтверждаю запись: использовать её в похожих запросах<small>Без подтверждения запись сохранится как черновик.</small></span></label>
+          <fieldset class="memory-sources wide"><legend>Связанные источники</legend><div id="memory-sources" class="memory-source-list"></div><p class="settings-field-help">Общая запись доступна только пользователям с доступом ко всем связанным источникам и используется в соответствующей области поиска.</p></fieldset>
+          <label class="memory-confirm wide"><input id="memory-confirmed" type="checkbox"><span>Подтверждаю запись и добавляю в общую память АС<small>Другие пользователи с доступом к источникам смогут её использовать. Без подтверждения ручная запись останется вашим личным черновиком.</small></span></label>
         </div>
         <div class="resource-actions"><button id="memory-cancel" class="text-button" type="button">Отмена</button><button id="memory-save" class="secondary-button" type="submit">Сохранить запись</button></div>
       </form>
       <div id="memory-list" class="settings-items"></div>
-      <p id="memory-empty" class="settings-empty">Память появится автоматически после завершения запроса. Вы также можете добавить проверенную заметку.</p>
+      <button id="memory-load-more" class="secondary-button" type="button" hidden>Показать ещё</button>
+      <p id="memory-empty" class="settings-empty">В вашей области доступа пока нет записей. Общий опыт появится автоматически после завершения запросов с включённой памятью. Можно добавить проверенную заметку.</p>
     </dialog>
 
     <dialog id="delete-dialog" class="auth-dialog" aria-labelledby="delete-title">

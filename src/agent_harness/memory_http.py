@@ -1,4 +1,4 @@
-"""Authenticated private-memory routes, mountable by the small Harness HTTP app."""
+"""Authenticated shared-memory routes with source ACLs and author-only mutations."""
 
 from __future__ import annotations
 
@@ -26,7 +26,10 @@ def create_memory_routes(runtime: HarnessRuntime, principal: PrincipalResolver) 
     async def memories(request: Request) -> Response:
         identity = await principal(request, mutate=request.method != "GET")
         if request.method == "GET":
-            return _json(await runtime.list_memory(identity))
+            offset = request.query_params.get("offset", "0")
+            if len(offset) > 5 or not offset.isascii() or not offset.isdecimal():
+                raise HTTPException(400, "Недопустимая страница памяти.")
+            return _json(await runtime.list_memory(identity, offset=int(offset)))
         try:
             payload = MemoryInput.model_validate_json(await _body(request))
         except (ValidationError, ValueError):

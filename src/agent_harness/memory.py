@@ -1,4 +1,4 @@
-"""Private notes and automatically collected, explicitly unverified run experience."""
+"""Shared system knowledge and unverified experience, filtered by source permissions."""
 
 from __future__ import annotations
 
@@ -6,14 +6,15 @@ import builtins
 import hashlib
 import json
 import re
-from typing import Any, Literal
+import sqlite3
+from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_harness.store import RunStore, timestamp
 
-MAX_PER_OWNER = 200
+LIST_LIMIT = 200
 MAX_TOTAL = 10_000
 MAX_FAILURES = 12
 _STOP = frozenset(
@@ -109,12 +110,18 @@ class MemoryFeedback(BaseModel):
         return value.strip()
 
 
+class MemoryPage(TypedDict):
+    items: list[dict[str, Any]]
+    total: int
+    next_offset: int | None
+
+
 def _terms(value: str) -> set[str]:
     return {word for word in re.findall(r"[\w-]{3,}", value.casefold()) if word not in _STOP}
 
 
 class MemoryStore:
-    """Uses the run database; every read/write includes the authenticated owner."""
+    """Shared reads use source ACLs; the author alone can edit or delete a memory."""
 
     def __init__(self, runs: RunStore) -> None:
         self.runs = runs
@@ -150,13 +157,38 @@ class MemoryStore:
                 (owner, int(enabled)),
             )
 
-    def list(self, owner: str, allowed: set[str]) -> builtins.list[dict[str, Any]]:
+    def list(
+        self, owner: str, allowed: set[str], *, offset: int = 0
+    ) -> builtins.list[dict[str, Any]]:
+        return self.page(owner, allowed, offset=offset)["items"]
+
+    def page(self, owner: str, allowed: set[str], *, offset: int = 0) -> MemoryPage:
+        """Paginate permitted records so restricted entries never affect counts or offsets."""
+        if offset < 0:
+            raise ValueError("Memory offset must be nonnegative")
+        visible = self._visible(owner, allowed, include_drafts=True)
+        next_offset = offset + LIST_LIMIT
+        return {
+            "items": visible[offset:next_offset],
+            "total": len(visible),
+            "next_offset": next_offset if next_offset < len(visible) else None,
+        }
+
+    def _visible(
+        self, owner: str, allowed: set[str], *, include_drafts: bool = False
+    ) -> builtins.list[dict[str, Any]]:
+        """Read the shared pool before filtering/ranking, not just the UI's latest page."""
         with self.runs._connect() as db:
             rows = db.execute(
-                "SELECT data FROM memories WHERE owner=? ORDER BY updated DESC LIMIT ?",
-                (owner, MAX_PER_OWNER),
+                "SELECT owner,data FROM memories WHERE status IN ('active','experience') "
+                "OR (status='draft' AND owner=? AND ?) ORDER BY updated DESC,id DESC LIMIT ?",
+                (owner, include_drafts, MAX_TOTAL),
             ).fetchall()
-        return [item for row in rows if set((item := json.loads(row[0]))["index_ids"]) <= allowed]
+        return [
+            {**item, "_author": author, "_reader": owner}
+            for author, data in rows
+            if set((item := json.loads(data))["index_ids"]) <= allowed
+        ]
 
     def get(self, owner: str, memory_id: str) -> dict[str, Any]:
         with self.runs._connect() as db:
@@ -165,7 +197,7 @@ class MemoryStore:
             ).fetchone()
         if row is None:
             raise KeyError("Memory not found")
-        return dict(json.loads(row[0]))
+        return {**json.loads(row[0]), "_author": owner, "_reader": owner}
 
     def save(
         self,
@@ -183,7 +215,7 @@ class MemoryStore:
             "status": "active" if request.confirmed else "draft",
             "created_at": existing["created_at"] if existing else now,
             "updated_at": now,
-            # Matching text is private and never sent to another owner or to the UI.
+            # Matching text stays internal; source permissions also cover its use in ranking.
             "_match_question": match_question[:2000] or (existing or {}).get("_match_question", ""),
         }
         for key in (
@@ -209,13 +241,8 @@ class MemoryStore:
                 ).fetchone()
             ):
                 raise KeyError("Run not found")
-            if existing is None:
-                count = db.execute(
-                    "SELECT COUNT(*) FROM memories WHERE owner=?", (owner,)
-                ).fetchone()[0]
-                total = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-                if count >= MAX_PER_OWNER or total >= MAX_TOTAL:
-                    raise ValueError("Память заполнена. Удалите ненужные записи перед сохранением.")
+            if existing is None and not self._make_room(db):
+                raise ValueError("Память заполнена. Удалите ненужные записи перед сохранением.")
             db.execute(
                 "INSERT INTO memories VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
                 "status=excluded.status,source_run_id=excluded.source_run_id,updated=excluded.updated,"
@@ -229,16 +256,14 @@ class MemoryStore:
                     json.dumps(item, ensure_ascii=False),
                 ),
             )
-        return self.public(item)
+        return self.public({**item, "_author": owner, "_reader": owner})
 
     def delete(self, owner: str, memory_id: str) -> None:
         with self.runs._connect() as db:
             deleted = db.execute("DELETE FROM memories WHERE id=? AND owner=?", (memory_id, owner))
             if not deleted.rowcount:
                 raise KeyError("Memory not found")
-            db.execute(
-                "DELETE FROM memory_usages WHERE memory_id=? AND owner=?", (memory_id, owner)
-            )
+            db.execute("DELETE FROM memory_usages WHERE memory_id=?", (memory_id,))
 
     def retrieve(
         self,
@@ -255,7 +280,7 @@ class MemoryStore:
         if not query:
             return []
         ranked: list[tuple[int, dict[str, Any]]] = []
-        for item in self.list(owner, allowed & selected):
+        for item in self._visible(owner, allowed & selected):
             if exclude_run_id is not None and item.get("source_run_id") == exclude_run_id:
                 continue
             if item["status"] not in {"active", "experience"}:
@@ -309,6 +334,8 @@ class MemoryStore:
 
     def record_usage(self, owner: str, memory_ids: builtins.list[str], run_id: str) -> None:
         """Count at most once per consuming run, without refreshing retention order."""
+        if not self.enabled(owner):
+            return
         now = timestamp()
         with self.runs._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -318,7 +345,8 @@ class MemoryStore:
                 return
             for memory_id in set(memory_ids):
                 row = db.execute(
-                    "SELECT data FROM memories WHERE id=? AND owner=?", (memory_id, owner)
+                    "SELECT data FROM memories WHERE id=? AND status IN ('active','experience')",
+                    (memory_id,),
                 ).fetchone()
                 if row is None:
                     continue
@@ -334,9 +362,27 @@ class MemoryStore:
                     last_used_at=now,
                 )
                 db.execute(
-                    "UPDATE memories SET data=? WHERE id=? AND owner=?",
-                    (json.dumps(item, ensure_ascii=False), memory_id, owner),
+                    "UPDATE memories SET data=? WHERE id=?",
+                    (json.dumps(item, ensure_ascii=False), memory_id),
                 )
+
+    @staticmethod
+    def _make_room(db: sqlite3.Connection) -> bool:
+        """Rotate the oldest automatic cases globally; keep manual/confirmed knowledge."""
+        total = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        if total < MAX_TOTAL:
+            return True
+        rows = db.execute(
+            "SELECT id,data FROM memories WHERE status='experience' ORDER BY updated ASC"
+        ).fetchall()
+        candidates = [key for key, data in rows if json.loads(data).get("origin") == "automatic"]
+        needed = total - MAX_TOTAL + 1
+        if len(candidates) < needed:
+            return False
+        for key in candidates[:needed]:
+            db.execute("DELETE FROM memories WHERE id=?", (key,))
+            db.execute("DELETE FROM memory_usages WHERE memory_id=?", (key,))
+        return True
 
     @staticmethod
     def _automatic_id(owner: str, run_id: str) -> str:
@@ -505,30 +551,8 @@ class MemoryStore:
                 "SELECT 1 FROM runs WHERE id=? AND owner=?", (run["id"], owner)
             ).fetchone():
                 return None
-            if existing is None:
-                count = db.execute(
-                    "SELECT COUNT(*) FROM memories WHERE owner=?", (owner,)
-                ).fetchone()[0]
-                total = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-                if count >= MAX_PER_OWNER or total >= MAX_TOTAL:
-                    # Rotate old automatic experience only; never discard a person's notes.
-                    rows = db.execute(
-                        "SELECT id,owner,data FROM memories WHERE status='experience' "
-                        "ORDER BY updated ASC"
-                    ).fetchall()
-                    candidate = next(
-                        (
-                            (key, item_owner)
-                            for key, item_owner, data in rows
-                            if (count < MAX_PER_OWNER or item_owner == owner)
-                            and json.loads(data).get("origin") == "automatic"
-                        ),
-                        None,
-                    )
-                    if candidate is None:
-                        return None
-                    db.execute("DELETE FROM memories WHERE id=? AND owner=?", candidate)
-                    db.execute("DELETE FROM memory_usages WHERE memory_id=? AND owner=?", candidate)
+            if existing is None and not self._make_room(db):
+                return None
             db.execute(
                 "INSERT INTO memories VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
                 "status=excluded.status,updated=excluded.updated,data=excluded.data "
@@ -542,7 +566,7 @@ class MemoryStore:
                     json.dumps(item, ensure_ascii=False),
                 ),
             )
-        return self.public(item)
+        return self.public({**item, "_author": owner, "_reader": owner})
 
     def record_failure(
         self, owner: str, run: dict[str, Any], *, operation: str, index_ids: builtins.list[str]
@@ -573,4 +597,13 @@ class MemoryStore:
 
     @staticmethod
     def public(item: dict[str, Any]) -> dict[str, Any]:
-        return {key: value for key, value in item.items() if not key.startswith("_")}
+        editable = item.get("_reader") is not None and item.get("_reader") == item.get("_author")
+        result = {key: value for key, value in item.items() if not key.startswith("_")}
+        result.update(
+            visibility="private" if item["status"] == "draft" else "shared",
+            can_edit=editable,
+            can_delete=editable,
+        )
+        if not editable:
+            result.pop("source_run_id", None)
+        return result

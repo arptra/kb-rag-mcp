@@ -32,7 +32,7 @@
     controller: null, generation: 0, activeTab: "repositories", message: "", probes: new Map(),
   };
   const sshState = { credentials: [], controller: null, busy: false, editingId: null, generation: 0 };
-  const memoryState = { available: false, enabled: true, memories: [], editing: null, controller: null, busy: false };
+  const memoryState = { available: false, enabled: true, memories: [], nextOffset: null, total: null, loading: false, editing: null, controller: null, busy: false };
   const discoveryState = { current: [], all: [], signature: null, controller: null, adminController: null, busy: new Set() };
   const deletionState = { target: null, controller: null };
   const feedbackState = { controller: null, busy: false, runId: null, message: "" };
@@ -950,25 +950,36 @@
     $("memory-new").disabled = memoryState.busy;
     const automaticCount = memoryState.memories.filter((record) => record.status === "experience").length;
     const confirmedCount = memoryState.memories.filter((record) => record.status === "active").length;
-    $("memory-summary").textContent = "Автоматический опыт: " + automaticCount + " · Подтверждённые записи: " + confirmedCount;
+    const draftCount = memoryState.memories.filter((record) => record.visibility !== "shared").length;
+    $("memory-summary").textContent = (memoryState.total === null ? "В списке: " : "Доступно вам: " + memoryState.total + " · Загружено: ") +
+      memoryState.memories.length + ". В списке: автоматический опыт — " + automaticCount +
+      ", подтверждённые записи — " + confirmedCount + ", ваши черновики — " + draftCount + ".";
+    $("memory-load-more").hidden = memoryState.nextOffset === null || !memoryState.available || state.needsAuth;
+    $("memory-load-more").disabled = memoryState.busy || memoryState.loading;
+    $("memory-load-more").textContent = memoryState.loading ? "Загружаем записи…" : "Показать ещё";
     $("memory-list").replaceChildren(...memoryState.memories.map((record) => {
       const card = element("article", "settings-resource");
       const heading = element("div", "settings-resource-heading");
       heading.append(element("h4", "", record.title));
       const actions = element("div", "resource-actions");
-      const edit = element("button", "text-button", record.status !== "active" ? "Проверить и подтвердить" : "Изменить"); edit.type = "button";
-      edit.addEventListener("click", () => editMemory(record));
-      const remove = element("button", "text-button", "Удалить"); remove.type = "button";
-      remove.addEventListener("click", () => openDeletion("memory", record)); actions.append(edit, remove); heading.append(actions);
-      edit.disabled = memoryState.busy; remove.disabled = memoryState.busy;
+      if (record.can_edit === true) {
+        const edit = element("button", "text-button", record.status !== "active" ? "Проверить и подтвердить" : "Изменить"); edit.type = "button";
+        edit.addEventListener("click", () => editMemory(record)); edit.disabled = memoryState.busy; actions.append(edit);
+      }
+      if (record.can_delete === true) {
+        const remove = element("button", "text-button", "Удалить"); remove.type = "button";
+        remove.addEventListener("click", () => openDeletion("memory", record)); remove.disabled = memoryState.busy; actions.append(remove);
+      }
+      if (actions.childElementCount) heading.append(actions);
       const kind = { note: "Заметка", correction: "Уточнение", lesson: "Урок из ошибки", case: "Опыт решения" }[record.kind] || "Заметка";
-      const status = record.status === "active" ? "Подтверждено вами" : record.status === "experience" ? "Автоматически · требует повторной проверки" : "Черновик · не используется";
-      card.append(heading, element("p", "discovery-meta", kind + " · " + status),
+      const visibility = record.visibility === "shared" ? "Общая память АС" : "Ваш личный черновик";
+      const status = record.status === "active" ? "Подтверждено автором" : record.status === "experience" ? "Автоматически · требует повторной проверки" : "Не используется в ответах";
+      card.append(heading, element("p", "discovery-meta", visibility + " · " + kind + " · " + status),
         element("p", "memory-record-text", record.text), element("p", "settings-field-help", "Источники: " + (record.index_ids || []).map(sourceName).join(", ")));
       const details = [];
       if (record.outcome) details.push("Исход запроса: " + (STATUS_LABELS[record.outcome] || record.outcome));
-      if (record.feedback?.rating) details.push("Ваша оценка: " + (record.feedback.rating === "helpful" ? "помогло" : "не помогло"));
-      details.push("Использовано в запросах: " + Math.max(0, Number(record.usage_count) || 0));
+      if (record.feedback?.rating) details.push("Оценка автора запроса: " + (record.feedback.rating === "helpful" ? "помогло" : "не помогло"));
+      details.push("Использовано всеми пользователями: " + Math.max(0, Number(record.usage_count) || 0));
       if (record.last_used_at) details.push("Последний раз: " + dateLabel(record.last_used_at, true));
       card.append(element("p", "memory-usage", details.join(" · ")));
       return card;
@@ -976,22 +987,30 @@
     $("memory-empty").hidden = memoryState.memories.length > 0;
     $("remember-run").hidden = !memoryState.available || !state.current || ACTIVE.has(state.current.status);
   }
-  async function loadMemory() {
+  async function loadMemory(append = false) {
     if (state.needsAuth || memoryState.busy) return;
+    if (append && (memoryState.loading || memoryState.nextOffset === null)) return;
+    const offset = append ? memoryState.nextOffset : 0;
     memoryState.controller?.abort();
     const controller = new AbortController(), epoch = state.identityEpoch; memoryState.controller = controller;
+    memoryState.loading = true; renderMemory(); memoryError();
     try {
-      const result = await api("memory", { signal: controller.signal });
-      if (controller.signal.aborted || epoch !== state.identityEpoch) return;
+      const result = await api("memory" + (append ? "?offset=" + encodeURIComponent(offset) : ""), { signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch || memoryState.controller !== controller) return;
       memoryState.available = true; memoryState.enabled = result.enabled !== false;
-      memoryState.memories = Array.isArray(result.memories) ? result.memories : [];
+      const page = Array.isArray(result.memories) ? result.memories.filter((record) => record && typeof record.id === "string") : [];
+      memoryState.memories = [...new Map([...(append ? memoryState.memories : []), ...page].map((record) => [record.id, record])).values()];
+      memoryState.nextOffset = Number.isInteger(result.pagination?.next_offset) && result.pagination.next_offset > offset ? result.pagination.next_offset : null;
+      memoryState.total = Number.isInteger(result.pagination?.total) && result.pagination.total >= 0 ? result.pagination.total : null;
+      const editedRecord = memoryState.editing?.id ? page.find((record) => record.id === memoryState.editing.id) : null;
+      if (editedRecord?.can_edit === false) clearMemoryEditor();
       renderMemory();
     } catch (error) {
-      if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) {
+      if (!controller.signal.aborted && memoryState.controller === controller && error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) {
         if (error.status === 404) { memoryState.available = false; renderMemory(); }
         else if ($("memory-dialog").open) memoryError(errorMessage(error));
       }
-    } finally { if (memoryState.controller === controller) memoryState.controller = null; }
+    } finally { if (memoryState.controller === controller) { memoryState.controller = null; memoryState.loading = false; renderMemory(); } }
   }
   function openMemory() {
     if (!memoryState.available || state.needsAuth) return;
@@ -1000,6 +1019,7 @@
   }
   function editMemory(record = null, run = null) {
     if (memoryState.busy) return;
+    if (record && record.can_edit !== true) { memoryError("Изменить запись может только её автор."); return; }
     if (run && !Array.isArray(run.index_ids)) { memoryError("Запрос ещё загружается. Дождитесь его открытия и повторите сохранение уточнения."); return; }
     clearMemoryEditor(); memoryError();
     memoryState.editing = { id: record?.id || null, source_run_id: record?.source_run_id || (run ? idOf(run) : null) };
@@ -1029,14 +1049,14 @@
     const sourceIds = editing.source_run_id ? editing.index_ids : [...$("memory-sources").querySelectorAll("input:checked")].map((input) => input.value);
     if (!sourceIds.length) { memoryError("Выберите хотя бы один связанный источник."); return; }
     const controller = new AbortController(); memoryState.controller?.abort(); memoryState.controller = controller;
-    memoryState.busy = true; $("memory-save").disabled = true; renderMemory(); memoryError();
+    memoryState.loading = false; memoryState.busy = true; $("memory-save").disabled = true; renderMemory(); memoryError();
     const body = { title: $("memory-name").value.trim(), text: $("memory-text").value.trim(), kind: $("memory-kind").value,
       index_ids: sourceIds, confirmed: $("memory-confirmed").checked, ...(editing.source_run_id ? { source_run_id: editing.source_run_id } : {}) };
     try {
       await api("memory" + (editing.id ? "/" + encodeURIComponent(editing.id) : ""), { method: editing.id ? "PUT" : "POST", body, signal: controller.signal });
       if (controller.signal.aborted || epoch !== state.identityEpoch) return;
       clearMemoryEditor();
-      $("memory-feedback").textContent = body.confirmed ? "Запись сохранена и будет учитываться в похожих запросах." : "Черновик сохранён. Пока он не влияет на ответы.";
+      $("memory-feedback").textContent = body.confirmed ? "Запись добавлена в общую память АС. Она доступна пользователям с доступом к связанным источникам." : "Ваш личный черновик сохранён. Другие пользователи его не видят, в ответах он не используется.";
     } catch (error) { if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) memoryError(errorMessage(error)); }
     finally {
       if (memoryState.controller === controller) { memoryState.controller = null; memoryState.busy = false; $("memory-save").disabled = false; renderMemory(); if (epoch === state.identityEpoch && !controller.signal.aborted) loadMemory(); }
@@ -1045,23 +1065,27 @@
   async function changeMemoryPreference() {
     if (memoryState.busy || state.needsAuth) return;
     const enabled = $("memory-enabled").checked, epoch = state.identityEpoch;
+    memoryState.controller?.abort(); memoryState.controller = null; memoryState.loading = false;
     memoryState.busy = true; renderMemory(); memoryError();
     try {
       const result = await api("memory/preferences", { method: "PUT", body: { enabled } });
       if (epoch !== state.identityEpoch) return;
       memoryState.enabled = result.enabled === true;
-      $("memory-feedback").textContent = memoryState.enabled ? "Опыт и подтверждённые записи будут учитываться в похожих запросах." : "Память отключена для новых запросов. Записи сохранены.";
+      $("memory-feedback").textContent = memoryState.enabled ? "Ваши новые запросы будут использовать общую память АС и автоматически пополнять её опытом." : "Ваши новые запросы не будут использовать и автоматически пополнять память. Существующие общие записи сохранены и доступны другим пользователям.";
     } catch (error) { if (error.status !== 401 && epoch === state.identityEpoch) memoryError(errorMessage(error)); }
     finally { if (epoch === state.identityEpoch) { memoryState.busy = false; renderMemory(); } }
   }
   function openDeletion(kind, item) {
     if (deletionState.controller || state.needsAuth) return;
+    if (kind === "memory" && item.can_delete !== true) { memoryError("Удалить запись может только её автор."); return; }
     const active = kind === "run" && ACTIVE.has(item.status);
+    const sharedMemory = kind === "memory" && item.visibility === "shared";
     deletionState.target = { kind, item, active };
-    $("delete-title").textContent = kind === "run" ? active ? "Сначала остановить запрос?" : "Удалить запрос?" : kind === "memory" ? "Удалить запись памяти?" : kind === "tls" ? "Удалить сертификаты?" : "Удалить SSH-ключ?";
+    $("delete-title").textContent = kind === "run" ? active ? "Сначала остановить запрос?" : "Удалить запрос?" : kind === "memory" ? sharedMemory ? "Удалить общую запись памяти?" : "Удалить личный черновик?" : kind === "tls" ? "Удалить сертификаты?" : "Удалить SSH-ключ?";
     $("delete-description").textContent = kind === "run" ? active ? "Исследование ещё выполняется. Остановите его, затем удалите запрос из истории." :
-      "Запрос, ответ, найденные материалы и связанные с ним записи памяти будут удалены. Восстановить их нельзя." : kind === "memory" ?
-      "Запись перестанет учитываться в новых запросах. Ранее сохранённые ответы останутся в истории." : kind === "tls" ?
+      "Этот личный запрос, его продолжения, ответы, найденные материалы и связанные личные черновики будут удалены без восстановления. Общие записи памяти АС сохранятся; удалить свои общие записи можно отдельно в памяти." : kind === "memory" ? sharedMemory ?
+      "Запись будет удалена из общей памяти АС и перестанет учитываться в новых ответах для всех пользователей. Ранее сохранённые ответы и личные чаты останутся в истории." :
+      "Ваш личный черновик будет удалён без восстановления. Общая память АС и чаты сохранятся." : kind === "tls" ?
       "Сертификаты и связанный приватный ключ будут удалены с сервера. Сначала уберите этот набор из подключения модели." :
       "Ключ будет удалён с сервера. Сначала его нужно убрать из настроек репозиториев.";
     $("delete-confirm").textContent = active ? "Остановить запрос" : "Удалить";
@@ -1072,6 +1096,7 @@
     event.preventDefault();
     const target = deletionState.target;
     if (!target || deletionState.controller || state.needsAuth) return;
+    if (target.kind === "memory" && target.item.can_delete !== true) return;
     const epoch = state.identityEpoch, controller = new AbortController(); deletionState.controller = controller;
     $("delete-confirm").disabled = true;
     const id = target.kind === "run" ? idOf(target.item) : target.item.id;
@@ -1102,7 +1127,7 @@
     resetRunFeedback();
     state.memoryRunSignature = null;
     for (const controller of [memoryState.controller, discoveryState.controller, discoveryState.adminController, deletionState.controller]) controller?.abort();
-    Object.assign(memoryState, { available: false, enabled: true, memories: [], editing: null, controller: null, busy: false });
+    Object.assign(memoryState, { available: false, enabled: true, memories: [], nextOffset: null, total: null, loading: false, editing: null, controller: null, busy: false });
     Object.assign(discoveryState, { current: [], all: [], signature: null, controller: null, adminController: null, busy: new Set() });
     Object.assign(deletionState, { target: null, controller: null });
     if ($("memory-dialog").open) $("memory-dialog").close();
@@ -1548,7 +1573,7 @@
     $("run-feedback-comment").disabled = feedbackState.busy;
     $("run-feedback-status").textContent = feedbackState.busy ? "Сохраняем оценку…" : feedbackState.message ||
       (run.feedback?.rating ? "Ваша оценка: «" + (run.feedback.rating === "helpful" ? "Помогло" : "Не помогло") + "». Можно изменить оценку или добавить комментарий." :
-        "Оценка уточнит сохранённый опыт для следующих похожих запросов.");
+        memoryState.enabled ? "Оценка уточнит общий опыт АС для похожих запросов пользователей с доступом к источникам." : "Оценка сохранится в вашем чате. Если опыт уже есть в общей памяти, он тоже обновится.");
   }
   async function saveRunFeedback(rating) {
     const run = state.current;
@@ -1565,7 +1590,7 @@
       const response = await api("runs/" + encodeURIComponent(id) + "/feedback", { method: "PUT", body, signal: controller.signal });
       if (controller.signal.aborted || epoch !== state.identityEpoch || generation !== state.generation || id !== idOf(state.current)) return;
       state.current.feedback = response.feedback;
-      feedbackState.message = response.memory ? "Оценка сохранена. Опыт в памяти обновлён." : "Оценка сохранена.";
+      feedbackState.message = response.memory ? "Оценка сохранена. Общий опыт АС обновлён для следующих похожих запросов." : "Оценка сохранена в вашем чате.";
       loadMemory();
     } catch (error) {
       if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch && generation === state.generation && id === idOf(state.current)) feedbackState.message = errorMessage(error);
@@ -1617,7 +1642,7 @@
     $("resume-run").hidden = active || run.resumable !== true;
     $("remember-run").hidden = active || !memoryState.available;
     const memories = Array.isArray(run.memory_used) ? run.memory_used : [];
-    $("run-memory-used").replaceChildren(element("strong", "", "Учтено из памяти: " + memories.length), ...memories.map((item) => element("p", "", item.title || "Сохранённая запись")));
+    $("run-memory-used").replaceChildren(element("strong", "", "Учтено из общей памяти АС: " + memories.length), ...memories.map((item) => element("p", "", item.title || "Сохранённая запись")));
     $("run-memory-used").hidden = !memories.length;
     renderRunEnvironment(run);
     const warnings = Array.isArray(run.warnings) ? run.warnings.filter((item) => typeof item === "string") : [];
@@ -1904,6 +1929,7 @@
   $("memory-close").addEventListener("click", () => $("memory-dialog").close());
   $("memory-dialog").addEventListener("close", clearMemoryEditor);
   $("memory-new").addEventListener("click", () => editMemory());
+  $("memory-load-more").addEventListener("click", () => loadMemory(true));
   $("memory-cancel").addEventListener("click", clearMemoryEditor);
   $("memory-editor").addEventListener("submit", saveMemory);
   $("memory-enabled").addEventListener("change", changeMemoryPreference);

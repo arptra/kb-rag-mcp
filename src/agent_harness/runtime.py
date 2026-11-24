@@ -24,7 +24,7 @@ from agent_harness.contracts import (
     ToolPort,
 )
 from agent_harness.graph import ExecutionContext, HarnessGraph
-from agent_harness.memory import MAX_PER_OWNER, MemoryFeedback, MemoryInput, MemoryStore
+from agent_harness.memory import LIST_LIMIT, MAX_TOTAL, MemoryFeedback, MemoryInput, MemoryStore
 from agent_harness.model_connection import ModelConnectionError
 from agent_harness.policy import BUDGETS, QUICK_BUDGETS, SYSTEM_PROMPT
 from agent_harness.store import ACTIVE, RunStore, timestamp
@@ -265,14 +265,19 @@ class HarnessRuntime:
         queue.put_nowait((principal, run_id))
         return {key: value for key, value in run.items() if not key.startswith("_")}
 
-    async def list_memory(self, principal: Principal) -> dict[str, Any]:
+    async def list_memory(self, principal: Principal, *, offset: int = 0) -> dict[str, Any]:
+        if offset < 0 or offset > MAX_TOTAL:
+            raise ValueError("Недопустимая страница памяти.")
         allowed = {item["id"] for item in await self._indexes(principal)}
+        page = self.memory.page(principal.owner_id, allowed, offset=offset)
         return {
+            "scope": "system",
             "enabled": self.memory.enabled(principal.owner_id),
-            "memories": [
-                self.memory.public(item) for item in self.memory.list(principal.owner_id, allowed)
-            ],
-            "limits": {"max_per_owner": MAX_PER_OWNER},
+            "memories": [self.memory.public(item) for item in page["items"]],
+            "limits": {"max_total": MAX_TOTAL, "list_limit": LIST_LIMIT},
+            "pagination": {
+                "offset": offset, "next_offset": page["next_offset"], "total": page["total"],
+            },
         }
 
     async def save_memory(
@@ -939,7 +944,7 @@ class HarnessRuntime:
             "prior_tool_attempts": [],
             "history_question_not_evidence": None,
             "history_answer_not_evidence": None,
-            "private_notes_not_evidence": [],
+            "shared_memory_not_evidence": [],
             "remaining_followup_calls": max(0, profile.source_calls - self._followup_calls(run)),
         }
         messages = [
@@ -984,8 +989,8 @@ class HarnessRuntime:
         for item in memories:
             note = {key: item.get(key) for key in
                     ("id", "title", "text", "kind", "status", "origin", "feedback", "outcome")}
-            candidate = {**context, "private_notes_not_evidence": [
-                *context["private_notes_not_evidence"], note,
+            candidate = {**context, "shared_memory_not_evidence": [
+                *context["shared_memory_not_evidence"], note,
             ]}
             if fits(candidate):
                 context = candidate

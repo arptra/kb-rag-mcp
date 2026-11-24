@@ -1,4 +1,4 @@
-"""Private confirmed notes and automatic experience remain scoped advisory context."""
+"""Shared notes and experience respect source access; conversations remain private."""
 
 import asyncio
 import json
@@ -56,12 +56,13 @@ def runtime(tmp_path: Path) -> HarnessRuntime:
 
 
 async def finish(
-    app: HarnessRuntime, question: str = "payment timeout", **kwargs: Any
+    app: HarnessRuntime, question: str = "payment timeout", *,
+    principal: Principal = ALICE, **kwargs: Any,
 ) -> dict[str, Any]:
-    run = await app.submit(ALICE, RunRequest(question=question, **kwargs))
+    run = await app.submit(principal, RunRequest(question=question, **kwargs))
     async with asyncio.timeout(3):
         while True:
-            result = await app.get(ALICE, run["id"])
+            result = await app.get(principal, run["id"])
             if result["status"] not in {"queued", "running", "cancelling"}:
                 return result
             await asyncio.sleep(0.01)
@@ -77,20 +78,24 @@ def note(**kwargs: Any) -> MemoryInput:
 
 
 @pytest.mark.asyncio
-async def test_only_confirmed_matching_private_memory_is_used(tmp_path: Path) -> None:
+async def test_confirmed_memory_is_shared_but_drafts_are_private(tmp_path: Path) -> None:
     app = runtime(tmp_path)
     await app.start()
     try:
         saved = await app.save_memory(ALICE, note())
-        await app.save_memory(BOB, note(confirmed=True))
-        assert not (await finish(app, index_ids=["a"]))["memory_used"]
-        assert (await app.list_memory(BOB))["memories"][0]["id"] != saved["id"]
+        shared = await app.save_memory(BOB, note(confirmed=True))
+        first = await finish(app, index_ids=["a"])
+        assert shared["id"] in {item["id"] for item in first["memory_used"]}
+        assert saved["id"] not in {item["id"] for item in first["memory_used"]}
+        assert saved["id"] not in {
+            item["id"] for item in (await app.list_memory(BOB))["memories"]
+        }
         await app.save_memory(ALICE, note(confirmed=True), saved["id"])
         result = await finish(app, index_ids=["a"])
         assert saved["id"] in {item["id"] for item in result["memory_used"]}
         assert isinstance(app.model, Model)
         context = app.model.contexts[-1]
-        assert context["private_notes_not_evidence"][0]["text"].startswith("Check payment")
+        assert context["shared_memory_not_evidence"][0]["text"].startswith("Check payment")
         assert all(item["id"] != saved["id"] for item in context["evidence"])
         assert not (await finish(app, "inventory billing", index_ids=["a"]))["memory_used"]
     finally:
@@ -129,7 +134,7 @@ async def test_correction_replaces_advice_without_changing_evidence(tmp_path: Pa
         await finish(app, index_ids=["a"])
         assert isinstance(app.model, Model)
         context = app.model.contexts[-1]
-        assert context["private_notes_not_evidence"][0]["text"] == corrected.text
+        assert context["shared_memory_not_evidence"][0]["text"] == corrected.text
         assert context["evidence"][0]["text"] == "Fresh verified state"
     finally:
         await app.stop()
@@ -173,7 +178,7 @@ async def test_failure_experience_is_automatically_used_as_safe_advice(tmp_path:
         assert notes[0]["id"] in {item["id"] for item in repeated["memory_used"]}
         assert isinstance(app.model, Model)
         context = app.model.contexts[-1]
-        assert context["private_notes_not_evidence"][0]["text"].startswith("НЕПОДТВЕРЖДЁННЫЙ ОПЫТ")
+        assert context["shared_memory_not_evidence"][0]["text"].startswith("НЕПОДТВЕРЖДЁННЫЙ ОПЫТ")
         assert all(item["id"] != notes[0]["id"] for item in context["evidence"])
     finally:
         await app.stop()
@@ -195,7 +200,7 @@ async def test_parent_answer_is_bounded_rechecked_advisory_context(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_deletion_removes_descendants_memory_and_prevents_resurrection(
+async def test_deletion_removes_private_chat_but_preserves_shared_memory(
     tmp_path: Path,
 ) -> None:
     app = runtime(tmp_path)
@@ -203,12 +208,18 @@ async def test_deletion_removes_descendants_memory_and_prevents_resurrection(
     try:
         first = await finish(app, index_ids=["a"])
         second = await finish(app, parent_run_id=first["id"], index_ids=["a"])
-        await app.save_memory(ALICE, note(confirmed=True, source_run_id=second["id"]))
+        saved = await app.save_memory(ALICE, note(confirmed=True, source_run_id=second["id"]))
+        draft = await app.save_memory(ALICE, note(source_run_id=second["id"]))
         with pytest.raises(KeyError):
             await app.delete_run(BOB, first["id"])
         deleted = await app.delete_run(ALICE, first["id"])
         assert set(deleted["deleted_ids"]) == {first["id"], second["id"]}
-        assert (await app.list_memory(ALICE))["memories"] == []
+        memories = (await app.list_memory(ALICE))["memories"]
+        assert len(memories) == 3
+        assert all(item["source_run_id"] is None for item in memories)
+        assert saved["id"] in {item["id"] for item in memories}
+        assert draft["id"] not in {item["id"] for item in memories}
+        assert len((await app.list_memory(BOB))["memories"]) == 3
         app.store.save(ALICE.owner_id, first)
         with pytest.raises(KeyError):
             await app.get(ALICE, first["id"])
@@ -233,7 +244,9 @@ async def test_active_deletion_is_blocked_cancelled_queued_deletion_is_safe(tmp_
         await app.stop()
 
 
-def test_memory_http_is_owner_scoped_validated_and_origin_protected(tmp_path: Path) -> None:
+def test_memory_http_shares_reads_but_restricts_mutations_and_validates_origin(
+    tmp_path: Path,
+) -> None:
     from starlette.requests import Request
     from starlette.testclient import TestClient
 
@@ -252,7 +265,14 @@ def test_memory_http_is_owner_scoped_validated_and_origin_protected(tmp_path: Pa
         assert saved.status_code == 201
         item = saved.json()
         assert item["status"] == "active" and "_match_question" not in item
-        assert client.get("/api/memory", headers={"x-user": "bob"}).json()["memories"] == []
+        shared = client.get("/api/memory", headers={"x-user": "bob"}).json()
+        assert shared["scope"] == "system"
+        assert shared["limits"]["max_total"] == 10_000
+        assert len(shared["memories"]) == 1
+        visible = shared["memories"][0]
+        assert visible["id"] == item["id"] and visible["visibility"] == "shared"
+        assert not visible["can_edit"] and not visible["can_delete"]
+        assert item["can_edit"] and item["can_delete"]
         assert (
             client.delete(f"/api/memory/{item['id']}", headers={"x-user": "bob"}).status_code == 404
         )
@@ -283,6 +303,50 @@ def test_memory_http_is_owner_scoped_validated_and_origin_protected(tmp_path: Pa
         assert client.get("/api/memory", headers=headers).json()["memories"] == []
 
 
+def test_shared_memory_http_pages_keep_old_records_manageable_without_exposing_drafts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from starlette.requests import Request
+    from starlette.testclient import TestClient
+
+    import agent_harness.memory as memory_module
+    import agent_harness.runtime as runtime_module
+    from agent_harness.http import create_app
+
+    monkeypatch.setattr(memory_module, "LIST_LIMIT", 2)
+    monkeypatch.setattr(runtime_module, "LIST_LIMIT", 2)
+    engine = runtime(tmp_path)
+
+    async def authenticate(request: Request) -> Principal | None:
+        owner = request.headers.get("x-user")
+        return Principal(owner) if owner else None
+
+    alice, bob = {"x-user": "alice"}, {"x-user": "bob"}
+    with TestClient(create_app(engine, authenticate)) as client:
+        old = client.post(
+            "/api/memory", json=note(confirmed=True).model_dump(), headers=alice
+        ).json()
+        for _ in range(2):
+            client.post("/api/memory", json=note(confirmed=True).model_dump(), headers=alice)
+        draft = client.post("/api/memory", json=note().model_dump(), headers=alice).json()
+        first = client.get("/api/memory", headers=bob).json()
+        assert len(first["memories"]) == 2
+        assert first["pagination"] == {"offset": 0, "next_offset": 2, "total": 3}
+        assert old["id"] not in {item["id"] for item in first["memories"]}
+        second = client.get("/api/memory?offset=2", headers=bob).json()
+        assert second["pagination"] == {"offset": 2, "next_offset": None, "total": 3}
+        assert [item["id"] for item in second["memories"]] == [old["id"]]
+        assert not second["memories"][0]["can_edit"]
+        assert draft["id"] not in {item["id"] for item in first["memories"] + second["memories"]}
+        own_page = client.get("/api/memory?offset=2", headers=alice).json()
+        editable = next(item for item in own_page["memories"] if item["id"] == old["id"])
+        assert editable["can_delete"]
+        assert client.delete(f"/api/memory/{old['id']}", headers=alice).status_code == 200
+        assert client.get("/api/memory?offset=10000", headers=bob).json()["memories"] == []
+        for invalid in ("-1", "10001", "text", "0.5", "99999999999"):
+            assert client.get(f"/api/memory?offset={invalid}", headers=bob).status_code == 400
+
+
 @pytest.mark.asyncio
 async def test_finished_case_feedback_and_reuse_are_visible_without_manual_save(
     tmp_path: Path,
@@ -302,7 +366,7 @@ async def test_finished_case_feedback_and_reuse_are_visible_without_manual_save(
         second = await finish(app, index_ids=["a"])
         assert item["id"] in {used["id"] for used in second["memory_used"]}
         assert isinstance(app.model, Model)
-        used = app.model.contexts[-1]["private_notes_not_evidence"]
+        used = app.model.contexts[-1]["shared_memory_not_evidence"]
         assert used[0]["status"] == "experience"
         assert "Check ledger retries" in used[0]["text"]
         assert "Fresh answer" not in used[0]["text"]
@@ -334,6 +398,92 @@ async def test_feedback_checks_owner_and_current_full_scope(tmp_path: Path) -> N
         with pytest.raises(ValueError, match="источникам"):
             await app.set_run_feedback(ALICE, first["id"], request)
         assert not app.store.get(ALICE.owner_id, first["id"]).get("feedback")
+    finally:
+        await app.stop()
+
+
+@pytest.mark.asyncio
+async def test_experience_and_feedback_cross_users_without_sharing_conversations(
+    tmp_path: Path,
+) -> None:
+    app = runtime(tmp_path)
+    await app.start()
+    try:
+        first = await finish(app, index_ids=["a"])
+        shared = (await app.list_memory(BOB))["memories"]
+        assert len(shared) == 1
+        case = shared[0]
+        assert case["visibility"] == "shared"
+        assert "source_run_id" not in case and not case["can_edit"]
+        assert not any(key.startswith("_") for key in case)
+        with pytest.raises(KeyError):
+            await app.get(BOB, first["id"])
+        second = await finish(app, principal=BOB, index_ids=["a"])
+        assert case["id"] in {item["id"] for item in second["memory_used"]}
+        assert app.memory.get(ALICE.owner_id, case["id"])["usage_count"] == 1
+        await app.set_run_feedback(
+            ALICE, first["id"],
+            MemoryFeedback(rating="unhelpful", comment="Inspect ledger retry worker"),
+        )
+        assert isinstance(app.model, Model)
+        third = await finish(app, principal=BOB, index_ids=["a"])
+        context = app.model.contexts[-1]
+        used = next(
+            item for item in context["shared_memory_not_evidence"] if item["id"] == case["id"]
+        )
+        assert used["kind"] == "lesson" and used["feedback"]["rating"] == "unhelpful"
+        assert "Inspect ledger retry worker" in used["text"]
+        assert "Fresh answer" not in used["text"]
+        assert case["id"] in {item["id"] for item in third["memory_used"]}
+        assert app.memory.get(ALICE.owner_id, case["id"])["usage_count"] == 2
+    finally:
+        await app.stop()
+
+
+@pytest.mark.asyncio
+async def test_shared_memory_respects_each_readers_full_source_access(tmp_path: Path) -> None:
+    class ScopedSource(Source):
+        async def indexes(self, principal: Principal) -> list[dict[str, str]]:
+            indexes = self.allowed if principal == ALICE else ["a"]
+            return [{"id": item, "name": item} for item in indexes]
+
+    app = HarnessRuntime(
+        HarnessSettings(enabled=True, state_dir=tmp_path, _env_file=None), ScopedSource(), Model()
+    )
+    await app.start()
+    try:
+        first = await finish(app, index_ids=["a", "b"])
+        case = (await app.list_memory(ALICE))["memories"][0]
+        assert case["source_run_id"] == first["id"]
+        assert (await app.list_memory(BOB))["memories"] == []
+        second = await finish(app, principal=BOB, index_ids=["a"])
+        assert not second["memory_used"]
+        assert isinstance(app.model, Model)
+        assert not app.model.contexts[-1]["shared_memory_not_evidence"]
+        with pytest.raises(KeyError):
+            await app.save_memory(BOB, note(confirmed=True), case["id"])
+    finally:
+        await app.stop()
+
+
+@pytest.mark.asyncio
+async def test_personal_opt_out_and_shared_deletion_affect_the_intended_users(
+    tmp_path: Path,
+) -> None:
+    app = runtime(tmp_path)
+    await app.start()
+    try:
+        note_item = await app.save_memory(ALICE, note(confirmed=True))
+        await app.set_memory_enabled(ALICE, False)
+        alice = await finish(app, index_ids=["a"])
+        assert not alice["memory_used"]
+        assert len((await app.list_memory(ALICE))["memories"]) == 1
+        bob = await finish(app, principal=BOB, index_ids=["a"])
+        assert note_item["id"] in {item["id"] for item in bob["memory_used"]}
+        assert (await app.list_memory(BOB))["enabled"]
+        await app.delete_memory(ALICE, note_item["id"])
+        next_bob = await finish(app, principal=BOB, index_ids=["a"])
+        assert note_item["id"] not in {item["id"] for item in next_bob["memory_used"]}
     finally:
         await app.stop()
 
