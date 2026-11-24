@@ -5,7 +5,7 @@ from __future__ import annotations
 import builtins
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -284,7 +284,9 @@ class RunStore:
                     f"AND runs.owner={table}.owner)"
                 )
 
-    def recover(self) -> None:
+    def recover(
+        self, on_interrupted: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
         with self._connect() as db:
             rows = db.execute(
                 "SELECT owner,data FROM runs WHERE status IN ('queued','running','cancelling')"
@@ -292,10 +294,13 @@ class RunStore:
             interrupted = list(rows)
         for owner, data in interrupted:
             run = json.loads(data)
-            run.update(status="interrupted", phase="finished", completed_at=timestamp())
+            run.update(status="interrupted", phase="finished", completed_at=timestamp(),
+                       stop_reason="interrupted", current_action=None)
             run["warnings"].append(
                 "Сервис перезапущен. Запуск прерван; автоматического resume нет."
             )
+            if on_interrupted and (run.get("evidence") or run.get("research_trace")):
+                on_interrupted(owner, run)
             self.save(owner, run)
         self.prune()
 

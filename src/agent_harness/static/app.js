@@ -1075,6 +1075,36 @@
     $("memory-editor").reset(); $("memory-editor").hidden = true;
     $("memory-sources").replaceChildren();
   }
+  function memoryToolName(entry) {
+    if (entry.tool) return entry.remote_tool || actionLabel(entry.tool);
+    const operations = { search: "Поиск в базе знаний", read: "Чтение документа",
+      external: "Внешний инструмент", invalid: "Проверка вызова инструмента" };
+    return operations[entry.operation] || "Вызов инструмента";
+  }
+  function memoryToolPreview(entry) {
+    const scopes = entry.index_id ? [entry.index_id] : entry.index_ids || [];
+    const names = scopes.map((id) => indexes().find((source) => source.id === id)?.name || id);
+    return [memoryToolName(entry), ...names].join(" · ");
+  }
+  function memoryToolSection(title, entries) {
+    const section = element("details", "memory-tool-section");
+    const more = entries.length > 1 ? " (+" + (entries.length - 1) + ")" : "";
+    section.append(element("summary", "", title + " · " + memoryToolPreview(entries[0]) + more));
+    const list = element("ul", "");
+    for (const entry of entries) {
+      const row = element("li", "", memoryToolPreview(entry));
+      if (entry.tool && !entry.remote_tool) row.append(element("code", "", entry.tool));
+      if (entry.operation && Object.hasOwn(TOOL_FAILURE_LABELS, entry.reason)) {
+        row.append(element("small", "", TOOL_FAILURE_LABELS[entry.reason]));
+      }
+      if (entry.evidence_ids?.length) {
+        row.append(element("small", "", "Материалы · " + entry.evidence_ids.join(", ")));
+      }
+      list.append(row);
+    }
+    section.append(list);
+    return section;
+  }
   function renderMemory() {
     $("memory-open").hidden = !memoryState.available || state.needsAuth;
     $("memory-enabled").checked = memoryState.enabled;
@@ -1106,8 +1136,16 @@
       const kind = { note: "Заметка", correction: "Уточнение", lesson: "Урок из ошибки", case: "Опыт решения" }[record.kind] || "Заметка";
       const visibility = record.visibility === "shared" ? "Общая память АС" : "Ваш личный черновик";
       const status = record.status === "active" ? "Подтверждено автором" : record.status === "experience" ? "Автоматически · требует повторной проверки" : "Не используется в ответах";
-      card.append(heading, element("p", "discovery-meta", visibility + " · " + kind + " · " + status),
-        element("p", "memory-record-text", record.text), element("p", "settings-field-help", "Источники: " + (record.index_ids || []).map(sourceName).join(", ")));
+      card.append(heading, element("p", "discovery-meta", visibility + " · " + kind + " · " + status));
+      for (const [title, entries] of [
+        ["Что помогло", record.strategy?.successful_tools],
+        ["Материалы незавершённой проверки", record.strategy?.observed_tools],
+        ["Сбои инструментов", record.failures],
+      ]) {
+        if (Array.isArray(entries) && entries.length) card.append(memoryToolSection(title, entries));
+      }
+      card.append(element("p", "memory-record-text", record.text),
+        element("p", "settings-field-help", "Источники: " + (record.index_ids || []).map(sourceName).join(", ")));
       const details = [];
       if (record.outcome) details.push("Исход запроса: " + (STATUS_LABELS[record.outcome] || record.outcome));
       if (record.feedback?.rating) details.push("Оценка автора запроса: " + (record.feedback.rating === "helpful" ? "помогло" : "не помогло"));
@@ -1894,9 +1932,18 @@
     model_retry: "Повторный запрос к модели", model_response: "Модель анализирует материалы и готовит ответ",
     model_received: "Получен ответ модели", model_call: "Ожидаем ответ модели",
     context_compaction: "Обновляем сводку беседы", compact_conversation: "Сохранение сводки беседы",
+    memory_unavailable: "Общая память временно недоступна",
     conversation_compaction: "Сохранение сводки беседы", mcp_list_tools: "Изучаем доступные инструменты",
     mcp_tool_schema: "Проверяем параметры инструмента",
     search_repository: "Поиск в репозитории", read_repository: "Чтение файла в репозитории",
+  };
+  const TOOL_FAILURE_LABELS = {
+    timeout: "Истекло время ожидания", permission: "Доступ к источнику отклонён",
+    remote_error: "Внешний инструмент сообщил об ошибке", nonzero_exit: "Команда завершилась с ошибкой",
+  };
+  const MEMORY_SKIP_LABELS = {
+    disabled: "Запись опыта отключена в ваших настройках памяти.",
+    full: "В общей памяти достигнут лимит записей. Администратор может увеличить его в управлении Harness.",
   };
   function actionLabel(name) {
     if (!name) return "";
@@ -2035,9 +2082,23 @@
     $("resume-run").hidden = active || run.resumable !== true;
     $("remember-run").hidden = active || !memoryState.available;
     const memories = Array.isArray(run.memory_used) ? run.memory_used : [];
-    $("run-memory-used").replaceChildren(element("strong", "", "Учтено из общей памяти АС: " + memories.length), ...memories.map((item) => element("p", "", item.title || "Сохранённая запись")));
-    if (run.memory_contribution?.updated) $("run-memory-used").append(element("p", "memory-contribution", "Опыт этого запроса добавлен в общую память АС. Оцените ответ, чтобы уточнить, что помогло и что нужно исправить."));
-    $("run-memory-used").hidden = !memories.length && !run.memory_contribution?.updated;
+    $("run-memory-used").replaceChildren(element("strong", "", "Учтено из общей памяти АС: " + memories.length), ...memories.map((item) => {
+      const line = element("p", "", item.title || "Сохранённая запись");
+      if (item.successful_tools?.length) {
+        const choices = item.successful_tools;
+        const more = choices.length > 1 ? " (+" + (choices.length - 1) + ")" : "";
+        line.append(element("small", "memory-tool-hint", "Предложено агенту из опыта · " + memoryToolPreview(choices[0]) + more));
+      }
+      return line;
+    }));
+    const contribution = run.memory_contribution;
+    let memoryMessage = "";
+    if (contribution?.updated) memoryMessage = "Опыт этого запроса добавлен в общую память АС. Оцените ответ, чтобы уточнить, что помогло и что нужно исправить.";
+    else if (contribution?.updated === false && Object.hasOwn(MEMORY_SKIP_LABELS, contribution.reason)) {
+      memoryMessage = MEMORY_SKIP_LABELS[contribution.reason];
+    }
+    if (memoryMessage) $("run-memory-used").append(element("p", "memory-contribution", memoryMessage));
+    $("run-memory-used").hidden = !memories.length && !memoryMessage;
     renderRunEnvironment(run);
     const warnings = Array.isArray(run.warnings) ? run.warnings.filter((item) => typeof item === "string") : [];
     $("run-warnings").replaceChildren(...warnings.map((text) => element("p", "", text)));

@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent_harness.contracts import Evidence, Principal
+from agent_harness.contracts import Evidence, Principal, ToolExecutionFailure, tool_failure_reason
 from agent_harness.credentials import CredentialStore
 from agent_harness.integrations_config import IntegrationSettings, IntegrationStore, SandboxConfig
 
@@ -223,6 +223,7 @@ class IntegrationHub:
             raise ValueError("Tool is not allowed")
         validated = ARGUMENTS[name].model_validate(args).model_dump()
         settings = self.store.load()
+        mcp_failure = None
         if "repository_id" in validated:
             resource_id = "repo:" + validated["repository_id"]
             repository = next(
@@ -269,14 +270,19 @@ class IntegrationHub:
             ):
                 raise PermissionError("Connection is outside the permitted scope")
             credential_env = connection.credential_env
-            result = await self.remote.call(
-                name,
-                validated,
-                connection=connection,
-                principal=principal,
-                run_id=run_id,
-                cancel=cancel,
-            )
+            try:
+                result = await self.remote.call(
+                    name, validated, connection=connection, principal=principal,
+                    run_id=run_id, cancel=cancel,
+                )
+            except Exception as exc:
+                if name != "mcp_call":
+                    raise
+                # Recheck the allowlist below before returning the identity of the failed tool.
+                mcp_failure = ToolExecutionFailure(
+                    "MCP call failed", reason=tool_failure_reason(exc), index_id=resource_id,
+                )
+                result = []
         await self._check(principal, cancel)
         if resource_id not in {item["id"] for item in await self.indexes(principal)}:
             raise PermissionError("Resource access was revoked")
@@ -308,11 +314,18 @@ class IntegrationHub:
             ):
                 raise PermissionError("Connection permission changed during the call")
         secret = os.environ.get(credential_env, "") if credential_env else ""
+        remote_tool = validated["tool"] if name == "mcp_call" else None
+        if remote_tool and secret and secret in remote_tool:
+            remote_tool = None
+        if mcp_failure is not None:
+            mcp_failure.remote_tool = remote_tool
+            raise mcp_failure
         accepted = []
         for item in result[:10]:
             payload = Evidence.model_validate(item).model_dump()
             if payload["index_id"] != resource_id:
                 raise ValueError("Tool returned evidence outside its scope")
+            payload["remote_tool"] = remote_tool
             if secret:
                 payload = {
                     key: value.replace(secret, "[redacted]") if isinstance(value, str) else value

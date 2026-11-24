@@ -98,7 +98,30 @@ def answer_for_history(content: str | None) -> str:
 def _draft_issue(content: str, sources: set[str] | None) -> str | None:
     if sources is None and not _BOILERPLATE.search(content):
         return None
+    has_finding, saw_boilerplate, references = _inspect_markdown(content, sources)
+    if not has_finding and (sources is not None or saw_boilerplate):
+        return _NO_FINDING
+    if sources is None:
+        return None
+    if references - sources:
+        return "В ответе есть ссылка без подтверждающего материала в этом исследовании."
+    if not references:
+        return "Укажите точный идентификатор проверенного материала в квадратных скобках."
+    return None
 
+
+def cited_evidence_ids(content: str, evidence: list[dict[str, Any]]) -> set[str]:
+    """Credit the same literal source references the answer validator recognizes."""
+    sources = {item["id"] for item in evidence if item.get("id") and is_answer_source(item)}
+    if not sources or "[" not in content:
+        return set()
+    _, _, references = _inspect_markdown(content, sources)
+    return references & sources
+
+
+def _inspect_markdown(
+    content: str, sources: set[str] | None,
+) -> tuple[bool, bool, set[str]]:
     references: set[str] = set()
 
     def collect(match: re.Match[str]) -> str:
@@ -145,12 +168,4 @@ def _draft_issue(content: str, sources: set[str] | None) -> str | None:
             elif not (_LABEL.fullmatch(clause) or (in_plan and _PLAN_TASK.match(clause))):
                 has_finding = True
 
-    if not has_finding and (sources is not None or saw_boilerplate):
-        return _NO_FINDING
-    if sources is None:
-        return None
-    if references - sources:
-        return "В ответе есть ссылка без подтверждающего материала в этом исследовании."
-    if not references:
-        return "Укажите точный идентификатор проверенного материала в квадратных скобках."
-    return None
+    return has_finding, saw_boilerplate, references

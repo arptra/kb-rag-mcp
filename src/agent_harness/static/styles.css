@@ -616,6 +616,12 @@ summary[aria-expanded="true"] .disclosure-chevron { transform: rotate(0deg); }
 .memory-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin: 24px 0 14px; }
 .memory-editor h3 { font-size: 22px; font-weight: 550; margin: 0; }
 .memory-record-text { white-space: pre-wrap; overflow-wrap: anywhere; color: #dedede; font-size: 18px; line-height: 1.8; }
+.memory-tool-section { border-top: 1px solid #333; overflow-wrap: anywhere; }
+.memory-tool-section > summary { padding: 8px 0; cursor: pointer; font-size: 15px; color: #dedede; }
+.memory-tool-section ul { margin: 0 0 10px; padding-inline-start: 22px; font-size: 15px; }
+.memory-tool-section li + li { margin-top: 5px; }
+.memory-tool-section code { margin-inline-start: 8px; }
+.memory-tool-section small, .memory-tool-hint { display: block; color: #a8a8a8; overflow-wrap: anywhere; }
 .memory-summary, .memory-usage { color: #a8a8a8; font-size: 16px; line-height: 1.8; }
 .memory-summary { padding: 14px 0; border-block: 1px solid #333333; }
 .memory-usage { margin: 14px 0 0; }

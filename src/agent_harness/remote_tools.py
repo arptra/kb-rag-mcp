@@ -26,7 +26,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from referencing import Registry
 
-from .contracts import Evidence, Principal
+from .contracts import Evidence, Principal, ToolExecutionFailure, tool_failure_reason
 from .integrations_config import ConnectionConfig
 
 _MAX_CHARS = 12000
@@ -36,8 +36,12 @@ _MAX_TOOLS = 128
 _T = TypeVar("_T")
 
 
-class RemoteToolError(RuntimeError):
+class RemoteToolError(ToolExecutionFailure):
     """A deliberately sanitized error safe for a model or a browser to display."""
+
+
+class _PeerFailure(ValueError):
+    """The remote invocation explicitly reported a failed result."""
 
 
 class _LimitedStream(httpx.AsyncByteStream):
@@ -85,11 +89,16 @@ def _redact_tree(value: Any, secret: str) -> Any:
     return value
 
 
-def _error_kind(error: BaseException) -> str:
+def _error_cause(error: BaseException) -> BaseException:
     # The MCP SDK wraps even local validation errors in AnyIO task groups.
     while isinstance(error, BaseExceptionGroup) and len(error.exceptions) == 1:
         error = error.exceptions[0]
-    return type(error).__name__
+    return error
+
+
+def _error_kind(error: BaseException) -> str:
+    cause = _error_cause(error)
+    return "ValueError" if isinstance(cause, _PeerFailure) else type(cause).__name__
 
 
 def _text_parts(parts: Any) -> list[str]:
@@ -298,6 +307,7 @@ class RemoteTools:
                     title=_redact(title, secret)[:300],
                     text=_redact(text, secret)[:_MAX_CHARS],
                     url=connection.url,
+                    tool_outcome="empty" if name == "mcp_call" and not text.strip() else None,
                     kind="tool_metadata"
                     if name in {"mcp_list_tools", "mcp_tool_schema"} else "source",
                 )
@@ -305,7 +315,18 @@ class RemoteTools:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            raise RemoteToolError(f"Remote operation failed ({_error_kind(exc)})") from None
+            cause = _error_cause(exc)
+            reason = tool_failure_reason(cause)
+            if isinstance(cause, _PeerFailure):
+                reason = "remote_error"
+            elif isinstance(cause, httpx.TimeoutException):
+                reason = "timeout"
+            elif (isinstance(cause, httpx.HTTPStatusError)
+                  and cause.response.status_code in {401, 403}):
+                reason = "permission"
+            raise RemoteToolError(
+                f"Remote operation failed ({_error_kind(exc)})", reason=reason,
+            ) from None
 
     async def _tools(
         self, session: ClientSession, allowed_names: set[str] | None = None,
@@ -429,14 +450,15 @@ class RemoteTools:
             _validate_schema(matches[0]["inputSchema"], arguments)
             result = await session.call_tool(tool, arguments)
             if result.isError:
-                raise ValueError("Remote tool reported a failure")
+                raise _PeerFailure("Remote tool reported a failure")
             parts = [part.model_dump(mode="json") for part in result.content]
             texts = _text_parts(parts)
             if result.structuredContent is not None:
                 texts.append(_json(result.structuredContent))
-            if not texts:
+            if not texts and parts:
                 raise ValueError("Remote tool returned no text or structured content")
-            return "\n\n".join(texts)
+            nonempty = (text for text in texts if text.strip() not in {"", "[]", "{}", "null"})
+            return "\n\n".join(nonempty)
 
     @staticmethod
     async def _response_json(response: httpx.Response) -> dict[str, Any]:

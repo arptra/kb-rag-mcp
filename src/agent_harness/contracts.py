@@ -17,6 +17,25 @@ class ConversationUnavailable(ModelDecisionError):
     """A failed compaction must not silently drop the user's earlier constraints."""
 
 
+class ToolExecutionFailure(RuntimeError):
+    """Safe classification supplied by a trusted adapter, independent of response text."""
+
+    def __init__(
+        self, message: str, *, reason: str | None = None, remote_tool: str | None = None,
+        index_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason, self.remote_tool, self.index_id = reason, remote_tool, index_id
+
+
+def tool_failure_reason(error: BaseException) -> str | None:
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, PermissionError):
+        return "permission"
+    return error.reason if isinstance(error, ToolExecutionFailure) else None
+
+
 @dataclass(frozen=True)
 class Principal:
     owner_id: str
@@ -53,6 +72,9 @@ class Evidence(BaseModel):
     url: str | None = None
     revision: str | None = None
     kind: Literal["source", "tool_metadata"] = "source"
+    # Optional adapter metadata describes the operation, independently of untrusted text.
+    tool_outcome: Literal["failed", "empty"] | None = None
+    remote_tool: str | None = Field(default=None, max_length=200)
 
 
 class SourcePort(Protocol):

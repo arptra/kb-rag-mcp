@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from threading import Event
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from agent_harness.contracts import Evidence, Principal
@@ -701,6 +701,7 @@ class SandboxBackend:
         deadline: float,
     ) -> list[Evidence]:
         suffix, text = "checkout", ""
+        tool_outcome: Literal["empty", "failed"] | None = None
         if name == "clone_repository":
             text = f"Repository {repository.name}; ref {repository.ref}; commit {checkout.commit}."
         elif name == "run_in_sandbox":
@@ -710,6 +711,10 @@ class SandboxBackend:
                 config, checkout, args["command"], cancel=cancel, run=run, deadline=deadline
             )
             suffix = "command/" + uuid4().hex
+            if output.code:
+                tool_outcome = "failed"
+            elif not (output.stdout.strip() or output.stderr.strip()):
+                tool_outcome = "empty"
             text = f"Exit code: {output.code}\n{output.stdout}\n{output.stderr}"
             if output.truncated or len(text) > config.max_output_chars:
                 text = text[: config.max_output_chars - 40] + "\n[Command output truncated]"
@@ -734,6 +739,8 @@ class SandboxBackend:
             if name == "read_repository":
                 suffix = f"{args['path']}#L{args.get('start_line', 1)}"
                 text = str(data.get("text", ""))
+                if not text.strip():
+                    tool_outcome = "empty"
                 if data.get("truncated"):
                     text += "\n[File excerpt truncated]"
             else:
@@ -742,6 +749,7 @@ class SandboxBackend:
                     raise SandboxError("Sandbox returned invalid search results")
                 text = "\n".join(f"{m['path']}:{m['line']}: {m['text']}" for m in matches)
                 if not matches:
+                    tool_outcome = "empty"
                     text = "No literal matches in the inspected files."
                 if data.get("limited"):
                     text += "\n[Search limits reached; results are incomplete]"
@@ -759,6 +767,7 @@ class SandboxBackend:
                 text=text[: config.max_output_chars],
                 url=repository.url,
                 revision=revision,
+                tool_outcome=tool_outcome,
             )
         ]
 

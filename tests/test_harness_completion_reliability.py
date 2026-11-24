@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import sqlite3
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -57,6 +58,82 @@ async def finished(app: HarnessRuntime, run_id: str) -> dict[str, Any]:
             if run["status"] not in {"queued", "running", "cancelling"}:
                 return run
             await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("broken_method", ["retrieve", "record_usage"])
+async def test_optional_memory_failure_preserves_verified_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broken_method: str,
+) -> None:
+    app = runtime(tmp_path)
+    await app.start()
+    try:
+        request = RunRequest(question="Payment processing status", index_ids=["a"])
+        seed = await app.submit(OWNER, request)
+        assert (await finished(app, seed["id"]))["memory_contribution"]["updated"]
+
+        def broken(*args: Any, **kwargs: Any) -> None:
+            raise sqlite3.OperationalError("PRIVATE DB DETAILS")
+
+        monkeypatch.setattr(app.memory, broken_method, broken)
+        submitted = await app.submit(OWNER, request)
+        result = await finished(app, submitted["id"])
+        assert result["status"] == "completed" and result["answer"] == "Current explanation [doc]."
+        notices = [s for s in result["research_trace"] if s["name"] == "memory_unavailable"]
+        assert len(notices) == 1 and notices[0]["result"] in result["warnings"]
+        assert "PRIVATE DB DETAILS" not in str(result)
+    finally:
+        await app.stop()
+
+
+async def test_failing_failure_journal_preserves_source_error_and_other_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = runtime(tmp_path)
+    await app.start()
+    try:
+        async def slow_read(**kwargs: Any) -> Evidence:
+            raise TimeoutError
+
+        def broken(*args: Any, **kwargs: Any) -> None:
+            raise sqlite3.OperationalError("PRIVATE FAILURE LOG")
+
+        monkeypatch.setattr(app.source, "read", slow_read)
+        monkeypatch.setattr(app.memory, "record_failure", broken)
+        submitted = await app.submit(OWNER, RunRequest(question="Payments", mode="investigate"))
+        result = await finished(app, submitted["id"])
+        assert result["answer"] == "Current explanation [doc]."
+        assert result["evidence"] and result["status"] == "partial"
+        assert any("TimeoutError" in w or "время" in w.casefold() for w in result["warnings"])
+        assert any(s["name"] == "memory_unavailable" for s in result["research_trace"])
+        assert "PRIVATE FAILURE LOG" not in str(result)
+    finally:
+        await app.stop()
+
+
+async def test_restart_retains_observed_choice_without_replaying_the_interrupted_tool(
+    tmp_path: Path,
+) -> None:
+    app = runtime(tmp_path)
+    store = RunStore(app.settings)
+    origin = {"tool": "read_document", "index_id": "a"}
+    store.save(OWNER.owner_id, {
+        "id": "interrupted-tool", "status": "running", "created_at": timestamp(),
+        "question": "Payment processing status", "index_ids": ["a"], "warnings": [],
+        "evidence": [{"id": "doc", "index_id": "a", "kind": "source", "title": "Payments",
+                      "text": "Processing details", "tool_origin": origin}],
+        "current_action": {"name": "model_planning"},
+    })
+    await app.start()
+    try:
+        run = store.get(OWNER.owner_id, "interrupted-tool")
+        assert run["stop_reason"] == "interrupted" and run["current_action"] is None
+        assert run["memory_contribution"]["updated"]
+        result, = (await app.list_memory(Principal("colleague")))["memories"]
+        assert result["outcome"] == "interrupted"
+        assert result["strategy"]["successful_tools"] == []
+        assert result["strategy"]["observed_tools"] == [{**origin, "evidence_ids": ["doc"]}]
+    finally:
+        await app.stop()
 
 
 @pytest.mark.asyncio

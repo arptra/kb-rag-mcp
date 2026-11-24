@@ -27,8 +27,10 @@ from agent_harness.remote_tools import RemoteTools
 from agent_harness.runtime import HarnessRuntime
 
 OWNER = Principal("investigator")
+COLLEAGUE = Principal("second-investigator")
 QUESTION = "Почему платёж выполнен, а клиент видит статус «В обработке»?"  # noqa: RUF001
 ISSUE = "PAY-3471"
+NEXT_ISSUE = "PAY-3522"
 DOCUMENT = "incident-routing-73"
 FOLLOW_UP = "notification-projector status-retry-v2 delay"
 REMOTE_TOOL = "get_issue_details"
@@ -46,14 +48,13 @@ class CurrentKnowledge:
         self.queries: list[str] = []
 
     async def indexes(self, principal: Principal) -> list[dict[str, str]]:
-        assert principal == OWNER
         return [{"id": "knowledge", "name": "Confluence"}]
 
     async def search(self, **kwargs: Any) -> list[Evidence]:
-        assert kwargs["principal"] == OWNER and kwargs["index_id"] == "knowledge"
+        assert kwargs["principal"] in {OWNER, COLLEAGUE} and kwargs["index_id"] == "knowledge"
         query = kwargs["query"]
         self.queries.append(query)
-        if query == QUESTION:
+        if query.startswith(QUESTION):
             self.events.append("initial_rag")
             return [Evidence(
                 id="routing-hit", document_id=DOCUMENT, index_id="knowledge",
@@ -71,12 +72,13 @@ class CurrentKnowledge:
         )]
 
     async def read(self, **kwargs: Any) -> Evidence:
-        assert kwargs["principal"] == OWNER and kwargs["index_id"] == "knowledge"
+        assert kwargs["principal"] in {OWNER, COLLEAGUE} and kwargs["index_id"] == "knowledge"
         assert kwargs["document_id"] == DOCUMENT
         self.events.append("read_document")
         return Evidence(
             id=DOCUMENT, index_id="knowledge", title="Диагностика платежного контура",
-            text=json.dumps({"issue_key": ISSUE, "mcp_connection": "jira"}),
+            text=json.dumps({"issue_key": ISSUE if kwargs["principal"] == OWNER else NEXT_ISSUE,
+                             "mcp_connection": "jira"}),
             revision="2026-11-24",
         )
 
@@ -110,10 +112,12 @@ class MCPPeer:
                  "inputSchema": {"type": "object"}},
             ]}
         elif method == "tools/call":
-            assert body["params"] == {"name": REMOTE_TOOL, "arguments": {"issue_key": ISSUE}}
+            issue = body["params"]["arguments"]["issue_key"]
+            assert issue in {ISSUE, NEXT_ISSUE}
+            assert body["params"] == {"name": REMOTE_TOOL, "arguments": {"issue_key": issue}}
             self.events.append("mcp_tool_call")
             result = {"content": [{"type": "text", "text": json.dumps({
-                "issue_key": ISSUE, "component": "notification-projector",
+                "issue_key": issue, "component": "notification-projector",
                 "retry_topic": "status-retry-v2", "status": "confirmed",
             })}], "isError": False}
         else:
@@ -241,10 +245,12 @@ class ModelPeer:
         })
 
 
-async def finished(runtime: HarnessRuntime, run_id: str) -> dict[str, Any]:
+async def finished(
+    runtime: HarnessRuntime, run_id: str, principal: Principal = OWNER,
+) -> dict[str, Any]:
     async with asyncio.timeout(10):
         while True:
-            run = await runtime.get(OWNER, run_id)
+            run = await runtime.get(principal, run_id)
             if run["status"] not in {"queued", "running", "cancelling"}:
                 return run
             await asyncio.sleep(0.01)
@@ -274,14 +280,14 @@ async def test_autonomous_deepseek_investigates_across_rag_and_real_mcp_sdk(
     integrations = IntegrationStore(tmp_path)
     integrations.save(IntegrationSettings.model_validate({"connections": [{
         "id": "jira", "name": "Jira", "kind": "mcp", "url": "https://jira.test/mcp",
-        "allowed_tools": [REMOTE_TOOL], "allowed_owners": [OWNER.owner_id],
+        "allowed_tools": [REMOTE_TOOL], "allowed_owners": [OWNER.owner_id, COLLEAGUE.owner_id],
     }, {
         "id": "private", "name": "Private", "kind": "mcp", "url": "https://private.test/mcp",
         "allowed_tools": ["delete_issue"], "allowed_owners": ["someone-else"],
     }]}))
 
     async def authorized(principal: Principal) -> bool:
-        return principal == OWNER
+        return principal in {OWNER, COLLEAGUE}
 
     hub = IntegrationHub(integrations, authorized)
     hub._remote = RemoteTools()
@@ -343,5 +349,63 @@ async def test_autonomous_deepseek_investigates_across_rag_and_real_mcp_sdk(
         assert durable["research_trace"] == trace
         assert durable["research_plan"]["ready_to_answer"] is True
         assert len(model.contexts) == 7, "Reading durable history must not rerun the investigation"
+        await check_colleague_tool_reuse(restored, router, peer)
     finally:
         await restored.stop()
+
+
+async def check_colleague_tool_reuse(
+    runtime: HarnessRuntime, router: ModelRouter, peer: MCPPeer,
+) -> None:
+    """Only shared memory identifies which of the gateway's tools worked in the first run."""
+    visible = (await runtime.list_memory(COLLEAGUE))["memories"]
+    assert len(visible) == 1 and "source_run_id" not in visible[0]
+    assert not (await runtime.list_memory(Principal("reader-without-jira")))["memories"]
+    hints = visible[0]["strategy"]["successful_tools"]
+    route = next(h for h in hints if h["tool"] == "mcp_call")
+    assert route["remote_tool"] == REMOTE_TOOL and route["index_id"] == "connection:jira"
+    assert route["evidence_ids"] and "arguments" not in route
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        ctx = json.loads(payload["messages"][-1]["content"])
+        saved = ctx["shared_memory_not_evidence"][0]["strategy"]["successful_tools"]
+        hint = next(h for h in saved if h["tool"] == "mcp_call")
+        assert hint == route
+        name = hint["remote_tool"]
+        args: dict[str, Any] = {
+            "connection_id": hint["index_id"].removeprefix("connection:"), "tool": name,
+        }
+        evidence = {item["id"]: item for item in ctx["evidence"]}
+        remote = [item for item in evidence.values() if item["index_id"] == hint["index_id"]]
+        docs = [item for item in remote if item["kind"] == "source"]
+        message: dict[str, Any]
+        if docs:
+            assert json.loads(docs[0]["text"])["issue_key"] == NEXT_ISSUE
+            message = {"content": f"Статус задачи {NEXT_ISSUE} подтверждён [{docs[0]['id']}]."}
+        else:
+            tool = "mcp_tool_schema"
+            if remote:
+                schema = json.loads(remote[0]["text"])
+                assert schema["name"] == name
+                current_issue = json.loads(evidence[DOCUMENT]["text"])["issue_key"]
+                assert current_issue == NEXT_ISSUE
+                args["arguments"] = {schema["inputSchema"]["required"][0]: current_issue}
+                tool = "mcp_call"
+            message = {"tool_calls": [{"type": "function", "function": {
+                "name": tool, "arguments": json.dumps(args),
+            }}]}
+        return httpx.Response(200, json={"choices": [{"message": message}]})
+
+    router.transport = httpx.MockTransport(respond)
+    submitted = await runtime.submit(COLLEAGUE, RunRequest(
+        question=f"{QUESTION} Проверь {NEXT_ISSUE}.", mode="autonomous",
+        index_ids=["knowledge", "connection:jira"],
+    ))
+    result = await finished(runtime, submitted["id"], COLLEAGUE)
+    assert result["status"] == "completed", result["warnings"]
+    assert NEXT_ISSUE in result["answer"]
+    assert route in result["memory_used"][0]["successful_tools"]
+    calls = [r["params"] for r in peer.requests if r["method"] == "tools/call"]
+    assert calls == [{"name": REMOTE_TOOL, "arguments": {"issue_key": issue}}
+                     for issue in (ISSUE, NEXT_ISSUE)]

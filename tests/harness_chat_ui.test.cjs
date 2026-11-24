@@ -85,7 +85,7 @@ function fixture(t, handler = () => ({}), { session = () => ({ ok: false, status
   const source = fs.readFileSync(path.join(staticPath, "app.js"), "utf8").replace(
     /  updateSubmit\(\);\s+renderHistory\(\);\s+loadWorkspace\(\);\s+\}\)\(\);\s*$/,
     "globalThis.ui = { state, conversationState, api, loadConversation, loadConversations, " +
-    "selectRun, refreshRun, submitRun, resetWorkspace, renderResearchActivity, renderStatus, renderBudget, modelConnectionValue, applyModelConnection, " +
+    "selectRun, refreshRun, submitRun, resetWorkspace, loadMemory, renderResearchActivity, renderStatus, renderBudget, modelConnectionValue, applyModelConnection, " +
     "settingsState, modelConnectionState, tlsState, changeModelConnection, saveTlsBundle, layoutState, setPanelCollapsed, initLayout, renderTranscript, renderAnswer, renderRun, applyProfileDefaults };\n})();",
   );
   vm.runInContext(fs.readFileSync(path.join(staticPath, "vendor/markdown-it.min.js"), "utf8"), context);
@@ -447,6 +447,58 @@ test("missing administrator rights give an actionable error and keep unsaved mod
 function descendants(node) {
   return [node, ...node.children.flatMap(descendants)];
 }
+
+test("shared memory distinguishes cited tool results, incomplete checks and failed calls", async (t) => {
+  const base = { kind: "case", status: "experience", visibility: "shared", index_ids: ["a"], text: "Материалы проверки" };
+  const success = { tool: "mcp_call", index_id: "a", remote_tool: "jira_get_issue", evidence_ids: ["PAY-72"],
+    args: { token: "PRIVATE_ARGUMENT" } };
+  const { ui, nodes } = fixture(t, () => ({ memories: [
+    { ...base, id: "case", title: "Платежи", strategy: { successful_tools: [success] },
+      failures: [{ operation: "external", remote_tool: "jira_history", tool: "mcp_call", index_ids: ["a"], reason: "PRIVATE_ERROR" }] },
+    { ...base, id: "unfinished", title: "Поиск причины", outcome: "partial",
+      strategy: { observed_tools: [{ tool: "read_document", index_id: "a", evidence_ids: ["REG-4"] }] } },
+    { ...base, id: "old", title: "Прежняя запись", strategy: { tools: ["model_response", "mcp_call"] } },
+    { ...base, id: "old-failure", title: "Старый сбой", failures: [{ operation: "external", index_ids: ["a"] }] },
+  ] }));
+  await ui.loadMemory();
+  const [current, unresolved, historical, legacyFailure] = nodes.get("memory-list").children;
+  const [helpful, failed] = current.children.filter((node) => node.tagName === "details");
+  assert.equal(helpful.firstElementChild.textContent, "Что помогло · jira_get_issue · Documents");
+  assert.match(helpful.textContent, /PAY-72/);
+  assert.equal(failed.firstElementChild.textContent, "Сбои инструментов · jira_history · Documents");
+  assert.doesNotMatch(current.textContent, /PRIVATE_/);
+  assert.match(unresolved.textContent, /Материалы незавершённой проверки · Чтение документа · Documents/);
+  assert.match(unresolved.textContent, /REG-4/);
+  assert.doesNotMatch(unresolved.textContent, /Что помогло/);
+  assert(!historical.children.some((node) => node.tagName === "details"));
+  assert.match(legacyFailure.textContent, /Сбои инструментов · Внешний инструмент · Documents/);
+  ui.state.current = run("with-hint", { memory_used: [{ title: "Платежи", successful_tools: [success] }] });
+  ui.renderRun();
+  assert.match(nodes.get("run-memory-used").textContent, /Предложено агенту из опыта · jira_get_issue · Documents/);
+  assert.doesNotMatch(nodes.get("run-memory-used").textContent, /PRIVATE_|PAY-72/);
+});
+
+test("shared memory names known failure categories and explains why a run was not saved", async (t) => {
+  const { ui, nodes } = fixture(t, () => ({ memories: [{ id: "failed", text: "", index_ids: ["a"],
+    failures: ["timeout", "permission", "remote_error", "nonzero_exit", "PRIVATE_ERROR"].map((reason) => ({
+      operation: "external", index_ids: ["a"], reason,
+    })) }] }));
+  await ui.loadMemory();
+  const failures = nodes.get("memory-list").textContent;
+  for (const label of ["Истекло время ожидания", "Доступ к источнику отклонён", "Внешний инструмент сообщил об ошибке", "Команда завершилась с ошибкой"]) {
+    assert(failures.includes(label));
+  }
+  assert.doesNotMatch(failures, /PRIVATE_ERROR/);
+  for (const [reason, expected] of [["full", /достигнут лимит записей/], ["disabled", /отключена в ваших настройках памяти/]]) {
+    ui.state.current = run(reason, { memory_contribution: { updated: false, reason },
+      research_trace: [{ name: "memory_unavailable", result: "Сохранить запись не удалось." }] });
+    ui.renderRun();
+    assert.equal(nodes.get("run-memory-used").hidden, false);
+    assert.match(nodes.get("run-memory-used").textContent, expected);
+    assert.doesNotMatch(nodes.get("run-memory-used").textContent, /добавлен/);
+    assert.match(nodes.get("research-timeline").textContent, /Общая память временно недоступна/);
+  }
+});
 
 test("Markdown preserves heading levels, nested lists, tables, quotations and fenced code", (t) => {
   const { ui, nodes } = fixture(t);

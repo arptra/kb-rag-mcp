@@ -602,9 +602,8 @@ class HarnessGraph:
         except (ValueError, TypeError):
             result = "Вызов отклонён: недопустимый инструмент, аргументы или индекс."
             engine._warn(run, result)
-            engine.memory.record_failure(
-                principal.owner_id, run, operation="invalid", index_ids=run["index_ids"]
-            )
+            engine._record_tool_failure(principal, run, operation="invalid",
+                                        index_ids=run["index_ids"])
         engine._trace(run, name, args, result)
         run["current_action"] = None
         return self._result(

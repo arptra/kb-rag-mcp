@@ -33,7 +33,9 @@ from agent_harness.contracts import (
     Principal,
     RunRequest,
     SourcePort,
+    ToolExecutionFailure,
     ToolPort,
+    tool_failure_reason,
 )
 from agent_harness.control.settings import ControlSettings, ControlStore, RunLimits, RuntimeLimits
 from agent_harness.graph import ExecutionContext, HarnessGraph
@@ -54,6 +56,10 @@ from agent_harness.store import ACTIVE, RunStore, timestamp
 
 _LOG = logging.getLogger(__name__)
 _ANSWER_TRUNCATED = "\n\n[Ответ сокращён по ограничению размера.]"
+_TOOL_FAILURE_MESSAGES = {
+    "permission": "нет доступа", "timeout": "истекло время ожидания",
+    "remote_error": "удалённый инструмент вернул ошибку",
+}
 
 
 class QueueFullError(RuntimeError):
@@ -151,7 +157,7 @@ class HarnessRuntime:
         self._store = RunStore(self.settings)
         self._memory = MemoryStore(self.store)
         self._conversation_context = ConversationContext(self.store)
-        self.store.recover()
+        self.store.recover(on_interrupted=self._record_run_outcome)
         checkpoint_path = self.settings.state_dir / "checkpoints.sqlite3"
         checkpoint_path.touch(mode=0o600, exist_ok=True)
         checkpoint_path.chmod(0o600)
@@ -925,18 +931,7 @@ class HarnessRuntime:
             run["metrics"]["duration_ms"] = previous_duration + round(
                 (time.monotonic() - started) * 1000
             )
-            try:
-                contribution = self.memory.record_outcome(
-                    principal.owner_id, run, index_ids=sorted(self._run_scope(run))
-                )
-                if contribution is not None:
-                    run["memory_contribution"] = {
-                        "id": contribution["id"], "kind": contribution["kind"],
-                        "status": contribution["status"], "updated": True,
-                    }
-            except Exception as exc:
-                self._warn(run, "Ответ сохранён без нового опыта: память временно недоступна.")
-                _LOG.warning("Harness memory update deferred (%s)", type(exc).__name__)
+            self._record_run_outcome(principal.owner_id, run)
             self.store.save(principal.owner_id, run)
             try:
                 self.store.prune()
@@ -944,6 +939,44 @@ class HarnessRuntime:
                     await self._graph.prune()
             except Exception as exc:
                 _LOG.warning("Harness retention deferred (%s)", type(exc).__name__)
+
+    def _record_run_outcome(self, owner: str, run: dict[str, Any]) -> None:
+        try:
+            contribution = self.memory.record_outcome(
+                owner, run, index_ids=sorted(self._run_scope(run)),
+            )
+            if contribution is not None:
+                run["memory_contribution"] = {
+                    "id": contribution["id"], "kind": contribution["kind"],
+                    "status": contribution["status"], "updated": True,
+                }
+        except Exception as exc:
+            self._memory_problem(
+                run, "Ответ сохранён без нового опыта: память временно недоступна.", exc,
+            )
+        # A memory outage is visible independently of whether the sources answered
+        # the user's question. Do not downgrade a verified answer to partial.
+        for notice in run.pop("_memory_notices", []):
+            self._warn(run, notice)
+
+    def _memory_problem(self, run: dict[str, Any], message: str, exc: Exception) -> None:
+        notices = run.setdefault("_memory_notices", [])
+        if message not in notices:
+            notices.append(message)
+            self._trace(run, "memory_unavailable", {}, message)
+            _LOG.warning("Harness memory operation failed for run %s (%s)", run["id"],
+                         type(exc).__name__)
+
+    def _record_tool_failure(
+        self, principal: Principal, run: dict[str, Any], *, operation: str, index_ids: list[str],
+        tool: str | None = None, remote_tool: str | None = None, reason: str | None = None,
+    ) -> None:
+        try:
+            self.memory.record_failure(principal.owner_id, run, operation=operation,
+                                       index_ids=index_ids, tool=tool, remote_tool=remote_tool,
+                                       reason=reason)
+        except Exception as exc:
+            self._memory_problem(run, "Сбой инструмента не записан в общую память.", exc)
 
     def _run_timeout(self, run: dict[str, Any]) -> float:
         return self._budget(run).timeout_seconds
@@ -1058,6 +1091,14 @@ class HarnessRuntime:
     ) -> str:
         assert self.tools is not None
         run["metrics"]["source_calls"] += 1
+        # Narrow failures to the selected resource when the arguments identify it.
+        scope = run["index_ids"]
+        field, prefix = (("connection_id", "connection:")
+                         if name in {"mcp_call", "mcp_list_tools", "mcp_tool_schema", "a2a_ask"}
+                         else ("repository_id", "repo:"))
+        resource = args.get(field) if isinstance(args, dict) else None
+        if isinstance(resource, str) and prefix + resource in scope:
+            scope = [prefix + resource]
         try:
             timeout = min(self._runtime_limits(run).external_tool_timeout_seconds,
                           max(0.01, deadline - self._now(run)))
@@ -1079,20 +1120,36 @@ class HarnessRuntime:
                 timeout,
             )
             accepted = 0
+            failed = False
             # Catalogs, schemas and checkout receipts describe available tools or code.
             setup_only = name in {"clone_repository", "mcp_list_tools", "mcp_tool_schema"}
             for item in items:
                 if item.index_id not in run["index_ids"]:
                     raise ValueError("Tool evidence is outside run scope")
-                accepted += self._add_evidence(
+                if item.tool_outcome == "failed":
+                    failed = True
+                    self._record_tool_failure(
+                        principal, run, operation="external", index_ids=[item.index_id], tool=name,
+                        reason="nonzero_exit" if name == "run_in_sandbox" else None,
+                    )
+                stored = self._add_evidence(
                     run, item, item.index_id, fresh=True, checked_with=None if setup_only else name,
+                    origin_tool=None if setup_only else name,
                 )
+                accepted += int(stored and item.tool_outcome is None and bool(item.text.strip()))
+            if failed:
+                return "Команда завершилась ошибкой. Код завершения и вывод доступны для разбора."
             return f"Получено подтверждений: {accepted}."
         except Exception as exc:
-            message = f"Инструмент {name} недоступен ({type(exc).__name__})."
+            reason = tool_failure_reason(exc)
+            detail = _TOOL_FAILURE_MESSAGES.get(reason or "", type(exc).__name__)
+            message = f"Инструмент {name} недоступен ({detail})."
             self._warn(run, message)
-            self.memory.record_failure(
-                principal.owner_id, run, operation="external", index_ids=run["index_ids"]
+            remote_tool = (exc.remote_tool if isinstance(exc, ToolExecutionFailure)
+                           and exc.index_id in scope else None)
+            self._record_tool_failure(
+                principal, run, operation="external", index_ids=scope, tool=name,
+                remote_tool=remote_tool, reason=reason,
             )
             return message
         finally:
@@ -1150,7 +1207,8 @@ class HarnessRuntime:
                     check = "search_knowledge"
             accepted = sum(
                 self._add_evidence(run, item, index_id, fresh=not initial,
-                                   checked_with=check, recovery=recovery)
+                                   checked_with=check, recovery=recovery,
+                                   origin_tool="search_knowledge")
                 for item in items[:count]
             )
             if initial:
@@ -1163,8 +1221,9 @@ class HarnessRuntime:
                 run.setdefault("coverage", {})[index_id] = {"status": "failed", "count": 0}
             outcome = f"Поиск в {index_id} недоступен ({type(exc).__name__})."
             self._warn(run, outcome)
-            self.memory.record_failure(
-                principal.owner_id, run, operation="search", index_ids=[index_id]
+            self._record_tool_failure(
+                principal, run, operation="search", index_ids=[index_id], tool="search_knowledge",
+                reason=tool_failure_reason(exc),
             )
             return outcome
         finally:
@@ -1195,14 +1254,16 @@ class HarnessRuntime:
                 "Документ прочитан; подтверждение включено в контекст."
                 if self._add_evidence(run, item, args["index_id"], document=True,
                                       checked_with="read_document"
-                                      if model_requested or recovery else None, recovery=recovery)
+                                      if model_requested or recovery else None, recovery=recovery,
+                                      origin_tool="read_document")
                 else "Документ не включён: ограничение области доступа или бюджета."
             )
         except Exception as exc:
             outcome = f"Чтение документа недоступно ({type(exc).__name__})."
             self._warn(run, outcome)
-            self.memory.record_failure(
-                principal.owner_id, run, operation="read", index_ids=[args["index_id"]]
+            self._record_tool_failure(
+                principal, run, operation="read", index_ids=[args["index_id"]],
+                tool="read_document", reason=tool_failure_reason(exc),
             )
             return outcome
         finally:
@@ -1235,12 +1296,15 @@ class HarnessRuntime:
     def _add_evidence(
         self, run: dict[str, Any], item: Evidence, index_id: str, *, document: bool = False,
         fresh: bool = False, checked_with: str | None = None, recovery: bool = False,
+        origin_tool: str | None = None,
     ) -> bool:
         item = Evidence.model_validate(item)
         if item.index_id != index_id:
             self._warn(run, "Источник вернул evidence за пределами запрошенного индекса.")
             return False
-        payload = item.model_dump()
+        payload = item.model_dump(exclude={"tool_outcome", "remote_tool"})
+        if item.tool_outcome:
+            payload["tool_outcome"] = item.tool_outcome
         profile = self._budget(run)
         text_limit = (
             min(profile.document_chars, self._input_tokens(run))
@@ -1257,8 +1321,14 @@ class HarnessRuntime:
                    and text in " ".join(previous["text"].casefold().split())
                    for previous in run["evidence"]):
                 checked_with = None
-        if (checked_with and run.get("mode") == "autonomous" and item.kind == "source"
-                and payload["text"].strip()):
+        substantive = (item.tool_outcome is None and item.kind == "source"
+                       and bool(payload["text"].strip()))
+        if substantive and origin_tool and (not recovery or checked_with):
+            origin = {"tool": origin_tool, "index_id": index_id}
+            if origin_tool == "mcp_call" and item.remote_tool:
+                origin["remote_tool"] = item.remote_tool
+            payload["tool_origin"] = origin
+        if checked_with and run.get("mode") == "autonomous" and substantive:
             payload["checked_with"] = checked_with
         payload["title"] = payload["title"][:300]
         payload["id"] = payload["id"][:1000]
@@ -1276,10 +1346,11 @@ class HarnessRuntime:
                             and existing["text"].strip()):
                         existing["checked_with"] = payload["checked_with"]
                     return True
-                if (existing.get("checked_with") and payload["kind"] == "source"
-                        and existing["text"] == payload["text"]
+                if (substantive and existing["text"] == payload["text"]
                         and existing.get("revision") == payload["revision"]):
-                    payload.setdefault("checked_with", existing["checked_with"])
+                    for field in ("checked_with", "tool_origin"):
+                        if existing.get(field):
+                            payload.setdefault(field, existing[field])
                 run["evidence"][i] = payload
                 return True
         if len(run["evidence"]) < self._runtime_limits(run).max_evidence:
@@ -1337,10 +1408,14 @@ class HarnessRuntime:
         maximum_tokens = self._input_tokens(run)
         maximum = int(maximum_tokens * run["_control"]["context"]["chars_per_token"])
         allowed = {item["id"] for item in await self._indexes(principal)}
-        memories = self.memory.retrieve(
-            principal.owner_id, run["question"], allowed, set(run["index_ids"]),
-            exclude_run_id=run["id"],
-        )
+        try:
+            memories = self.memory.retrieve(
+                principal.owner_id, run["question"], allowed, set(run["index_ids"]),
+                exclude_run_id=run["id"],
+            )
+        except Exception as exc:
+            self._memory_problem(run, "Общая память недоступна для подбора опыта к вопросу.", exc)
+            memories = []
         self._parent_context(principal, run, allowed)
         for attempt in range(2):
             try:
@@ -1457,7 +1532,7 @@ class HarnessRuntime:
         for item in memories:
             note = {key: item.get(key) for key in
                     ("id", "title", "text", "kind", "status", "origin", "feedback", "outcome",
-                     "quality", "learning_state", "strategy", "research_plan")}
+                     "quality", "learning_state", "strategy", "research_plan", "failures")}
             candidate = {**context, "shared_memory_not_evidence": [
                 *context["shared_memory_not_evidence"], note,
             ]}
@@ -1523,6 +1598,8 @@ class HarnessRuntime:
             used[item["id"]] = {
                 key: item.get(key) for key in ("id", "title", "status", "origin", "feedback")
             }
+            if choices := item.get("strategy", {}).get("successful_tools"):
+                used[item["id"]]["successful_tools"] = choices
             run["context_index_ids"] = sorted(
                 set(run.get("context_index_ids", [])) | set(item["index_ids"])
             )
@@ -1644,7 +1721,10 @@ class HarnessRuntime:
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 metrics[target] = metrics.get(target, 0) + value
         if included_memory_ids:
-            self.memory.record_usage(principal.owner_id, included_memory_ids, run["id"])
+            try:
+                self.memory.record_usage(principal.owner_id, included_memory_ids, run["id"])
+            except Exception as exc:
+                self._memory_problem(run, "Статистика использования общей памяти не записана.", exc)
         return result
 
     async def _synthesize(self, principal: Principal, run: dict[str, Any], event: Event) -> None:

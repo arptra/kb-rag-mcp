@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections import Counter
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
@@ -14,13 +15,18 @@ from langchain_core.messages import HumanMessage
 from langchain_core.messages.utils import count_tokens_approximately
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from agent_harness.answer_quality import answer_for_history
+from agent_harness.answer_quality import answer_for_history, cited_evidence_ids, is_answer_source
 from agent_harness.control.settings import ControlStore
 from agent_harness.store import RunStore, timestamp
 
 LIST_LIMIT = 200
 MAX_TOTAL = 10_000
 MAX_FAILURES = 12
+_SOURCE_TOOLS = frozenset({
+    "search_knowledge", "read_document", "search_repository", "read_repository",
+    "run_in_sandbox", "mcp_call", "a2a_ask",
+})
+_ATTEMPT_TOOLS = _SOURCE_TOOLS | {"clone_repository", "mcp_list_tools", "mcp_tool_schema"}
 _PREVIOUS_CONCLUSION = "Предыдущий вывод (не подтверждённое знание): "
 _STOP = frozenset(
     [
@@ -125,6 +131,51 @@ def _terms(value: str) -> set[str]:
     return {word for word in re.findall(r"[\w-]{3,}", value.casefold()) if word not in _STOP}
 
 
+def _source_choices(run: dict[str, Any]) -> list[dict[str, Any]]:
+    """Attribute only retained source material to the tool that actually produced it."""
+    evidence = run.get("evidence", [])
+    choices: dict[tuple[str, str, str], dict[str, Any]] = {}
+    candidates = []
+    for item in evidence:
+        if (item.get("tool_outcome") in {"failed", "empty"} or not item.get("id")
+                or not is_answer_source(item)):
+            continue
+        origin = item.get("tool_origin")
+        if origin is None and not item["index_id"].startswith(("connection:", "repo:")):
+            # These two fields were stamped by the RAG runtime before tool origins existed.
+            # Catalog receipts, trace text or answer prose cannot establish provenance.
+            tool = "read_document" if item.get("read_document") else item.get("checked_with")
+            if tool in {"read_document", "search_knowledge"}:
+                origin = {"tool": tool, "index_id": item["index_id"]}
+        if isinstance(origin, dict):
+            candidates.append((item, origin))
+    if not candidates:
+        return []
+    if run["status"] == "completed":
+        cited = cited_evidence_ids(run.get("answer", ""), evidence)
+        counts = Counter(item.get("id") for item in evidence)
+        candidates = [(item, origin) for item, origin in candidates
+                      if item["id"] in cited and counts[item["id"]] == 1]
+    for item, origin in candidates:
+        tool, index = origin.get("tool"), origin.get("index_id")
+        if tool not in _SOURCE_TOOLS or index != item["index_id"]:
+            continue
+        remote = origin.get("remote_tool", "") if tool == "mcp_call" else ""
+        if tool == "mcp_call" and not (isinstance(remote, str) and 0 < len(remote) <= 200):
+            continue
+        key = (tool, index, remote)
+        if key not in choices:
+            if len(choices) >= 8:
+                continue
+            choices[key] = {"tool": tool, "index_id": index, "evidence_ids": []}
+            if remote:
+                choices[key]["remote_tool"] = remote
+        ids = choices[key]["evidence_ids"]
+        if len(ids) < 3 and item["id"] not in ids:
+            ids.append(item["id"])
+    return list(choices.values())
+
+
 class MemoryStore:
     """Shared reads use source ACLs; the author alone can edit or delete a memory."""
 
@@ -152,6 +203,50 @@ class MemoryStore:
                 "(memory_id TEXT NOT NULL, run_id TEXT NOT NULL, owner TEXT NOT NULL, "
                 "status TEXT NOT NULL, rating TEXT NOT NULL, PRIMARY KEY(memory_id,run_id))"
             )
+        self._backfill_tool_choices()
+
+    def _backfill_tool_choices(self) -> None:
+        """Recover provable choices for existing cases while their private producer still exists."""
+        cursor = ""
+        while True:
+            with self.runs._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                rows = db.execute(
+                    "SELECT m.id FROM memories m JOIN runs r "
+                    "ON r.owner=m.owner AND r.id=m.source_run_id "
+                    "WHERE m.id>? AND m.status='experience' AND r.status='completed' "
+                    "AND json_valid(m.data) "
+                    "AND json_extract(m.data,'$.origin')='automatic' "
+                    "AND json_type(m.data,'$.strategy.successful_tools') IS NULL "
+                    "ORDER BY m.id LIMIT 16", (cursor,),
+                ).fetchall()
+                if not rows:
+                    return
+                for (memory_id,) in rows:
+                    card_data, run_data = db.execute(
+                        "SELECT m.data,r.data FROM memories m JOIN runs r "
+                        "ON r.owner=m.owner AND r.id=m.source_run_id WHERE m.id=?", (memory_id,),
+                    ).fetchone()
+                    try:
+                        card, producer = json.loads(card_data), json.loads(run_data)
+                        scope = (set(producer.get("index_ids", []))
+                                 | set(producer.get("context_index_ids", []))
+                                 | {e["index_id"] for e in producer.get("evidence", [])})
+                        choices = []
+                        if (card.get("outcome") == "completed"
+                                and card.get("source_run_id") == producer.get("id")
+                                and scope <= set(card["index_ids"])
+                                and not producer.get("_final_quality_issue")
+                                and all((value.get("feedback") or {}).get("rating") != "unhelpful"
+                                        for value in (producer, card))):
+                            choices = _source_choices(producer)
+                        card.setdefault("strategy", {})["successful_tools"] = choices
+                    except (AttributeError, KeyError, TypeError, ValueError, RecursionError):
+                        # An incompatible historical record is not evidence of a tool choice.
+                        continue
+                    db.execute("UPDATE memories SET data=? WHERE id=?",
+                               (json.dumps(card, ensure_ascii=False), memory_id))
+                cursor = rows[-1][0]
 
     def enabled(self, owner: str) -> bool:
         with self.runs._connect() as db:
@@ -249,6 +344,8 @@ class MemoryStore:
             if existing and key in existing:
                 item[key] = existing[key]
         item.setdefault("origin", "manual")
+        if existing and item["origin"] == "automatic":
+            item["index_ids"] = sorted(set(item["index_ids"]) | set(existing["index_ids"]))
         with self.runs._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if (
@@ -327,7 +424,10 @@ class MemoryStore:
                 # Relevance remains primary. Ratings break ties; completion alone is not truth.
                 rating_bonus = max(-3, min(3, quality["helpful"] - quality["unhelpful"]))
                 ranked.append((score * 16 + priority * 2 + rating_bonus, item))
-        ranked.sort(key=lambda pair: (pair[0], pair[1]["updated_at"]), reverse=True)
+        ranked.sort(key=lambda pair: (
+            pair[0], bool(pair[1].get("strategy", {}).get("successful_tools")),
+            pair[1]["updated_at"],
+        ), reverse=True)
         policy = self.controls.load()
         remaining = policy.runtime.memory_context_tokens
         result: builtins.list[dict[str, Any]] = []
@@ -355,8 +455,19 @@ class MemoryStore:
                     "Проверьте, каких подтверждений не хватает. "
                 )
             text = prefix + item["text"]
+            stored_strategy = item.get("strategy", {})
+            strategy = {
+                "tools": [tool for tool in stored_strategy.get("tools", [])
+                          if tool in _ATTEMPT_TOOLS],
+                "successful_tools": stored_strategy.get("successful_tools", []),
+                "observed_tools": stored_strategy.get("observed_tools", []),
+            }
+            failures = item.get("failures", [])
+            tool_context = json.dumps({"strategy": strategy, "failures": failures},
+                                      ensure_ascii=False)
             tokens = count_tokens_approximately(
-                [HumanMessage(content=text)], chars_per_token=policy.context.chars_per_token,
+                [HumanMessage(content=text + "\n" + tool_context)],
+                chars_per_token=policy.context.chars_per_token,
             )
             if tokens > remaining or not text:
                 continue
@@ -375,7 +486,7 @@ class MemoryStore:
                     "quality": quality,
                     "learning_state": self._learning_state(item),
                     "research_plan": item.get("research_plan", {}),
-                    "strategy": {"tools": item.get("strategy", {}).get("tools", [])},
+                    "strategy": strategy, "failures": failures,
                 }
             )
             remaining -= tokens
@@ -535,13 +646,13 @@ class MemoryStore:
         """Save one bounded case per finished run; successful completion is not verification."""
         if run.get("status") not in {"completed", "partial", "failed", "timed_out", "interrupted"}:
             return None
-        if not self.enabled(owner) or not index_ids:
+        if not index_ids:
+            return None
+        if not self.enabled(owner):
+            run["memory_contribution"] = {"updated": False, "reason": "disabled"}
             return None
         self._record_learning(owner, run)
-        existing = self._automatic(owner, run["id"])
-        if existing and existing["status"] == "active":
-            return self.public(existing)
-        return self._save_experience(owner, run, index_ids=index_ids, existing=existing)
+        return self._save_experience(owner, run, index_ids=index_ids)
 
     def record_feedback(
         self,
@@ -561,7 +672,7 @@ class MemoryStore:
         # Feedback corrects previously collected experience even while reuse is disabled.
         updated = {**run, "feedback": {**feedback.model_dump(), "updated_at": timestamp()}}
         self._record_learning(owner, updated)
-        return self._save_experience(owner, updated, index_ids=index_ids, existing=existing)
+        return self._save_experience(owner, updated, index_ids=index_ids, feedback_update=True)
 
     @staticmethod
     def _research_plan(run: dict[str, Any]) -> dict[str, Any]:
@@ -583,18 +694,17 @@ class MemoryStore:
         result["round"] = max(0, min(1000, round_number)) if isinstance(round_number, int) else 0
         return result
 
-    def _save_experience(
+    def _experience_data(
         self,
         owner: str,
         run: dict[str, Any],
         *,
         index_ids: builtins.list[str],
         existing: dict[str, Any] | None,
-        failures: builtins.list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any] | None:
-        failure_update = failures is not None
+        failures: builtins.list[dict[str, Any]],
+        choices: builtins.list[dict[str, Any]],
+    ) -> dict[str, Any]:
         now = timestamp()
-        failures = failures if failures is not None else (existing or {}).get("failures", [])
         feedback = run.get("feedback") or (existing or {}).get("feedback")
         bad = (feedback or {}).get("rating") == "unhelpful"
         outcome = run.get("status", "failed")
@@ -618,11 +728,13 @@ class MemoryStore:
             },
             "tools": list(
                 dict.fromkeys(
-                    str(step.get("name", ""))[:100]
+                    step["name"]
                     for step in run.get("research_trace", [])
-                    if isinstance(step, dict) and step.get("name")
+                    if isinstance(step, dict) and step.get("name") in _ATTEMPT_TOOLS
                 )
             )[:20],
+            "successful_tools": choices if not incomplete and not bad else [],
+            "observed_tools": choices if incomplete and not bad else [],
             "coverage": {
                 str(index_id)[:200]: {
                     "status": value.get("status", "pending"),
@@ -675,7 +787,8 @@ class MemoryStore:
         }
         for failure in failures[:MAX_FAILURES]:
             indexes = ", ".join(failure["index_ids"][:3])[:240]
-            text += f"{failure['operation']} [{indexes}]: {recommendations[failure['operation']]}\n"
+            label = failure.get("remote_tool") or failure.get("tool") or failure["operation"]
+            text += f"{label} [{indexes}]: {recommendations[failure['operation']]}\n"
         if sources:
             text += (
                 "Ранее найденные документы (проверить заново): "
@@ -689,7 +802,7 @@ class MemoryStore:
                 and run.get("stop_reason") not in {"model_policy_stop", "model_refusal_text"}
                 and not run.get("_final_quality_issue")):
             text += _PREVIOUS_CONCLUSION + str(run["answer"])[:1000]
-        item = {
+        return {
             "id": self._automatic_id(owner, run["id"]),
             "title": ("Урок: " if bad or incomplete or failures else "Опыт: ") + question[:150],
             "text": text[:2400],
@@ -717,6 +830,15 @@ class MemoryStore:
             "quality": self._quality(existing or {}),
             "_match_question": question,
         }
+
+    def _save_experience(
+        self, owner: str, run: dict[str, Any], *, index_ids: builtins.list[str],
+        failure: dict[str, Any] | None = None, feedback_update: bool = False,
+    ) -> dict[str, Any] | None:
+        # Parse potentially long answers before acquiring SQLite's writer lock.
+        rejected_final = run.get("status") == "completed" and run.get("_final_quality_issue")
+        choices = _source_choices(run) if failure is None and not rejected_final else []
+        memory_id = self._automatic_id(owner, run["id"])
         with self.runs._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             stored = db.execute(
@@ -729,10 +851,36 @@ class MemoryStore:
             # A detached operation can finish after cancellation or a new resume.
             # Check the producer inside the write transaction, not before reading
             # the existing case. Final outcome/feedback writes remain permitted.
-            if failure_update and (stored[0] != "running" or run.get("status") != "running"):
+            if failure and (stored[0] != "running" or run.get("status") != "running"):
                 return None
+            # Read current counters, scope and recorded failures under the same
+            # transaction as the write. Parallel updates must not discard each other.
+            row = db.execute(
+                "SELECT data FROM memories WHERE id=? AND owner=?", (memory_id, owner)
+            ).fetchone()
+            existing = json.loads(row[0]) if row else None
+            if existing and existing["status"] == "active" and not feedback_update:
+                return self.public({**existing, "_author": owner, "_reader": owner})
+            failures = list((existing or {}).get("failures", []))
+            if failure:
+                if failure in failures or len(failures) >= MAX_FAILURES:
+                    return None
+                failures.append(failure)
             if existing is None and not self._make_room(db):
+                if not failure and not feedback_update:
+                    run["memory_contribution"] = {"updated": False, "reason": "full"}
                 return None
+            if existing and existing.get("feedback") and not feedback_update:
+                run = {**run, "feedback": existing["feedback"]}
+            item = self._experience_data(
+                owner, run, index_ids=index_ids, existing=existing, failures=failures,
+                choices=choices,
+            )
+            if existing and existing["status"] == "active":
+                # The author has confirmed/edited this card. Updating the vote on the
+                # originating answer must not replace their text with a generated lesson.
+                item = {**existing, "feedback": item["feedback"], "strategy": item["strategy"],
+                        "updated_at": item["updated_at"]}
             db.execute(
                 "INSERT INTO memories VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
                 "status=excluded.status,updated=excluded.updated,data=excluded.data "
@@ -742,14 +890,15 @@ class MemoryStore:
                     owner,
                     item["status"],
                     run["id"],
-                    now,
+                    item["updated_at"],
                     json.dumps(item, ensure_ascii=False),
                 ),
             )
         return self.public({**item, "_author": owner, "_reader": owner})
 
     def record_failure(
-        self, owner: str, run: dict[str, Any], *, operation: str, index_ids: builtins.list[str]
+        self, owner: str, run: dict[str, Any], *, operation: str, index_ids: builtins.list[str],
+        tool: str | None = None, remote_tool: str | None = None, reason: str | None = None,
     ) -> None:
         """Keep operation/scope and next checks, never exception text or tool arguments."""
         if (
@@ -758,22 +907,14 @@ class MemoryStore:
             or not self.enabled(owner)
         ):
             return
-        existing = self._automatic(owner, run["id"])
-        if existing and existing["status"] == "active":
-            return
-        failures = (existing or {}).get("failures", [])
-        failure = {"operation": operation, "index_ids": sorted(set(index_ids))}
-        if failure in failures or len(failures) >= MAX_FAILURES:
-            return
-        scope = (
-            set(index_ids)
-            | set(run.get("index_ids", []))
-            | set(run.get("context_index_ids", []))
-            | {source["index_id"] for source in run.get("evidence", [])}
-        )
-        self._save_experience(
-            owner, run, index_ids=sorted(scope), existing=existing, failures=[*failures, failure]
-        )
+        failure: dict[str, Any] = {"operation": operation, "index_ids": sorted(set(index_ids))}
+        if reason in {"timeout", "permission", "remote_error", "nonzero_exit"}:
+            failure["reason"] = reason
+        if tool in _ATTEMPT_TOOLS:
+            failure["tool"] = tool
+            if tool in {"mcp_call", "mcp_tool_schema"} and remote_tool and len(remote_tool) <= 200:
+                failure["remote_tool"] = remote_tool
+        self._save_experience(owner, run, index_ids=index_ids, failure=failure)
 
     @staticmethod
     def public(item: dict[str, Any]) -> dict[str, Any]:
