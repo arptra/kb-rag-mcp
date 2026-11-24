@@ -246,7 +246,9 @@ def test_get_after_access_revocation_hides_trace_and_context_metadata(tmp_path: 
             ],
             coverage={"private": {"status": "searched", "count": 1}},
             context_summary={"evidence_included": 1},
-            answer="Private answer",
+            answer_kind="verified_excerpt", answer="SECRET_ANSWER [private-doc]",
+            _retrieval_support={"id": "private-doc", "index_id": "private",
+                                "quote": "SECRET_ANSWER"},
         )
         app.store.save(OWNER.owner_id, run)
         response = client.get(f"/api/runs/{run['id']}")
@@ -256,7 +258,7 @@ def test_get_after_access_revocation_hides_trace_and_context_metadata(tmp_path: 
         assert visible.get("research_trace", []) == []
         assert visible.get("coverage", {}) == {}
         assert visible.get("context_summary", {}) == {}
-        assert "SECRET_DOCUMENT_ID" not in response.text
+        assert "SECRET_DOCUMENT_ID" not in response.text and "SECRET_ANSWER" not in response.text
 
 
 @pytest.mark.asyncio

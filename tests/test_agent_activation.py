@@ -12,7 +12,12 @@ from typing import Any
 import pytest
 
 from corporate_kb.agents.activation import GigaCodeAgentController
-from corporate_kb.gigacode_runner import GigaCodeCancelled, GigaCodeInvalidOutput, GigaCodeTimedOut
+from corporate_kb.gigacode_runner import (
+    GigaCodeCancelled,
+    GigaCodeInvalidOutput,
+    GigaCodeTimedOut,
+    GigaCodeTransientError,
+)
 
 _VERSION = "corporate-gigacode 26.11"
 _URL = "https://login.example.test/device?code=private-device-secret"
@@ -311,7 +316,8 @@ def test_incomplete_or_timed_out_reply_does_not_disable_authenticated_model(
     controller.stop()
 
 
-@pytest.mark.parametrize("error", [GigaCodeInvalidOutput(_URL), GigaCodeTimedOut(_URL)])
+@pytest.mark.parametrize("error", [GigaCodeInvalidOutput(_URL), GigaCodeTimedOut(_URL),
+                                   GigaCodeTransientError()])
 def test_incomplete_reply_during_pending_authentication_requires_reauthorization(
     settings_factory, monkeypatch, error,
 ):

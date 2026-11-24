@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
 from langchain_core.messages.utils import count_tokens_approximately
+from langchain_core.runnables import RunnableLambda
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from pydantic import ValidationError
 
@@ -35,6 +36,7 @@ from agent_harness.answer_quality import (
     quote_options,
     render_quoted_findings,
     requested_json,
+    reviewed_excerpt,
     selected_quotes,
     supporting_reason,
 )
@@ -77,7 +79,7 @@ from agent_harness.model_connection import (
     ModelPolicyStop,
     ModelRouter,
     ModelTransientError,
-    check_model_policy,
+    check_model_reply,
 )
 from agent_harness.model_profiles import DEEPSEEK_CONTEXT_WINDOW_TOKENS
 from agent_harness.planning_context import (
@@ -1086,21 +1088,17 @@ class HarnessRuntime:
             terminal = "partial" if run["evidence"] else "failed"
             model_stop = exc.stop_reason
             message = str(exc)
-            run["answer"] = (
-                message + " Модель не завершила этот шаг."
-            )
-            searched = sum(row.get("status") in {"searched", "empty"}
-                           for row in run.get("coverage", {}).values())
-            if searched or run["evidence"]:
-                run["answer"] += (f" До остановки опрошено индексов — {searched}, "
-                                  f"сохранено материалов — {len(run['evidence'])}. "
-                                  "Они доступны в разделе «Источники».")
-            run["answer"] += (" Диагностика в ходе исследования поможет найти "
-                              "событие в журнале шлюза.")
+            run["answer_kind"] = "restricted"
+            run["answer"] = ("Получен отказ. Причиной названы правила провайдера."
+                             if exc.signal == "text" else
+                             "Корпоративный шлюз ограничил ответ на этот запрос.")
+            if any(is_answer_source(item) for item in run["evidence"]):
+                run["answer"] += " Собранные материалы доступны в разделе «Источники»."
             self._warn(run, message)
             self._trace(run, model_stop, {}, message)
         except ModelConnectionError as exc:
             terminal = "partial" if run["evidence"] else "failed"
+            model_stop = "model_connection_error"
             self._warn(run, str(exc))
         except Exception as exc:
             terminal = "partial" if run["evidence"] else "failed"
@@ -1161,7 +1159,8 @@ class HarnessRuntime:
                 0, self._now(run) - started,
             )
             self.store.interrupt_autopilot(run)
-        elif not run["answer"]:
+        elif (terminal == "cancelled" or not run["answer"]
+              or run.get("stop_reason") == "incomplete_generation"):
             self._evidence_answer(run)
         run.setdefault("stop_reason", run["status"])
         run.update(phase="finished", completed_at=timestamp(), current_action=None)
@@ -1581,7 +1580,8 @@ class HarnessRuntime:
                     return fallback
                 opened["checked_with"] = "read_document"
                 item = opened
-            support = {"id": item["id"], "index_id": item["index_id"], "quote": quote}
+            support = {"id": item["id"], "index_id": item["index_id"], "quote": quote,
+                       "revision": item.get("revision"), "quote_is_answer": review.quote_is_answer}
             run["_retrieval_support"] = support
             run.pop("_retrieval_gap", None)
             run.get("_source_assessments", {}).pop(item["index_id"], None)
@@ -1956,6 +1956,64 @@ class HarnessRuntime:
                 first.append(item)
                 indexes.add(item["index_id"])
         return first + remaining
+
+    async def _decide_with_transport_retry(
+        self, principal: Principal, run: dict[str, Any], event: Event,
+        tools: list[dict[str, Any]], exchange: list[dict[str, Any]] | None = None,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        """Retry a provider decision while preserving completed tool receipts."""
+        if not isinstance(self.model, ModelRouter):
+            return await self._decide(principal, run, event, tools, exchange, deadline)
+
+        limit = self._budget(run).model_calls
+        if run.get("phase") == "synthesizing":
+            limit += self._runtime_limits(run).max_answer_retries
+        else:
+            limit -= 2 if run["mode"] == "autonomous" else 1
+        attempts = min(self._runtime_limits(run).max_decision_errors,
+                       limit - self._decision_calls(run))
+        if attempts < 2:
+            return await self._decide(principal, run, event, tools, exchange, deadline)
+
+        previous: ModelTransientError | None = None
+
+        def can_retry(exc: BaseException) -> bool:
+            return (isinstance(exc, ModelTransientError) and not event.is_set()
+                    and self._decision_calls(run) < limit
+                    and (deadline is None or self._now(run) + exc.retry_after < deadline))
+
+        async def request(_: None) -> dict[str, Any]:
+            nonlocal previous
+            if event.is_set():
+                raise asyncio.CancelledError
+            retrying = previous is not None
+            if previous is not None and not can_retry(previous):
+                raise previous
+            if retrying:
+                self._trace(run, "model_retry", {},
+                            "Повторяем вызов. Результаты проверок сохранены.")
+            before = self._decision_calls(run)
+            try:
+                return await self._decide(principal, run, event, tools, exchange, deadline)
+            except ModelTransientError as exc:
+                previous = exc
+                raise
+            finally:
+                # A long Retry-After may park the run before a request goes out.
+                if retrying and self._decision_calls(run) > before:
+                    metrics = run["metrics"]
+                    metrics["transport_retries"] = metrics.get("transport_retries", 0) + 1
+
+        # The graph can execute external actions. Only the provider decision is
+        # inside RunnableRetry. _invoke_model handles Retry-After, cancellation,
+        # accounting and durable parking when a gateway requests a longer pause.
+        call = RunnableLambda[None, dict[str, Any]](request, name="harness_model_decision")
+        action = call.with_retry(
+            retry_if_exception_type=can_retry, stop_after_attempt=attempts,
+            exponential_jitter_params={"initial": 0.1, "max": 0.5, "jitter": 0.1},
+        )
+        return await action.ainvoke(None)
 
     async def _decide(
         self, principal: Principal, run: dict[str, Any], event: Event,
@@ -2617,11 +2675,12 @@ class HarnessRuntime:
                     raise TimeoutError("Investigation decision budget exhausted")
             result = await operation
             if isinstance(result, dict):
-                check_model_policy(result, result.get("finish_reason"))
+                check_model_reply(result, result.get("finish_reason"))
         except ModelPolicyStop as exc:
             stage = {"model_planning": "Выбор следующего действия",
                      "model_budget_review": "Проверка бюджета",
                      "context_compaction": "Сжатие истории",
+                     "search_assessment": "Проверка найденных фрагментов",
                      "model_response": "Подготовка ответа"}[action_name]
             exc.args = (f"{stage}. {exc}",)
             run["provider_diagnostic"] = {
@@ -2650,6 +2709,8 @@ class HarnessRuntime:
         except asyncio.CancelledError:
             signal.set()
             await self._cleanup(operation, run)
+            raise
+        except ModelDecisionError:
             raise
         except ValueError:
             raise ModelDecisionError("Модель вернула некорректный формат решения.") from None
@@ -2694,11 +2755,12 @@ class HarnessRuntime:
         # tool action is replayed and quick mode pays for it only after a failure.
         retries = self._runtime_limits(run).max_answer_retries
         partial: dict[str, Any] | None = None
+        transport_exhausted = False
         for attempt in range(retries + 1):
             if event.is_set():
                 return
             try:
-                decision = await self._decide(principal, run, event, [])
+                decision = await self._decide_with_transport_retry(principal, run, event, [])
                 if decision.get("tool_calls"):
                     raise ModelDecisionError("Итоговый ответ не может запускать инструменты.")
                 incomplete = decision.get("finish_reason") in RETRYABLE_FINISH_REASONS
@@ -2721,20 +2783,23 @@ class HarnessRuntime:
                 run["metrics"]["decision_errors"] = run["metrics"].get("decision_errors", 0) + 1
             except ModelTransientError as exc:
                 self._trace(run, "model_retry", {}, str(exc))
-                if attempt == retries:
+                if isinstance(self.model, ModelRouter) or attempt == retries:
                     self._warn(run, str(exc))
+                    transport_exhausted = True
+                    break
             if attempt < retries:
                 run["metrics"]["answer_retries"] = run["metrics"].get("answer_retries", 0) + 1
                 self._trace(run, "answer_recovery", {},
                             "Готовлю ответ повторно по проверенным материалам.")
                 self._checkpoint(principal, run, event)
-        if partial:
-            self._answer(run, partial)
+        accepted = partial is not None and self._answer(run, partial)
+        if not accepted and transport_exhausted:
+            run.setdefault("stop_reason", "model_transport")
         run["status"] = "partial"
         if issue := run.get("_final_quality_issue"):
             run.setdefault("stop_reason", "answer_quality")
             self._warn(run, issue)
-        else:
+        elif not transport_exhausted:
             self._warn(run, "Модель не сформировала законченный ответ после повторной попытки.")
 
     def _draft_quality_issue(self, run: dict[str, Any], content: str) -> str | None:
@@ -2838,18 +2903,37 @@ class HarnessRuntime:
 
     def _evidence_answer(self, run: dict[str, Any]) -> None:
         reason = run.get("stop_reason") or run["status"]
-        messages = {
-            "model_unavailable": "Модель недоступна. Проверьте подключение в настройках модели.",
-            "answer_quality": "Модель не смогла подтвердить вывод по собранным материалам.",
-            "time_limit": "Время запроса истекло до получения законченного ответа.",
-            "budget_ceiling": "До получения ответа был исчерпан выделенный бюджет.",
-            "context_limit": "Контекст беседы превысил доступный объём для ответа.",
-            "cancelled": "Запрос остановлен.",
-        }
-        answer = messages.get(reason, "Подготовка ответа прервана.")
+        if reason == "cancelled":
+            run.update(answer="Запрос остановлен.", answer_kind="incomplete")
+            return
+        # Keep the outcome of a successful model review when a later writing step
+        # fails. A policy stop and an unexpected access failure never take this path.
+        if reason in {"model_connection_error", "model_transport", "answer_quality",
+                      "incomplete_generation", "time_limit", "budget_ceiling", "context_limit",
+                      "model_unavailable"}:
+            excerpt = reviewed_excerpt(run)
+            if (excerpt and len(excerpt) <= self._runtime_limits(run).answer_chars
+                    and not self._draft_quality_issue(run, excerpt)):
+                run.update(answer=excerpt, answer_kind="verified_excerpt")
+                self._trace(run, "verified_excerpt", {},
+                            "Фрагмент повторно сверен по тексту источника.")
+                return
+        if reason == "incomplete_generation" and run.get("answer"):
+            return
+        coverage = run.get("coverage", {})
         count = sum(is_answer_source(item) for item in run["evidence"])
+        checked = sum(row.get("status") in {"searched", "empty"} for row in coverage.values())
         if count:
-            answer += f" Найденные материалы доступны в разделе «Источники» ({count})."
-        elif reason != "cancelled":
-            answer += " Подтверждённых данных по вопросу пока нет."
-        run.update(answer=answer, answer_kind="incomplete")
+            answer = "Вывод по вопросу пока не подтверждён."
+            if checked:
+                answer += f" Проверено баз: {checked} из {len(coverage)}."
+            answer += f" Собранные материалы доступны в разделе «Источники» ({count})."
+            run.update(answer=answer, answer_kind="incomplete")
+        elif checked and checked == len(coverage) and not run.get("provider_diagnostic"):
+            run.update(answer="Подтверждённых данных по вопросу пока нет. "
+                       "Какой документ, компонент или номер заявки поможет уточнить поиск?",
+                       answer_kind="clarification")
+        else:
+            run.update(answer="Подтверждённых данных по вопросу пока нет. "
+                       "Доступность источников и последний шаг видны в «Как получен ответ».",
+                       answer_kind="incomplete")

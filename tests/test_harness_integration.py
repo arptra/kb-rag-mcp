@@ -418,7 +418,8 @@ async def test_existing_launcher_activates_harness_without_profile_and_keeps_log
         if policy_stop:
             assert result["status"] == "partial", result
             assert result["stop_reason"] == "model_policy_stop"
-            assert "(refusal)" in result["answer"]
+            assert result["answer_kind"] == "restricted"
+            assert result["provider_diagnostic"]["signal"] == "refusal"
             assert controller.status()["available"]
         else:
             assert result["status"] == "completed", result

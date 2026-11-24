@@ -17,7 +17,12 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
-from agent_harness.answer_quality import is_answer_source, requested_field, requested_field_label
+from agent_harness.answer_quality import (
+    is_answer_source,
+    requested_field,
+    requested_field_label,
+    reviewed_excerpt,
+)
 from agent_harness.budgets import BUDGET_TOOL, BudgetChanges, BudgetRequest
 from agent_harness.contracts import (
     ConversationUnavailable,
@@ -389,6 +394,13 @@ class HarnessGraph:
             return self._result(context, "tools", knowledge_ids=knowledge, external=external,
                                 calls=[{"name": "check_sandbox_api", "args": {}}], exchange=[],
                                 finish_after_sandbox_check=True)
+        if verified and not external and run.get("_retrieval_support", {}).get("quote_is_answer"):
+            if not engine._run_scope(run) <= {i["id"] for i in await engine._indexes(principal)}:
+                raise ValueError("Source access changed during the investigation")
+            excerpt = reviewed_excerpt(run)
+            if not event.is_set() and excerpt and engine._answer(run, {"content": excerpt}):
+                run["answer_kind"] = "verified_excerpt"
+                return self._result(context, "done")
         return self._result(
             context,
             "synthesize" if verified or (quick and not external) else "inspect",
@@ -785,7 +797,7 @@ class HarnessGraph:
             hidden = {*METADATA, "mcp_call"} if inspected else {"mcp_call"}
             catalog = [t for t in catalog if t["function"]["name"] not in hidden]
         try:
-            decision = await engine._decide(
+            decision = await engine._decide_with_transport_retry(
                 context.principal,
                 run,
                 event,
@@ -804,15 +816,11 @@ class HarnessGraph:
             return self._result(context, "done")
         except ModelTransientError as exc:
             autonomous = run["mode"] == "autonomous"
-            if ((autonomous or isinstance(engine.model, ModelRouter))
+            if (autonomous and not isinstance(engine.model, ModelRouter)
                     and not run["metrics"].get("planner_retries")
-                    and engine._decision_calls(run) < budget.model_calls - (2 if autonomous else 1)
+                    and engine._decision_calls(run) < budget.model_calls - 2
                     and engine._now(run) < self._reserve_deadline(context)):
                 run["metrics"]["planner_retries"] = 1
-                if not autonomous:
-                    engine._trace(run, "model_retry", {},
-                                  f"{exc} Повторяем выбор действия по собранным данным.")
-                    return self._result(context, "decide")
                 engine._trace(run, "model_retry", {},
                               f"{exc} Выбираем другую проверку.")
                 return self._result(context, "replan",

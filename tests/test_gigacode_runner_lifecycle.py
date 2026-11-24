@@ -186,6 +186,9 @@ def test_missing_unusable_and_truncated_results_have_a_recoverable_type(
      "message": {"content": [{"type": "refusal", "refusal": "upstream-body"}]}},
     {"type": "stream_event", "event": {"type": "message_delta",
                                      "delta": {"stop_reason": "refusal"}}},
+    {"type": "stream_event", "event": {"type": "error", "error": {
+        "code": "invalid_request", "innererror": {"code": "ResponsibleAIPolicyViolation"},
+    }}},
     {"type": "result", "is_error": True,
      "error": {"code": "content_filter", "message": "upstream-body"}},
 ])
@@ -203,6 +206,58 @@ def test_result_payload_can_describe_filters_and_refusals(settings_factory, tmp_
     content = {"finish_reason": "content_filter", "refusal": "Example from the documentation"}
     result = execute(settings_factory, tmp_path, "sys.stdin.read()\n" + terminal(result=content))
     assert result.payload == content
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_native_overload_can_recover_inside_cli_but_subsequent_denial_is_terminal(
+    settings_factory, tmp_path, blocked: bool,
+):
+    events = [{"type": "error", "error": {"code": "rate_limit_exceeded"}}]
+    if blocked:
+        events.append({"type": "assistant", "error": "blacklist", "message": {}})
+    body = "sys.stdin.read()\n" + "".join(
+        f"print({json.dumps(event)!r}, flush=True)\n" for event in events) + terminal()
+    if blocked:
+        with pytest.raises(GigaCodePolicyStop):
+            execute(settings_factory, tmp_path, body)
+    else:
+        assert execute(settings_factory, tmp_path, body).payload["content"] == "answer"
+
+
+def test_error_event_is_not_a_completed_authentication(settings_factory, tmp_path):
+    from corporate_kb.gigacode_runner import GigaCodeTransientError
+
+    callbacks = []
+    body = ("sys.stdin.read()\n"
+            "print('Open browser https://login.example.test/device', flush=True)\n"
+            "print(json.dumps({'type':'assistant','error':'rate_limit','message':{}}))\n"
+            "raise SystemExit(1)\n")
+    with pytest.raises(GigaCodeTransientError):
+        execute(settings_factory, tmp_path, body, authentication_url=lambda _: callbacks.append(1),
+                authentication_complete=lambda: callbacks.append(2))
+    assert callbacks == [1]
+
+
+@pytest.mark.parametrize(("error", "expected"), [
+    ({"code": "blacklist"}, GigaCodePolicyStop),
+    ({"code": 429}, module.GigaCodeTransientError),
+])
+def test_native_error_on_stderr_preserves_its_type(settings_factory, tmp_path, error, expected):
+    message = json.dumps({"type": "error", "error": error})
+    body = (f"sys.stdin.read()\nprint({message!r}, file=sys.stderr, flush=True)\n"
+            "raise SystemExit(1)\n")
+    with pytest.raises(expected):
+        execute(settings_factory, tmp_path, body)
+
+
+def test_truncated_native_message_invalidates_complete_looking_cli_result(
+    settings_factory, tmp_path,
+):
+    event = {"type": "stream_event", "event": {"type": "message_delta",
+                                               "delta": {"stop_reason": "max_tokens"}}}
+    body = "sys.stdin.read()\n" + f"print({json.dumps(event)!r}, flush=True)\n" + terminal()
+    with pytest.raises(GigaCodeInvalidOutput):
+        execute(settings_factory, tmp_path, body)
 
 
 def test_unbounded_output_is_rejected_without_truncating_into_an_answer(

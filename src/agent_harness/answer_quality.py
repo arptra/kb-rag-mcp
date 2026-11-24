@@ -339,6 +339,29 @@ def _source_references(evidence: list[dict[str, Any]]) -> dict[str, str]:
     return {alias: pair[1] for alias, pair in _reference_pairs(evidence).items()}
 
 
+def reviewed_excerpt(run: dict[str, Any]) -> str | None:
+    """Bind the reviewer's literal finding to the same retained and citable source."""
+    support = run.get("_retrieval_support") or {}
+    pending = ("_retrieval_gap", "_pending_source_checks", "_uncertain_tool_call",
+               "_uncertain_calls", "_inflight_action", "sandbox_profile_id")
+    if (not support or any(run.get(key) for key in pending)
+            or run.get("research_plan", {}).get("gaps") or requested_json(run["question"])):
+        return None
+    pair = (support.get("index_id"), support.get("id"))
+    quote = support.get("quote")
+    if not isinstance(quote, str) or not 8 <= len(quote) <= 800 or pair[0] not in run["index_ids"]:
+        return None
+    evidence = run["evidence"]
+    if not any((e["index_id"], e["id"]) == pair and is_answer_source(e)
+               and e.get("revision") == support.get("revision") and quote in e["text"]
+               and (run["mode"] != "autonomous" or e.get("checked_with")) for e in evidence):
+        return None
+    refs = _reference_pairs(evidence)
+    ref = next((key for key, target in refs.items() if target == pair
+                and not re.search(r"[\r\n\[\]]", key)), None)
+    return f"{quote} [{ref}]" if ref else None
+
+
 def answer_quality_issue(run: dict[str, Any], content: str) -> str | None:
     """A finished source-backed answer must contain a finding and cite current evidence."""
     sources = None

@@ -9,10 +9,32 @@ from agent_harness.answer_quality import (
     answer_quality_issue,
     format_source_reference,
     render_quoted_findings,
+    reviewed_excerpt,
 )
 
 DOCUMENT = "Pay/ops:v2.5+current#L14"
 CHECKOUT = "api/ref123/checkout"
+
+
+def test_reviewed_excerpt_is_bound_to_scope_revision_and_an_accepted_source() -> None:
+    quote = "Requests are retried once after 20 seconds."
+    entry = {"index_id": "wiki", "id": "entry", "revision": "42", "text": quote,
+             "checked_with": "read_document"}
+    support = {"index_id": "wiki", "id": "entry", "revision": "42", "quote": quote,
+               "quote_is_answer": True}
+    run = {"mode": "autonomous", "question": "What is the retry delay?", "index_ids": ["wiki"],
+           "evidence": [entry], "_retrieval_support": support}
+    assert reviewed_excerpt(run) == f"{quote} [entry]"
+    assert reviewed_excerpt({**run, "index_ids": ["another"]}) is None
+    for unresolved in ({"_retrieval_gap": "Missing current value"}, {"_uncertain_calls": ["wait"]},
+                       {"_pending_source_checks": ["wiki"]}, {"_inflight_action": {"key": "x"}},
+                       {"research_plan": {"gaps": ["Check the source"]}},
+                       {"sandbox_profile_id": "java"}):
+        assert reviewed_excerpt({**run, **unresolved}) is None
+    for change in ({"revision": "43"}, {"text": "The configuration is now different."},
+                   {"retrieval_relevance": "irrelevant"}, {"checked_with": None},
+                   {"kind": "tool_metadata"}, {"tool_outcome": "failed"}):
+        assert reviewed_excerpt({**run, "evidence": [{**entry, **change}]}) is None
 
 
 def test_explicit_reference_or_exact_source_sentence_can_be_formatted() -> None:

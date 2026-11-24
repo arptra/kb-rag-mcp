@@ -33,6 +33,7 @@ from corporate_kb.gigacode_runner import (
     GigaCodePolicyStop,
     GigaCodeRunner,
     GigaCodeTimedOut,
+    GigaCodeTransientError,
     browser_authentication_url,
 )
 
@@ -408,18 +409,21 @@ class GigaCodeAgentController:
                 generation, "ready", "Ответ GigaCode не завершён. Можно повторить запрос."
             )
             raise GigaCodeDecisionError("GigaCode returned an incomplete response") from None
-        except GigaCodeTimedOut:
+        except (GigaCodeTimedOut, GigaCodeTransientError) as exc:
             with self._lock:
                 if self._current(generation):
                     if self._state == "authentication_required":
                         self._set_state(
-                            "error", "Истекло время авторизации GigaCode. "
+                            "error", "Авторизация GigaCode не завершена. "
                             "Нажмите «Включить агента» для повторного входа.",
                         )
+                        raise RuntimeError("GigaCode authentication did not complete") from None
                     else:
                         self._set_state(
-                            "ready", "GigaCode не успел ответить. Можно повторить запрос.",
+                            "ready", "GigaCode готов к повторному запросу.",
                         )
+            if isinstance(exc, GigaCodeTransientError):
+                raise
             raise GigaCodeTimedOut("GigaCode did not respond within the request timeout") from None
         except GigaCodeCancelled:
             with self._lock:

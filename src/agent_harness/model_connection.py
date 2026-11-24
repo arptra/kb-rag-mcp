@@ -33,7 +33,7 @@ from agent_harness.model_profiles import (
 )
 
 RETRYABLE_FINISH_REASONS = frozenset({
-    "length", "max_tokens", "insufficient_system_resource", "aborted",
+    "length", "max_tokens", "max_output_tokens", "insufficient_system_resource", "aborted",
 })
 INCOMPLETE_FINISH_REASONS = RETRYABLE_FINISH_REASONS
 
@@ -215,8 +215,7 @@ class ModelPolicyStop(ModelConnectionError):
         self.http_status: int | None = None
         self.stop_reason = "model_refusal_text" if signal == "text" else "model_policy_stop"
         message = (
-            "Модель прислала шаблонный ответ об ограничениях или мнении. "
-            "Шлюз не указал причину."
+            "В ответе прямо указано ограничение политики провайдера."
             if signal == "text" else f"API модели сообщил об ограничении ({signal})."
         )
         if re.fullmatch(r"(?:req[-_])?(?:[0-9a-fA-F]{16,64}|[0-9a-fA-F]{8}"
@@ -228,44 +227,81 @@ class ModelPolicyStop(ModelConnectionError):
 
 _POLICY_SIGNALS = {"blacklist", "refusal", "content_filter", "content_policy_violation",
                    "responsibleaipolicyviolation"}
-_REFUSAL_SENTENCE = re.compile(
+_OPINION_NOTICE = re.compile(
     r"(?:к сожалению[, ]+)?(?:"
     r"(?:я |у меня |как (?:ии|языковая модель)[, ]+(?:я )?)(?:нет |не (?:имею|обладаю) )"
     r"(?:(?:собственн|личн)\w* ){1,2}мнен\w*"
     r"|(?:мой ответ|этот ответ|ответ модели|результат генерации|мои ответы) "
     r"(?:не (?:явля\w*|отража\w*)|может не отражать) (?:официальн\w* )?"
     r"(?:точк\w* зрения|мнени\w*)"
-    r"|(?:я )?не могу (?:ответить|предоставить ответ) (?:на (?:этот|ваш) (?:вопрос|запрос) )?"
-    r"(?:из-за|в связи с|согласно|в рамках) (?:действующ\w* |корпоративн\w* )?"
-    r"(?:правил|политик|ограничени)"
     r"|(?:as an ai(?: language model)?,? )?i (?:do not|don't) have (?:a |any )?"
     r"(?:personal opinions?\b))[^.!?;\[\]\n]{0,110}[.!?…]*", re.I,
 )
+_POLICY_DENIAL = re.compile(
+    r"(?:к сожалению[, ]+)?(?:я )?не могу (?:ответить|предоставить ответ|выполнить запрос)"
+    r"(?: на (?:этот|ваш) (?:вопрос|запрос))? (?:из-за|в связи с|согласно|в рамках) "
+    r"(?:(?:действующ|корпоративн|установленн)\w* )?(?:правил|политик|ограничени)\w*"
+    r"|(?:unfortunately[, ]+)?i (?:cannot|can't|am unable to) (?:answer|respond to|fulfill)"
+    r"(?: (?:this|your) (?:request|question))? (?:due to|because of|under) "
+    r"(?:our |the |my )?(?:corporate |content |safety )?(?:policy|policies|rules|restrictions)",
+    re.I,
+)
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?…])\s+|\n+|,\s*(?:но|однако|but|however)\s+", re.I)
 
 
 def check_model_policy(
     message: dict[str, Any], reason: Any, request_id: str = "", *, field: str = "finish_reason",
 ) -> None:
-    if isinstance(reason, str) and reason.lower() in _POLICY_SIGNALS:
-        raise ModelPolicyStop(reason.lower(), request_id, field=field)
-    if message.get("refusal"):
+    if isinstance(reason, str) and reason.strip().casefold() in _POLICY_SIGNALS:
+        raise ModelPolicyStop(reason.strip().casefold(), request_id, field=field)
+    refusal = message.get("refusal")
+    if (refusal.strip() if isinstance(refusal, str) else refusal):
         raise ModelPolicyStop("refusal", request_id, field="message.refusal")
     content = message.get("content")
-    if isinstance(content, list) and any(
-        isinstance(part, dict) and part.get("type") == "refusal" for part in content
+    if isinstance(content, list):
+        if any(isinstance(part, dict) and part.get("type") == "refusal" for part in content):
+            raise ModelPolicyStop("refusal", request_id, field="message.content[].type")
+        content = "".join(part["text"] for part in content if isinstance(part, dict)
+                          and part.get("type") in {"text", "output_text"}
+                          and isinstance(part.get("text"), str))
+    # Only a direct refusal identifies an explicit policy boundary. Ordinary model
+    # opinions and a business document discussing the gateway belong to the writer.
+    if isinstance(content, str):
+        for sentence in _SENTENCE_BREAK.split(content.lstrip()[:1500], maxsplit=4):
+            if _POLICY_DENIAL.match(sentence):
+                raise ModelPolicyStop("text", request_id, field="message.content")
+            if not _OPINION_NOTICE.fullmatch(sentence):
+                break
+
+
+def check_model_reply(message: dict[str, Any], reason: Any, request_id: str = "") -> None:
+    check_model_policy(message, reason, request_id)
+    content = message.get("content")
+    if ((isinstance(reason, str) and reason in INCOMPLETE_FINISH_REASONS)
+            or message.get("tool_calls")
+            or not isinstance(content, str) or len(content) > 1200):
+        return
+    sentences = _SENTENCE_BREAK.split(content.strip(), maxsplit=4)
+    if len(sentences) <= 4 and all(_OPINION_NOTICE.fullmatch(s) for s in sentences):
+        raise ModelDecisionError("В черновике нет результата проверки.")
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and all(
+        isinstance(part, dict) and part.get("type") in {"text", "output_text"}
+        and isinstance(part.get("text"), str) for part in content
     ):
-        raise ModelPolicyStop("refusal", request_id, field="message.content[].type")
-    # A phrase quoted inside a technical answer is not a provider refusal.
-    if isinstance(content, str) and len(content) <= 1200 and not message.get("tool_calls"):
-        sentences = re.split(r"(?<=[.!?…])\s+|\n+|,\s*(?:но|однако|but|however)\s+",
-                             content.strip(), flags=re.I)
-        if len(sentences) <= 4 and all(_REFUSAL_SENTENCE.fullmatch(s) for s in sentences):
-            raise ModelPolicyStop("text", request_id, field="message.content")
+        return "".join(part["text"] for part in content)
+    raise ModelDecisionError("В сообщении модели нет читаемого текста.")
 
 
 def _check_policy_error(body: Any, request_id: str) -> None:
     error = body.get("error") if isinstance(body, dict) else None
-    if isinstance(error, dict):
+    if isinstance(error, str):
+        check_model_policy({}, error, request_id, field="error")
+    elif isinstance(error, dict):
         for path, data in (("error", error), ("error.innererror", error.get("innererror"))):
             if isinstance(data, dict):
                 for key in ("code", "type"):
@@ -278,6 +314,32 @@ def _check_context_error(body: Any) -> None:
         "context_length_exceeded", "max_context_length_exceeded", "input_too_long",
     ):
         raise ModelContextTooLarge("Размер запроса превысил контекстное окно шлюза.")
+
+
+def _check_envelope_policy(body: Any, request_id: str) -> None:
+    _check_policy_error(body, request_id)
+    choices = body.get("choices") if isinstance(body, dict) else None
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        choice = choices[0]
+        _check_policy_error(choice, request_id)
+        reply = choice.get("message")
+        check_model_policy(reply if isinstance(reply, dict) else {},
+                           choice.get("finish_reason"), request_id)
+
+
+def _check_completion_error(envelope: dict[str, Any]) -> None:
+    """An HTTP-200 response can carry an upstream error instead of a completion."""
+    _check_context_error(envelope)
+    error = envelope.get("error")
+    if not isinstance(error, dict) or not error:
+        return
+    code = error.get("code") or error.get("type")
+    if isinstance(code, str) and code.casefold() in {
+        "server_error", "internal_server_error", "service_unavailable", "rate_limit_exceeded",
+        "overloaded_error", "timeout",
+    }:
+        raise ModelTransientError("Шлюз сообщил о временном сбое обработки запроса.")
+    raise ModelConnectionError("Шлюз вернул ошибку обработки запроса.")
 
 
 class ModelRouter:
@@ -346,9 +408,13 @@ class ModelRouter:
         if settings.provider == "gigacode":
             if self.fallback is None:
                 raise ModelConnectionError("GigaCode не подключён.")
-            return await self.fallback.decide(
+            result = await self.fallback.decide(
                 messages=messages, tools=tools, cancel=cancel, max_input_chars=max_input_chars
             )
+            if not isinstance(result, dict):
+                raise ModelDecisionError("GigaCode вернул некорректный формат решения.")
+            check_model_reply(result, result.get("finish_reason"))
+            return result
         if (
             len(json.dumps(messages, ensure_ascii=False))
             + len(json.dumps(tools, ensure_ascii=False))
@@ -451,13 +517,7 @@ class ModelRouter:
                     # Non-JSON errors still receive the normal HTTP diagnostic.
                     with suppress(ValueError):
                         error_data = json.loads(error_body)
-                        _check_policy_error(error_data, request_id)
-                        choices = (error_data.get("choices")
-                                   if isinstance(error_data, dict) else None)
-                        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-                            reply = choices[0].get("message")
-                            check_model_policy(reply if isinstance(reply, dict) else {},
-                                               choices[0].get("finish_reason"), request_id)
+                        _check_envelope_policy(error_data, request_id)
                         if response.status_code in {400, 413, 422}:
                             _check_context_error(error_data)
                 if response.status_code == 413:
@@ -494,13 +554,16 @@ class ModelRouter:
                     if len(data) > 8_000_000:
                         raise ModelConnectionError("Ответ API превышает допустимый размер.")
             decoded = _completion_envelope(data)
-            _check_policy_error(decoded, request_id)
+            _check_envelope_policy(decoded, request_id)
+            _check_completion_error(decoded)
             if "choices" in decoded and decoded["choices"] in ([], None):
                 raise ModelTransientError("Шлюз вернул пустую выдачу модели.")
             choice = decoded["choices"][0]
+            _check_completion_error(choice)
             reason = choice.get("finish_reason")
+            if isinstance(reason, str):
+                reason = reason.strip().casefold()
             message = choice.get("message") or {}
-            check_model_policy(message, reason, request_id)
             if not message and reason in {None, "stop", "tool_calls"}:
                 raise ModelTransientError("Шлюз не передал сообщение модели.")
             if reason not in {None, "", "stop", "tool_calls", "function_call", "end_turn",
@@ -509,9 +572,8 @@ class ModelRouter:
                     "API прислал неизвестную причину остановки. Проверьте ответ шлюза "
                     "и совместимость с Chat Completions."
                 )
-            content = message.get("content") or ""
-            if not isinstance(content, str):
-                raise ValueError("Invalid content")
+            content = _message_text(message.get("content") or "")
+            check_model_reply({**message, "content": content}, reason, request_id)
             calls = message.get("tool_calls")
             if calls is None:
                 calls = []
@@ -617,7 +679,7 @@ class ModelRouter:
             if settings.provider == "gigacode" and self.fallback is not None:
                 result = await self.fallback.decide(messages=messages, tools=tools,
                                                     max_input_chars=16_000, cancel=cancel)
-                check_model_policy(result, result.get("finish_reason"))
+                check_model_reply(result, result.get("finish_reason"))
                 return result
             return await self._completion(settings, messages, tools, probe=True)
 

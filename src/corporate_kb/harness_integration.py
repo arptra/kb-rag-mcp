@@ -24,7 +24,11 @@ from corporate_kb.access.http import AccessControl
 from corporate_kb.agents.activation import GigaCodeAgentController
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
-from corporate_kb.gigacode_runner import GigaCodePolicyStop, GigaCodeTimedOut
+from corporate_kb.gigacode_runner import (
+    GigaCodePolicyStop,
+    GigaCodeTimedOut,
+    GigaCodeTransientError,
+)
 from corporate_kb.harness_graph import GRAPH_INDEX, read_graph, search_graph
 from corporate_kb.models import SearchFilters
 
@@ -179,6 +183,8 @@ class GigaCodeDecisionModel:
             raise ModelPolicyStop("refusal", field="GigaCode") from None
         except GigaCodeTimedOut:
             raise ModelTransientError("GigaCode не успел ответить на этот шаг.") from None
+        except GigaCodeTransientError:
+            raise ModelTransientError("Провайдер GigaCode временно недоступен.") from None
 
 
 def build_model(

@@ -1,6 +1,6 @@
 """Corporate API policy signals, neutral diagnostics and durable run outcomes."""
 
-# ruff: noqa: RUF001  # Russian provider responses.
+# Russian provider responses.
 
 import json
 import re
@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
+from test_harness_api_recovery import client_for, finish
 from test_harness_goal_research import OWNER, Source, finished
 
 from agent_harness.config import HarnessSettings
@@ -19,6 +20,64 @@ from agent_harness.runtime import HarnessRuntime
 REFUSAL = "PRIVATE_PROVIDER_RESPONSE"
 REQUEST_ID = "6dbedfc8-6d39-4c3a-acab-ad4e7bb58131"
 CALL = {"function": {"name": "read_document", "arguments": "{unfinished PRIVATE"}}
+
+
+@pytest.mark.parametrize("outcome", [
+    "assessment_restricted", "quote_is_answer", "writer_offline", "writer_restricted",
+])
+async def test_public_chat_preserves_reviewed_result_and_distinguishes_real_policy(
+    tmp_path: Path, outcome: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_harness.contracts import Evidence
+
+    quote = "Новые клиентские заявки поступают через единый приёмный сервис."
+    calls = []
+
+    def gateway(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assessment = any(t["function"]["name"] == "assess_passages"
+                         for t in payload.get("tools", []))
+        calls.append("review" if assessment else "write")
+        if ((assessment and outcome == "assessment_restricted")
+                or (not assessment and outcome == "writer_restricted")):
+            return httpx.Response(200, headers={"x-request-id": REQUEST_ID}, json={
+                "choices": [{"finish_reason": "blacklist", "message": {"content": REFUSAL}}],
+            })
+        if assessment:
+            ctx = json.loads(payload["messages"][-1]["content"])
+            passage = next(p["number"] for p in ctx["passages"] if p["text"] == quote)
+            review = {"passage": passage, "quote": quote,
+                      "quote_is_answer": outcome == "quote_is_answer"}
+            return httpx.Response(200, json={"choices": [
+                {"finish_reason": "stop", "message": {"content": json.dumps(review)}},
+            ]})
+        return httpx.Response(503)
+
+    async def source_read(**kwargs: Any) -> Evidence:
+        return Evidence(id="entry", title="Приём обращений", index_id="a", text=quote)
+
+    async with client_for(tmp_path, gateway) as (client, source):
+        monkeypatch.setattr(source, "supports_passage_retrieval", True, raising=False)
+        monkeypatch.setattr(source, "read", source_read)
+        created = await client.post("/api/runs", json={"question": "Как поступают новые заявки?"})
+        result = await finish(client, "/api/runs/" + created.json()["id"])
+    assert calls[0] == "review" and REFUSAL not in json.dumps(result)
+    if outcome.endswith("restricted"):
+        assert calls == (["review"] if outcome.startswith("assessment") else ["review", "write"])
+        assert result["answer_kind"] == "restricted" and not result["resumable"]
+        assert "blacklist" not in result["answer"] and quote not in result["answer"]
+        stage = ("Проверка найденных фрагментов" if outcome.startswith("assessment")
+                 else "Подготовка ответа")
+        assert result["provider_diagnostic"]["stage"] == stage
+        assert result["provider_diagnostic"]["request_id"] == REQUEST_ID
+    else:
+        assert result["answer"] == quote + " [entry]"
+        assert result["answer_kind"] == "verified_excerpt"
+        if outcome == "quote_is_answer":
+            assert result["status"] == "completed" and calls == ["review"]
+        else:
+            assert result["status"] == "partial" and result["stop_reason"] == "model_transport"
+            assert calls.count("write") >= 2 and calls.count("review") == 1
 
 
 @pytest.mark.parametrize("status", [400, 413])
@@ -79,7 +138,8 @@ async def test_overlength_rebuilds_only_the_model_request(tmp_path: Path, status
         "code": "ResponsibleAIPolicyViolation", "message": REFUSAL}}},
      "responsibleaipolicyviolation"),
     (200, {"error": {"code": "content_filter", "message": REFUSAL}}, "content_filter"),
-    (200, {"choices": [{"message": {"content": "У меня нет личного мнения."}}]}, "text"),
+    (200, {"choices": [{"message": {
+        "content": "Я не могу ответить на ваш вопрос из-за корпоративных правил."}}]}, "text"),
 ])
 async def test_policy_stops_graph_once_and_keeps_private_refusal_out_of_state(
     tmp_path: Path, code: int, body: dict[str, Any], signal: str,
@@ -112,8 +172,12 @@ async def test_policy_stops_graph_once_and_keeps_private_refusal_out_of_state(
         assert result["metrics"]["tool_calls"] == 0
         assert result["metrics"]["model_calls"] == calls == 1
         assert result["research_trace"][-1]["name"] == expected
-        assert REQUEST_ID in result["answer"] and "Выбор следующего действия" in result["answer"]
+        assert result["answer_kind"] == "restricted" and REQUEST_ID not in result["answer"]
+        expected_notice = ("правила провайдера" if signal == "text"
+                           else "Корпоративный шлюз ограничил ответ")
+        assert expected_notice in result["answer"]
         diagnostic = result["provider_diagnostic"]
+        assert diagnostic["stage"] == "Выбор следующего действия"
         assert diagnostic["http_status"] == code and diagnostic["signal"] == signal
         assert diagnostic["field"] and diagnostic["request_id"] == REQUEST_ID
         assert diagnostic["tools_offered"] > 0 and diagnostic["estimated_input_tokens"] > 0

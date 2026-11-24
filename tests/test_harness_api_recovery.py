@@ -1,6 +1,7 @@
 """Exercise provider failures through the public run and cancellation endpoints."""
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -117,6 +118,122 @@ async def test_retry_after_is_observable_and_cancellable(tmp_path: Path, cancel:
         assert len(times) == (1 if cancel else 2)
         if not cancel:
             assert times[1] - times[0] >= .98
+
+
+async def test_transport_recovery_leaves_formatting_repair_for_an_interrupted_answer(
+    tmp_path: Path,
+) -> None:
+    responses = [
+        httpx.Response(502),
+        httpx.Response(200, json={"choices": [{"finish_reason": "length", "message": {
+            "content": "The value starts with",
+        }}]}),
+        httpx.Response(502),
+        httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {
+            "content": "Requests arrive through payment-service [entry].",
+        }}]}),
+    ]
+
+    def gateway(_request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    async with client_for(tmp_path, gateway) as (client, source):
+        submitted = await client.post("/api/runs", json={"question": "How do requests arrive?"})
+        result = await finish(client, "/api/runs/" + submitted.json()["id"])
+        assert result["status"] == "completed" and not responses, result["warnings"]
+        assert result["answer"] == "Requests arrive through payment-service [entry]."
+        assert result["metrics"]["model_calls"] == 4
+        assert result["metrics"]["transport_retries"] == 2
+        assert result["metrics"]["answer_retries"] == 1
+        assert len(source.queries) == 1
+
+
+async def test_retry_stops_on_explicit_provider_restriction(tmp_path: Path) -> None:
+    responses = [
+        httpx.Response(502),
+        httpx.Response(200, json={"choices": [{"finish_reason": "content_filter",
+                                               "message": {}}]}),
+    ]
+
+    def gateway(_request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    async with client_for(tmp_path, gateway) as (client, _):
+        submitted = await client.post("/api/runs", json={"question": "How do requests arrive?"})
+        result = await finish(client, "/api/runs/" + submitted.json()["id"])
+        assert result["stop_reason"] == "model_policy_stop" and not responses
+        assert result["metrics"]["model_calls"] == 2
+        assert result["metrics"]["transport_retries"] == 1
+
+
+@pytest.mark.parametrize(("allowed_calls", "allowed_attempts", "expected"),
+                         [(1, 3, 1), (8, 2, 2)])
+async def test_transport_retries_respect_the_run_and_decision_limits(
+    tmp_path: Path, allowed_calls: int, allowed_attempts: int, expected: int,
+) -> None:
+    from agent_harness.control.settings import ControlStore
+
+    control = ControlStore(HarnessSettings(_env_file=None, enabled=True, state_dir=tmp_path))
+    policy = control.load()
+    policy.runtime.max_decision_errors = allowed_attempts
+    policy.runtime.max_answer_retries = 0
+    policy.profiles["quick"]["medium"].model_calls = allowed_calls
+    control.save(policy, expected_revision=policy.revision)
+    calls = 0
+
+    def gateway(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(502)
+
+    async with client_for(tmp_path, gateway) as (client, source):
+        response = await client.post("/api/runs", json={
+            "question": "How do requests arrive?", "mode": "quick", "effort": "medium",
+        })
+        run = await finish(client, "/api/runs/" + response.json()["id"])
+        assert run["status"] == "partial" and run["stop_reason"] == "model_transport"
+        assert calls == run["metrics"]["model_calls"] == expected
+        assert len(source.queries) == 1
+
+
+async def test_independent_gateway_outages_do_not_replay_an_agent_tool(tmp_path: Path) -> None:
+    calls = 0
+
+    def gateway(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls in {1, 3, 4}:
+            return httpx.Response(502)
+        payload = json.loads(request.content)
+        if calls in {2, 5}:
+            assert payload.get("tools")
+            if calls == 2:
+                action = {"name": "search_knowledge", "arguments":
+                          '{"index_id":"a","query":"ledger"}'}
+            else:
+                decision_context = json.loads(payload["messages"][-1]["content"])
+                receipt, = decision_context["last_tool_observations"]
+                assert receipt["tool"] == "search_knowledge"
+                index, doc = receipt["sources"][0]
+                action = {"name": "read_document", "arguments": json.dumps(
+                    {"index_id": index, "document_id": doc})}
+            message = {"tool_calls": [{"type": "function", "function": action}]}
+        else:
+            assert calls == 6
+            message = {"content": "Requests arrive through payment-service [entry]."}
+        return httpx.Response(200, json={"choices": [{"message": message}]})
+
+    async with client_for(tmp_path, gateway) as (client, source):
+        response = await client.post("/api/runs", json={
+            "question": "How do requests arrive?", "mode": "autonomous",
+            "effort": "high", "index_ids": ["a"],
+        })
+        run = await finish(client, "/api/runs/" + response.json()["id"])
+        assert run["status"] == "completed" and "[entry]" in run["answer"], run["warnings"]
+        assert calls == run["metrics"]["model_calls"] == 6
+        assert run["metrics"]["transport_retries"] == 3
+        assert run["metrics"]["tool_calls"] == 2
+        assert source.queries == ["How do requests arrive?", "ledger"]
 
 
 async def test_temporarily_busy_planner_keeps_its_tool_catalog(tmp_path: Path) -> None:

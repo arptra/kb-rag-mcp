@@ -839,7 +839,56 @@ test("one poll shows why research continued, the active target, and earlier step
   ui.state.current = { ...active, current_action: null, status: "partial", stop_reason: "model_policy_stop" };
   ui.renderRun();
   assert.equal(nodes.get("run-recovery-note").hidden, true);
-  assert.equal(nodes.get("run-status").textContent, "Провайдер остановил генерацию");
+  assert.equal(nodes.get("run-status").textContent, "Запрос ограничен");
+});
+
+test("a restricted turn keeps the policy decision and request ID in the disclosure when revisiting a chat", (t) => {
+  const { ui, nodes } = fixture(t);
+  const requestId = "req-68e1421d8fad9c934198576fe693634e";
+  const technical = "API модели сообщил об ограничении (blacklist). ID запроса шлюза: " + requestId + ".";
+  const archived = run("archived", { status: "failed", stop_reason: "model_policy_stop",
+    answer: technical + " Модель не завершила этот шаг.", warnings: [technical, technical],
+    provider_diagnostic: { signal: "blacklist", request_id: requestId, http_status: 403 } });
+  const current = run("current", { status: "partial", answer_kind: "restricted", stop_reason: "model_policy_stop",
+    answer: "Правила корпоративного шлюза ограничивают обработку этого запроса." });
+  ui.conversationState.id = "chat"; ui.conversationState.runs = [archived, current];
+  ui.state.current = current; ui.renderRun();
+  const previous = nodes.get("conversation-messages").firstElementChild;
+  assert.match(previous.textContent, /ограничена правилами/);
+  assert.doesNotMatch(previous.textContent, /blacklist|req-|Модель не завершила/);
+  assert.equal(nodes.get("answer").textContent, current.answer);
+  ui.state.current = archived; ui.renderRun();
+  assert.doesNotMatch(nodes.get("answer").textContent, /blacklist|req-|Модель не завершила/);
+  assert.equal(nodes.get("run-progress").hidden, true);
+  assert.equal(nodes.get("run-details").open, false);
+  assert.equal(nodes.get("run-warnings").children.length, 1);
+  assert.equal(nodes.get("research-activity").hidden, false, "A stored diagnostic can exist without a step trace");
+  assert.match(nodes.get("research-plan").textContent, /blacklist/);
+  assert(nodes.get("research-plan").textContent.includes(requestId));
+  assert.doesNotMatch(nodes.get("research-plan").textContent, /undefined/);
+  const html = fs.readFileSync(path.join(staticPath, "index.html"), "utf8");
+  assert(html.indexOf('id="run-details"') < html.indexOf('id="run-warnings"'));
+  assert(html.indexOf('id="run-warnings"') < html.indexOf('class="run-footer"'));
+});
+
+test("verified excerpts keep their source links after a writer error and archived placeholders never replace real findings", (t) => {
+  const { ui, nodes } = fixture(t);
+  const old = run("old", { status: "partial", answer_kind: "incomplete", stop_reason: "model_unavailable",
+    answer: "Модель недоступна. Проверьте подключение в настройках модели. Подтверждённых данных по вопросу пока нет." });
+  const excerpt = run("excerpt", { status: "partial", stop_reason: "answer_quality", answer_kind: "verified_excerpt",
+    evidence: [{ index_id: "a", id: "ops", title: "Протокол", text: "Установлена версия 4.2." }],
+    answer: "Установлена версия 4.2. [ops]" });
+  const business = run("business", { status: "partial", stop_reason: "answer_quality", answer_kind: "incomplete",
+    answer: "Параметр blacklist фильтрует домены." });
+  ui.conversationState.id = "chat"; ui.conversationState.runs = [old, business, excerpt];
+  ui.state.current = excerpt; ui.renderRun();
+  const [earlier, unrelated] = nodes.get("conversation-messages").children;
+  assert.match(earlier.textContent, /пока нет подтверждённых данных/);
+  assert.doesNotMatch(earlier.textContent, /Модель недоступна/);
+  assert(unrelated.textContent.includes(business.answer));
+  assert.equal(nodes.get("run-status").textContent, "Частичный ответ по источнику");
+  assert.equal(nodes.get("answer").textContent, "Установлена версия 4.2. [1]");
+  assert.equal(nodes.get("answer").firstElementChild.children.at(-1).tagName, "button");
 });
 
 test("DeepSeek profile recommendations only change custom values after the apply action", (t) => {

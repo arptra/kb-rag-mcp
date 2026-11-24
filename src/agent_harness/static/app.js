@@ -29,10 +29,23 @@
     synthesizing: "Сопоставляем материалы и готовим ответ.", finished: "",
   };
   const ANSWER_STOP_LABELS = {
-    model_policy_stop: "Провайдер остановил генерацию",
-    model_refusal_text: "Модель не ответила на вопрос",
-    answer_quality: "Ответ не прошёл проверку",
+    model_policy_stop: "Запрос ограничен",
+    model_refusal_text: "Вывод не подтверждён",
+    answer_quality: "Вывод не подтверждён",
   };
+  // Older runs persisted backend diagnostics as the whole assistant message. Keep
+  // actual partial answers intact, including answers about API or blacklist rules.
+  const ARCHIVED_INCOMPLETE = /^(?:Модель недоступна\. Проверьте подключение в настройках модели\.|Модель не смогла подтвердить вывод по собранным материалам\.|Подготовка ответа прервана\.)(?: Подтверждённых данных по вопросу пока нет\.| Найденные материалы доступны в разделе «Источники» \(\d+\)\.)?$/u;
+  function chatAnswer(run) {
+    const answer = typeof run.answer === "string" ? run.answer : "";
+    if (ACTIVE.has(run.status) || ["restricted", "verified_excerpt", "clarification"].includes(run.answer_kind)) return answer;
+    if (run.stop_reason === "model_policy_stop") return "Обработка этого запроса ограничена правилами корпоративного шлюза.";
+    if (run.stop_reason === "model_refusal_text" || (run.answer_kind === "incomplete" && ARCHIVED_INCOMPLETE.test(answer))) {
+      return run.evidence?.length ? "Найденные материалы доступны в «Источниках». Сведений для вывода пока недостаточно." :
+        "По этому вопросу пока нет подтверждённых данных.";
+    }
+    return answer;
+  }
   const $ = (id) => document.getElementById(id);
   const layoutState = { historyCollapsed: false, contextCollapsed: false };
   function setPanelCollapsed(panel, collapsed, { persist = true } = {}) {
@@ -2091,7 +2104,7 @@
       if (idOf(run) === idOf(state.current)) assistant.append(panel);
       else {
         if (ACTIVE.has(run.status)) assistant.append(element("p", "chat-turn-status", actionDescription(run.current_action) || PHASE_LABELS[run.phase] || STATUS_LABELS[run.status]));
-        const answer = element("div", "answer chat-answer"); renderAnswer(typeof run.answer === "string" ? run.answer : "", answer, run); assistant.append(answer);
+        const answer = element("div", "answer chat-answer"); renderAnswer(chatAnswer(run), answer, run); assistant.append(answer);
         const inspect = element("button", "text-button chat-inspect", "Показать ход работы и материалы"); inspect.type = "button";
         inspect.addEventListener("click", () => selectRun(run)); assistant.append(inspect);
       }
@@ -2370,6 +2383,8 @@
   function runStatusLabel(run) {
     if (run.status === "queued" && run.phase === "waiting_for_gateway") return "Ожидаем шлюз модели";
     if (run.answer_kind === "clarification") return "Ждём уточнения";
+    if (run.answer_kind === "verified_excerpt") return run.status === "completed" ? "Подтверждено источником" : "Частичный ответ по источнику";
+    if (run.answer_kind === "restricted") return "Запрос ограничен";
     if (["partial", "failed"].includes(run.status) && Object.hasOwn(ANSWER_STOP_LABELS, run.stop_reason)) return ANSWER_STOP_LABELS[run.stop_reason];
     if (run.answer_kind === "incomplete") return "Ответ не завершён";
     if (run.status === "partial" && !run.evidence?.length) return "Недостаточно данных";
@@ -2381,7 +2396,8 @@
     const strings = (items) => Array.isArray(items) ? items.filter((item) => typeof item === "string").slice(0, 16) : [];
     const questions = strings(plan.questions), completed = strings(plan.completed), gaps = strings(plan.gaps);
     const currentAction = ACTIVE.has(run.status) && typeof run.current_action?.name === "string" ? run.current_action.name : "";
-    $("research-activity").hidden = !trace.length && !plan.goal && !questions.length && !gaps.length && !currentAction;
+    const diagnostic = run.provider_diagnostic;
+    $("research-activity").hidden = !trace.length && !plan.goal && !questions.length && !gaps.length && !currentAction && !diagnostic?.signal;
     $("research-goal").textContent = typeof plan.goal === "string" ? "Цель: " + plan.goal : "";
     $("research-goal").hidden = !plan.goal;
     const next = ACTIVE.has(run.status) && typeof plan.next_action === "string" ? plan.next_action :
@@ -2396,13 +2412,12 @@
       if (branch.reason) section.append(element("p", "muted", branch.reason));
       blocks.push(section);
     }
-    const diagnostic = run.provider_diagnostic;
     if (diagnostic?.signal) {
       const section = element("section", "research-plan-group");
       const fields = [diagnostic.stage, diagnostic.http_status ? "HTTP " + diagnostic.http_status : "",
         [diagnostic.field, diagnostic.signal].filter(Boolean).join(" = "),
-        "Инструментов в запросе — " + diagnostic.tools_offered,
-        "Вход — около " + diagnostic.estimated_input_tokens + " токенов",
+        Number.isFinite(diagnostic.tools_offered) ? "Инструментов в запросе — " + diagnostic.tools_offered : "",
+        Number.isFinite(diagnostic.estimated_input_tokens) ? "Вход — около " + diagnostic.estimated_input_tokens + " токенов" : "",
         diagnostic.request_id ? "ID шлюза " + diagnostic.request_id : ""];
       section.append(element("h4", "", "Диагностика ответа модели"), element("p", "", fields.filter(Boolean).join(" · ")));
       blocks.push(section);
@@ -2466,7 +2481,8 @@
     const evidenceCount = Array.isArray(run.evidence) ? run.evidence.length : 0;
     const status = runStatusLabel(run), currentAction = active ? actionDescription(run.current_action) : "";
     $("run-status").textContent = currentAction || status;
-    $("run-progress").hidden = !active && run.status === "completed";
+    // In a conversation the message header already shows the terminal outcome.
+    $("run-progress").hidden = !active && (Boolean(conversationState.id) || run.status === "completed");
     const actionStart = Date.parse(run.current_action?.started_at || "");
     const elapsed = Number.isFinite(actionStart) ? Math.max(0, Math.floor((Date.now() - actionStart) / 1000)) : 0;
     const retryTime = run.status === "queued" && run.phase === "waiting_for_gateway" && Number.isFinite(run.current_action?.retry_at)
@@ -2494,10 +2510,7 @@
     $("run-details-label").textContent = run.mode === "search" ? "Ход поиска" : active ? "План и ход исследования" : "Как получен ответ";
     $("run-details-summary").textContent = "Подтверждений: " + evidenceCount + (run.metrics?.tool_calls ? " · Действий: " + run.metrics.tool_calls : "");
     const phase = run.status === "cancelling" ? "Ожидаем завершения текущего действия." :
-      active ? (PHASE_LABELS[run.phase] || "Ожидаем обновления от сервера.") :
-      run.answer_kind === "clarification" ? "Напишите уточнение в этом чате, чтобы продолжить." :
-      run.status === "partial" ? "Ответ может быть неполным. Проверьте найденные материалы и замечания." :
-      ["failed", "interrupted", "timed_out"].includes(run.status) ? "Найденные до остановки материалы сохранены." : "";
+      active ? (PHASE_LABELS[run.phase] || "Ожидаем обновления от сервера.") : "";
     $("run-phase").textContent = phase;
     $("run-phase").hidden = !phase;
     $("run-status-dot").className = "run-status-dot " + (active ? "active" : run.status === "completed" ? "completed" : ["failed", "timed_out"].includes(run.status) ? "failed" : "");
@@ -2537,10 +2550,10 @@
     if (memoryMessage) $("run-memory-used").append(element("p", "memory-contribution", memoryMessage));
     $("run-memory-used").hidden = !memories.length && !memoryMessage;
     renderRunEnvironment(run);
-    const warnings = Array.isArray(run.warnings) ? run.warnings.filter((item) => typeof item === "string") : [];
+    const warnings = Array.isArray(run.warnings) ? [...new Set(run.warnings.filter((item) => typeof item === "string" && item.trim()))] : [];
     $("run-warnings").replaceChildren(...warnings.map((text) => element("p", "", text)));
     $("run-warnings").hidden = !warnings.length;
-    const answer = typeof run.answer === "string" ? run.answer : "";
+    const answer = chatAnswer(run);
     renderAnswer(answer);
     $("answer-placeholder").hidden = Boolean(answer) || !active;
     renderEvidence(run.evidence);

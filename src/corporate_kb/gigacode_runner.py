@@ -107,6 +107,13 @@ class GigaCodeTimedOut(RuntimeError):
     """Raised when GigaCode does not stop within the configured deadline."""
 
 
+class GigaCodeTransientError(RuntimeError):
+    """The native provider reported a temporary failure on this decision."""
+
+    def __init__(self) -> None:
+        super().__init__("The GigaCode provider is temporarily unavailable")
+
+
 class GigaCodeInvalidOutput(RuntimeError):
     """The CLI ran but returned an incomplete or unusable model response."""
 
@@ -516,6 +523,8 @@ class GigaCodeRunner:
         authentication_deadline: float | None = None
         open_streams = {"stdout", "stderr", "stdin"}
         result_event: dict[str, Any] | None = None
+        incomplete_decision = False
+        temporary_error = False
         result_deadline: float | None = None
         cleanup_deadline: float | None = None
         process_cleaned = False
@@ -586,6 +595,16 @@ class GigaCodeRunner:
                         progress(f"GigaCode waits for browser authentication: {auth_url}")
                     if authentication_url is not None:
                         authentication_url(auth_url)
+                event = self._parse_event(line)
+                if event is not None and (source == "stdout" or event.get("type") == "error"):
+                    for metadata in self._native_stop_metadata(event):
+                        if self._policy_stopped(metadata):
+                            raise GigaCodePolicyStop()
+                        if metadata.get("error"):
+                            temporary_error = self._temporary_provider_error(metadata["error"])
+                        if decision_only or model_profile is not None:
+                            # A successful CLI wrapper can omit the model's actual stop reason.
+                            incomplete_decision |= self._incomplete_result(metadata)
                 if source == "stderr":
                     if debug_stderr is not None:
                         debug_stderr.write(f"{line}\n")
@@ -594,9 +613,6 @@ class GigaCodeRunner:
                     if progress is not None:
                         progress(f"GigaCode stderr | {line[:2000]}")
                     continue
-                event = self._parse_event(line)
-                if event is not None and self._policy_stopped(event):
-                    raise GigaCodePolicyStop()
                 stdout_tail = self._tail(stdout_tail, line)
                 if debug_stdout is not None:
                     debug_stdout.write(f"{line}\n")
@@ -660,14 +676,23 @@ class GigaCodeRunner:
             if debug_stderr is not None:
                 debug_stderr.close()
         return_code = process.wait(timeout=2)
-        if result_event is not None and self._incomplete_result(result_event):
+        shutdown_codes = {-2, -9, -15, 130, 137, 143}
+        expected_shutdown = stopped_after_result and return_code in shutdown_codes
+        failed_exit = return_code != 0 and not expected_shutdown
+        # A native runner can recover internally. Honor its later successful result.
+        # An explicit policy stop always takes priority in the event loop above.
+        if temporary_error and (failed_exit or result_event is None or result_event.get("is_error")
+                                or result_event.get("error")):
+            raise GigaCodeTransientError()
+        if incomplete_decision or (
+            result_event is not None and self._incomplete_result(result_event)
+        ):
             error: RuntimeError = GigaCodeInvalidOutput(
                 "GigaCode stopped before completing the response"
             )
             self._write_debug_failure(debug_directory, error)
             raise error
-        shutdown_codes = {-2, -9, -15, 130, 137, 143}
-        if return_code != 0 and not (stopped_after_result and return_code in shutdown_codes):
+        if failed_exit:
             detail_lines = [*stderr_tail[-20:], *stdout_tail[-10:]]
             detail = "\n".join(detail_lines)
             error = RuntimeError(
@@ -1108,39 +1133,67 @@ class GigaCodeRunner:
             cls._publish(events, (source, None), stop)
 
     @staticmethod
-    def _policy_stopped(event: dict[str, Any]) -> bool:
+    def _native_stop_metadata(event: dict[str, Any]) -> tuple[dict[str, Any], ...]:
         # Inspect native metadata only. The result payload, tool arguments and
         # generated text may legitimately document these fields or quote a refusal.
         kind = event.get("type")
         metadata: object
         if kind in ("result", "error"):
-            metadata = event
-        elif kind == "assistant":
+            return (event,)
+        if kind == "assistant":
             metadata = event.get("message")
+            return (event, metadata) if isinstance(metadata, dict) else (event,)
         elif kind == "stream_event":
             stream_event = event.get("event")
             if not isinstance(stream_event, dict):
-                return False
+                return ()
             if stream_event.get("type") == "content_block_start":
-                block = stream_event.get("content_block")
-                return isinstance(block, dict) and block.get("type") == "refusal"
-            if stream_event.get("type") != "message_delta":
-                return False
-            metadata = stream_event.get("delta")
+                return ({"content": [stream_event.get("content_block")]},)
+            if stream_event.get("type") == "message_start":
+                metadata = stream_event.get("message")
+            elif stream_event.get("type") == "error":
+                metadata = stream_event
+            elif stream_event.get("type") == "message_delta":
+                metadata = stream_event.get("delta")
+            else:
+                return ()
         else:
-            return False
-        if not isinstance(metadata, dict):
-            return False
+            return ()
+        return (metadata,) if isinstance(metadata, dict) else ()
+
+    @staticmethod
+    def _temporary_provider_error(error: Any) -> bool:
+        if isinstance(error, dict):
+            code = error.get("code") or error.get("type")
+            if code in ("insufficient_quota", "authentication_error", "permission_denied"):
+                return False
+            status = error.get("status_code") or error.get("status") or code
+            if str(status) in {"408", "425", "429", "500", "502", "503", "504", "529"}:
+                return True
+            error = code
+        return isinstance(error, str) and error.casefold() in {
+            "rate_limit", "rate_limit_error", "rate_limit_exceeded", "server_error", "api_error",
+            "internal_server_error", "overloaded_error", "service_unavailable", "timeout",
+        }
+
+    @staticmethod
+    def _policy_stopped(metadata: dict[str, Any]) -> bool:
         error = metadata.get("error")
         reasons = [metadata.get("stop_reason"), metadata.get("finish_reason")]
+        if isinstance(error, str):
+            reasons.append(error)
         if isinstance(error, dict):
             reasons.extend((error.get("code"), error.get("type")))
-        if any(isinstance(reason, str) and reason.casefold() in {
+            inner = error.get("innererror")
+            if isinstance(inner, dict):
+                reasons.extend((inner.get("code"), inner.get("type")))
+        if any(isinstance(reason, str) and reason.strip().casefold() in {
             "refusal", "content_filter", "blacklist", "content_policy_violation",
             "responsibleaipolicyviolation",
         } for reason in reasons):
             return True
-        if metadata.get("refusal"):
+        refusal = metadata.get("refusal")
+        if (refusal.strip() if isinstance(refusal, str) else refusal):
             return True
         content = metadata.get("content")
         return isinstance(content, list) and any(
@@ -1250,9 +1303,11 @@ class GigaCodeRunner:
                 return validated
         return None
 
-    @staticmethod
-    def _signals_analysis_activity(event: dict[str, Any]) -> bool:
+    @classmethod
+    def _signals_analysis_activity(cls, event: dict[str, Any]) -> bool:
         kind = event.get("type")
+        if any(metadata.get("error") for metadata in cls._native_stop_metadata(event)):
+            return False
         if kind == "result":
             return not bool(event.get("is_error"))
         if kind in {"assistant", "user"}:

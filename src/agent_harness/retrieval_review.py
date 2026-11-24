@@ -28,6 +28,7 @@ class PassageReview(BaseModel):
     # A positive decision must point to a passage actually shown to this call.
     passage: int = Field(default=0, ge=0)
     quote: str = Field(default="", max_length=800)
+    quote_is_answer: bool = False
     query: str = Field(default="", max_length=500)
     gap: str = Field(default="", max_length=300)
     indexes: list[str] = Field(default_factory=list, max_length=5)
@@ -46,7 +47,10 @@ REVIEW_PROMPT = (
     "не устанавливает время события. Просьба выполнить действие, проверить конкретный источник "
     "или несколько систем требует соответствующих проверок. Если есть полное подтверждение, "
     "укажи номер passage "
-    "и дословную цитату quote. При пробеле поставь passage=0, укажи в gap, каких сведений "
+    "и дословную цитату quote. Если цитата сама по себе уже является полным ответом на "
+    "языке пользователя и в запрошенном виде, поставь quote_is_answer=true. Если необходимы "
+    "сравнение, объяснение или вывод из нескольких материалов, оставь false. "
+    "При пробеле поставь passage=0, укажи в gap, каких сведений "
     "не хватает, и сформулируй другой короткий "
     "поисковый query словами, которые могут встретиться ВНУТРИ документа. Используй "
     "синоним, операционный термин или обозначение из материалов. Выбери подходящие indexes "
