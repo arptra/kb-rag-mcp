@@ -15,6 +15,7 @@ import corporate_kb.gigacode_runner as module
 from corporate_kb.gigacode_runner import (
     GigaCodeCancelled,
     GigaCodeInvalidOutput,
+    GigaCodePolicyStop,
     GigaCodeRunner,
     GigaCodeTimedOut,
 )
@@ -177,6 +178,31 @@ def test_missing_unusable_and_truncated_results_have_a_recoverable_type(
 ):
     with pytest.raises(GigaCodeInvalidOutput):
         execute(settings_factory, tmp_path, body)
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "result", "finish_reason": "blacklist", "result": {"tool_calls": []}},
+    {"type": "assistant",
+     "message": {"content": [{"type": "refusal", "refusal": "upstream-body"}]}},
+    {"type": "stream_event", "event": {"type": "message_delta",
+                                     "delta": {"stop_reason": "refusal"}}},
+    {"type": "result", "is_error": True,
+     "error": {"code": "content_filter", "message": "upstream-body"}},
+])
+def test_native_policy_stop_discards_other_results_and_keeps_event_private(
+    settings_factory, tmp_path, event,
+):
+    body = "sys.stdin.read()\n" + terminal() + f"print({json.dumps(event)!r}, flush=True)\n"
+    progress: list[str] = []
+    with pytest.raises(GigaCodePolicyStop) as stopped:
+        execute(settings_factory, tmp_path, body + terminal(), progress=progress.append)
+    assert "upstream-body" not in str(stopped.value) + "".join(progress)
+
+
+def test_result_payload_can_describe_filters_and_refusals(settings_factory, tmp_path):
+    content = {"finish_reason": "content_filter", "refusal": "Example from the documentation"}
+    result = execute(settings_factory, tmp_path, "sys.stdin.read()\n" + terminal(result=content))
+    assert result.payload == content
 
 
 def test_unbounded_output_is_rejected_without_truncating_into_an_answer(

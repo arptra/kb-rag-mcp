@@ -18,11 +18,13 @@ from agent_harness.contracts import Evidence, Principal
 from agent_harness.http import create_app
 from agent_harness.integrations import IntegrationHub
 from agent_harness.integrations_config import IntegrationStore
+from agent_harness.model_connection import ModelPolicyStop
 from agent_harness.runtime import HarnessRuntime
 from corporate_kb.access.http import AccessControl
 from corporate_kb.agents.activation import GigaCodeAgentController
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
+from corporate_kb.gigacode_runner import GigaCodePolicyStop
 
 
 class CatalogSource:
@@ -122,12 +124,12 @@ class GigaCodeDecisionModel:
         cancel: Event,
         max_input_chars: int,
     ) -> dict[str, Any]:
-        return await self.model_control.decide(
-            messages=messages,
-            tools=tools,
-            cancel=cancel,
-            max_input_chars=max_input_chars,
-        )
+        try:
+            return await self.model_control.decide(
+                messages=messages, tools=tools, cancel=cancel, max_input_chars=max_input_chars,
+            )
+        except GigaCodePolicyStop:
+            raise ModelPolicyStop("refusal") from None
 
 
 def build_model(

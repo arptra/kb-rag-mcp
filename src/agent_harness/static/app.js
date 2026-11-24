@@ -25,6 +25,11 @@
     investigating: "Проверяем связи и уточняем найденные сведения.",
     synthesizing: "Сопоставляем материалы и готовим ответ.", finished: "",
   };
+  const ANSWER_STOP_LABELS = {
+    model_policy_stop: "Провайдер остановил генерацию",
+    model_refusal_text: "Модель не ответила на вопрос",
+    answer_quality: "Ответ не прошёл проверку",
+  };
   const $ = (id) => document.getElementById(id);
   const layoutState = { historyCollapsed: false, contextCollapsed: false };
   function setPanelCollapsed(panel, collapsed, { persist = true } = {}) {
@@ -198,7 +203,8 @@
     const controller = new AbortController(), abort = () => controller.abort();
     let timedOut = false, mutationStarted = false;
     if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
-    const wait = timeoutMs || (path === "model/connection/probe" ? Math.min(3600, Number(body?.timeout_seconds || modelConnectionState.settings?.timeout_seconds) || 60) * 1000 + 5000 : method === "GET" ? 20000 : 45000);
+    const modelProbe = path.split("?", 1)[0] === "model/connection/probe";
+    const wait = timeoutMs || (modelProbe ? Math.min(3600, Number(body?.timeout_seconds || modelConnectionState.settings?.timeout_seconds) || 60) * 1000 + 5000 : method === "GET" ? 20000 : 45000);
     const timer = window.setTimeout(() => { timedOut = true; abort(); }, wait);
     try {
       if (method !== "GET" && /^(settings|model|credentials)(\/|$)/.test(path)) {
@@ -240,12 +246,13 @@
       return result;
     } catch (error) {
       if (timedOut) {
-        const timeout = new Error(method === "GET" ? "Сервер не ответил вовремя. Последние данные сохранены; можно обновить чат." : mutationStarted
+        const timeout = new Error(modelProbe && mutationStarted ? "Истекло время проверки модели. Проверьте адрес и время ожидания." :
+          method === "GET" ? "Сервер не ответил вовремя. Последние данные сохранены; можно обновить чат." : mutationStarted
           ? "Не дождались подтверждения сервера. Действие могло выполниться — обновите чат перед повторной отправкой."
           : "Не удалось подтвердить сессию администратора вовремя. Изменения не отправлены. Повторите попытку.");
-        timeout.name = "RequestTimeoutError"; timeout.uncertainMutation = mutationStarted; throw timeout;
+        timeout.name = "RequestTimeoutError"; timeout.uncertainMutation = mutationStarted && !modelProbe; throw timeout;
       }
-      if (method !== "GET" && error instanceof TypeError) error.uncertainMutation = mutationStarted;
+      if (method !== "GET" && error instanceof TypeError) error.uncertainMutation = mutationStarted && !modelProbe;
       throw error;
     } finally { window.clearTimeout(timer); signal?.removeEventListener("abort", abort); }
   }
@@ -737,6 +744,8 @@
     $("model-connection-save").disabled = modelConnectionState.busy || !modelConnectionState.settings || !modelConnectionState.dirty;
     $("model-connection-probe").disabled = modelConnectionState.busy || !modelConnectionState.settings;
     $("model-connection-probe").title = "Отправить простой запрос с текущими настройками, не сохраняя их";
+    $("model-autopilot-probe").hidden = !direct;
+    $("model-autopilot-probe").disabled = !direct || $("model-connection-probe").disabled;
     $("settings-panel-model").querySelectorAll(".model-connection-fields input, .model-connection-fields select").forEach((input) => { input.disabled = modelConnectionState.busy; });
   }
   function fillTlsSelect(value) {
@@ -773,18 +782,22 @@
     } catch (error) { if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) $("model-connection-feedback").textContent = errorMessage(error); }
     finally { if (modelConnectionState.controller === controller) { modelConnectionState.controller = null; modelConnectionState.busy = false; updateModelConnection(); } }
   }
-  async function changeModelConnection(probe = false) {
+  async function changeModelConnection(action = "save") {
     if (modelConnectionState.busy || !settingsState.canManage || state.needsAuth) return;
     const config = modelConnectionValue();
+    const autopilot = action === "autopilot", probe = action !== "save";
+    if (autopilot && config.provider !== "openai") return;
     if (config.provider === "openai") {
       if (!config.base_url) { $("model-connection-feedback").textContent = "Укажите HTTPS-адрес API модели. Название модели и ключ необязательны."; return; }
       for (const input of $("direct-model-fields").querySelectorAll("input")) { if (!input.checkValidity()) { input.reportValidity(); return; } }
     }
     const controller = new AbortController(), epoch = state.identityEpoch;
     modelConnectionState.controller = controller; modelConnectionState.busy = true; updateModelConnection();
-    $("model-connection-feedback").textContent = probe ? "Отправляем простой запрос модели с текущими настройками…" : "Сохраняем подключение…";
+    $("model-connection-feedback").textContent = autopilot ? "Проверяем ответ и выбор инструмента…" :
+      probe ? "Отправляем простой запрос модели с текущими настройками…" : "Сохраняем подключение…";
     try {
-      const response = await api("model/connection" + (probe ? "/probe" : ""), { method: probe ? "POST" : "PUT", body: config, signal: controller.signal });
+      const route = probe ? "model/connection/probe" + (autopilot ? "?autopilot=1" : "") : "model/connection";
+      const response = await api(route, { method: probe ? "POST" : "PUT", body: config, signal: controller.signal });
       if (controller.signal.aborted || epoch !== state.identityEpoch) return;
       if (probe) $("model-connection-feedback").textContent = (response.message || (response.available ? "Модель ответила на проверочный запрос." : "Подключение пока недоступно.")) +
         (modelConnectionState.dirty ? " Настройки ещё не сохранены." : "");
@@ -1695,7 +1708,7 @@
     $("refresh-conversation").disabled = conversationState.loading;
     $("composer-section").classList.toggle("in-conversation", hasConversation);
     $("question").placeholder = hasConversation ? "Уточните вопрос или продолжите исследование…" : "Что хотите узнать о системе?";
-    const signature = JSON.stringify([idOf(state.current), conversationState.runs.map((run) => [idOf(run), run.question, run.answer, run.phase, run.status, run.evidence?.length, run.research_plan, run.memory_used, run.current_action, run.research_trace?.at(-1)])]);
+    const signature = JSON.stringify([idOf(state.current), conversationState.runs.map((run) => [idOf(run), run.question, run.answer, run.phase, run.status, run.stop_reason, run.evidence?.length, run.research_plan, run.memory_used, run.current_action, run.research_trace?.at(-1)])]);
     if (signature === conversationState.signature) return;
     conversationState.signature = signature;
     const fragment = document.createDocumentFragment();
@@ -1705,11 +1718,11 @@
       user.append(element("span", "chat-role", "Вы"), element("p", "chat-user-text", run.question || "Сообщение"));
       const assistant = element("div", "chat-assistant");
       const heading = element("div", "chat-assistant-heading");
-      heading.append(element("span", "chat-role", "Ответ Harness"), element("span", "chat-status" + (ACTIVE.has(run.status) ? " is-active" : ""), STATUS_LABELS[run.status] || "Ответ"));
+      heading.append(element("span", "chat-role", "Ответ Harness"), element("span", "chat-status" + (ACTIVE.has(run.status) ? " is-active" : ""), runStatusLabel(run)));
       assistant.append(heading);
       if (idOf(run) === idOf(state.current)) assistant.append(panel);
       else {
-        if (ACTIVE.has(run.status)) assistant.append(element("p", "chat-turn-status", actionLabel(run.current_action?.name) || PHASE_LABELS[run.phase] || STATUS_LABELS[run.status]));
+        if (ACTIVE.has(run.status)) assistant.append(element("p", "chat-turn-status", actionDescription(run.current_action) || PHASE_LABELS[run.phase] || STATUS_LABELS[run.status]));
         const answer = element("div", "answer chat-answer"); renderAnswer(typeof run.answer === "string" ? run.answer : "", answer); assistant.append(answer);
         const inspect = element("button", "text-button chat-inspect", "Показать ход работы и материалы"); inspect.type = "button";
         inspect.addEventListener("click", () => selectRun(run)); assistant.append(inspect);
@@ -1870,18 +1883,43 @@
       }
     }
   }
+  const ACTION_LABELS = {
+    update_research_plan: "Обновление плана", request_budget: "Запрос дополнительных ресурсов",
+    budget_review: "Проверка необходимого бюджета", research_round: "Проверка результатов поиска",
+    goal_check: "Проверка оставшихся вопросов", answer_recovery: "Повторная подготовка ответа",
+    answer_quality_check: "Проверка ответа по источникам", answer_quality_rejected: "Черновик не прошёл проверку",
+    research_recovery: "Поиск дополнительных подтверждений",
+    model_policy_stop: ANSWER_STOP_LABELS.model_policy_stop, model_refusal_text: ANSWER_STOP_LABELS.model_refusal_text,
+    model_planning: "Модель выбирает следующий шаг", model_budget_review: "Модель оценивает бюджет",
+    model_retry: "Повторный запрос к модели", model_response: "Модель анализирует материалы и готовит ответ",
+    model_received: "Получен ответ модели", model_call: "Ожидаем ответ модели",
+    context_compaction: "Обновляем сводку беседы", compact_conversation: "Сохранение сводки беседы",
+    conversation_compaction: "Сохранение сводки беседы", mcp_list_tools: "Изучаем доступные инструменты",
+    mcp_tool_schema: "Проверяем параметры инструмента",
+    search_repository: "Поиск в репозитории", read_repository: "Чтение файла в репозитории",
+  };
   function actionLabel(name) {
-      if (!name) return "";
-      const steps = { update_research_plan: "Обновление плана", request_budget: "Запрос дополнительных ресурсов", budget_review: "Проверка необходимого бюджета", research_round: "Проверка результатов поиска", goal_check: "Проверка оставшихся вопросов", answer_recovery: "Повторная подготовка ответа", model_response: "Модель анализирует материалы и готовит ответ", model_received: "Получен ответ модели", model_call: "Ожидаем ответ модели", context_compaction: "Обновляем сводку беседы", mcp_list_tools: "Изучаем доступные инструменты", mcp_tool_schema: "Проверяем параметры инструмента", compact_conversation: "Сохранение сводки беседы", conversation_compaction: "Сохранение сводки беседы" };
-      if (steps[name]) return steps[name];
-      if (/search.*(knowledge|index|document)|^search$/.test(name)) return "Поиск в базе знаний";
-      if (/read.*document/.test(name)) return "Чтение документа";
-      if (/clone|prepare.*repository/.test(name)) return "Подготовка репозитория";
-      if (/search.*(code|repository|repo)|read.*(code|file)|repository/.test(name)) return "Изучение кода сервиса";
-      if (/execute|sandbox|run_code|run_command/.test(name)) return "Проверка в песочнице";
-      if (/a2a|agent/.test(name)) return "Запрос подключённому агенту";
-      if (/mcp/.test(name)) return "Запрос подключённому инструменту";
-      return "Проверка источника";
+    if (!name) return "";
+    if (Object.hasOwn(ACTION_LABELS, name)) return ACTION_LABELS[name];
+    if (/search.*(knowledge|index|document)|^search$/.test(name)) return "Поиск в базе знаний";
+    if (/read.*document/.test(name)) return "Чтение документа";
+    if (/clone|prepare.*repository/.test(name)) return "Подготовка репозитория";
+    if (/search.*(code|repository|repo)|read.*(code|file)|repository/.test(name)) return "Изучение кода сервиса";
+    if (/execute|sandbox|run_code|run_command/.test(name)) return "Проверка в песочнице";
+    if (/a2a|agent/.test(name)) return "Запрос подключённому агенту";
+    if (/mcp/.test(name)) return "Запрос подключённому инструменту";
+    return "Шаг исследования";
+  }
+  function actionDescription(action) {
+    if (!action?.name) return "";
+    const ids = action.args || {};
+    const scope = ids.index_id ? sourceName(ids.index_id) : ids.repository_id || ids.connection_id;
+    return [actionLabel(action.name), scope, ids.document_id].filter(Boolean).join(" · ");
+  }
+  function runStatusLabel(run) {
+    if (["partial", "failed"].includes(run.status) && Object.hasOwn(ANSWER_STOP_LABELS, run.stop_reason)) return ANSWER_STOP_LABELS[run.stop_reason];
+    if (run.status === "partial" && !run.evidence?.length) return "Недостаточно данных";
+    return STATUS_LABELS[run.status] || "Состояние запроса обновляется";
   }
   function renderResearchActivity(run) {
     const plan = run.research_plan && typeof run.research_plan === "object" ? run.research_plan : {};
@@ -1906,12 +1944,11 @@
       block.append(list); blocks.push(block);
     }
     $("research-plan").replaceChildren(...blocks);
-    $("research-current").textContent = currentAction ? "Сейчас: " + actionLabel(currentAction) : "";
+    $("research-current").textContent = currentAction ? "Сейчас: " + actionDescription(run.current_action) : "";
     $("research-current").hidden = !currentAction;
-    $("research-timeline").replaceChildren(...trace.slice(-18).map((item) => {
-      const row = element("li", "research-event"), identifiers = item.args && typeof item.args === "object" ? item.args : {};
-      const label = actionLabel(item.name), scope = identifiers.index_id ? sourceName(identifiers.index_id) : identifiers.repository_id || identifiers.connection_id || "";
-      row.append(element("strong", "", label + (scope ? " · " + scope : "")));
+    $("research-timeline").replaceChildren(...trace.reverse().map((item) => {
+      const row = element("li", "research-event");
+      row.append(element("strong", "", actionDescription(item)));
       if (typeof item.result === "string" && item.result) row.append(element("p", "", item.result.slice(0, 400)));
       if (item.timestamp) row.append(element("time", "", dateLabel(item.timestamp, true)));
       return row;
@@ -1955,18 +1992,22 @@
     $("run-question").textContent = run.question || "Запрос";
     $("parent-note").hidden = true;
     const evidenceCount = Array.isArray(run.evidence) ? run.evidence.length : 0;
-    const status = run.status === "partial" && !evidenceCount ? "Недостаточно данных" :
-      STATUS_LABELS[run.status] || "Состояние запроса обновляется";
-    $("run-status").textContent = active ? actionLabel(run.current_action?.name) || status : status;
+    const status = runStatusLabel(run), currentAction = active ? actionDescription(run.current_action) : "";
+    $("run-status").textContent = currentAction || status;
     $("run-progress").hidden = !active && run.status === "completed";
     const actionStart = Date.parse(run.current_action?.started_at || "");
     const elapsed = Number.isFinite(actionStart) ? Math.max(0, Math.floor((Date.now() - actionStart) / 1000)) : 0;
     $("run-waiting").hidden = !active || !Number.isFinite(actionStart);
     $("run-waiting").textContent = "Текущее действие: " + (elapsed >= 60 ? Math.floor(elapsed / 60) + " мин " + elapsed % 60 + " сек" : elapsed + " сек") +
-      (/model_response|model_call/.test(run.current_action?.name || "") ? " · Ожидаем модель; медленный ответ не прерывает исследование." : " · Статус обновляется автоматически.");
-    const lastStep = (run.research_trace || []).filter((item) => item?.name).at(-1);
+      (["model_response", "model_call", "model_planning", "model_budget_review", "context_compaction"].includes(run.current_action?.name) ? " · Ожидаем ответ модели." : "");
+    const trace = Array.isArray(run.research_trace) ? run.research_trace : [];
+    const lastStep = trace.at(-1);
+    const rejected = trace.findLast((item) => item?.name === "answer_quality_rejected");
+    const showRejection = active && rejected && rejected !== lastStep;
+    $("run-recovery-note").hidden = !showRejection;
+    $("run-recovery-note").textContent = showRejection ? [actionLabel(rejected.name), rejected.result].filter(Boolean).join(" · ") : "";
     $("run-last-step").hidden = !active || !lastStep;
-    $("run-last-step").textContent = lastStep ? "Последнее действие: " + actionLabel(lastStep.name) + (lastStep.result ? " · " + String(lastStep.result).slice(0, 180) : "") : "";
+    $("run-last-step").textContent = lastStep ? "Последнее действие: " + actionDescription(lastStep) + (lastStep.result ? " · " + String(lastStep.result).slice(0, 180) : "") : "";
     if (newPresentation || $("run-details").dataset.active !== String(active)) $("run-details").open = false;
     $("run-details").dataset.active = String(active);
     $("run-details-label").textContent = active ? "План и ход исследования" : "Как получен ответ";
@@ -1987,7 +2028,7 @@
       (failed ? " · Недоступно: " + failed : "") + (pending ? " · Ещё не проверено: " + pending : "");
     renderResearchActivity(run);
     renderBudget(run);
-    const announcement = [active ? actionLabel(run.current_action?.name) : status, phase, "Найдено подтверждений: " + evidenceCount].filter(Boolean).join(". ");
+    const announcement = [currentAction || status, phase, "Найдено подтверждений: " + evidenceCount].filter(Boolean).join(". ");
     if ($("progress-live").textContent !== announcement) $("progress-live").textContent = announcement;
     $("cancel-run").hidden = !active;
     $("deepen-run").hidden = active || ["failed", "interrupted"].includes(run.status);
@@ -2296,7 +2337,8 @@
   $("model-profile").addEventListener("change", changeModelProfile);
   for (const id of ["direct-model-url", "direct-model-name", "direct-model-token", "direct-model-tls", "direct-model-timeout", "model-output-tokens"]) $(id).addEventListener("input", updateModelConnection);
   $("model-connection-save").addEventListener("click", () => changeModelConnection());
-  $("model-connection-probe").addEventListener("click", () => changeModelConnection(true));
+  $("model-connection-probe").addEventListener("click", () => changeModelConnection("simple"));
+  $("model-autopilot-probe").addEventListener("click", () => changeModelConnection("autopilot"));
   $("tls-new").addEventListener("click", () => openTlsEditor());
   $("tls-cancel").addEventListener("click", clearTlsEditor);
   $("tls-save").addEventListener("click", saveTlsBundle);

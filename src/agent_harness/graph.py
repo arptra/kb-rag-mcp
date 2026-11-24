@@ -17,14 +17,16 @@ from langgraph.runtime import Runtime
 
 from agent_harness.budgets import BUDGET_TOOL
 from agent_harness.contracts import ConversationUnavailable, ModelDecisionError, Principal
-from agent_harness.model_connection import INCOMPLETE_FINISH_REASONS, ModelTransientError
+from agent_harness.model_connection import RETRYABLE_FINISH_REASONS, ModelTransientError
 from agent_harness.policy import TOOLS, validate_call
 from agent_harness.research import (
     PLAN_TOOL,
     evidence_signature,
     initial_search_query,
     initialize_plan,
+    lookup_key,
     needs_source_check,
+    next_source_lookup,
     update_plan,
 )
 from agent_harness.store import timestamp
@@ -41,6 +43,9 @@ class GraphState(TypedDict, total=False):
     external: list[dict[str, Any]]
     calls: list[Any]
     exchange: list[dict[str, Any]]
+    attempted_lookups: list[str]
+    recovery_lookup: bool
+    quality_rounds: int
 
 
 @dataclass
@@ -124,6 +129,9 @@ class HarnessGraph:
                     "run": copy.deepcopy(context.run),
                     "calls": [],
                     "exchange": [],
+                    "recovery_lookup": False,
+                    "attempted_lookups": [],
+                    "quality_rounds": 0,
                     "next_step": "collect",
                 },
                 as_node="prepare",
@@ -305,6 +313,7 @@ class HarnessGraph:
         engine._checkpoint(context.principal, run, context.cancel)
         budget = engine._budget(run)
         candidates = engine._ranked_evidence(run)
+        attempted = set(state.get("attempted_lookups", []))
         count = 0
         for item in candidates:
             if (count >= budget.document_reads or context.cancel.is_set()
@@ -320,9 +329,64 @@ class HarnessGraph:
                 continue
             result = await engine._read(context.principal, run, context.cancel, args,
                                         deadline=self._reserve_deadline(context))
+            attempted.add(lookup_key("read_document", args))
             engine._trace(run, "read_document", args, result)
             count += 1
-        return self._result(context, "decide")
+        return self._result(context, "decide", attempted_lookups=sorted(attempted))
+
+    def _recover_draft(
+        self, state: GraphState, context: ExecutionContext, issue: str,
+    ) -> GraphState:
+        run, engine = context.run, self.engine
+        metrics = run["metrics"]
+        metrics["rejected_drafts"] = metrics.get("rejected_drafts", 0) + 1
+        round_number = state.get("quality_rounds", 0) + 1
+        run["phase"] = "checking"
+        engine._trace(run, "answer_quality_rejected", {}, issue)
+        # First let the agent choose a domain-specific tool, including repository
+        # reads or a configured MCP. Keep the last model call for reporting.
+        decisions_left = engine._budget(run).model_calls - engine._decision_calls(run)
+        if round_number == 1 and decisions_left > 2:
+            if needs_source_check(run):
+                run["_goal_review_requested"] = True
+                engine._trace(run, "goal_check", {}, "Для вывода нужна проверка источником.")
+            engine._trace(run, "research_recovery", {},
+                          "Выберите зацепку из материалов и проверьте её подходящим инструментом. "
+                          "Используйте новые данные и укажите подтверждающие источники в ответе.")
+            return self._result(context, "decide", quality_rounds=round_number)
+        recovery = self._try_source_lookup(state, context)
+        if recovery:
+            return recovery
+        engine._trace(run, "research_recovery", {},
+                      "Завершаем проверку черновика по уже собранным материалам.")
+        return self._result(context, "synthesize")
+
+    def _try_source_lookup(
+        self, state: GraphState, context: ExecutionContext,
+    ) -> GraphState | None:
+        run, engine = context.run, self.engine
+        round_number = state.get("quality_rounds", 0) + 1
+        budget = engine._budget(run)
+        if (round_number > engine._runtime_limits(run).max_stalled_rounds
+                or context.cancel.is_set() or engine._now(run) >= self._reserve_deadline(context)
+                or run["metrics"]["tool_calls"] >= budget.tool_calls
+                or engine._followup_calls(run) >= budget.source_calls):
+            return None
+        knowledge = state.get("knowledge_ids", [])
+        attempted = set(state.get("attempted_lookups", []))
+        attempted.update(lookup_key("search_knowledge", {
+            "index_id": index, "query": initial_search_query(run),
+        }) for index in knowledge)
+        lookup = next_source_lookup(engine._ranked_evidence(run), knowledge, attempted)
+        if lookup is None:
+            return None
+        name, args = lookup["name"], lookup["args"]
+        target = args.get("document_id") or args["query"]
+        action = "Читаем документ" if name == "read_document" else "Уточняем поиск по"
+        engine._trace(run, "research_recovery", args, f"{action} «{target}».")
+        run["_round_evidence"] = evidence_signature(run)
+        return self._result(context, "tools", calls=[lookup], recovery_lookup=True,
+                            quality_rounds=round_number)
 
     async def decide(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
         context = self._context(state, runtime)
@@ -338,6 +402,18 @@ class HarnessGraph:
             or run["metrics"]["tool_calls"] >= budget.tool_calls
             or engine._followup_calls(run) >= budget.source_calls
         ):
+            plan = run.get("research_plan", {})
+            covered = {index for index, value in run.get("coverage", {}).items()
+                       if value["status"] in {"searched", "empty"}}
+            covered.update(item["index_id"] for item in run["evidence"] if item.get("checked_with"))
+            if (run["mode"] == "autonomous" and plan.get("model_updated")
+                    and plan.get("ready_to_answer") and not plan.get("gaps")
+                    and not needs_source_check(run) and set(run["index_ids"]) <= covered):
+                # Using the last allowed operation to resolve a goal is success.
+                # The normal synthesis gate still validates the actual answer.
+                engine._trace(run, "goal_check", {},
+                              "Проверки плана завершены. Готовим ответ по полученным материалам.")
+                return self._result(context, "synthesize")
             previous_timeout = budget.timeout_seconds
             if await engine._review_budget(
                 context.principal, run, event, started=context.started,
@@ -379,6 +455,13 @@ class HarnessGraph:
             run["status"] = "partial"
             return self._result(context, "done")
         except ModelTransientError as exc:
+            if (run["mode"] == "autonomous" and not run["metrics"].get("planner_retries")
+                    and engine._decision_calls(run) < budget.model_calls - 2
+                    and engine._now(run) < self._reserve_deadline(context)):
+                run["metrics"]["planner_retries"] = 1
+                engine._trace(run, "model_retry", {},
+                              f"{exc} Повторяем выбор инструмента для следующего шага.")
+                return self._result(context, "decide")
             engine._trace(run, "model_retry", {},
                           f"{exc} Готовим итог повторным запросом без повторения действий.")
             return self._result(context, "synthesize")
@@ -393,9 +476,16 @@ class HarnessGraph:
             return self._result(context, "synthesize")
         calls = decision.get("tool_calls", [])
         if not calls:
-            if decision.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
+            if decision.get("finish_reason") in RETRYABLE_FINISH_REASONS:
                 engine._trace(run, "answer_recovery", {},
                               "Предыдущий ответ был обрезан. Подготовьте краткий законченный итог.")
+                return self._result(context, "synthesize")
+            issue = engine._draft_quality_issue(run, decision.get("content", ""))
+            if issue:
+                run["_final_quality_issue"] = issue
+                if run["mode"] == "autonomous":
+                    return self._recover_draft(state, context, issue)
+                engine._trace(run, "answer_quality_rejected", {}, issue)
                 return self._result(context, "synthesize")
             plan = run.get("research_plan", {})
             missing_check = needs_source_check(run)
@@ -409,6 +499,9 @@ class HarnessGraph:
                               "по которой проверка недоступна.")
                 return self._result(context, "decide")
             if missing_check:
+                recovery = self._try_source_lookup(state, context)
+                if recovery:
+                    return recovery
                 return self._result(context, "synthesize")
             if plan.get("model_updated") and not plan.get("ready_to_answer"):
                 if not run.get("_gap_review_requested"):
@@ -430,6 +523,7 @@ class HarnessGraph:
             "tools",
             calls=calls[: budget.tool_calls - run["metrics"]["tool_calls"]],
             exchange=state.get("exchange", []),
+            recovery_lookup=False,
         )
 
     async def tools(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
@@ -452,12 +546,18 @@ class HarnessGraph:
             engine._warn(run, "Некорректный формат вызова инструмента отклонён.")
             return self._result(context, "tools" if calls else "decide", calls=calls)
         name, args = str(call.get("name", "")), call.get("args", {})
+        attempted = set(state.get("attempted_lookups", []))
         phases = {"search_knowledge": "refining", "read_document": "reading",
                   "read_repository": "reading_code", "search_repository": "reading_code",
                   "clone_repository": "reading_code", "run_in_sandbox": "running_code",
                   "update_research_plan": "planning", "request_budget": "budget_review"}
         run["phase"] = phases.get(name, "checking")
-        run["current_action"] = {"name": name, "started_at": timestamp()}
+        run["current_action"] = {
+            "name": name, "started_at": timestamp(),
+            "args": {key: str(args[key])[:1000] for key in
+                     ("index_id", "document_id", "connection_id", "repository_id")
+                     if isinstance(args, dict) and key in args},
+        }
         engine._checkpoint(principal, run, event)
         try:
             signature = hashlib.sha256(json.dumps(
@@ -480,6 +580,7 @@ class HarnessGraph:
                 )
             else:
                 validated = validate_call(name, args, set(state.get("knowledge_ids", [])))
+                attempted.add(lookup_key(name, validated))
                 seen.append(signature)
                 result = (
                     await engine._search(
@@ -490,11 +591,13 @@ class HarnessGraph:
                         validated["query"],
                         validated["limit"],
                         deadline=self._reserve_deadline(context),
+                        recovery=state.get("recovery_lookup", False),
                     )
                     if name == "search_knowledge"
                     else await engine._read(principal, run, event, validated,
                                             deadline=self._reserve_deadline(context),
-                                            model_requested=True)
+                                            model_requested=not state.get("recovery_lookup"),
+                                            recovery=state.get("recovery_lookup", False))
                 )
         except (ValueError, TypeError):
             result = "Вызов отклонён: недопустимый инструмент, аргументы или индекс."
@@ -508,6 +611,8 @@ class HarnessGraph:
             context,
             "tools" if calls else "reflect",
             calls=calls,
+            attempted_lookups=sorted(attempted),
+            recovery_lookup=False,
             exchange=[*state.get("exchange", []), {"name": name, "result": result}][-50:],
         )
 
@@ -526,6 +631,10 @@ class HarnessGraph:
             if changed else "Новых материалов нет; нужен другой запрос или источник.",
         )
         if run["_stalled_rounds"] >= self.engine._runtime_limits(run).max_stalled_rounds:
+            if run["mode"] == "autonomous":
+                recovery = self._try_source_lookup(state, context)
+                if recovery:
+                    return recovery
             run["stop_reason"] = "no_new_evidence"
             plan["completion_reason"] = "Поиск не даёт новых данных."
             self.engine._warn(run, "Повторные действия не дали новых данных; поиск ограничен.")

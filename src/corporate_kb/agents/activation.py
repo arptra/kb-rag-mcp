@@ -30,6 +30,7 @@ from corporate_kb.gigacode_runner import (
     GigaCodeCancelled,
     GigaCodeInvalidOutput,
     GigaCodeJsonResult,
+    GigaCodePolicyStop,
     GigaCodeRunner,
     GigaCodeTimedOut,
     browser_authentication_url,
@@ -289,6 +290,8 @@ class GigaCodeAgentController:
                 "Истекло время ожидания GigaCode или авторизации. "
                 "Нажмите «Включить агента», чтобы повторить запуск."
             )
+        elif isinstance(exc, GigaCodePolicyStop):
+            message = "Провайдер GigaCode ограничил проверочный запрос."
         else:
             message = (
                 "GigaCode не завершил запрос. Нажмите «Включить агента» для повторной проверки."
@@ -377,6 +380,17 @@ class GigaCodeAgentController:
                 raise GigaCodeDecisionError("GigaCode returned an invalid tool decision") from None
             self._update(generation, "ready", "GigaCode готов. Агент может исследовать документы.")
             return decision
+        except GigaCodePolicyStop:
+            with self._lock:
+                if self._current(generation):
+                    if self._state == "authentication_required":
+                        self._set_state(
+                            "error", "Провайдер остановил запрос до подтверждения входа. "
+                            "Нажмите «Включить агента» для повторного входа.",
+                        )
+                    else:
+                        self._set_state("ready", "Провайдер GigaCode ограничил ответ на запрос.")
+            raise
         except GigaCodeDecisionError:
             self._update(
                 generation, "ready", "Некорректный ответ модели. GigaCode готов к повтору."

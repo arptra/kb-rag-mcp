@@ -20,7 +20,7 @@ from corporate_kb.access.tls import identity_from_der
 from corporate_kb.agents import activation
 from corporate_kb.config import Settings
 from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
-from corporate_kb.gigacode_runner import GigaCodeCancelled, GigaCodeJsonResult
+from corporate_kb.gigacode_runner import GigaCodeCancelled, GigaCodeJsonResult, GigaCodePolicyStop
 from corporate_kb.mcp.http_server import create_http_app
 from corporate_kb.service import KnowledgeService
 
@@ -295,9 +295,11 @@ async def test_cookie_admin_saves_model_and_tls_only_with_session_csrf(
         assert (await client.post(tls_path, json=bundle, headers=headers)).status_code == 403
 
 
-@pytest.mark.parametrize("a2a_enabled", [False, True])
+@pytest.mark.parametrize(("a2a_enabled", "policy_stop"), [
+    (False, False), (True, False), (False, True),
+])
 async def test_existing_launcher_activates_harness_without_profile_and_keeps_login_private(
-    settings_factory: Any, monkeypatch: pytest.MonkeyPatch, a2a_enabled: bool,
+    settings_factory: Any, monkeypatch: pytest.MonkeyPatch, a2a_enabled: bool, policy_stop: bool,
 ) -> None:
     login_url = "https://login.example.test/device?code=private-harness-authorization"
     answer = "payments-service проверяет суточные лимиты перед обработкой платежа [1]."
@@ -323,6 +325,8 @@ async def test_existing_launcher_activates_harness_without_profile_and_keeps_log
                 payload = {"ready": True}
             else:
                 assert "payments-service checks daily limits" in kwargs["prompt"]
+                if policy_stop:
+                    raise GigaCodePolicyStop()
                 payload = {"content": answer, "tool_calls": []}
             return GigaCodeJsonResult(payload, (), None, "fake-model", 1, {})
 
@@ -411,8 +415,14 @@ async def test_existing_launcher_activates_harness_without_profile_and_keeps_log
                 if result["status"] not in {"queued", "running", "cancelling"}:
                     break
                 await asyncio.sleep(0.01)
-        assert result["status"] == "completed", result
-        assert result["answer"] == answer
+        if policy_stop:
+            assert result["status"] == "partial", result
+            assert result["stop_reason"] == "model_policy_stop"
+            assert "(refusal)" in result["answer"]
+            assert controller.status()["available"]
+        else:
+            assert result["status"] == "completed", result
+            assert result["answer"] == answer
         assert result["evidence"]
         assert result["metrics"]["model_calls"] == 1
         assert len(calls) == 2  # One activation probe, one answer from actual RAG evidence.

@@ -1,14 +1,17 @@
 """Switch between the host's GigaCode runner and a certificate-authenticated model API."""
 
+# ruff: noqa: RUF001  # Russian diagnostics and response phrases.
+
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import ssl
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from threading import Event
 from typing import Any, Literal, Self
@@ -28,7 +31,7 @@ from agent_harness.model_profiles import (
 RETRYABLE_FINISH_REASONS = frozenset({
     "length", "max_tokens", "insufficient_system_resource", "aborted",
 })
-INCOMPLETE_FINISH_REASONS = RETRYABLE_FINISH_REASONS | {"content_filter"}
+INCOMPLETE_FINISH_REASONS = RETRYABLE_FINISH_REASONS
 
 
 class ModelConnection(BaseModel):
@@ -154,6 +157,66 @@ class ModelConnectionError(RuntimeError):
 
 class ModelTransientError(ModelConnectionError):
     """A temporary upstream failure; the run may retry within its reserved budget."""
+
+
+class ModelPolicyStop(ModelConnectionError):
+    """Terminal provider refusal. Only known signals and opaque trace IDs are public."""
+
+    def __init__(self, signal: str, request_id: str = "") -> None:
+        self.stop_reason = "model_refusal_text" if signal == "text" else "model_policy_stop"
+        message = (
+            "Модель прислала шаблонный ответ об ограничениях или мнении. "
+            "Шлюз не указал причину."
+            if signal == "text" else f"API модели сообщил об ограничении ({signal})."
+        )
+        if re.fullmatch(r"(?:req[-_])?(?:[0-9a-fA-F]{16,64}|[0-9a-fA-F]{8}"
+                        r"(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})", request_id):
+            message += f" ID запроса шлюза: {request_id}."
+        super().__init__(message)
+
+
+_POLICY_SIGNALS = {"blacklist", "refusal", "content_filter", "content_policy_violation",
+                   "responsibleaipolicyviolation"}
+_REFUSAL_SENTENCE = re.compile(
+    r"(?:к сожалению[, ]+)?(?:"
+    r"(?:я |у меня |как (?:ии|языковая модель)[, ]+(?:я )?)(?:нет |не (?:имею|обладаю) )"
+    r"(?:(?:собственн|личн)\w* ){1,2}мнен\w*"
+    r"|(?:мой ответ|этот ответ|ответ модели|результат генерации|мои ответы) "
+    r"(?:не (?:явля\w*|отража\w*)|может не отражать) (?:официальн\w* )?"
+    r"(?:точк\w* зрения|мнени\w*)"
+    r"|(?:я )?не могу (?:ответить|предоставить ответ) (?:на (?:этот|ваш) (?:вопрос|запрос) )?"
+    r"(?:из-за|в связи с|согласно|в рамках) (?:действующ\w* |корпоративн\w* )?"
+    r"(?:правил|политик|ограничени)"
+    r"|(?:as an ai(?: language model)?,? )?i (?:do not|don't) have (?:a |any )?"
+    r"(?:personal opinions?\b))[^.!?;\[\]\n]{0,110}[.!?…]*", re.I,
+)
+
+
+def check_model_policy(message: dict[str, Any], reason: Any, request_id: str = "") -> None:
+    if isinstance(reason, str) and reason.lower() in _POLICY_SIGNALS:
+        raise ModelPolicyStop(reason.lower(), request_id)
+    if message.get("refusal"):
+        raise ModelPolicyStop("refusal", request_id)
+    content = message.get("content")
+    if isinstance(content, list) and any(
+        isinstance(part, dict) and part.get("type") == "refusal" for part in content
+    ):
+        raise ModelPolicyStop("refusal", request_id)
+    # A phrase quoted inside a technical answer is not a provider refusal.
+    if isinstance(content, str) and len(content) <= 1200 and not message.get("tool_calls"):
+        sentences = re.split(r"(?<=[.!?…])\s+|\n+|,\s*(?:но|однако|but|however)\s+",
+                             content.strip(), flags=re.I)
+        if len(sentences) <= 4 and all(_REFUSAL_SENTENCE.fullmatch(s) for s in sentences):
+            raise ModelPolicyStop("text", request_id)
+
+
+def _check_policy_error(body: Any, request_id: str) -> None:
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        for field in (error, error.get("innererror")):
+            if isinstance(field, dict):
+                for key in ("code", "type"):
+                    check_model_policy({}, field.get(key), request_id)
 
 
 class ModelRouter:
@@ -308,6 +371,16 @@ class ModelRouter:
                     json=payload,
                 ) as response,
             ):
+                request_id = response.headers.get("x-request-id", "")
+                if response.status_code in {400, 403, 422}:
+                    error_body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(error_body) + len(chunk) > 32768:
+                            break
+                        error_body.extend(chunk)
+                    # Non-JSON errors still receive the normal HTTP diagnostic.
+                    with suppress(ValueError):
+                        _check_policy_error(json.loads(error_body), request_id)
                 if response.status_code in {401, 403}:
                     raise ModelConnectionError(
                         "API отклонил доступ. Проверьте клиентский сертификат и права на модель. "
@@ -338,9 +411,17 @@ class ModelRouter:
                     if len(data) > 8_000_000:
                         raise ModelConnectionError("Ответ API превышает допустимый размер.")
             decoded = json.loads(data)
+            _check_policy_error(decoded, request_id)
             choice = decoded["choices"][0]
-            message = choice["message"]
             reason = choice.get("finish_reason")
+            message = choice.get("message") or {}
+            check_model_policy(message, reason, request_id)
+            if reason not in {None, "", "stop", "tool_calls", "function_call", "end_turn",
+                              *RETRYABLE_FINISH_REASONS}:
+                raise ModelConnectionError(
+                    "API прислал неизвестную причину остановки. Проверьте ответ шлюза "
+                    "и совместимость с Chat Completions."
+                )
             content = message.get("content") or ""
             if not isinstance(content, str):
                 raise ValueError("Invalid content")
@@ -425,33 +506,58 @@ class ModelRouter:
         except (ValueError, KeyError, TypeError, IndexError, AttributeError):
             raise ModelConnectionError("API вернул несовместимый ответ модели.") from None
 
-    async def probe(self, settings: ModelConnection | None = None) -> dict[str, Any]:
+    async def probe(
+        self, settings: ModelConnection | None = None, *, autopilot: bool = False,
+    ) -> dict[str, Any]:
         settings = settings if settings is not None else self.store.load()
         if settings.provider == "gigacode":
+            if autopilot:
+                return {"available": False, "message":
+                        "Проверка инструментов запроса доступна для прямого API модели."}
             status = (
                 await asyncio.to_thread(self.fallback.status)
                 if self.fallback is not None
                 else {"available": False, "reason": "GigaCode не подключён."}
             )
             return {"available": bool(status.get("available")), "message": status.get("reason", "")}
+        stage = ""
         try:
             async with asyncio.timeout(settings.timeout_seconds):
                 result = await self._completion(
                     settings, [{"role": "user", "content": "Reply with OK."}], [], probe=True
                 )
-            if not result["content"].strip():
-                raise ModelConnectionError("API не вернул текстовый ответ.")
-            if result.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
-                raise ModelConnectionError(
-                    "API не завершил проверочный ответ. Проверьте профиль модели.",
-                )
-            return {"available": True, "message": "Соединение и генерация ответа проверены."}
+                if result.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
+                    raise ModelConnectionError("API не завершил проверочный ответ.")
+                if result["content"].strip().rstrip(".!").casefold() != "ok":
+                    raise ModelConnectionError(
+                        "На простой запрос API вернул текст, отличный от ожидаемого OK. "
+                        "Проверьте выбранную модель и маршрут корпоративного API."
+                    )
+                if autopilot:
+                    stage = "Простой запрос прошёл. Проверка выбора инструмента: "
+                    tool = {"type": "function", "function": {
+                        "name": "read_sample", "description": "Read a synthetic sample by ID.",
+                        "parameters": {"type": "object", "properties": {"id": {"type": "string"}},
+                                       "required": ["id"], "additionalProperties": False},
+                    }}
+                    step = await self._completion(settings, [
+                        {"role": "user", "content": "Прочитай учебный документ sample-1. "
+                         "Для этого вызови read_sample с id sample-1."},
+                    ], [tool], probe=True)
+                    if step["tool_calls"] != [{"name": "read_sample", "args": {"id": "sample-1"}}]:
+                        raise ModelConnectionError(
+                            "API не вернул ожидаемый вызов read_sample. Проверьте поддержку "
+                            "tool calling и политики шлюза для запросов с инструментами."
+                        )
+                    return {"available": True, "message":
+                            "Модель ответила OK и выбрала инструмент для учебного документа."}
+            return {"available": True, "message": "Соединение проверено. API ответил OK."}
         except (ModelConnectionError, ModelDecisionError) as exc:
-            return {"available": False, "message": str(exc)}
+            return {"available": False, "message": stage + str(exc)}
         except TimeoutError:
             return {
                 "available": False,
-                "message": "API модели не ответил вовремя. Увеличьте время ожидания.",
+                "message": stage + "API модели не ответил вовремя. Увеличьте время ожидания.",
             }
         except (ValueError, KeyError, OSError):
             return {

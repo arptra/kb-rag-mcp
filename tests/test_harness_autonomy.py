@@ -278,8 +278,10 @@ async def test_time_grant_finishes_pending_bootstrap_without_repeating_searched_
                 await asyncio.sleep(0.25)
             return [Evidence(id=index, title=index, text="Verified", index_id=index)]
 
-    model = Model([request(timeout_seconds=2.0, model_calls=6), ANSWER])
-    runtime = build(tmp_path, model, timeout_seconds=0.5, parallelism=1)
+    answer = {"content": "Verified source [a].", "tool_calls": []}
+    model = Model([request(timeout_seconds=2.0, model_calls=6), answer])
+    # Only the initial sweep is funded here; verify newly granted time resumes it.
+    runtime = build(tmp_path, model, timeout_seconds=0.5, parallelism=1, source_calls=0)
     source = SlowInitialSource()
     runtime.source = source
     await runtime.start()
@@ -298,7 +300,7 @@ async def test_time_grant_finishes_pending_bootstrap_without_repeating_searched_
         assert all(item["status"] != "pending" for item in run["coverage"].values())
         assert run["metrics"]["bootstrap_calls"] == 4
         assert run["metrics"]["source_calls"] == 4
-        assert run["answer"] == ANSWER["content"]
+        assert run["answer"] == answer["content"]
     finally:
         await runtime.stop()
 
@@ -672,7 +674,8 @@ async def test_plan_and_preparatory_tools_cannot_complete_bootstrap_only_researc
 async def test_repeating_initial_search_is_not_an_autopilot_followup(tmp_path: Path) -> None:
     replay = {"name": "search_knowledge", "args": {"index_id": "a", "query": "Explain"}}
     model = Model([{"content": "", "tool_calls": [replay, *PLAN_READY["tool_calls"]]}, ANSWER])
-    runtime = build(tmp_path, model, model_calls=6)
+    # Spend the sole follow-up on a replay. No further document read can supply proof.
+    runtime = build(tmp_path, model, model_calls=6, source_calls=1)
     await runtime.start()
     try:
         submitted = await runtime.submit(OWNER, RunRequest(

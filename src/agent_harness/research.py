@@ -1,5 +1,8 @@
 """Visible research objectives and progress, never private model reasoning."""
 
+import hashlib
+import json
+import re
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -40,7 +43,7 @@ PLAN_TOOL = {
 
 
 def needs_source_check(run: dict[str, Any]) -> bool:
-    """Autopilot must retain a source result from a check the model actually requested."""
+    """Autopilot needs a retained result from a follow-up source check."""
     return run["mode"] == "autonomous" and not any(
         item.get("checked_with") for item in run["evidence"]
     )
@@ -50,6 +53,37 @@ def initial_search_query(run: dict[str, Any]) -> str:
     parent = run.get("parent_question")
     question = run["question"]
     return (f"{parent}\nFollow-up: {question}" if parent else question)[:8000]
+
+
+def lookup_key(name: str, args: dict[str, Any]) -> str:
+    # Keep queries out of persistent diagnostic fields. Formatting and result
+    # count don't turn a previously attempted lookup into a new lead.
+    target = (str(args["document_id"]) if name == "read_document"
+              else " ".join(str(args["query"]).casefold().split()))
+    return hashlib.sha256(f"{name}\0{args['index_id']}\0{target}".encode()).hexdigest()
+
+
+def next_source_lookup(
+    ranked: list[dict[str, Any]], knowledge_ids: list[str],
+    attempted: set[str],
+) -> dict[str, Any] | None:
+    """Pick an untried read or a literal lead from the same selected index."""
+    sources = [item for item in ranked if item["index_id"] in knowledge_ids
+               and item.get("kind", "source") == "source"]
+    for item in sources:
+        args = {"index_id": item["index_id"], "document_id": item.get("document_id") or item["id"]}
+        if not item.get("read_document") and lookup_key("read_document", args) not in attempted:
+            return {"name": "read_document", "args": args}
+    for item in sources:
+        # Ticket references and service names make useful literal search terms.
+        # Never forward free-form document contents across source boundaries.
+        for match in re.finditer(r"\b(?:[A-Z][A-Z0-9]{1,9}-[0-9]{1,10}"
+                                 r"|[a-z][a-z0-9]{1,30}(?:-[a-z][a-z0-9]{1,30}){1,3})\b",
+                                 item["title"] + "\n" + item["text"]):
+            args = {"index_id": item["index_id"], "query": match.group()}
+            if lookup_key("search_knowledge", args) not in attempted:
+                return {"name": "search_knowledge", "args": args}
+    return None
 
 
 def initialize_plan(run: dict[str, Any]) -> None:
@@ -75,9 +109,6 @@ def update_plan(run: dict[str, Any], args: Any) -> None:
 
 def evidence_signature(run: dict[str, Any]) -> str:
     """A content fingerprint catches new detail even when document IDs stay unchanged."""
-    import hashlib
-    import json
-
     data = [(item["index_id"], item["id"], item.get("text", ""), item.get("revision"))
             for item in run["evidence"]]
     return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True).encode()).hexdigest()

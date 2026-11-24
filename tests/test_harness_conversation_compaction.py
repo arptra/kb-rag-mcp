@@ -1,12 +1,14 @@
 """Real LangChain compaction preserves private history and processes long turns in full."""
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from threading import Event
 from typing import Any
 
 import pytest
+from langchain_core.messages import HumanMessage, messages_to_dict
 
 from agent_harness.config import HarnessSettings
 from agent_harness.context import (
@@ -166,3 +168,45 @@ async def test_deleting_chat_immediately_removes_its_private_summary(tmp_path: P
     db.delete("alice", "long")
     with db._connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM conversation_summaries").fetchone()[0] == 0
+
+
+async def test_legacy_notice_and_its_old_cached_summary_do_not_reenter_chat(tmp_path: Path) -> None:
+    db = store(tmp_path)
+    context = ConversationContext(db)
+    notice = "Иногда генеративные модели могут создавать некорректные ответы."
+    first = turn(db, "old", answer=notice)
+    factual = "Данных о причине пока нет. В журнале зафиксирован таймаут [PAY-183]."  # noqa: RUF001
+    turn(db, "recent", parent="old", question="Нашли причину?", answer=factual)
+    # This is the old, raw-answer fingerprint of an existing pre-upgrade summary.
+    payload = [[first["id"], first["question"], notice, ["a"], 0]]
+    old_key = hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
+    with db._connect() as connection:
+        connection.execute("INSERT INTO conversation_summaries VALUES(?,?,?,?)", (
+            "alice", "old", json.dumps({
+                "fingerprint": old_key, "source_run_ids": ["old"], "index_ids": ["a"],
+                "messages": messages_to_dict([HumanMessage(content=notice)]),
+            }), timestamp(),
+        ))
+    result = await prepare(context, "recent", Summarizer())
+    assert not result["reused_summary"]
+    assert result["messages"] == [
+        {"role": "user", "content": first["question"]},
+        {"role": "user", "content": "Нашли причину?"},
+        {"role": "assistant", "content": factual},
+    ]
+    assert db.get("alice", "old")["answer"] == notice
+
+
+@pytest.mark.parametrize("reason", ["model_policy_stop", "model_refusal_text"])
+async def test_provider_stop_diagnostic_is_not_an_assistant_turn(
+    tmp_path: Path, reason: str,
+) -> None:
+    db = store(tmp_path)
+    context = ConversationContext(db)
+    stopped = turn(db, "old", answer="The API stopped generation. Trace id: abcd.")
+    stopped["stop_reason"] = reason
+    db.save("alice", stopped)
+    assert context._fingerprint([stopped]) == context._fingerprint([{**stopped, "answer": ""}])
+    result = await prepare(context, "old", Summarizer())
+    assert result["messages"] == [{"role": "user", "content": stopped["question"]}]
+    assert db.get("alice", "old")["answer"] == stopped["answer"]

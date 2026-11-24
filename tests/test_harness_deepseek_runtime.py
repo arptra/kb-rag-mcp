@@ -159,7 +159,7 @@ async def test_slow_autopilot_plans_searches_reads_and_finishes_with_full_contex
         ))
         await asyncio.wait_for(entered.wait(), 2)
         live = runtime.store.get(OWNER.owner_id, submitted["id"])
-        assert live["current_action"]["name"] == "model_response"
+        assert live["current_action"]["name"] == "model_planning"
         assert live["current_action"]["started_at"]
         assert live["status"] == "running" and not live["answer"]
         release.set()
@@ -293,10 +293,10 @@ async def test_prose_plan_requires_research_before_autopilot_can_finish(
             assert calls == 4
         else:
             assert result["status"] == "partial"
-            assert calls == 3
-            assert "Автопилот не получил подтверждения собственной проверки источника." in (
-                result["warnings"]
-            )
+            assert 2 <= calls <= result["budget"]["current"]["model_calls"]
+            assert result["answer"] and "Сейчас я проверю" not in result["answer"]
+            assert any(step["name"] == "answer_quality_rejected"
+                       for step in result["research_trace"])
     finally:
         await runtime.stop()
 
@@ -318,7 +318,13 @@ async def test_transient_failure_recovers_final_answer_without_replaying_actions
             calls += 1
             if calls == 1:
                 raise ModelTransientError("API модели временно недоступен.")
-            assert not kwargs["tools"]
+            if mode == "autonomous" and calls == 2:
+                assert any(tool["function"]["name"] == "read_document" for tool in kwargs["tools"])
+                return {"content": "", "tool_calls": [{"name": "read_document", "args": {
+                    "index_id": "docs", "document_id": "payment",
+                }}]}
+            if mode != "autonomous":
+                assert not kwargs["tools"]
             return {"content": "Законченный ответ [payment].", "tool_calls": []}
 
     source = Source()
@@ -330,8 +336,8 @@ async def test_transient_failure_recovers_final_answer_without_replaying_actions
         ))
         result = await finished(runtime, submitted["id"])
         assert result["answer"] == "Законченный ответ [payment]."
-        assert result["status"] == ("partial" if mode == "autonomous" else "completed")
-        assert calls == 2
+        assert result["status"] == "completed"
+        assert calls == (3 if mode == "autonomous" else 2)
         assert source.searches == ["Explain"]
         assert any(step["name"] == "model_retry" for step in result["research_trace"])
     finally:

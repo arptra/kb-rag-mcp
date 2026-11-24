@@ -78,6 +78,7 @@
                 <div id="run-progress" class="run-progress">
                   <div class="progress-description"><span id="run-status-dot" class="run-status-dot" aria-hidden="true"></span><div><strong id="run-status">Запрос принят</strong><p id="run-phase"></p><p id="run-waiting" class="run-waiting" hidden></p></div></div>
                   <button id="cancel-run" class="text-button" type="button" hidden>Остановить</button>
+                  <p id="run-recovery-note" class="run-last-step" hidden></p>
                   <p id="run-last-step" class="run-last-step" hidden></p>
                 </div>
                 <div id="progress-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -108,7 +109,7 @@
                       <p id="research-current" class="research-next" hidden></p>
                       <p id="research-goal" class="research-goal" hidden></p>
                       <p id="research-next" class="research-next" hidden></p>
-                      <details id="research-details"><summary>План и выполненные действия</summary><div id="research-plan" class="research-plan"></div><ol id="research-timeline" class="research-timeline"></ol></details>
+                      <div id="research-details"><div id="research-plan" class="research-plan"></div><ol id="research-timeline" class="research-timeline" aria-label="Действия исследования от новых к старым" tabindex="0" reversed></ol></div>
                     </section>
                     <details id="run-budget" class="run-budget" hidden><summary>Ресурсы и управление контекстом</summary><p id="run-context-summary" class="muted"></p><div id="run-budget-values" class="budget-values"></div><ol id="run-budget-events" class="research-timeline"></ol></details>
                     <div id="run-memory-used" class="run-memory-used" hidden></div>
@@ -266,7 +267,11 @@
                     <label class="settings-field"><span class="settings-field-label">Предел ответа API, токены</span><input id="model-output-tokens" type="number" min="128" max="131072" value="32768"><small class="settings-field-help">Для прямого API. Фактический предел также зависит от вашей модели.</small></label>
                   </div>
                 </div>
-                <div class="resource-actions"><button id="model-connection-probe" class="secondary-button" type="button">Проверить запросом</button><button id="model-connection-save" class="text-button" type="button">Сохранить подключение</button></div>
+                <div class="resource-actions">
+                  <button id="model-connection-probe" class="secondary-button" type="button">Проверить запросом</button>
+                  <button id="model-autopilot-probe" class="secondary-button" type="button" title="Проверить ответ модели и выбор инструмента на учебном запросе" hidden>Проверить Автопилот</button>
+                  <button id="model-connection-save" class="text-button" type="button">Сохранить подключение</button>
+                </div>
                 <p id="model-connection-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
               </div>
               <div class="settings-section-heading tls-section-heading"><div><h3>Сертификаты TLS</h3><p>Корпоративный центр сертификации и клиентская пара для mTLS, если сервер модели их требует.</p></div><button id="tls-new" class="secondary-button" type="button">Добавить сертификаты</button></div>

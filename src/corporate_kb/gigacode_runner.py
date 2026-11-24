@@ -111,6 +111,13 @@ class GigaCodeInvalidOutput(RuntimeError):
     """The CLI ran but returned an incomplete or unusable model response."""
 
 
+class GigaCodePolicyStop(RuntimeError):
+    """The native event envelope explicitly signalled a provider restriction."""
+
+    def __init__(self) -> None:
+        super().__init__("GigaCode reported a provider policy stop")
+
+
 @dataclass(frozen=True, slots=True)
 class GigaCodeModelProfile:
     """Deployment-verified launcher contract for model-only invocations.
@@ -587,11 +594,13 @@ class GigaCodeRunner:
                     if progress is not None:
                         progress(f"GigaCode stderr | {line[:2000]}")
                     continue
+                event = self._parse_event(line)
+                if event is not None and self._policy_stopped(event):
+                    raise GigaCodePolicyStop()
                 stdout_tail = self._tail(stdout_tail, line)
                 if debug_stdout is not None:
                     debug_stdout.write(f"{line}\n")
                     debug_stdout.flush()
-                event = self._parse_event(line)
                 if event is None:
                     if progress is not None:
                         progress(f"GigaCode stdout (non-JSON) | {line[:1000]}")
@@ -1097,6 +1106,46 @@ class GigaCodeRunner:
         finally:
             stream.close()
             cls._publish(events, (source, None), stop)
+
+    @staticmethod
+    def _policy_stopped(event: dict[str, Any]) -> bool:
+        # Inspect native metadata only. The result payload, tool arguments and
+        # generated text may legitimately document these fields or quote a refusal.
+        kind = event.get("type")
+        metadata: object
+        if kind in ("result", "error"):
+            metadata = event
+        elif kind == "assistant":
+            metadata = event.get("message")
+        elif kind == "stream_event":
+            stream_event = event.get("event")
+            if not isinstance(stream_event, dict):
+                return False
+            if stream_event.get("type") == "content_block_start":
+                block = stream_event.get("content_block")
+                return isinstance(block, dict) and block.get("type") == "refusal"
+            if stream_event.get("type") != "message_delta":
+                return False
+            metadata = stream_event.get("delta")
+        else:
+            return False
+        if not isinstance(metadata, dict):
+            return False
+        error = metadata.get("error")
+        reasons = [metadata.get("stop_reason"), metadata.get("finish_reason")]
+        if isinstance(error, dict):
+            reasons.extend((error.get("code"), error.get("type")))
+        if any(isinstance(reason, str) and reason.casefold() in {
+            "refusal", "content_filter", "blacklist", "content_policy_violation",
+            "responsibleaipolicyviolation",
+        } for reason in reasons):
+            return True
+        if metadata.get("refusal"):
+            return True
+        content = metadata.get("content")
+        return isinstance(content, list) and any(
+            isinstance(part, dict) and part.get("type") == "refusal" for part in content
+        )
 
     @staticmethod
     def _incomplete_result(event: dict[str, Any]) -> bool:

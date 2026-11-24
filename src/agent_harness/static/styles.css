@@ -242,6 +242,8 @@ svg { width: 22px; height: 22px; flex-shrink: 0; }
 .research-plan-group ul { padding-left: 20px; margin: 0; color: #bdbdc2; }
 .research-round { color: #a8a8ad; margin: 14px 0 0; }
 .research-timeline { padding: 0; margin: 20px 0 0; list-style: none; }
+#research-timeline { max-height: min(45vh, 26rem); overflow-y: auto; }
+#research-timeline:empty { display: none; }
 .research-event { padding: 0 0 17px 15px; border-left: 1px solid #55555b; margin-left: 3px; }
 .research-event:last-child { padding-bottom: 0; }
 .research-event strong { font-size: 16px; font-weight: 500; color: #e6e6eb; }

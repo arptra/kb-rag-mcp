@@ -14,12 +14,14 @@ from langchain_core.messages import HumanMessage
 from langchain_core.messages.utils import count_tokens_approximately
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from agent_harness.answer_quality import answer_for_history
 from agent_harness.control.settings import ControlStore
 from agent_harness.store import RunStore, timestamp
 
 LIST_LIMIT = 200
 MAX_TOTAL = 10_000
 MAX_FAILURES = 12
+_PREVIOUS_CONCLUSION = "Предыдущий вывод (не подтверждённое знание): "
 _STOP = frozenset(
     [
         "what",
@@ -301,6 +303,12 @@ class MemoryStore:
                 continue
             if item["status"] not in {"active", "experience"}:
                 continue
+            if item.get("origin") == "automatic" and item["status"] == "experience":
+                preceding, marker, previous = item["text"].rpartition("\n" + _PREVIOUS_CONCLUSION)
+                if marker and previous and not answer_for_history(previous):
+                    # Legacy cases retain their feedback and research history. Only
+                    # exclude the old model notice from retrieval and term matching.
+                    item = {**item, "text": preceding}
             words = _terms(f"{item['title']} {item['text']} {item.get('_match_question', '')}")
             score = len(query & words)
             if score:
@@ -677,8 +685,10 @@ class MemoryStore:
                 )[:500]
                 + "\n"
             )
-        if not bad and run.get("answer"):
-            text += "Предыдущий вывод (не подтверждённое знание): " + str(run["answer"])[:1000]
+        if (not bad and run.get("answer")
+                and run.get("stop_reason") not in {"model_policy_stop", "model_refusal_text"}
+                and not run.get("_final_quality_issue")):
+            text += _PREVIOUS_CONCLUSION + str(run["answer"])[:1000]
         item = {
             "id": self._automatic_id(owner, run["id"]),
             "title": ("Урок: " if bad or incomplete or failures else "Опыт: ") + question[:150],

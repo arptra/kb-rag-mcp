@@ -51,7 +51,7 @@ async def test_api_respects_output_budget_and_preserves_usage_and_long_answers(
     assert result["usage"] == {"prompt_tokens": 123, "completion_tokens": 456}
 
 
-@pytest.mark.parametrize("finish_reason", ["length", "max_tokens", "content_filter"])
+@pytest.mark.parametrize("finish_reason", ["length", "max_tokens"])
 async def test_api_preserves_incomplete_generation_marker(
     tmp_path: Path, finish_reason: str,
 ) -> None:

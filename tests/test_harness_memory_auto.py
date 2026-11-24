@@ -65,6 +65,33 @@ def test_completed_run_is_remembered_after_restart_and_reused_only_as_experience
     assert len(memory.list("alice", {"payments"})) == 1
 
 
+def test_retrieving_legacy_cases_drops_automatic_notice_but_preserves_manual_notes(
+    tmp_path: Path,
+) -> None:
+    memory = store(tmp_path)
+    notice = "Иногда генеративные модели могут создавать некорректные ответы."
+    case = memory.record_outcome("alice", run(memory, answer=notice), index_ids=["payments"])
+    assert case is not None and notice in case["text"]
+    finding = notice + " Ledger records a timeout [doc]."
+    verified = memory.record_outcome(
+        "alice", run(memory, "mixed", answer=finding), index_ids=["payments"],
+    )
+    assert verified is not None
+    manual = memory.save("alice", MemoryInput(
+        title="Ledger manual", text="Пример ответа модели:\n" + notice,
+        index_ids=["payments"], confirmed=True,
+    ))
+    selected = {"payments"}
+    found = {item["id"]: item for item in memory.retrieve("bob", "ledger", selected, selected)}
+    assert notice not in found[case["id"]]["text"]
+    assert "search_knowledge" in found[case["id"]]["text"]
+    assert notice in found[manual["id"]]["text"]
+    assert finding in found[verified["id"]]["text"]
+    matches = memory.retrieve("bob", "некорректные", selected, selected)
+    assert {item["id"] for item in matches} == {manual["id"], verified["id"]}
+    assert notice in memory.get("alice", case["id"])["text"]
+
+
 def test_automatic_case_is_shared_only_with_readers_who_have_its_full_scope(tmp_path: Path) -> None:
     memory = store(tmp_path)
     first = run(memory, context_index_ids=["private-logs"])

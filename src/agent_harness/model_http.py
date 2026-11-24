@@ -82,7 +82,9 @@ def create_model_routes(
                 ) from None
         # Testing a candidate must neither replace the active model nor interrupt
         # investigations. Empty bodies retain the previous saved-settings contract.
-        return JSONResponse(await router.probe(candidate), headers={"Cache-Control": "no-store"})
+        autopilot = request.query_params.get("autopilot") == "1"
+        result = await router.probe(candidate, autopilot=autopilot)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     return [
         Route("/api/model/connection", settings, methods=["GET", "PUT"]),

@@ -33,6 +33,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from agent_harness.answer_quality import answer_for_history
+from agent_harness.model_connection import ModelPolicyStop
 from agent_harness.store import ACTIVE, RunStore, timestamp
 
 SummaryInvoker = Callable[[list[dict[str, str]]], Awaitable[str]]
@@ -135,9 +137,17 @@ class ConversationContext:
         return (set(run.get("index_ids", [])) | set(run.get("context_index_ids", []))
                 | {item["index_id"] for item in run.get("evidence", [])})
 
+    @staticmethod
+    def _history_answer(run: dict[str, Any]) -> str:
+        if run.get("stop_reason") in {"model_policy_stop", "model_refusal_text"}:
+            return ""
+        return answer_for_history(run.get("answer"))
+
     @classmethod
     def _fingerprint(cls, runs: list[dict[str, Any]]) -> str:
-        payload = [(run["id"], run.get("question", ""), run.get("answer", ""),
+        # Use exactly the projected assistant text. This invalidates pre-fix summaries
+        # only for chains whose old answer would contaminate the next request.
+        payload = [(run["id"], run.get("question", ""), cls._history_answer(run),
                     sorted(cls._scope(run)), run.get("resume_count", 0)) for run in runs]
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
 
@@ -165,13 +175,14 @@ class ConversationContext:
             parent = previous.get("parent_run_id")
         return list(reversed(chain)), truncated
 
-    @staticmethod
-    def _messages(run: dict[str, Any]) -> list[BaseMessage]:
+    @classmethod
+    def _messages(cls, run: dict[str, Any]) -> list[BaseMessage]:
         result: list[BaseMessage] = [
             HumanMessage(content=run.get("question", ""), id=run["id"] + ":user"),
         ]
-        if run.get("answer"):
-            result.append(AIMessage(content=run["answer"], id=run["id"] + ":assistant"))
+        answer = cls._history_answer(run)
+        if answer:
+            result.append(AIMessage(content=answer, id=run["id"] + ":assistant"))
         return result
 
     def _cached(
@@ -274,7 +285,7 @@ class ConversationContext:
                 )
             try:
                 result = await model.ainvoke(prompt)
-            except (asyncio.CancelledError, ContextBudgetError, CompactionError):
+            except (asyncio.CancelledError, ContextBudgetError, CompactionError, ModelPolicyStop):
                 raise
             except Exception as exc:
                 raise CompactionError(

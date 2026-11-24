@@ -16,6 +16,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from agent_harness.answer_quality import answer_quality_issue, is_answer_source
 from agent_harness.budgets import BUDGET_TOOL, apply_request
 from agent_harness.config import HarnessSettings
 from agent_harness.context import (
@@ -41,8 +42,10 @@ from agent_harness.model_connection import (
     INCOMPLETE_FINISH_REASONS,
     RETRYABLE_FINISH_REASONS,
     ModelConnectionError,
+    ModelPolicyStop,
     ModelRouter,
     ModelTransientError,
+    check_model_policy,
 )
 from agent_harness.model_profiles import DEEPSEEK_CONTEXT_WINDOW_TOKENS
 from agent_harness.policy import SYSTEM_PROMPT
@@ -50,6 +53,7 @@ from agent_harness.research import initial_search_query, needs_source_check
 from agent_harness.store import ACTIVE, RunStore, timestamp
 
 _LOG = logging.getLogger(__name__)
+_ANSWER_TRUNCATED = "\n\n[Ответ сокращён по ограничению размера.]"
 
 
 class QueueFullError(RuntimeError):
@@ -364,6 +368,7 @@ class HarnessRuntime:
         if (
             self._graph is None
             or run["status"] not in {"interrupted", "timed_out", "failed", "partial", "cancelled"}
+            or run.get("stop_reason") in {"model_policy_stop", "model_refusal_text"}
             or not {"mode", "effort", "metrics"} <= run.keys()
             or run.get("resume_count", 0) >= self._runtime_limits(run).max_resume_attempts
         ):
@@ -846,6 +851,7 @@ class HarnessRuntime:
         self.store.save(principal.owner_id, run)
         operation = asyncio.create_task(self._research(principal, run, event, deadline))
         terminal: str | None = None
+        model_stop: str | None = None
         try:
             while not operation.done():
                 await asyncio.wait({operation}, timeout=0.05)
@@ -875,6 +881,16 @@ class HarnessRuntime:
             current = asyncio.current_task()
             if current is not None and current.cancelling():
                 raise
+        except ModelPolicyStop as exc:
+            terminal = "partial" if run["evidence"] else "failed"
+            model_stop = exc.stop_reason
+            message = str(exc)
+            run["answer"] = (
+                message + " Исследование остановлено. Администратор в настройках модели "
+                "может проверить простой запрос и выбор инструмента."
+            )
+            self._warn(run, message)
+            self._trace(run, model_stop, {}, message)
         except ModelConnectionError as exc:
             terminal = "partial" if run["evidence"] else "failed"
             self._warn(run, str(exc))
@@ -896,7 +912,7 @@ class HarnessRuntime:
                     self._warn(run, "Очистка песочницы не подтверждена; сообщите администратору.")
             if terminal:
                 run["status"] = terminal
-                run["stop_reason"] = {
+                run["stop_reason"] = model_stop or {
                     "timed_out": "time_limit", "cancelled": "cancelled",
                 }.get(terminal, "failed" if terminal == "failed" else "partial")
             elif run["status"] in ACTIVE:
@@ -1092,6 +1108,7 @@ class HarnessRuntime:
         limit: int | None = None,
         deadline: float | None = None,
         initial: bool = False,
+        recovery: bool = False,
     ) -> str:
         if event.is_set() or self.source is None:
             return "Вызов отменён либо источник отключён."
@@ -1133,7 +1150,7 @@ class HarnessRuntime:
                     check = "search_knowledge"
             accepted = sum(
                 self._add_evidence(run, item, index_id, fresh=not initial,
-                                   checked_with=check)
+                                   checked_with=check, recovery=recovery)
                 for item in items[:count]
             )
             if initial:
@@ -1155,12 +1172,15 @@ class HarnessRuntime:
 
     async def _read(
         self, principal: Principal, run: dict[str, Any], event: Event, args: dict[str, Any],
-        deadline: float | None = None, *, model_requested: bool = False,
+        deadline: float | None = None, *, model_requested: bool = False, recovery: bool = False,
     ) -> str:
         if event.is_set() or self.source is None:
             return "Вызов отменён либо источник отключён."
         run["metrics"]["source_calls"] += 1
-        run["current_action"] = {"name": "read_document", "started_at": timestamp()}
+        run["current_action"] = {
+            "name": "read_document", "started_at": timestamp(),
+            "args": {key: args[key] for key in ("index_id", "document_id")},
+        }
         self._checkpoint(principal, run, event)
         try:
             timeout = self._source_timeout(run)
@@ -1174,7 +1194,8 @@ class HarnessRuntime:
             return (
                 "Документ прочитан; подтверждение включено в контекст."
                 if self._add_evidence(run, item, args["index_id"], document=True,
-                                      checked_with="read_document" if model_requested else None)
+                                      checked_with="read_document"
+                                      if model_requested or recovery else None, recovery=recovery)
                 else "Документ не включён: ограничение области доступа или бюджета."
             )
         except Exception as exc:
@@ -1213,7 +1234,7 @@ class HarnessRuntime:
 
     def _add_evidence(
         self, run: dict[str, Any], item: Evidence, index_id: str, *, document: bool = False,
-        fresh: bool = False, checked_with: str | None = None,
+        fresh: bool = False, checked_with: str | None = None, recovery: bool = False,
     ) -> bool:
         item = Evidence.model_validate(item)
         if item.index_id != index_id:
@@ -1228,6 +1249,14 @@ class HarnessRuntime:
             else min(self._runtime_limits(run).evidence_chars, profile.evidence_chars)
         )
         payload["text"] = payload["text"][:text_limit]
+        if recovery and checked_with:
+            # An automatic read/search can confirm a finding only if its retained
+            # text actually adds detail. A new hit id can wrap an identical snippet.
+            text = " ".join(payload["text"].casefold().split())
+            if any(previous["index_id"] == index_id
+                   and text in " ".join(previous["text"].casefold().split())
+                   for previous in run["evidence"]):
+                checked_with = None
         if (checked_with and run.get("mode") == "autonomous" and item.kind == "source"
                 and payload["text"].strip()):
             payload["checked_with"] = checked_with
@@ -1241,7 +1270,8 @@ class HarnessRuntime:
         for i, existing in enumerate(run["evidence"]):
             if (existing["id"], existing["index_id"]) == (payload["id"], index_id):
                 if existing.get("read_document") and not document:
-                    if (payload.get("checked_with") and existing.get("kind") == "source"
+                    if (not recovery and payload.get("checked_with")
+                            and existing.get("kind") == "source"
                             and existing.get("revision") == payload["revision"]
                             and existing["text"].strip()):
                         existing["checked_with"] = payload["checked_with"]
@@ -1337,6 +1367,7 @@ class HarnessRuntime:
             raise ValueError("Source access changed during the investigation")
         coverage = run.get("coverage", {})
         context: dict[str, Any] = {
+            "question": run["question"],
             "mode": run["mode"], "effort": run["effort"],
             "stage": run["phase"],
             "sandbox_profile_id": run.get("sandbox_profile_id", ""),
@@ -1368,7 +1399,6 @@ class HarnessRuntime:
             {"role": "system", "content": SYSTEM_PROMPT},
             *[{key: item[key] for key in ("role", "content")}
               for item in conversation["messages"]],
-            {"role": "user", "content": run["question"]},
         ]
         # Measure the actual serialized envelope, including a JSON context string
         # nested in messages. Source code contains many quotes and newlines.
@@ -1546,7 +1576,9 @@ class HarnessRuntime:
         options = (
             {"max_output_tokens": output_tokens} if isinstance(self.model, ModelRouter) else {}
         )
-        action_name = "context_compaction" if summary else "model_response"
+        action_name = "context_compaction" if summary else {
+            "investigating": "model_planning", "budget_review": "model_budget_review",
+        }.get(run.get("phase", ""), "model_response")
         run["current_action"] = {"name": action_name, "started_at": timestamp()}
         self._checkpoint(principal, run, event)
         operation = asyncio.create_task(
@@ -1566,6 +1598,15 @@ class HarnessRuntime:
                         raise asyncio.CancelledError
                     raise TimeoutError("Investigation decision budget exhausted")
             result = await operation
+            if isinstance(result, dict):
+                check_model_policy(result, result.get("finish_reason"))
+        except ModelPolicyStop as exc:
+            stage = {"model_planning": "Выбор следующего действия",
+                     "model_budget_review": "Проверка бюджета",
+                     "context_compaction": "Сжатие истории",
+                     "model_response": "Подготовка ответа"}[action_name]
+            exc.args = (f"{stage}. {exc}",)
+            raise
         except _AuthenticationTimeout:
             signal.set()
             await self._cleanup(operation, run)
@@ -1581,7 +1622,7 @@ class HarnessRuntime:
         finally:
             run["current_action"] = None
             self._checkpoint(principal, run, event)
-        self._trace(run, action_name, {},
+        self._trace(run, "context_compaction" if summary else "model_response", {},
                     "Модель вернула результат сжатия истории." if summary
                     else "Модель ответила; проверяем результат и следующий шаг.")
         if not isinstance(result, dict) or not isinstance(result.get("tool_calls", []), list):
@@ -1623,8 +1664,11 @@ class HarnessRuntime:
                 incomplete = decision.get("finish_reason") in RETRYABLE_FINISH_REASONS
                 if incomplete and decision.get("content"):
                     partial = decision
-                if (not incomplete or attempt == retries) and self._answer(run, decision):
-                    return
+                if not incomplete or attempt == retries:
+                    if self._answer(run, decision):
+                        return
+                    if run.get("_final_quality_issue"):
+                        self._checkpoint(principal, run, event)
             except ConversationUnavailable:
                 run["status"] = "partial"
                 return
@@ -1644,19 +1688,37 @@ class HarnessRuntime:
         if partial:
             self._answer(run, partial)
         run["status"] = "partial"
-        self._warn(run, "Модель не сформировала законченный ответ после повторной попытки.")
+        if issue := run.get("_final_quality_issue"):
+            run.setdefault("stop_reason", "answer_quality")
+            self._warn(run, issue)
+        else:
+            self._warn(run, "Модель не сформировала законченный ответ после повторной попытки.")
+
+    def _draft_quality_issue(self, run: dict[str, Any], content: str) -> str | None:
+        limit = self._runtime_limits(run).answer_chars
+        if len(content) > limit:
+            content = content[:limit - len(_ANSWER_TRUNCATED)]
+        return answer_quality_issue(run, content)
 
     def _answer(self, run: dict[str, Any], decision: dict[str, Any]) -> bool:
         content = decision.get("content")
         if not isinstance(content, str) or not content.strip():
             return False
         content = content.strip()
+        issue = self._draft_quality_issue(run, content)
+        if issue:
+            run["_final_quality_issue"] = issue
+            self._trace(run, "answer_quality_rejected", {}, issue)
+            return False
+        run.pop("_final_quality_issue", None)
+        if run["mode"] == "autonomous":
+            self._trace(run, "answer_quality_check", {},
+                        "Ссылки из ответа найдены в материалах этого исследования.")
         answer_chars = self._runtime_limits(run).answer_chars
         run["answer"] = content[:answer_chars]
         if len(content) > answer_chars:
             self._warn(run, "Ответ превышает настроенный размер и показан не полностью.")
-            marker = "\n\n[Ответ сокращён по ограничению размера.]"
-            run["answer"] = content[:answer_chars - len(marker)] + marker
+            run["answer"] = content[:answer_chars - len(_ANSWER_TRUNCATED)] + _ANSWER_TRUNCATED
         if decision.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
             self._warn(run, "Модель остановила генерацию до завершения ответа.")
         plan = run.get("research_plan", {})
@@ -1681,8 +1743,24 @@ class HarnessRuntime:
         if message not in run["warnings"] and len(run["warnings"]) < 30:
             run["warnings"].append(message)
 
-    @staticmethod
-    def _evidence_answer(run: dict[str, Any]) -> None:
+    def _evidence_answer(self, run: dict[str, Any]) -> None:
+        if run.get("_final_quality_issue") or run.get("stop_reason") == "answer_quality":
+            # Keep source excerpts literal. A model failure is not permission to invent
+            # a conclusion, render source markup or disclose administrative diagnostics.
+            parts = ["Получить подтверждённый ответ на вопрос не удалось."]
+            sources = [item for item in HarnessRuntime._ranked_evidence(run)
+                       if is_answer_source(item)]
+            if sources:
+                parts.append("**Что удалось найти**")
+                for source in sources[:3]:
+                    excerpt = " ".join(source["text"].split())
+                    title = " ".join(source["title"].split())
+                    parts.append("    " + title[:120] + " [" + " ".join(source["id"].split())[:160]
+                                 + "]\n    " + excerpt[:320] + ("…" if len(excerpt) > 320 else ""))
+            else:
+                parts.append("Среди выбранных источников нет материала для подтверждения вывода.")
+            run["answer"] = "\n\n".join(parts)[:self._runtime_limits(run).answer_chars]
+            return
         run["answer"] = (
             "Найдены фрагменты источников. Объяснение системы не сформировано; "
             "проверьте найденные подтверждения и ограничения ниже."

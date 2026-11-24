@@ -367,6 +367,34 @@ test("model URL and keyless TLS selection survive saving and probing with cookie
   }
 });
 
+test("Autopilot probe tests unsaved direct settings and keeps the simple probe available", async (t) => {
+  let finishProbe;
+  const probeResult = new Promise((resolve) => { finishProbe = resolve; });
+  const { ui, nodes, requests } = fixture(t, (request) => request.path.includes("?autopilot=") ? probeResult :
+    { available: true, message: "Модель ответила" }, { session: () => ({ csrf_token: "session-token" }) });
+  ui.settingsState.canManage = true;
+  ui.applyModelConnection({ provider: "gigacode" });
+  const probe = nodes.get("model-autopilot-probe");
+  assert(probe.hidden && probe.disabled);
+  ui.applyModelConnection({ provider: "openai", base_url: "https://saved.test/v1" });
+  nodes.get("direct-model-url").value = "https://draft.test/v1";
+  nodes.get("direct-model-tls").value = "corp";
+  assert.equal(probe.hidden, false);
+  const pending = probe.listeners.click();
+  assert.match(nodes.get("model-connection-feedback").textContent, /Проверяем ответ и выбор инструмента/);
+  assert(probe.disabled && nodes.get("model-connection-probe").disabled);
+  finishProbe({ available: false, message: "Модель не вызвала инструмент." });
+  await pending;
+  assert.match(nodes.get("model-connection-feedback").textContent, /Модель не вызвала инструмент.*Настройки ещё не сохранены/);
+  await nodes.get("model-connection-probe").listeners.click();
+  const calls = requests.filter((request) => request.method === "POST");
+  assert.deepEqual(calls.map((call) => call.path), ["model/connection/probe?autopilot=1", "model/connection/probe"]);
+  assert.equal(calls[0].body, calls[1].body);
+  assert.equal(JSON.parse(calls[0].body).base_url, "https://draft.test/v1");
+  assert.equal(JSON.parse(calls[0].body).tls_bundle_id, "corp");
+  assert(!requests.some((call) => call.method === "PUT"));
+});
+
 test("header authentication still works without a portal session endpoint", async (t) => {
   for (const [kind, status, baseURI] of [["admin", 401, "http://localhost/harness/"],
     ["bearer", 404, "http://localhost/"]]) {
@@ -472,6 +500,33 @@ test("live activity shows model waiting and elapsed time, then collapses complet
   assert.equal(nodes.get("run-progress").hidden, true);
   assert.equal(nodes.get("run-details").open, false);
   assert.equal(nodes.get("answer").textContent, "Answer active");
+});
+
+test("one poll shows why research continued, the active target, and earlier steps from the server", async (t) => {
+  const trace = [
+    { name: "mcp_list_tools", result: "Изучен каталог" },
+    ...Array.from({ length: 20 }, () => ({ name: "research_round", result: "Проверены материалы" })),
+    { name: "model_planning" }, { name: "answer_quality_rejected", result: "В ответе отсутствуют ссылки на источники." },
+    { name: "research_recovery", result: "Проверяем другой документ" },
+  ];
+  const active = run("auto", { status: "running", mode: "autonomous", phase: "reading", answer: "",
+    research_trace: trace, current_action: { name: "read_document", args: { index_id: "a", document_id: "PAY-42" } } });
+  const { ui, nodes } = fixture(t, ({ path }) => path === "runs/auto" ? active : {});
+  ui.state.current = run("auto", { status: "queued" });
+  ui.conversationState.id = "chat"; ui.conversationState.runs = [ui.state.current];
+  await ui.refreshRun("auto", ui.state.generation);
+  assert.equal(nodes.get("run-recovery-note").hidden, false);
+  assert.match(nodes.get("run-recovery-note").textContent, /Черновик не прошёл проверку.*отсутствуют ссылки/);
+  assert.match(nodes.get("run-status").textContent, /Чтение документа · Documents · PAY-42/);
+  assert.match(nodes.get("run-last-step").textContent, /Поиск дополнительных подтверждений/);
+  const timeline = nodes.get("research-timeline");
+  assert.equal(timeline.children.length, trace.length);
+  assert.match(timeline.firstElementChild.textContent, /другой документ/);
+  assert.match(timeline.lastElementChild.textContent, /Изучен каталог/);
+  ui.state.current = { ...active, current_action: null, status: "partial", stop_reason: "model_policy_stop" };
+  ui.renderRun();
+  assert.equal(nodes.get("run-recovery-note").hidden, true);
+  assert.equal(nodes.get("run-status").textContent, "Провайдер остановил генерацию");
 });
 
 test("DeepSeek profile recommendations only change custom values after the apply action", (t) => {
