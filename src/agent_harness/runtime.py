@@ -46,6 +46,7 @@ from agent_harness.model_connection import (
 )
 from agent_harness.model_profiles import DEEPSEEK_CONTEXT_WINDOW_TOKENS
 from agent_harness.policy import SYSTEM_PROMPT
+from agent_harness.research import initial_search_query, needs_source_check
 from agent_harness.store import ACTIVE, RunStore, timestamp
 
 _LOG = logging.getLogger(__name__)
@@ -1062,10 +1063,14 @@ class HarnessRuntime:
                 timeout,
             )
             accepted = 0
+            # Catalogs, schemas and checkout receipts describe available tools or code.
+            setup_only = name in {"clone_repository", "mcp_list_tools", "mcp_tool_schema"}
             for item in items:
                 if item.index_id not in run["index_ids"]:
                     raise ValueError("Tool evidence is outside run scope")
-                accepted += self._add_evidence(run, item, item.index_id, fresh=True)
+                accepted += self._add_evidence(
+                    run, item, item.index_id, fresh=True, checked_with=None if setup_only else name,
+                )
             return f"Получено подтверждений: {accepted}."
         except Exception as exc:
             message = f"Инструмент {name} недоступен ({type(exc).__name__})."
@@ -1119,8 +1124,18 @@ class HarnessRuntime:
                     ),
                     timeout,
                 )
-            accepted = sum(self._add_evidence(run, item, index_id, fresh=not initial)
-                           for item in items[:count])
+            check = None
+            if not initial and run["mode"] == "autonomous":
+                previous_status = run.get("coverage", {}).get(index_id, {}).get("status")
+                initial_terms = initial_search_query(run).casefold().split()
+                same_query = query.casefold().split() == initial_terms
+                if not same_query or previous_status not in {"searched", "empty"}:
+                    check = "search_knowledge"
+            accepted = sum(
+                self._add_evidence(run, item, index_id, fresh=not initial,
+                                   checked_with=check)
+                for item in items[:count]
+            )
             if initial:
                 run.setdefault("coverage", {})[index_id] = {
                     "status": "searched" if items else "empty", "count": len(items[:count]),
@@ -1140,7 +1155,7 @@ class HarnessRuntime:
 
     async def _read(
         self, principal: Principal, run: dict[str, Any], event: Event, args: dict[str, Any],
-        deadline: float | None = None,
+        deadline: float | None = None, *, model_requested: bool = False,
     ) -> str:
         if event.is_set() or self.source is None:
             return "Вызов отменён либо источник отключён."
@@ -1158,7 +1173,8 @@ class HarnessRuntime:
             run["metrics"]["document_reads"] = run["metrics"].get("document_reads", 0) + 1
             return (
                 "Документ прочитан; подтверждение включено в контекст."
-                if self._add_evidence(run, item, args["index_id"], document=True)
+                if self._add_evidence(run, item, args["index_id"], document=True,
+                                      checked_with="read_document" if model_requested else None)
                 else "Документ не включён: ограничение области доступа или бюджета."
             )
         except Exception as exc:
@@ -1197,7 +1213,7 @@ class HarnessRuntime:
 
     def _add_evidence(
         self, run: dict[str, Any], item: Evidence, index_id: str, *, document: bool = False,
-        fresh: bool = False,
+        fresh: bool = False, checked_with: str | None = None,
     ) -> bool:
         item = Evidence.model_validate(item)
         if item.index_id != index_id:
@@ -1212,6 +1228,9 @@ class HarnessRuntime:
             else min(self._runtime_limits(run).evidence_chars, profile.evidence_chars)
         )
         payload["text"] = payload["text"][:text_limit]
+        if (checked_with and run.get("mode") == "autonomous" and item.kind == "source"
+                and payload["text"].strip()):
+            payload["checked_with"] = checked_with
         payload["title"] = payload["title"][:300]
         payload["id"] = payload["id"][:1000]
         payload["url"] = payload["url"][:2000] if payload["url"] else None
@@ -1222,7 +1241,15 @@ class HarnessRuntime:
         for i, existing in enumerate(run["evidence"]):
             if (existing["id"], existing["index_id"]) == (payload["id"], index_id):
                 if existing.get("read_document") and not document:
+                    if (payload.get("checked_with") and existing.get("kind") == "source"
+                            and existing.get("revision") == payload["revision"]
+                            and existing["text"].strip()):
+                        existing["checked_with"] = payload["checked_with"]
                     return True
+                if (existing.get("checked_with") and payload["kind"] == "source"
+                        and existing["text"] == payload["text"]
+                        and existing.get("revision") == payload["revision"]):
+                    payload.setdefault("checked_with", existing["checked_with"])
                 run["evidence"][i] = payload
                 return True
         if len(run["evidence"]) < self._runtime_limits(run).max_evidence:
@@ -1633,11 +1660,8 @@ class HarnessRuntime:
         if decision.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
             self._warn(run, "Модель остановила генерацию до завершения ответа.")
         plan = run.get("research_plan", {})
-        if run.get("_unconfirmed_research") or (
-            run["mode"] == "autonomous" and run.get("_goal_review_requested")
-            and not run["metrics"]["tool_calls"] and not plan.get("ready_to_answer")
-        ):
-            self._warn(run, "Модель не подтвердила завершение исследования.")
+        if needs_source_check(run):
+            self._warn(run, "Автопилот не получил подтверждения собственной проверки источника.")
         if plan.get("model_updated") and plan.get("gaps"):
             self._warn(run, "План исследования содержит непроверенные вопросы.")
         elif plan.get("model_updated") and not plan.get("ready_to_answer"):

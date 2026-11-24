@@ -294,14 +294,16 @@ async def test_prose_plan_requires_research_before_autopilot_can_finish(
         else:
             assert result["status"] == "partial"
             assert calls == 3
-            assert "Модель не подтвердила завершение исследования." in result["warnings"]
+            assert "Автопилот не получил подтверждения собственной проверки источника." in (
+                result["warnings"]
+            )
     finally:
         await runtime.stop()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["quick", "investigate"])
-async def test_transient_failure_recovers_without_replaying_actions_or_partial_status(
+@pytest.mark.parametrize("mode", ["quick", "investigate", "autonomous"])
+async def test_transient_failure_recovers_final_answer_without_replaying_actions(
     tmp_path: Path, mode: str,
 ) -> None:
     connection(tmp_path)
@@ -327,7 +329,8 @@ async def test_transient_failure_recovers_without_replaying_actions_or_partial_s
             question="Explain", mode=mode, index_ids=["docs"],
         ))
         result = await finished(runtime, submitted["id"])
-        assert result["status"] == "completed", result["warnings"]
+        assert result["answer"] == "Законченный ответ [payment]."
+        assert result["status"] == ("partial" if mode == "autonomous" else "completed")
         assert calls == 2
         assert source.searches == ["Explain"]
         assert any(step["name"] == "model_retry" for step in result["research_trace"])

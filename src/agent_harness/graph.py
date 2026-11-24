@@ -19,7 +19,14 @@ from agent_harness.budgets import BUDGET_TOOL
 from agent_harness.contracts import ConversationUnavailable, ModelDecisionError, Principal
 from agent_harness.model_connection import INCOMPLETE_FINISH_REASONS, ModelTransientError
 from agent_harness.policy import TOOLS, validate_call
-from agent_harness.research import PLAN_TOOL, evidence_signature, initialize_plan, update_plan
+from agent_harness.research import (
+    PLAN_TOOL,
+    evidence_signature,
+    initial_search_query,
+    initialize_plan,
+    needs_source_check,
+    update_plan,
+)
 from agent_harness.store import timestamp
 
 if TYPE_CHECKING:
@@ -94,6 +101,7 @@ class HarnessGraph:
         config["recursion_limit"] = self.engine._runtime_limits(context.run).graph_recursion_limit
         state: GraphState | None = {"run": copy.deepcopy(context.run)}
         if resume:
+            context.run.pop("_goal_review_requested", None)
             snapshot = await self.graph.aget_state(config)
             if not snapshot.values:
                 raise ValueError("Контрольная точка не найдена. Создайте новый запрос.")
@@ -216,7 +224,7 @@ class HarnessGraph:
             raise ValueError("Source access changed during the investigation")
         parent = engine._parent_context(principal, run, available)
         run["parent_question"] = parent["question"] if parent else None
-        query = ((run["parent_question"] + "\nFollow-up: ") if parent else "") + run["question"]
+        query = initial_search_query(run)
         external = (
             await engine.tools.describe(principal, run["index_ids"])
             if engine.tools and run["mode"] != "quick"
@@ -245,7 +253,7 @@ class HarnessGraph:
                     run,
                     event,
                     index,
-                    query[:8000],
+                    query,
                     deadline=self._deadline(context) - engine._run_timeout(run) * 2 / 3
                     if run["mode"] == "quick"
                     else self._reserve_deadline(context),
@@ -390,18 +398,17 @@ class HarnessGraph:
                               "Предыдущий ответ был обрезан. Подготовьте краткий законченный итог.")
                 return self._result(context, "synthesize")
             plan = run.get("research_plan", {})
-            if (not plan.get("model_updated") and not run["metrics"]["tool_calls"]
-                    and not run.get("_goal_review_requested")):
+            missing_check = needs_source_check(run)
+            no_actions = not plan.get("model_updated") and not run["metrics"]["tool_calls"]
+            if (missing_check or no_actions) and not run.get("_goal_review_requested"):
                 run["_goal_review_requested"] = True
                 engine._trace(run, "goal_check", {},
-                              "Ответ без действий ещё не подтверждает завершение исследования. "
-                              "Выполните конкретную проверку инструментом и обновите план. "
-                              "Если данных достаточно, подтвердите ready_to_answer в плане; "
-                              "не ограничивайтесь обещанием провести исследование.")
+                              "Выберите зацепку в найденных материалах и проверьте её: "
+                              "уточните поиск, прочитайте документ, файл или запросите данные "
+                              "доступным инструментом. Укажите результат или причину, "
+                              "по которой проверка недоступна.")
                 return self._result(context, "decide")
-            if (run["mode"] == "autonomous" and run.get("_goal_review_requested")
-                    and not plan.get("model_updated") and not run["metrics"]["tool_calls"]):
-                run["_unconfirmed_research"] = True
+            if missing_check:
                 return self._result(context, "synthesize")
             if plan.get("model_updated") and not plan.get("ready_to_answer"):
                 if not run.get("_gap_review_requested"):
@@ -486,7 +493,8 @@ class HarnessGraph:
                     )
                     if name == "search_knowledge"
                     else await engine._read(principal, run, event, validated,
-                                            deadline=self._reserve_deadline(context))
+                                            deadline=self._reserve_deadline(context),
+                                            model_requested=True)
                 )
         except (ValueError, TypeError):
             result = "Вызов отклонён: недопустимый инструмент, аргументы или индекс."

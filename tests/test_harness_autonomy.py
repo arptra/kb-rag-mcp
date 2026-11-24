@@ -75,6 +75,9 @@ PLAN_READY = {"content": "", "tool_calls": [{"name": "update_research_plan", "ar
     "goal": "Explain", "completed": ["Verified source [Explain]"], "gaps": [],
     "ready_to_answer": True,
 }}]}
+READ = {"content": "", "tool_calls": [
+    {"name": "read_document", "args": {"index_id": "a", "document_id": "Explain"}},
+]}
 
 
 def build(tmp_path: Path, model: Model, **overrides: Any) -> HarnessRuntime:
@@ -234,7 +237,7 @@ async def test_repeated_extension_without_new_evidence_is_denied(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_time_grant_extends_outer_clock_not_just_displayed_budget(tmp_path: Path) -> None:
-    model = Model([request(timeout_seconds=2.0, model_calls=6), PLAN_READY, ANSWER])
+    model = Model([request(timeout_seconds=2.0, model_calls=6), READ, ANSWER])
     model.delay_second = 0.6
     runtime = build(tmp_path, model, timeout_seconds=0.4)
     await runtime.start()
@@ -388,7 +391,7 @@ async def test_provider_invocations_obey_separate_summary_and_decision_caps(tmp_
 async def test_low_initial_budget_triggers_model_review_before_investigation(
     tmp_path: Path,
 ) -> None:
-    model = Model([request(model_calls=6), PLAN_READY, ANSWER])
+    model = Model([request(model_calls=6), READ, ANSWER])
     runtime = build(tmp_path, model, model_calls=2)
     await runtime.start()
     try:
@@ -424,7 +427,7 @@ async def test_one_call_budget_preserves_final_answer_without_ungranted_extra_ca
             OWNER, RunRequest(question="Explain", mode="autonomous", index_ids=["a"])
         )
         run = await finished(runtime, submitted["id"])
-        assert run["status"] in {"completed", "partial"}
+        assert run["status"] == "partial"
         assert run["answer"] == ANSWER["content"]
         assert run["budget"]["extensions"] == 0
         assert run["budget"]["current"]["model_calls"] == 1
@@ -579,5 +582,106 @@ async def test_budget_request_cannot_change_source_permissions(tmp_path: Path) -
         assert run["budget"]["extensions"] == 0
         assert {item["index_id"] for item in run["evidence"]} == {"a"}
         assert any("недопустимый" in warning for warning in run["warnings"])
+    finally:
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_autopilot_rechecks_early_ready_claim_and_accepts_confirmed_same_document(
+    tmp_path: Path,
+) -> None:
+    premature = {"content": "Early summary of the initial sources.", "tool_calls": []}
+    model = Model([PLAN_READY, premature, READ, ANSWER])
+    runtime = build(tmp_path, model, model_calls=6, document_reads=1, source_calls=4)
+    await runtime.start()
+    try:
+        submitted = await runtime.submit(OWNER, RunRequest(
+            question="Explain", mode="autonomous", index_ids=["a"],
+        ))
+        result = await finished(runtime, submitted["id"])
+        assert result["answer"] == ANSWER["content"]
+        assert result["status"] == "completed", result["warnings"]
+        # Both the automatic inspection and the later model-directed verification
+        # return exactly the same id and body. Confirmation need not add a new source.
+        assert result["metrics"]["document_reads"] == 2
+        assert [item["id"] for item in result["evidence"]] == ["Explain"]
+        assert result["evidence"][0]["checked_with"] == "read_document"
+        assert any(step["name"] == "goal_check" for step in result["research_trace"])
+    finally:
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", [
+    None, "mcp_list_tools", "mcp_tool_schema", "clone_repository", "mcp_call",
+])
+async def test_plan_and_preparatory_tools_cannot_complete_bootstrap_only_research(
+    tmp_path: Path, operation: str | None,
+) -> None:
+    external_id = "repo:service" if operation == "clone_repository" else "connection:jira"
+    actions: list[str] = []
+
+    class PreparationTools:
+        async def indexes(self, principal: Principal) -> list[dict[str, str]]:
+            return [{"id": external_id, "name": "Selected connection"}]
+
+        async def describe(
+            self, principal: Principal, index_ids: list[str],
+        ) -> list[dict[str, Any]]:
+            return [{"type": "function", "function": {
+                "name": operation, "parameters": {"type": "object"},
+            }}] if operation else []
+
+        async def call(self, name: str, args: Any, **kwargs: Any) -> list[Evidence]:
+            actions.append(name)
+            if name == "mcp_call":
+                return []  # The backend was called but returned no findings.
+            return [Evidence(
+                id=name, index_id=external_id, title="Preparation", text="Available.",
+                # The repository adapter returns the checked-out ref as a source.
+                kind="source" if name == "clone_repository" else "tool_metadata",
+            )]
+
+        async def close_run(self, run_id: str) -> None:
+            pass
+
+    decisions = [PLAN_READY]
+    if operation:
+        decisions[0] = {"content": "", "tool_calls": [
+            {"name": operation, "args": {}}, *PLAN_READY["tool_calls"],
+        ]}
+    model = Model([*decisions, ANSWER])
+    runtime = build(tmp_path, model, model_calls=6, document_reads=1, source_calls=4)
+    runtime.tools = PreparationTools()
+    await runtime.start()
+    try:
+        submitted = await runtime.submit(OWNER, RunRequest(
+            question="Explain", mode="autonomous", index_ids=["a", external_id],
+        ))
+        result = await finished(runtime, submitted["id"])
+        assert actions == ([operation] if operation else [])
+        assert any(step["name"] == "update_research_plan" for step in result["research_trace"])
+        assert result["metrics"]["document_reads"] == 1
+        assert not any(item.get("checked_with") for item in result["evidence"])
+        assert result["answer"] and result["status"] == "partial"
+        assert result["warnings"]
+    finally:
+        await runtime.stop()
+
+
+async def test_repeating_initial_search_is_not_an_autopilot_followup(tmp_path: Path) -> None:
+    replay = {"name": "search_knowledge", "args": {"index_id": "a", "query": "Explain"}}
+    model = Model([{"content": "", "tool_calls": [replay, *PLAN_READY["tool_calls"]]}, ANSWER])
+    runtime = build(tmp_path, model, model_calls=6)
+    await runtime.start()
+    try:
+        submitted = await runtime.submit(OWNER, RunRequest(
+            question="Explain", mode="autonomous", index_ids=["a"],
+        ))
+        result = await finished(runtime, submitted["id"])
+        assert isinstance(runtime.source, Source)
+        assert runtime.source.queries == ["Explain", "Explain"]
+        assert result["status"] == "partial"
+        assert not any(item.get("checked_with") for item in result["evidence"])
     finally:
         await runtime.stop()

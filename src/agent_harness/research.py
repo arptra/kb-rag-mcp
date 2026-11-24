@@ -39,6 +39,19 @@ PLAN_TOOL = {
 }
 
 
+def needs_source_check(run: dict[str, Any]) -> bool:
+    """Autopilot must retain a source result from a check the model actually requested."""
+    return run["mode"] == "autonomous" and not any(
+        item.get("checked_with") for item in run["evidence"]
+    )
+
+
+def initial_search_query(run: dict[str, Any]) -> str:
+    parent = run.get("parent_question")
+    question = run["question"]
+    return (f"{parent}\nFollow-up: {question}" if parent else question)[:8000]
+
+
 def initialize_plan(run: dict[str, Any]) -> None:
     if run.get("research_plan"):
         return
