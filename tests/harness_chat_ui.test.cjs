@@ -69,7 +69,7 @@ function fixture(t, handler = () => ({})) {
   const source = fs.readFileSync(path.join(staticPath, "app.js"), "utf8").replace(
     /  updateSubmit\(\);\s+renderHistory\(\);\s+loadWorkspace\(\);\s+\}\)\(\);\s*$/,
     "globalThis.ui = { state, conversationState, api, loadConversation, loadConversations, " +
-    "selectRun, refreshRun, submitRun, resetWorkspace, renderResearchActivity, renderStatus };\n})();",
+    "selectRun, refreshRun, submitRun, resetWorkspace, renderResearchActivity, renderStatus, renderBudget, modelConnectionValue, applyModelConnection };\n})();",
   );
   vm.runInContext(source, context);
   assert(context.ui, "The test must expose the actual shipped script");
@@ -162,4 +162,34 @@ test("network timeout keeps mutation uncertainty explicit and never retries a PO
   await assert.rejects(ui.api("runs", { method: "POST", body: { question: "One request" }, timeoutMs: 5 }),
     (error) => error.name === "RequestTimeoutError" && error.uncertainMutation === true);
   assert.equal(requests.length, 1);
+});
+
+test("deepening an autonomous run preserves the mode and selected sandbox", async (t) => {
+  let submitted;
+  const { ui } = fixture(t, ({ path: route, method, body }) => {
+    if (route === "runs" && method === "POST") { submitted = JSON.parse(body); return run("next", { mode: "autonomous" }); }
+    return {};
+  });
+  ui.state.sandboxProfiles = [{ id: "java", name: "Java" }];
+  ui.state.selectedSandboxProfile = "java";
+  await ui.submitRun(run("first", { mode: "autonomous" }));
+  assert.equal(submitted.mode, "autonomous");
+  assert.equal(submitted.sandbox_profile_id, "java");
+  assert.equal(submitted.parent_run_id, "first");
+});
+
+test("budget UI separates main and summary calls and shows actual grants", (t) => {
+  const { ui, nodes } = fixture(t);
+  ui.renderBudget(run("auto", { mode: "autonomous", metrics: { model_calls: 8, decision_calls: 5, summary_calls: 3 }, budget: { current: { model_calls: 10, summary_calls: 6 }, ceiling: { model_calls: 20, summary_calls: 12 }, events: [{ accepted: true, reason: "Check dependency", requested: { model_calls: 10 }, granted: { model_calls: 10 } }] }, context_summary: { tokens_before: 20000, tokens_after: 3000, compactions: 1, reused_summary: true } }));
+  assert.match(nodes.get("run-budget-values").textContent, /Использовано 5/);
+  assert.match(nodes.get("run-budget-values").textContent, /Использовано 3/);
+  assert.match(nodes.get("run-budget-events").textContent, /Бюджет изменён.*Check dependency/);
+  assert.match(nodes.get("run-context-summary").textContent, /сохранённая сводка/);
+});
+
+test("API model output limit survives load and save", (t) => {
+  const { ui, nodes } = fixture(t);
+  ui.applyModelConnection({ provider: "openai", base_url: "https://models.test/v1", output_tokens: 12000 });
+  assert.equal(Number(nodes.get("model-output-tokens").value), 12000);
+  assert.equal(ui.modelConnectionValue().output_tokens, 12000);
 });

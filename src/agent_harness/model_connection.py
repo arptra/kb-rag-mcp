@@ -28,6 +28,7 @@ class ModelConnection(BaseModel):
     api_key_env: str = Field(default="", pattern=r"^([A-Z][A-Z0-9_]{0,127})?$")
     tls_bundle_id: str = Field(default="", pattern=r"^([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})?$")
     timeout_seconds: int = Field(default=60, ge=5, le=300)
+    output_tokens: int = Field(default=4096, ge=128, le=32768)
 
     @field_validator("base_url", "model", "api_key_env", "tls_bundle_id", mode="before")
     @classmethod
@@ -157,6 +158,7 @@ class ModelRouter:
         tools: list[dict[str, Any]],
         cancel: Event,
         max_input_chars: int,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
         settings = self.store.load()
         if settings.provider == "gigacode":
@@ -173,7 +175,9 @@ class ModelRouter:
             raise ModelConnectionError("Превышен лимит контекста модели.")
         if cancel.is_set():
             raise asyncio.CancelledError
-        task = asyncio.create_task(self._completion(settings, messages, tools))
+        task = asyncio.create_task(self._completion(
+            settings, messages, tools, max_output_tokens=max_output_tokens,
+        ))
         try:
             async with asyncio.timeout(settings.timeout_seconds):
                 while not task.done():
@@ -195,6 +199,7 @@ class ModelRouter:
         tools: list[dict[str, Any]],
         *,
         probe: bool = False,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
         secret = os.environ.get(settings.api_key_env, "") if settings.api_key_env else ""
@@ -205,7 +210,9 @@ class ModelRouter:
         payload: dict[str, Any] = {
             "messages": messages,
             "stream": False,
-            "max_tokens": 128 if probe else 4096,
+            "max_tokens": 128 if probe else min(
+                settings.output_tokens, max_output_tokens or settings.output_tokens,
+            ),
         }
         # Some corporate gateways select the model from the URL. Do not send an
         # empty name; endpoints requiring one will report it during the probe.
@@ -291,10 +298,19 @@ class ModelRouter:
                     return [redact(item) for item in value]
                 return value
 
-            decision = {"content": redact(content[:50000]), "tool_calls": redact(parsed_calls)}
+            # The response-byte guard bounds transport memory. The run's configured
+            # answer limit is applied by the runtime; do not silently clip it here.
+            decision = {"content": redact(content), "tool_calls": redact(parsed_calls)}
             reason = decoded["choices"][0].get("finish_reason")
-            if reason in {"length", "max_tokens", "content_filter"} or len(content) > 50000:
-                decision["finish_reason"] = reason if len(content) <= 50000 else "length"
+            if reason in {"length", "max_tokens", "content_filter"}:
+                decision["finish_reason"] = reason
+            usage = decoded.get("usage")
+            if isinstance(usage, dict):
+                counters = {key: value for key in ("prompt_tokens", "completion_tokens")
+                            if isinstance(value := usage.get(key), int)
+                            and not isinstance(value, bool) and value >= 0}
+                if counters:
+                    decision["usage"] = counters
             return decision
         except ModelConnectionError:
             raise

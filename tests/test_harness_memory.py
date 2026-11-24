@@ -40,12 +40,14 @@ class Source:
 class Model:
     def __init__(self) -> None:
         self.contexts: list[dict[str, Any]] = []
+        self.messages: list[list[dict[str, Any]]] = []
 
     def status(self) -> dict[str, Any]:
         return {"available": True}
 
     async def decide(self, **kwargs: Any) -> dict[str, Any]:
         self.contexts.append(json.loads(kwargs["messages"][-1]["content"]))
+        self.messages.append(kwargs["messages"])
         return {"content": "Fresh answer [doc]", "tool_calls": []}
 
 
@@ -185,16 +187,16 @@ async def test_failure_experience_is_automatically_used_as_safe_advice(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_parent_answer_is_bounded_rechecked_advisory_context(tmp_path: Path) -> None:
+async def test_parent_answer_is_rechecked_private_conversation_context(tmp_path: Path) -> None:
     app = runtime(tmp_path)
     await app.start()
     try:
         first = await finish(app, index_ids=["a"])
         await finish(app, "More detail", parent_run_id=first["id"], index_ids=["a"])
         assert isinstance(app.model, Model)
-        assert app.model.contexts[-1]["history_answer_not_evidence"] == "Fresh answer [doc]"
+        assert {"role": "assistant", "content": "Fresh answer [doc]"} in app.model.messages[-1]
         await finish(app, "More detail", parent_run_id=first["id"], index_ids=["b"])
-        assert app.model.contexts[-1]["history_answer_not_evidence"] is None
+        assert not any(message["role"] == "assistant" for message in app.model.messages[-1])
     finally:
         await app.stop()
 
@@ -343,7 +345,7 @@ def test_shared_memory_http_pages_keep_old_records_manageable_without_exposing_d
         assert editable["can_delete"]
         assert client.delete(f"/api/memory/{old['id']}", headers=alice).status_code == 200
         assert client.get("/api/memory?offset=10000", headers=bob).json()["memories"] == []
-        for invalid in ("-1", "10001", "text", "0.5", "99999999999"):
+        for invalid in ("-1", "1000001", "text", "0.5", "99999999999"):
             assert client.get(f"/api/memory?offset={invalid}", headers=bob).status_code == 400
 
 

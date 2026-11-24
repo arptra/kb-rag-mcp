@@ -13,6 +13,10 @@ class ModelDecisionError(ValueError):
     """A model reply can be corrected without restarting the model connection."""
 
 
+class ConversationUnavailable(ModelDecisionError):
+    """A failed compaction must not silently drop the user's earlier constraints."""
+
+
 @dataclass(frozen=True)
 class Principal:
     owner_id: str
@@ -23,7 +27,7 @@ class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     question: str = Field(min_length=1, max_length=8000)
-    mode: Literal["quick", "investigate"] = "quick"
+    mode: Literal["quick", "investigate", "autonomous"] = "quick"
     effort: Literal["low", "medium", "high"] = "medium"
     index_ids: list[str] = Field(default_factory=list, max_length=1000)
     parent_run_id: str | None = Field(default=None, max_length=80)

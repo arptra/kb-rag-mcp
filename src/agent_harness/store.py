@@ -114,6 +114,10 @@ class RunStore:
                 if previous[0] != owner:
                     return
                 stored = json.loads(previous[2])
+                # Server-side feedback/edit handlers may save a public snapshot.
+                # Preserve the operator policy fixed when the run was submitted.
+                if "_control" in stored:
+                    run.setdefault("_control", stored["_control"])
                 generation = int(run.get("resume_count", 0))
                 previous_generation = int(stored.get("resume_count", 0))
                 if checkpoint and (
@@ -234,6 +238,19 @@ class RunStore:
     @staticmethod
     def _cleanup_memory_references(db: sqlite3.Connection) -> None:
         """Retain shared knowledge after chat deletion; usage belongs to its consumer."""
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='conversation_summaries'"
+        ).fetchone():
+            retained = {(owner, key) for owner, key in db.execute("SELECT owner,id FROM runs")}
+            for owner, anchor, raw in db.execute(
+                "SELECT owner,anchor_run_id,data FROM conversation_summaries"
+            ).fetchall():
+                sources = json.loads(raw).get("source_run_ids", [])
+                if any((owner, key) not in retained for key in [anchor, *sources]):
+                    db.execute(
+                        "DELETE FROM conversation_summaries WHERE owner=? AND anchor_run_id=?",
+                        (owner, anchor),
+                    )
         # These tables are optional for standalone RunStore and older databases.
         has_memories = db.execute("SELECT 1 FROM sqlite_master WHERE name='memories'").fetchone()
         if has_memories:

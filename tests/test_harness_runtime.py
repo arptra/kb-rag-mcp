@@ -572,7 +572,10 @@ async def test_single_index_effort_changes_evidence_and_context(
         run = await finished(runtime, submitted["id"])
         assert len(run["evidence"]) == count
         assert all(len(item["text"]) == chars for item in run["evidence"])
-        assert model.requests[0]["max_input_chars"] == context
+        assert run["budget"]["current"]["context_tokens"] == context // 3
+        assert run["metrics"]["input_tokens_estimated"] <= context // 3
+        envelope = {key: model.requests[0][key] for key in ("messages", "tools")}
+        assert len(json.dumps(envelope, ensure_ascii=False)) < model.requests[0]["max_input_chars"]
         history = await runtime.list_runs(OWNER)
         assert history[0]["id"] == submitted["id"] and history[0]["question"] == "One index"
         assert (

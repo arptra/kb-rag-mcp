@@ -32,6 +32,7 @@
             <span id="connection-state" class="connection-state"><span class="connection-dot" aria-hidden="true"></span><span id="connection-label">Подключаемся</span></span>
             <button id="memory-open" class="settings-open" type="button" hidden>Общая память АС</button>
             <button id="settings-open" class="settings-open" type="button" hidden>Настройки</button>
+            <a id="control-open" class="settings-open control-link" href="./control/" hidden>Управление</a>
             <button id="auth-open" class="icon-button" type="button" aria-label="Вход в Harness" title="Вход в Harness">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M16.5 9.5a4.5 4.5 0 1 0-4.4 5.5H14v3h3v-3h3v-4h-4.3"/><circle cx="8" cy="10" r="1"/></svg>
             </button>
@@ -67,6 +68,7 @@
                     <legend class="sr-only">Режим работы</legend>
                     <label class="mode-option"><input type="radio" name="mode" value="quick" checked><span><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m11.5 2-7 9h5L8.5 18l7-10h-5z"/></svg>Быстро</span></label>
                     <label class="mode-option"><input type="radio" name="mode" value="investigate"><span><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="10" cy="10" r="7.5"/><path d="m13 7-2 4-4 2 2-4z"/></svg>Исследовать</span></label>
+                    <label class="mode-option"><input id="mode-autonomous" type="radio" name="mode" value="autonomous"><span>Автопилот</span></label>
                   </fieldset>
                   <label class="effort-select" for="effort">Усилие <select id="effort" name="effort"><option value="low">Низкое</option><option value="medium" selected>Обычное</option><option value="high">Высокое</option></select></label>
                 </div>
@@ -100,6 +102,7 @@
                 <details id="research-details"><summary>Что проверено и что ещё нужно выяснить</summary><div id="research-plan" class="research-plan"></div><ol id="research-timeline" class="research-timeline"></ol></details>
               </section>
               <div id="run-warnings" class="run-warnings" hidden></div>
+              <details id="run-budget" class="run-budget" hidden><summary>Ресурсы и управление контекстом</summary><p id="run-context-summary" class="muted"></p><div id="run-budget-values" class="budget-values"></div><ol id="run-budget-events" class="research-timeline"></ol></details>
               <div id="answer" class="answer"></div>
               <div id="answer-placeholder" class="answer-placeholder" hidden><p>Сведения появятся здесь.<br><span>Найденные материалы доступны в блоке подтверждений уже во время работы.</span></p></div>
               <div id="run-memory-used" class="run-memory-used" hidden></div>
@@ -222,6 +225,7 @@
                     <label class="settings-field wide"><span class="settings-field-label">Переменная с API-ключом · необязательно</span><input id="direct-model-token" maxlength="128" pattern="[A-Z][A-Z0-9_]{0,127}" autocomplete="off" placeholder="Для доступа только по сертификатам оставьте пустым"><small class="settings-field-help">Нужно только для API с ключом. Укажите имя переменной на сервере, например MODEL_API_KEY.</small></label>
                     <label class="settings-field wide"><span class="settings-field-label">Сертификаты подключения</span><select id="direct-model-tls"><option value="">Системные доверенные сертификаты</option></select></label>
                     <label class="settings-field"><span class="settings-field-label">Ожидание ответа, секунды</span><input id="direct-model-timeout" type="number" min="5" max="300" value="60"></label>
+                    <label class="settings-field"><span class="settings-field-label">Предел ответа API, токены</span><input id="model-output-tokens" type="number" min="128" max="32768" value="4096"><small class="settings-field-help">Для прямого API. Фактический предел также зависит от вашей модели.</small></label>
                   </div>
                 </div>
                 <div class="resource-actions"><button id="model-connection-probe" class="secondary-button" type="button">Проверить запросом</button><button id="model-connection-save" class="text-button" type="button">Сохранить подключение</button></div>

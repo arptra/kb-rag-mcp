@@ -26,6 +26,31 @@ class Runner:
         return {"content": "Runner answer", "tool_calls": []}
 
 
+@pytest.mark.parametrize("reserve,expected", [(None, 8192), (512, 512), (16384, 8192)])
+async def test_api_respects_output_budget_and_preserves_usage_and_long_answers(
+    tmp_path: Path, reserve: int | None, expected: int,
+) -> None:
+    router = ModelRouter(tmp_path, None)
+    router.store.save(ModelConnection(
+        provider="openai", base_url="https://models.test/v1", output_tokens=8192,
+    ))
+    content = "Long answer " * 5000
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["max_tokens"] == expected
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 123, "completion_tokens": 456, "irrelevant": "ignore"},
+        })
+
+    router.transport = httpx.MockTransport(respond)
+    result = await router.decide(messages=[], tools=[], cancel=Event(), max_input_chars=10000,
+                                 max_output_tokens=reserve)
+    assert result["content"] == content
+    assert "finish_reason" not in result
+    assert result["usage"] == {"prompt_tokens": 123, "completion_tokens": 456}
+
+
 @pytest.mark.parametrize("finish_reason", ["length", "max_tokens", "content_filter"])
 async def test_api_preserves_incomplete_generation_marker(
     tmp_path: Path, finish_reason: str,

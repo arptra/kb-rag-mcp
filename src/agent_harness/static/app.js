@@ -18,6 +18,8 @@
     reading_code: "Изучаем код подключённых сервисов.",
     running_code: "Проверяем код в песочнице.",
     checking: "Проверяем гипотезы по найденным материалам.",
+    compacting: "Сохраняем суть беседы и готовим контекст.",
+    budget_review: "Проверяем, сколько дополнительных ресурсов нужно исследованию.",
     authentication_required: "Ожидаем подключения модели.",
     investigating: "Проверяем связи и уточняем найденные сведения.",
     synthesizing: "Сопоставляем материалы и готовим ответ.", finished: "",
@@ -118,7 +120,7 @@
       day: "numeric", month: "short", ...(full ? { hour: "2-digit", minute: "2-digit" } : {}),
     }).format(date);
   }
-  function modeLabel(value) { return value === "investigate" ? "Исследование" : "Быстрый ответ"; }
+  function modeLabel(value) { return { quick: "Быстрый ответ", investigate: "Исследование", autonomous: "Автопилот" }[value] || "Запрос"; }
   function effortLabel(value) { return { low: "низкое", medium: "обычное", high: "высокое" }[value] || "не указано"; }
   function showError(message) {
     $("error-banner").textContent = message || "";
@@ -233,13 +235,14 @@
     Object.assign(modelConnectionState, { settings: null, saved: "", controller: null, busy: false, dirty: false });
     Object.assign(tlsState, { credentials: [], controller: null, busy: false });
     for (const id of ["direct-model-url", "direct-model-name", "direct-model-token"]) $(id).value = "";
-    $("model-provider").value = "gigacode"; $("direct-model-timeout").value = "60"; fillTlsSelect("");
+    $("model-provider").value = "gigacode"; $("direct-model-timeout").value = "60"; $("model-output-tokens").value = "4096"; fillTlsSelect("");
     for (const id of ["ssh-feedback", "tls-feedback", "model-connection-feedback"]) $(id).textContent = "";
     updateModelConnection();
     if (sshState.controller) sshState.controller.abort();
     Object.assign(sshState, { credentials: [], controller: null, busy: false });
     sshState.generation += 1;
     $("settings-open").hidden = true;
+    $("control-open").hidden = true;
     if ($("settings-dialog").open) $("settings-dialog").close();
     for (const id of ["settings-repositories", "settings-connections", "settings-sandbox", "settings-sandbox-profiles", "ssh-list", "tls-list", "settings-discoveries"]) $(id).replaceChildren();
     settingsError();
@@ -248,6 +251,7 @@
   function updateSettingsChrome() {
     const busy = Boolean(settingsState.busy);
     $("settings-open").hidden = !settingsState.canManage || state.needsAuth;
+    $("control-open").hidden = !settingsState.canManage || state.needsAuth || state.status?.control_enabled === false;
     $("settings-fields").disabled = busy || !settingsState.canManage;
     $("settings-save").disabled = busy || !settingsState.canManage || !settingsState.dirty;
     $("settings-discard").disabled = busy || !settingsState.dirty;
@@ -532,6 +536,7 @@
       settingsError();
       renderSettings();
       loadSshKeys();
+      if (window.location?.hash === "#settings") openSettings();
     } catch (error) {
       if (controller.signal.aborted || generation !== settingsState.generation || error.name === "AbortError") return;
       if ([403, 404].includes(error.status)) { resetSettingsAccess(); settingsState.checked = true; }
@@ -631,7 +636,8 @@
   }
   function modelConnectionValue() {
     return { provider: $("model-provider").value, base_url: $("direct-model-url").value.trim(), model: $("direct-model-name").value.trim(),
-      api_key_env: $("direct-model-token").value.trim(), tls_bundle_id: $("direct-model-tls").value, timeout_seconds: Number($("direct-model-timeout").value) || 60 };
+      api_key_env: $("direct-model-token").value.trim(), tls_bundle_id: $("direct-model-tls").value, timeout_seconds: Number($("direct-model-timeout").value) || 60,
+      output_tokens: Number($("model-output-tokens").value) || 4096 };
   }
   function updateModelConnection() {
     const direct = $("model-provider").value === "openai";
@@ -654,6 +660,7 @@
     $("model-provider").value = settings.provider === "openai" ? "openai" : "gigacode";
     $("direct-model-url").value = settings.base_url || ""; $("direct-model-name").value = settings.model || "";
     $("direct-model-token").value = settings.api_key_env || ""; $("direct-model-timeout").value = settings.timeout_seconds || 60;
+    $("model-output-tokens").value = settings.output_tokens || 4096;
     fillTlsSelect(settings.tls_bundle_id);
     modelConnectionState.saved = JSON.stringify(modelConnectionValue()); modelConnectionState.dirty = false;
     updateModelConnection();
@@ -1209,7 +1216,7 @@
     } finally { if (state.sandboxProfilesController === controller) state.sandboxProfilesController = null; }
   }
   function renderRunEnvironment(run) {
-    $("run-environment").hidden = run.mode !== "investigate";
+    $("run-environment").hidden = run.mode === "quick";
     $("run-environment").textContent = "Среда выполнения: " + sandboxProfileName(run.sandbox_profile_id || "") +
       (run.resumable ? ". Продолжение использует исходную среду. Для смены среды начните новый запрос." : ".");
   }
@@ -1217,13 +1224,15 @@
   function renderEffortDescription() {
     const mode = document.querySelector('input[name="mode"]:checked')?.value || "quick";
     const policy = state.status?.limits?.effort_policy?.[mode]?.[$("effort").value];
-    $("mode-description").textContent = mode === "investigate" ?
+    $("mode-description").textContent = mode !== "quick" ?
       "Базы знаний, код, MCP и другие агенты." : "Базы знаний, без запуска песочниц.";
-    const parts = [mode === "investigate" ? "Сначала обходим все выбранные базы знаний." : "Все выбранные базы знаний и один итоговый ответ."];
-    if (policy && mode === "investigate") {
+    const parts = [mode !== "quick" ? "Сначала обходим все выбранные базы знаний." : "Все выбранные базы знаний и один итоговый ответ."];
+    if (mode === "autonomous") parts.push("Агент сам запрашивает дополнительные ресурсы в пределах потолков администратора. Все расширения видны в чате.");
+    if (policy && mode !== "quick") {
       parts.push("Чтение документов: до " + policy.document_reads + ". Уточняющих обращений: до " + policy.source_calls + ".");
     } else if (mode === "quick") parts.push("Усилие определяет объём найденных материалов для ответа.");
-    if (Number(policy?.timeout_seconds) > 0) parts.push("Время работы: до " + Math.ceil(policy.timeout_seconds / 60) + " мин.");
+    if (Number(policy?.timeout_seconds) > 0) parts.push((mode === "autonomous" ? "Стартовое время: " : "Время работы: до ") + Math.ceil(policy.timeout_seconds / 60) + " мин.");
+    $("mode-autonomous").disabled = state.status?.limits?.autonomous_enabled === false;
     $("effort-description").textContent = parts.join(" ");
   }
   function sourceName(id) {
@@ -1317,6 +1326,7 @@
     $("model-heading").textContent = direct ? model.name || "Модель" : "GigaCode";
     const current = modelState();
     const canManage = (direct ? settingsState.canManage : state.modelDetails?.can_manage === true) && !state.needsAuth;
+    $("control-open").hidden = !(settingsState.canManage || canManage) || state.needsAuth || state.status?.control_enabled === false;
     const labels = { disabled: "Выключен", starting: "Запускается", authentication_required: "Нужен вход", ready: "Готов", error: "Ошибка запуска" };
     const messages = {
       disabled: direct ? "Подключите модель в настройках, чтобы получать ответы на основе найденных материалов." : "Подключите GigaCode, чтобы получать ответы на основе найденных материалов.",
@@ -1554,6 +1564,13 @@
       state.runs = [...new Map([...state.runs, ...runs].map((run) => [idOf(run), run])).values()];
       if (!previous) {
         state.current = conversationState.runs.find((run) => idOf(run) === selectedId) || conversationState.runs.at(-1) || null;
+        if (!sameConversation) {
+          const latest = conversationState.runs.at(-1);
+          const modeInput = latest && ["quick", "investigate", "autonomous"].includes(latest.mode) ? document.querySelector('input[name="mode"][value="' + latest.mode + '"]') : null;
+          if (modeInput) modeInput.checked = true;
+          if (latest?.effort) $("effort").value = latest.effort;
+          renderEffortDescription();
+        }
         if (state.current) { state.selected = new Set(state.current.index_ids || []); state.selectedSandboxProfile = state.current.sandbox_profile_id || ""; renderSources(); renderExecutionEnvironment(); }
         $("composer-options").open = false;
       }
@@ -1774,7 +1791,7 @@
     }
     $("research-plan").replaceChildren(...blocks);
     const toolLabel = (name) => {
-      const steps = { update_research_plan: "Обновление плана", research_round: "Проверка результатов поиска", goal_check: "Проверка оставшихся вопросов", answer_recovery: "Повторная подготовка ответа", model_response: "Проверка ответа модели" };
+      const steps = { update_research_plan: "Обновление плана", request_budget: "Запрос дополнительных ресурсов", budget_review: "Проверка необходимого бюджета", research_round: "Проверка результатов поиска", goal_check: "Проверка оставшихся вопросов", answer_recovery: "Повторная подготовка ответа", model_response: "Проверка ответа модели", compact_conversation: "Сохранение сводки беседы", conversation_compaction: "Сохранение сводки беседы" };
       if (steps[name]) return steps[name];
       if (/search.*(knowledge|index|document)|^search$/.test(name)) return "Поиск в базе знаний";
       if (/read.*document/.test(name)) return "Чтение документа";
@@ -1796,6 +1813,27 @@
       return row;
     }));
     $("research-details").hidden = !trace.length && !blocks.length;
+  }
+  function renderBudget(run) {
+    const budget = run.budget || {}, context = run.context_summary || {}, current = budget.current || {}, ceiling = budget.ceiling || {}, metrics = run.metrics || {};
+    $("run-budget").hidden = !Object.keys(current).length && !context.tokens_before && !context.compactions;
+    const format = (value) => typeof value === "number" && Number.isFinite(value) ? value.toLocaleString("ru-RU") : "—";
+    const used = { model_calls: metrics.decision_calls ?? metrics.model_calls, summary_calls: metrics.summary_calls, tool_calls: metrics.tool_calls, source_calls: Math.max(0, (metrics.source_calls || 0) - (metrics.bootstrap_calls || 0)) };
+    const labels = { model_calls: "Основные вызовы модели", summary_calls: "Подготовка сводки", source_calls: "Повторные поиски и чтения", tool_calls: "Инструменты", timeout_seconds: "Рабочее время, секунды", context_tokens: "Контекст, токены ≈", parallelism: "Параллельные обращения", document_reads: "Автоматическое чтение документов", evidence_per_index: "Материалы на индекс", evidence_chars: "Размер выдержки, символы", document_chars: "Размер документа, символы" };
+    $("run-budget-values").replaceChildren(...Object.entries(labels).filter(([key]) => current[key] !== undefined).map(([key, label]) => {
+      const card = element("div", "budget-value"); card.append(element("strong", "", label));
+      card.append(element("span", "", (used[key] !== undefined ? "Использовано " + format(used[key]) + " · " : "") + "Бюджет " + format(current[key]) + (run.mode === "autonomous" ? " · Потолок " + format(ceiling[key]) : ""))); return card;
+    }));
+    $("run-context-summary").textContent = context.tokens_before !== undefined ? "Беседа: ≈ " + format(context.tokens_before) + " → " + format(context.tokens_after) + " токенов. Сжатий: " + format(context.compactions || 0) + (context.reused_summary ? ". Использована сохранённая сводка." : ".") : "";
+    if (metrics.answer_retries) $("run-context-summary").textContent += " Дополнительных попыток восстановления ответа: " + format(metrics.answer_retries) + ".";
+    $("run-budget-events").replaceChildren(...(Array.isArray(budget.events) ? budget.events : []).map((event) => {
+      const row = element("li", "research-event"); row.append(element("strong", "", event.accepted ? "Бюджет изменён" : "Изменение не разрешено"));
+      if (typeof event.reason === "string") row.append(element("p", "", event.reason));
+      if (typeof event.message === "string") row.append(element("p", "", event.message));
+      if (typeof event.next_action === "string" && event.next_action) row.append(element("p", "", "Следующий шаг: " + event.next_action));
+      for (const [label, values] of [["Запрошено", event.requested], ["Разрешено", event.granted]]) if (values && typeof values === "object") row.append(element("p", "", label + ": " + Object.entries(values).map(([key, value]) => (labels[key] || key) + " " + format(value)).join(" · ")));
+      if (event.timestamp) row.append(element("time", "", dateLabel(event.timestamp, true))); return row;
+    }));
   }
   function renderRun() {
     const run = state.current;
@@ -1831,6 +1869,7 @@
     $("run-coverage").textContent = "Поиск по базам знаний: " + searched + " / " + coverage.length +
       (failed ? " · Недоступно: " + failed : "") + (pending ? " · Ещё не проверено: " + pending : "");
     renderResearchActivity(run);
+    renderBudget(run);
     const announcement = [status, phase, "Найдено подтверждений: " + evidenceCount].filter(Boolean).join(". ");
     if ($("progress-live").textContent !== announcement) $("progress-live").textContent = announcement;
     $("cancel-run").hidden = !active;
@@ -1994,12 +2033,13 @@
     }
     const payload = {
       question,
-      mode: parent ? "investigate" : document.querySelector('input[name="mode"]:checked').value,
+      mode: parent ? (parent.mode === "autonomous" ? "autonomous" : "investigate") : document.querySelector('input[name="mode"]:checked').value,
       effort: parent ? "high" : $("effort").value,
       index_ids: selected,
       ...(followup ? { parent_run_id: idOf(followup) } : {}),
     };
-    payload.sandbox_profile_id = payload.mode === "investigate" ? state.selectedSandboxProfile : "";
+    if (payload.mode === "autonomous" && state.status?.limits?.autonomous_enabled === false) { showError("Автопилот отключён администратором. Выберите другой режим."); return; }
+    payload.sandbox_profile_id = payload.mode !== "quick" ? state.selectedSandboxProfile : "";
     if (payload.sandbox_profile_id && !state.sandboxProfiles.some((profile) => profile.id === payload.sandbox_profile_id)) {
       showError("Выбранная среда выполнения недоступна. Выберите другую среду или вариант по умолчанию."); return;
     }
@@ -2133,7 +2173,7 @@
     if (generation === sshState.generation) $("ssh-file").value = "";
   });
   $("model-provider").addEventListener("change", updateModelConnection);
-  for (const id of ["direct-model-url", "direct-model-name", "direct-model-token", "direct-model-tls", "direct-model-timeout"]) $(id).addEventListener("input", updateModelConnection);
+  for (const id of ["direct-model-url", "direct-model-name", "direct-model-token", "direct-model-tls", "direct-model-timeout", "model-output-tokens"]) $(id).addEventListener("input", updateModelConnection);
   $("model-connection-save").addEventListener("click", () => changeModelConnection());
   $("model-connection-probe").addEventListener("click", () => changeModelConnection(true));
   $("tls-new").addEventListener("click", () => openTlsEditor());

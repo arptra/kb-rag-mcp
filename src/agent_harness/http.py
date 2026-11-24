@@ -18,6 +18,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from agent_harness.contracts import Principal, RunRequest
+from agent_harness.control.http import create_control_routes
 from agent_harness.credentials_http import create_credential_routes
 from agent_harness.discovery import DiscoveryStore
 from agent_harness.discovery_http import create_discovery_routes
@@ -169,7 +170,7 @@ def create_app(
         if request.method == "GET":
             return _json({"runs": await runtime.list_runs(identity)})
         parsed = await _run_request(request)
-        if parsed.mode == "investigate" and parsed.sandbox_profile_id:
+        if parsed.mode != "quick" and parsed.sandbox_profile_id:
             available_profiles = await integrations.profiles(identity) if integrations else []
             if parsed.sandbox_profile_id not in {item["id"] for item in available_profiles}:
                 raise HTTPException(403, "Выбранная среда выполнения недоступна.")
@@ -415,6 +416,8 @@ def create_app(
             Route("/api/runs/{run_id}", get_run, methods=["GET", "DELETE"]),
             Route("/api/runs/{run_id}/cancel", cancel_run, methods=["POST"]),
             Route("/api/runs/{run_id}/resume", resume_run, methods=["POST"]),
+            *(create_control_routes(runtime, authorize=manager_access, read_body=_body)
+              if getattr(runtime.settings, "control_enabled", True) else []),
             *create_memory_routes(runtime, principal),
             *create_discovery_routes(
                 runtime,

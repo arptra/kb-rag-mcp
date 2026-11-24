@@ -15,8 +15,9 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
-from agent_harness.contracts import ModelDecisionError, Principal
-from agent_harness.policy import BUDGETS, QUICK_BUDGETS, TOOLS, validate_call
+from agent_harness.budgets import BUDGET_TOOL
+from agent_harness.contracts import ConversationUnavailable, ModelDecisionError, Principal
+from agent_harness.policy import TOOLS, validate_call
 from agent_harness.research import PLAN_TOOL, evidence_signature, initialize_plan, update_plan
 
 if TYPE_CHECKING:
@@ -39,6 +40,7 @@ class ExecutionContext:
     run: dict[str, Any]
     cancel: Event
     deadline: float
+    started: float = 0
 
 
 class HarnessGraph:
@@ -81,11 +83,13 @@ class HarnessGraph:
     def config(self, principal: Principal, run_id: str) -> RunnableConfig:
         return {
             "configurable": {"thread_id": self.thread_id(principal, run_id)},
-            "recursion_limit": 128,
+            "recursion_limit": self.engine.control_store.load().runtime.graph_recursion_limit,
         }
 
     async def execute(self, context: ExecutionContext, *, resume: bool = False) -> None:
+        context.started = context.deadline - self.engine._run_timeout(context.run)
         config = self.config(context.principal, context.run["id"])
+        config["recursion_limit"] = self.engine._runtime_limits(context.run).graph_recursion_limit
         state: GraphState | None = {"run": copy.deepcopy(context.run)}
         if resume:
             snapshot = await self.graph.aget_state(config)
@@ -156,10 +160,13 @@ class HarnessGraph:
         )
 
     def _reserve_deadline(self, context: ExecutionContext) -> float:
-        settings = self.engine.settings
-        return context.deadline - min(
+        settings = self.engine._runtime_limits(context.run)
+        return self._deadline(context) - min(
             settings.final_reserve_seconds, self.engine._run_timeout(context.run) / 4
         )
+
+    def _deadline(self, context: ExecutionContext) -> float:
+        return context.started + self.engine._run_timeout(context.run)
 
     async def prepare(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
         context = self._context(state, runtime)
@@ -174,9 +181,9 @@ class HarnessGraph:
             self.engine._warn(run, "Один или несколько выбранных индексов недоступны.")
             return self._result(context, "done")
         selected = requested or sorted(available)
-        if len(selected) > self.engine.settings.max_indexes:
+        if len(selected) > self.engine._runtime_limits(run).max_indexes:
             self.engine._warn(run, "Область поиска ограничена бюджетом числа индексов.")
-        run["index_ids"] = selected[: self.engine.settings.max_indexes]
+        run["index_ids"] = selected[: self.engine._runtime_limits(run).max_indexes]
         if not run["index_ids"]:
             run["status"] = "partial"
             self.engine._warn(run, "Нет доступных источников; состояние системы не проверено.")
@@ -195,7 +202,7 @@ class HarnessGraph:
         engine = self.engine
         run["phase"] = "searching"
         engine._checkpoint(principal, run, event)
-        budget = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
+        budget = engine._budget(run)
         engine._semaphores[run["id"]] = asyncio.Semaphore(budget.parallelism)
         available = {item["id"] for item in await engine._indexes(principal)}
         if set(run["index_ids"]) - available:
@@ -205,7 +212,7 @@ class HarnessGraph:
         query = ((run["parent_question"] + "\nFollow-up: ") if parent else "") + run["question"]
         external = (
             await engine.tools.describe(principal, run["index_ids"])
-            if engine.tools and run["mode"] == "investigate"
+            if engine.tools and run["mode"] != "quick"
             else []
         )
         external_ids = (
@@ -218,8 +225,12 @@ class HarnessGraph:
             engine._warn(
                 run, "Быстрый ответ использует RAG. Код, MCP и A2A доступны в исследовании."
             )
-        bootstrap = knowledge if engine.source else []
-        run["coverage"] = {index: {"status": "pending", "count": 0} for index in knowledge}
+        pending_only = bool(run.pop("_collect_pending", False))
+        if not pending_only:
+            run["coverage"] = {index: {"status": "pending", "count": 0} for index in knowledge}
+        bootstrap = [index for index in knowledge if not pending_only
+                     or run["coverage"].get(index, {}).get("status") == "pending"] \
+            if engine.source else []
         await asyncio.gather(
             *(
                 engine._search(
@@ -228,7 +239,7 @@ class HarnessGraph:
                     event,
                     index,
                     query[:8000],
-                    deadline=context.deadline - engine.settings.quick_timeout_seconds * 2 / 3
+                    deadline=self._deadline(context) - engine._run_timeout(run) * 2 / 3
                     if run["mode"] == "quick"
                     else self._reserve_deadline(context),
                     initial=True,
@@ -273,7 +284,7 @@ class HarnessGraph:
         engine, run = self.engine, context.run
         run["phase"] = "reading"
         engine._checkpoint(context.principal, run, context.cancel)
-        budget = BUDGETS[run["effort"]]
+        budget = engine._budget(run)
         candidates = engine._ranked_evidence(run)
         count = 0
         for item in candidates:
@@ -297,20 +308,35 @@ class HarnessGraph:
     async def decide(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
         context = self._context(state, runtime)
         run, event, engine = context.run, context.cancel, self.engine
-        budget = BUDGETS[run["effort"]]
+        budget = engine._budget(run)
         if event.is_set():
             return self._result(context, "done")
         if (
             engine._now(run) >= self._reserve_deadline(context)
-            or run["metrics"]["model_calls"] >= budget.model_calls - 1
+            or engine._decision_calls(run) >= budget.model_calls - (
+                2 if run["mode"] == "autonomous" else 1
+            )
             or run["metrics"]["tool_calls"] >= budget.tool_calls
             or engine._followup_calls(run) >= budget.source_calls
         ):
+            previous_timeout = budget.timeout_seconds
+            if await engine._review_budget(
+                context.principal, run, event, started=context.started,
+                deadline=self._deadline(context), reason="Достигнут рабочий бюджет исследования.",
+            ):
+                if (engine._budget(run).timeout_seconds > previous_timeout
+                        and any(item["status"] == "pending"
+                                for item in run.get("coverage", {}).values())):
+                    run["_collect_pending"] = True
+                    return self._result(context, "collect")
+                return self._result(context, "decide")
+            run["stop_reason"] = "budget_ceiling"
             engine._warn(run, "Исследование ограничено бюджетом; итог по собранным источникам.")
             return self._result(context, "synthesize")
         run["phase"] = "investigating"
         engine.store.save(context.principal.owner_id, run)
-        catalog = [PLAN_TOOL, *(TOOLS if state.get("knowledge_ids") else []),
+        catalog = [*([BUDGET_TOOL] if run["mode"] == "autonomous" else []),
+                   PLAN_TOOL, *(TOOLS if state.get("knowledge_ids") else []),
                    *state.get("external", [])]
         try:
             decision = await engine._decide(
@@ -327,12 +353,15 @@ class HarnessGraph:
                 raise
             engine._warn(run, "Время поиска исчерпано; зарезервирован итоговый ответ.")
             return self._result(context, "synthesize")
+        except ConversationUnavailable:
+            run["status"] = "partial"
+            return self._result(context, "done")
         except ModelDecisionError:
             run["metrics"]["decision_errors"] = run["metrics"].get("decision_errors", 0) + 1
             engine._trace(run, "model_response", {},
                           "Некорректный формат предыдущего решения. Верните content и tool_calls; "
                           "используйте только перечисленные инструменты и их схемы аргументов.")
-            if run["metrics"]["decision_errors"] <= 2:
+            if run["metrics"]["decision_errors"] < engine._runtime_limits(run).max_decision_errors:
                 return self._result(context, "decide")
             engine._warn(run, "Модель не смогла сформировать корректные действия; готовим итог.")
             return self._result(context, "synthesize")
@@ -363,7 +392,7 @@ class HarnessGraph:
     async def tools(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
         context = self._context(state, runtime)
         engine, run, principal, event = self.engine, context.run, context.principal, context.cancel
-        budget = BUDGETS[run["effort"]]
+        budget = engine._budget(run)
         calls = list(state.get("calls", []))
         if event.is_set():
             return self._result(context, "done", calls=[])
@@ -383,7 +412,7 @@ class HarnessGraph:
         phases = {"search_knowledge": "refining", "read_document": "reading",
                   "read_repository": "reading_code", "search_repository": "reading_code",
                   "clone_repository": "reading_code", "run_in_sandbox": "running_code",
-                  "update_research_plan": "planning"}
+                  "update_research_plan": "planning", "request_budget": "budget_review"}
         run["phase"] = phases.get(name, "checking")
         run["current_action"] = {"name": name}
         engine._checkpoint(principal, run, event)
@@ -392,8 +421,12 @@ class HarnessGraph:
                 [name, args, evidence_signature(run)], sort_keys=True, ensure_ascii=False,
             ).encode()).hexdigest()
             seen = run.setdefault("_seen_tool_calls", [])
-            if name != "update_research_plan" and signature in seen:
+            if name not in {"update_research_plan", "request_budget"} and signature in seen:
                 result = "Повтор без новых данных пропущен. Измените запрос или источник."
+            elif name == "request_budget":
+                # Governance is accounted separately from source/tool execution.
+                run["metrics"]["tool_calls"] -= 1
+                result = engine._change_budget(run, args, started=context.started)
             elif name == "update_research_plan":
                 update_plan(run, args)
                 result = "План исследования обновлён. Проверки требуют подтверждений источниками."
@@ -448,7 +481,8 @@ class HarnessGraph:
             "Получены новые материалы; проверяем оставшиеся вопросы."
             if changed else "Новых материалов нет; нужен другой запрос или источник.",
         )
-        if run["_stalled_rounds"] >= 3:
+        if run["_stalled_rounds"] >= self.engine._runtime_limits(run).max_stalled_rounds:
+            run["stop_reason"] = "no_new_evidence"
             plan["completion_reason"] = "Поиск не даёт новых данных."
             self.engine._warn(run, "Повторные действия не дали новых данных; поиск ограничен.")
             return self._result(context, "synthesize", calls=[])
@@ -460,8 +494,9 @@ class HarnessGraph:
         initialize_plan(run)
         if not run["research_plan"].get("completion_reason"):
             run["research_plan"]["completion_reason"] = "Готовим итог по доступным подтверждениям."
-        budget = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
-        if not context.cancel.is_set() and run["metrics"]["model_calls"] < budget.model_calls:
+        budget = self.engine._budget(run)
+        if (not context.cancel.is_set()
+                and self.engine._decision_calls(run) < budget.model_calls):
             await self.engine._synthesize(context.principal, run, context.cancel)
         elif not context.cancel.is_set():
             run["status"] = "partial"

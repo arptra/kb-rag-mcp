@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Центр управления — Harness</title>
+  <link rel="stylesheet" href="./assets/styles.css">
+  <script src="./assets/chart.umd.min.js" defer></script><script src="./assets/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">К содержимому</a>
+  <header class="topbar"><a href="../" class="brand">Harness</a><nav aria-label="Навигация"><a href="../">Вернуться в чат</a><button id="auth-open" class="quiet">Доступ</button></nav></header>
+  <main id="main">
+    <div class="hero"><div><p class="eyebrow">Центр управления</p><h1>Работа под контролем.</h1><p class="lead">Расход ресурсов, самостоятельность агента и память беседы — в одном месте.</p></div><span id="connection" class="connection" role="status">Подключаемся</span></div>
+    <div id="message" class="notice" role="status" hidden></div><div id="error" class="notice error" role="alert" hidden></div>
+    <div id="access-panel" class="empty-state" hidden><h2>Нужен доступ администратора</h2><p>Войдите через портал или укажите ключ доступа. Статистика и настройки доступны только администратору.</p><button id="access-login" class="primary">Войти</button></div>
+    <div id="workspace" hidden>
+      <nav class="tabs" aria-label="Разделы управления"><a href="#overview">Обзор</a><a href="#budgets">Бюджеты</a><a href="#context">Контекст</a><a href="#runtime">Сервис</a></nav>
+      <section id="overview" aria-labelledby="overview-title">
+        <div class="section-heading"><div><p class="eyebrow">Фактическая работа</p><h2 id="overview-title">Расход и результат</h2></div><div class="actions"><label class="period">Период<select id="days"><option value="1">Сегодня</option><option value="7" selected>7 дней</option><option value="30">30 дней</option><option value="90">90 дней</option></select></label><button id="refresh" class="quiet">Обновить</button></div></div>
+        <div id="summary" class="kpi-grid"></div><p id="metrics-note" class="help"></p>
+        <div class="charts"><article class="card"><h3>Запросы и результаты</h3><div class="chart"><canvas id="runs-chart" aria-label="Количество запросов по дням" role="img"></canvas></div></article><article class="card"><h3>Вызовы модели и источников</h3><div class="chart"><canvas id="calls-chart" aria-label="Вызовы модели и источников по дням" role="img"></canvas></div></article><article class="card"><h3>Время ответа</h3><p class="help">Среднее и 95-й процентиль, секунды</p><div class="chart"><canvas id="duration-chart" aria-label="Длительность запросов по дням" role="img"></canvas></div></article><article class="card"><h3>Адаптация агента</h3><p class="help">Расширения бюджетов и сжатия беседы</p><div class="chart"><canvas id="adaptive-chart" aria-label="Расширения бюджетов и сжатия беседы по дням" role="img"></canvas></div></article></div>
+        <details class="card chart-data"><summary>Числовые данные графиков</summary><div id="series-table" class="table-wrap"></div></details>
+        <div class="split"><article class="card"><h3>Причины завершения</h3><div id="stop-reasons"></div></article><article class="card"><h3>Очереди сейчас</h3><div id="queues"></div></article></div>
+        <article class="card"><h3>Активные работы <span id="active-count" class="muted"></span></h3><p class="help">Все текущие запросы, независимо от выбранного периода. Содержимое личных чатов здесь не раскрывается.</p><div id="active-runs" class="table-wrap"></div></article>
+        <article class="card"><h3>Последние запросы</h3><p class="help">Техническая история расхода. Нажмите на строку, чтобы увидеть все счётчики.</p><div id="recent-runs" class="table-wrap"></div></article>
+      </section>
+      <form id="settings-form">
+        <section id="budgets" aria-labelledby="budgets-title"><div class="section-heading"><div><p class="eyebrow">Ресурсы на один запрос</p><h2 id="budgets-title">Бюджеты и Автопилот</h2></div><span id="revision" class="muted"></span></div>
+          <p class="lead small">В «Автопилоте» агент запрашивает дополнительные ресурсы сам. Начальный бюджет задаёт старт, потолок — максимальный разрешённый расход. Решение и причина видны в чате.</p>
+          <fieldset id="autonomy-fields" class="card field-grid"><legend>Самостоятельность</legend></fieldset>
+          <div class="profile-select card"><label>Режим<select id="profile-mode"><option value="quick">Быстро</option><option value="investigate">Исследовать</option><option value="autonomous">Автопилот</option></select></label><label>Усилие<select id="profile-effort"><option value="low">Низкое</option><option value="medium" selected>Обычное</option><option value="high">Высокое</option></select></label><p id="profile-help" class="help"></p></div>
+          <fieldset id="profile-fields" class="card field-grid"><legend>Начальный бюджет выбранного режима</legend></fieldset>
+          <details class="card" open><summary>Потолки Автопилота</summary><p class="help">Агент может увеличивать свои бюджеты только до этих значений. Доступы и ограничения самого провайдера модели этим не меняются.</p><fieldset id="ceiling-fields" class="field-grid"><legend class="sr-only">Максимальные бюджеты</legend></fieldset></details>
+        </section>
+        <section id="context" aria-labelledby="context-title"><div class="section-heading"><div><p class="eyebrow">Сохранение смысла</p><h2 id="context-title">Беседа и окно модели</h2></div></div><p class="lead small">Старые сообщения преобразуются в сохраняемую сводку, последние остаются в контексте. Полная переписка остаётся в истории. Укажите реальное окно вашей модели; подсчёт токенов здесь приблизительный.</p><fieldset id="context-fields" class="card field-grid"><legend>Автоматическое сжатие</legend></fieldset></section>
+        <section id="runtime" aria-labelledby="runtime-title"><div class="section-heading"><div><p class="eyebrow">Общие настройки</p><h2 id="runtime-title">Сервис и хранение</h2></div></div><fieldset id="runtime-fields" class="card field-grid"><legend>Ограничения сервиса</legend></fieldset><article class="card"><h3>Модель и среды выполнения</h3><p class="help">Адрес модели, сертификаты, предел ответа API, подключения MCP и ресурсы контейнеров находятся в настройках подключений.</p><a href="../#settings" class="text-link">Открыть настройки подключений ↗</a><div id="external-limits" class="help"></div></article></section>
+        <div class="save-bar"><div><strong id="save-state">Изменений нет</strong><p id="activation-note" class="help">Новые значения применяются к новым запросам. Уже запущенные сохраняют свой бюджет.</p></div><div class="actions"><button id="discard" type="button" class="quiet" disabled>Отменить изменения</button><button id="save" type="submit" class="primary" disabled>Сохранить</button></div></div>
+      </form>
+    </div>
+  </main>
+  <dialog id="auth-dialog"><form id="auth-form"><h2>Доступ к управлению</h2><p class="help">Используется та же авторизация, что и в чате Harness.</p><label>Способ входа<select id="auth-kind"><option value="bearer">Токен доступа</option><option value="admin">Пароль администратора</option></select></label><label>Ключ или пароль<input id="auth-secret" type="password" autocomplete="off" required></label><div class="actions"><button id="auth-close" class="quiet" type="button">Закрыть</button><button id="auth-clear" class="quiet" type="button">Выйти</button><button class="primary" type="submit">Войти</button></div></form></dialog>
+</body>
+</html>

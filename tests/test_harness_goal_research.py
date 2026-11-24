@@ -46,11 +46,13 @@ class Model:
     def __init__(self, decisions: list[dict[str, Any]]) -> None:
         self.decisions = decisions
         self.contexts: list[dict[str, Any]] = []
+        self.messages: list[list[dict[str, Any]]] = []
 
     def status(self) -> dict[str, Any]:
         return {"available": True}
 
     async def decide(self, **kwargs: Any) -> dict[str, Any]:
+        self.messages.append(kwargs["messages"])
         self.contexts.append(json.loads(kwargs["messages"][-1]["content"]))
         return self.decisions[min(len(self.contexts) - 1, len(self.decisions) - 1)]
 
@@ -157,11 +159,11 @@ async def test_model_receives_multiple_previous_turns_without_trusting_them(
             ))
             result = await finished(runtime, run["id"])
             parent = run["id"]
-        assert [turn["question"] for turn in model.contexts[-1]["conversation_not_evidence"]] == (
-            questions[:-1][-12:]
-        )
-        assert result["context_summary"]["conversation_turns"] == min(turn_count - 1, 12)
-        assert result["context_summary"]["conversation_truncated"] is (turn_count > 13)
+        previous_users = [item["content"] for item in model.messages[-1][1:-2]
+                          if item["role"] == "user"]
+        assert previous_users == questions[:-1]
+        assert result["context_summary"]["conversation_turns"] == turn_count - 1
+        assert result["context_summary"]["conversation_truncated"] is False
     finally:
         await runtime.stop()
 

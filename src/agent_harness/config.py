@@ -10,6 +10,7 @@ class HarnessSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="HARNESS_", env_file=".env", extra="ignore")
 
     enabled: bool = False
+    control_enabled: bool = True
     state_dir: Path = Path("var/agent-harness")
     quick_workers: int = Field(default=2, ge=1, le=16)
     investigate_workers: int = Field(default=1, ge=1, le=16)

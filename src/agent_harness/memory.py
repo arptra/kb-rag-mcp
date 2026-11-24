@@ -10,8 +10,11 @@ import sqlite3
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
+from langchain_core.messages import HumanMessage
+from langchain_core.messages.utils import count_tokens_approximately
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from agent_harness.control.settings import ControlStore
 from agent_harness.store import RunStore, timestamp
 
 LIST_LIMIT = 200
@@ -125,6 +128,7 @@ class MemoryStore:
 
     def __init__(self, runs: RunStore) -> None:
         self.runs = runs
+        self.controls = ControlStore(runs.settings)
         with runs._connect() as db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, owner TEXT NOT NULL, "
@@ -153,6 +157,10 @@ class MemoryStore:
                 "SELECT enabled FROM memory_preferences WHERE owner=?", (owner,)
             ).fetchone()
         return bool(row[0]) if row else True
+
+    def maximum(self) -> int:
+        policy = self.controls.load()
+        return policy.runtime.memory_max_records if policy.revision else MAX_TOTAL
 
     def set_enabled(self, owner: str, enabled: bool) -> None:
         with self.runs._connect() as db:
@@ -186,8 +194,8 @@ class MemoryStore:
         with self.runs._connect() as db:
             rows = db.execute(
                 "SELECT owner,data FROM memories WHERE status IN ('active','experience') "
-                "OR (status='draft' AND owner=? AND ?) ORDER BY updated DESC,id DESC LIMIT ?",
-                (owner, include_drafts, MAX_TOTAL),
+                "OR (status='draft' AND owner=? AND ?) ORDER BY updated DESC,id DESC",
+                (owner, include_drafts),
             ).fetchall()
         return [
             {**item, "_author": author, "_reader": owner}
@@ -312,9 +320,12 @@ class MemoryStore:
                 rating_bonus = max(-3, min(3, quality["helpful"] - quality["unhelpful"]))
                 ranked.append((score * 16 + priority * 2 + rating_bonus, item))
         ranked.sort(key=lambda pair: (pair[0], pair[1]["updated_at"]), reverse=True)
-        remaining = 2400
-        result = []
-        for _, item in ranked[:3]:
+        policy = self.controls.load()
+        remaining = policy.runtime.memory_context_tokens
+        result: builtins.list[dict[str, Any]] = []
+        for _, item in ranked:
+            if len(result) >= policy.runtime.memory_retrieval_count or remaining <= 0:
+                break
             quality = self._quality(item)
             prefix = ""
             if item["status"] == "experience":
@@ -335,9 +346,12 @@ class MemoryStore:
                     "это не доказывает ошибочность опыта. "
                     "Проверьте, каких подтверждений не хватает. "
                 )
-            text = (prefix + item["text"])[: min(1000, remaining)]
-            if not text:
-                break
+            text = prefix + item["text"]
+            tokens = count_tokens_approximately(
+                [HumanMessage(content=text)], chars_per_token=policy.context.chars_per_token,
+            )
+            if tokens > remaining or not text:
+                continue
             result.append(
                 {
                     "id": item["id"],
@@ -356,7 +370,7 @@ class MemoryStore:
                     "strategy": {"tools": item.get("strategy", {}).get("tools", [])},
                 }
             )
-            remaining -= len(text)
+            remaining -= tokens
         return result
 
     def record_usage(self, owner: str, memory_ids: builtins.list[str], run_id: str) -> None:
@@ -478,17 +492,17 @@ class MemoryStore:
                     (json.dumps(item, ensure_ascii=False), memory_id),
                 )
 
-    @staticmethod
-    def _make_room(db: sqlite3.Connection) -> bool:
+    def _make_room(self, db: sqlite3.Connection) -> bool:
         """Rotate the oldest automatic cases globally; keep manual/confirmed knowledge."""
         total = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-        if total < MAX_TOTAL:
+        maximum = self.maximum()
+        if total < maximum:
             return True
         rows = db.execute(
             "SELECT id,data FROM memories WHERE status='experience' ORDER BY updated ASC"
         ).fetchall()
         candidates = [key for key, data in rows if json.loads(data).get("origin") == "automatic"]
-        needed = total - MAX_TOTAL + 1
+        needed = total - maximum + 1
         if len(candidates) < needed:
             return False
         for key in candidates[:needed]:
