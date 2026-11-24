@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -11,6 +12,7 @@ from starlette.requests import Request
 
 from agent_harness.config import HarnessSettings
 from agent_harness.contracts import Evidence, Principal, RunRequest
+from agent_harness.discovery import DiscoveryStore
 from agent_harness.http import create_app
 from agent_harness.runtime import HarnessRuntime
 from agent_harness.store import RunStore, timestamp
@@ -82,6 +84,166 @@ async def turn(
 async def authenticate(request: Request) -> Principal | None:
     owner = request.headers.get("x-test-owner")
     return Principal(owner) if owner else None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["quick", "investigate", "autonomous"])
+async def test_greeting_http_lifecycle_never_contacts_research_providers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    app = runtime(tmp_path)
+    server = create_app(app, authenticate, manage_lifespan=False)
+    await app.start()
+    catalogs, model, scan = AsyncMock(), AsyncMock(), Mock()
+    monkeypatch.setattr(app, "_indexes", catalogs)
+    monkeypatch.setattr(app.model, "decide", model)
+    monkeypatch.setattr(DiscoveryStore, "scan", scan)
+    for queue in app._queues.values():
+        monkeypatch.setattr(queue, "full", lambda: True)
+    try:
+        selected = ["a", "connection:jira"]
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server), base_url="http://testserver",
+            headers={"x-test-owner": "alice"},
+        ) as client:
+            post = await client.post("/api/runs", json={
+                "question": "Привет, как дела?", "mode": mode, "effort": "high",
+                "index_ids": selected, "sandbox_profile_id": "java",
+            })
+            assert post.status_code == 202
+            run = post.json()
+            assert (run["answer_kind"], run["status"]) == ("conversation", "completed")
+            assert run["answer"] and run["started_at"] and run["completed_at"]
+            assert run["requested_index_ids"] == selected
+            assert run["index_ids"] == run["context_index_ids"] == run["evidence"] == []
+            assert not any(run["metrics"].values())
+            url = f"/api/runs/{run['id']}"
+            assert (await client.get(url)).json()["discoveries"] == []
+            timeline = (await client.get(f"/api/conversations/{run['id']}")).json()
+            assert timeline["runs"][0]["answer"] == run["answer"]
+            assert (await client.get("/api/conversations")).json()["total"] == 1
+            assert (await client.get(url, headers={"x-test-owner": "bob"})).status_code == 404
+            discoveries = await client.get("/api/discoveries", params={"run_id": run["id"]})
+            assert discoveries.json()["discoveries"] == []
+            feedback = (await client.put(url + "/feedback", json={"rating": "helpful"})).json()
+            assert feedback["feedback"]["rating"] == "helpful" and feedback["memory"] is None
+            assert app.store.get("alice", run["id"])["feedback"] == feedback["feedback"]
+            assert app.memory.list("alice", set(selected)) == []
+        catalogs.assert_not_awaited()
+        model.assert_not_awaited()
+        scan.assert_not_called()
+    finally:
+        await app.stop()
+
+
+@pytest.mark.asyncio
+async def test_source_bound_answer_cannot_opt_out_of_live_acl_with_chat_marker(
+    tmp_path: Path,
+) -> None:
+    app = runtime(tmp_path)
+    await app.start()
+    try:
+        run = await app.submit(ALICE, RunRequest(question="Привет"))
+        persisted = app.store.get("alice", run["id"])
+        persisted.update(answer="private source answer", context_index_ids=["revoked"])
+        app.store.save("alice", persisted)
+        visible = await app.get(ALICE, run["id"])
+        assert not visible["answer"] and visible["warnings"]
+    finally:
+        await app.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["chat", "blocked", "research"])
+async def test_classification_defers_sandbox_lookup_and_keeps_refusal_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str,
+) -> None:
+    app = runtime(tmp_path)
+    tools = Mock(profiles=AsyncMock(return_value=[]), close_run=AsyncMock())
+    monkeypatch.setattr(app, "tools", tools)
+    catalogs = AsyncMock(return_value=[])
+    monkeypatch.setattr(app, "_indexes", catalogs)
+    server = create_app(app, authenticate, manage_lifespan=False)
+    decision = ({"finish_reason": "content_filter", "content": "", "tool_calls": []}
+                if route == "blocked" else
+                {"tool_calls": [{"name": "RouteTurn", "args": {
+                    "route": route, "answer": "Слово." if route == "chat" else "",
+                }}]})
+    model = AsyncMock(return_value=decision)
+    monkeypatch.setattr(app.model, "decide", model)
+    await app.start()
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server), base_url="http://testserver",
+            headers={"x-test-owner": "alice"},
+        ) as client:
+            created = await client.post("/api/runs", json={
+                "question": "Объясни подробнее", "mode": "investigate", "routing": "auto",
+                "index_ids": ["a"], "sandbox_profile_id": "retired",
+            })
+            assert created.status_code == 202
+            result = await finish(app, created.json())
+            response = (await client.get(f"/api/runs/{result['id']}")).json()
+            assert response["answer"] and response["discoveries"] == []
+            assert result["requested_index_ids"] == ["a"] and result["index_ids"] == []
+            assert result["source_free"] and not result["resumable"]
+            if route == "research":
+                assert result["stop_reason"] == "sandbox_unavailable"
+                tools.profiles.assert_awaited_once_with(ALICE)
+            else:
+                tools.profiles.assert_not_awaited()
+                expected = "model_policy_stop" if route == "blocked" else "completed"
+                assert result["stop_reason"] == expected
+            model.assert_awaited_once()
+            tools.close_run.assert_not_awaited()
+            catalogs.assert_not_awaited()
+            assert not app.memory.list("alice", {"a"})
+    finally:
+        await app.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["routing", "waiting_for_gateway"])
+async def test_pending_route_exposes_picker_state_and_cancels_without_source_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    app = runtime(tmp_path)
+    server = create_app(app, authenticate, manage_lifespan=False)
+    await app.start()
+    catalogs = AsyncMock(return_value=[])
+    monkeypatch.setattr(app, "_indexes", catalogs)
+    # Keep the admitted request in its initial phase, without racing a real worker.
+    monkeypatch.setattr(app._queues["investigate"], "put_nowait", lambda _: None)
+    try:
+        accepted = await app.submit(ALICE, RunRequest(
+            question="Объясни подробнее", mode="investigate", index_ids=["a"], routing="auto",
+        ))
+        if phase == "waiting_for_gateway":
+            pending = app.store.get("alice", accepted["id"])
+            pending.update(phase=phase, resume_count=2, current_action={"name": "model_retry"})
+            app.store.save("alice", pending)
+        url = f"/api/runs/{accepted['id']}"
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server), base_url="http://testserver",
+            headers={"x-test-owner": "alice"},
+        ) as client:
+            for snapshot in (
+                (await client.get(url)).json(),
+                (await client.get(f"/api/conversations/{accepted['id']}")).json()["runs"][0],
+            ):
+                assert snapshot["phase"] == phase and snapshot["source_free"]
+                assert snapshot["requested_index_ids"] == ["a"] and snapshot["index_ids"] == []
+            discovered = (await client.get("/api/discoveries", params={"run_id": accepted["id"]}))
+            assert discovered.json()["discoveries"] == []
+            # A poll must never erase what a resumed investigation should validate.
+            assert app.store.get("alice", accepted["id"])["index_ids"] == ["a"]
+            cancelled = (await client.post(url + "/cancel")).json()
+            assert cancelled["status"] == "cancelled" and cancelled["source_free"]
+            assert (await client.get(url)).json()["requested_index_ids"] == ["a"]
+            assert not app.store.get("alice", accepted["id"])["index_ids"]
+            catalogs.assert_not_awaited()
+    finally:
+        await app.stop()
 
 
 @pytest.mark.asyncio

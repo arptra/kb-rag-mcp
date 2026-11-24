@@ -32,6 +32,10 @@ class ModelDecisionError(ValueError):
     """A model reply can be corrected without restarting the model connection."""
 
 
+class ModelToolFormatError(ModelDecisionError):
+    """The provider returned malformed tool names or arguments."""
+
+
 class ConversationUnavailable(ModelDecisionError):
     """A failed compaction must not silently drop the user's earlier constraints."""
 
@@ -67,7 +71,11 @@ class RunRequest(BaseModel):
     question: str = Field(min_length=1, max_length=8000)
     mode: Literal["quick", "investigate", "autonomous"] = "quick"
     effort: Literal["low", "medium", "high"] = "medium"
+    # The chat composer delegates lookup decisions to the agent. Existing /runs
+    # clients can continue requesting a research run directly.
+    routing: Literal["auto", "research"] | None = None
     index_ids: list[str] = Field(default_factory=list, max_length=1000)
+    use_default_sources: bool = True
     parent_run_id: str | None = Field(default=None, max_length=80)
     sandbox_profile_id: str = Field(default="", pattern=r"^([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})?$")
 

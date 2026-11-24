@@ -1,4 +1,4 @@
-"""A bounded LangChain agent turn over the Harness model and authorized tool dispatcher."""
+"""A bounded SDK agent turn over the Harness model and authorized tool dispatcher."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from langgraph.runtime import get_runtime
 from langsmith import tracing_context
 
 from agent_harness.contracts import ModelDecisionError
+from agent_harness.material_archive import deep_agents_installed
 
 Call = dict[str, Any]
 Decide = Callable[[list[dict[str, Any]]], Awaitable[dict[str, Any]]]
@@ -72,6 +73,8 @@ class _Round:
 
 
 class _HarnessChatModel(BaseChatModel):
+    model_name: str = "portal-harness:scoped-research"
+
     @property
     def _llm_type(self) -> str:
         return "harness-decision-port"
@@ -117,14 +120,46 @@ def _tool(specification: dict[str, Any]) -> StructuredTool:
 
 
 @lru_cache(maxsize=32)
-def _agent(catalog: str) -> Any:
+def _agent(catalog: str) -> tuple[str, Any]:
     tools = [_tool(item["function"]) for item in json.loads(catalog)]
-    return create_agent(_HarnessChatModel(cache=False), tools, context_schema=_Round,
-                        checkpointer=False, name="harness_research_agent")
+    model = _HarnessChatModel(cache=False)
+    builtins = frozenset({"ls", "glob", "grep", "read_file", "write_file", "edit_file",
+                          "execute", "delete", "task", "write_todos"})
+    if not deep_agents_installed() or any(tool.name in builtins for tool in tools):
+        # Keep the base installation usable, and preserve an operator's tool on a name collision.
+        return "LangChain", create_agent(model, tools, context_schema=_Round, checkpointer=False,
+                                         name="harness_research_agent")
+    from deepagents import (
+        GeneralPurposeSubagentProfile,
+        HarnessProfile,
+        create_deep_agent,
+        register_harness_profile,
+    )
+    from deepagents.backends import StateBackend
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+
+    register_harness_profile(model.model_name, HarnessProfile(
+        general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+        excluded_tools=builtins, excluded_middleware=frozenset({"SummarizationMiddleware"}),
+    ))
+    backend = StateBackend()
+    # The outer graph owns compaction. Evicting a large tool receipt here would
+    # replace it with a path into transient agent state that the graph cannot read.
+    # FilesystemMiddleware requires read_file in its allowlist. The profile
+    # excludes it from the model together with the other built-ins.
+    filesystem = FilesystemMiddleware(
+        backend=backend, tools=["read_file"], tool_token_limit_before_evict=None,
+        human_message_token_limit_before_evict=None,
+    )
+    return "Deep Agents", create_deep_agent(
+        model=model, tools=tools, backend=backend, middleware=[filesystem],
+        context_schema=_Round, checkpointer=False, name="harness_research_agent",
+    )
 
 
 async def run_agent_round(
     *, tools: list[dict[str, Any]], decide: Decide, dispatch: Dispatch,
+    on_start: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Execute one provider-proposed batch, then hand off its observation-informed decision.
 
@@ -132,11 +167,13 @@ async def run_agent_round(
     callback returns None when it needs control before another action/model call.
     """
     state = _Round(decide, dispatch, {t["function"]["name"] for t in tools})
-    agent = _agent(json.dumps(tools, ensure_ascii=False, sort_keys=True))
+    framework, agent = _agent(json.dumps(tools, ensure_ascii=False, sort_keys=True))
     # Neither the parent graph's saver nor another invocation's tool/model state
     # belongs to this ephemeral turn. Cancellation still propagates to this task.
     async def invoke() -> None:
         with tracing_context(enabled=False):
+            if on_start is not None:
+                on_start(framework)
             await agent.ainvoke(
                 {"messages": [HumanMessage(content="Research step")]}, context=state,
                 config={"recursion_limit": 72},

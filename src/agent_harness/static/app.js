@@ -13,6 +13,7 @@
   };
   const PHASE_LABELS = {
     queued: "Ожидаем свободное место для запуска.", searching: "Ищем подтверждения в выбранных источниках.",
+    routing: "Определяем, нужны ли источники для ответа.", responding: "Готовим ответ.",
     waiting_for_gateway: "Шлюз модели попросил отложить запрос. Автопилот продолжит автоматически.",
     reading: "Читаем документы и проверяем подробности за пределами поисковых фрагментов.",
     planning: "Определяем, какие сведения нужны для ответа.",
@@ -47,6 +48,11 @@
     return answer;
   }
   const $ = (id) => document.getElementById(id);
+  function isResearchTurn(run) {
+    return Boolean(run) && run.source_free !== true && run.answer_kind !== "conversation" &&
+      !["routing", "responding", "queued"].includes(run.phase) &&
+      !(run.status === "queued" && !run.phase);
+  }
   const layoutState = { historyCollapsed: false, contextCollapsed: false };
   function setPanelCollapsed(panel, collapsed, { persist = true } = {}) {
     const content = $(panel + "-content"), toggle = $(panel + "-toggle");
@@ -1160,13 +1166,13 @@
     const items = discoveryState.current.filter((item) => item.status !== "dismissed");
     $("run-discoveries").replaceChildren(...items.map((item) => discoveryCard(item, settingsState.canManage)));
     $("discoveries-count").textContent = String(items.length);
-    $("discoveries-card").hidden = !state.current || !items.length;
+    $("discoveries-card").hidden = !isResearchTurn(state.current) || !items.length;
     const all = discoveryState.all.filter((item) => item.status !== "dismissed");
     $("settings-discoveries").replaceChildren(...all.map((item) => discoveryCard(item, true)));
     $("settings-discoveries-empty").hidden = all.length > 0;
   }
   async function loadRunDiscoveries(force = false) {
-    if (!state.current || state.needsAuth) return;
+    if (!isResearchTurn(state.current) || state.needsAuth) return;
     const runId = idOf(state.current), epoch = state.identityEpoch;
     const signature = JSON.stringify([runId, state.current.status, state.current.phase, state.current.evidence?.length]);
     if (!force && discoveryState.signature === signature) return;
@@ -1349,7 +1355,7 @@
       return card;
     }));
     $("memory-empty").hidden = memoryState.memories.length > 0;
-    $("remember-run").hidden = !memoryState.available || !state.current || ACTIVE.has(state.current.status);
+    $("remember-run").hidden = !memoryState.available || !isResearchTurn(state.current) || ACTIVE.has(state.current.status);
   }
   async function loadMemory(append = false) {
     if (state.needsAuth || memoryState.busy) return;
@@ -1691,18 +1697,25 @@
     return mode === "quick" ? sources.filter((item) =>
       item.quick_search ?? item.direct_search ?? !/^(repo|connection):/.test(item.id)) : sources;
   }
+  function restoreResearchScope(run) {
+    if (!isResearchTurn(run) || !Array.isArray(run.index_ids)) return;
+    state.selected = new Set(run.index_ids);
+    state.sourcesInitialized = true;
+    state.selectedSandboxProfile = run.sandbox_profile_id || "";
+    renderSources(); renderExecutionEnvironment();
+  }
   function renderEffortDescription() {
     $("mode-autonomous").disabled = state.status?.limits?.autonomous_enabled === false;
     if ($("mode-autonomous").disabled && composerMode() === "autonomous") $("response-mode").value = "investigate";
     const mode = composerMode();
     const policy = state.status?.limits?.effort_policy?.[mode]?.[$("effort").value];
     $("mode-description").textContent = {
-      quick: "Ответ по базам знаний и MCP.",
+      quick: "Ответ в чате. Источники — при необходимости.",
       investigate: "Проверка по документам, коду и инструментам.",
       autonomous: "Агент выбирает и проверяет следующие шаги.",
     }[mode];
-    const parts = [mode === "quick" ? "Модель отвечает по выбранным базам знаний и инструментам чтения MCP."
-      : "Сначала обходим все выбранные базы знаний."];
+    const parts = [mode === "quick" ? "Для вопросов о системе доступны выбранные базы знаний и инструменты чтения MCP."
+      : "Для исследования агент выбирает источники по вопросу."];
     if (mode === "autonomous") parts.push("Агент сам запрашивает дополнительные ресурсы в пределах потолков администратора. Все расширения видны в чате.");
     if (policy && usesSandbox(mode)) {
       parts.push("Чтение документов: до " + policy.document_reads + ". Уточняющих обращений: до " + policy.source_calls + ".");
@@ -1775,7 +1788,7 @@
       notice = "Harness сейчас выключен. Сохранённые запросы остаются в истории.";
       connection("Выключено", "warning");
     } else if (status.source_available === false || status.sources_available === false || !indexes().length) {
-      notice = "Источники пока недоступны. Запрос не сможет получить подтверждения, пока доступ не восстановлен.";
+      notice = "Источники для исследования пока недоступны. Можно продолжить беседу.";
       connection("Нет источников", "warning");
     } else if (!status.model?.available) {
       notice = {
@@ -2046,13 +2059,23 @@
       state.runs = [...new Map([...state.runs, ...runs].map((run) => [idOf(run), run])).values()];
       if (!previous) {
         state.current = conversationState.runs.find((run) => idOf(run) === selectedId) || conversationState.runs.at(-1) || null;
-        if (!sameConversation) {
-          const latest = conversationState.runs.at(-1);
-          if (latest) $("response-mode").value = replyMode(latest.mode);
-          if (latest?.effort) $("effort").value = latest.effort;
+        const latest = state.current;
+        if (!sameConversation && latest) {
+          $("response-mode").value = replyMode(latest.mode);
+          if (latest.effort) $("effort").value = latest.effort;
           renderEffortDescription();
+          const available = new Set(indexes().map((item) => item.id));
+          const saved = latest.requested_index_ids;
+          const requested = Array.isArray(saved) ? saved.filter((id) => available.has(id)) : [];
+          if (!isResearchTurn(latest) && (requested.length || (saved?.length === 0 && latest.use_default_sources === false))) {
+            state.selected = new Set(requested);
+            state.sourcesInitialized = true;
+            state.selectedSandboxProfile = latest.sandbox_profile_id || "";
+          } else {
+            restoreResearchScope(conversationState.runs.findLast(isResearchTurn));
+          }
+          renderSources(); renderExecutionEnvironment();
         }
-        if (state.current) { state.selected = new Set(state.current.index_ids || []); state.selectedSandboxProfile = state.current.sandbox_profile_id || ""; renderSources(); renderExecutionEnvironment(); }
         $("composer-options").open = false;
       }
       conversationState.pollError = ""; showError(""); renderRun(); schedulePoll();
@@ -2094,7 +2117,7 @@
       const role = searchResults ? "Результаты поиска" : run.answer_kind === "clarification" ? "Уточнение Harness" : "Ответ Harness";
       heading.append(element("span", "chat-role", role),
         element("span", "chat-status" + (ACTIVE.has(run.status) ? " is-active" : ""), runStatusLabel(run)));
-      if (!searchResults && run.answer && run.evidence?.length && !ACTIVE.has(run.status)) {
+      if (isResearchTurn(run) && !searchResults && run.answer && run.evidence?.length && !ACTIVE.has(run.status)) {
         const sources = element("button", "chat-sources", "Источники · " + run.evidence.length);
         sources.type = "button"; sources.setAttribute("aria-controls", "evidence-list");
         sources.addEventListener("click", () => showRunSources(run));
@@ -2105,8 +2128,13 @@
       else {
         if (ACTIVE.has(run.status)) assistant.append(element("p", "chat-turn-status", actionDescription(run.current_action) || PHASE_LABELS[run.phase] || STATUS_LABELS[run.status]));
         const answer = element("div", "answer chat-answer"); renderAnswer(chatAnswer(run), answer, run); assistant.append(answer);
-        const inspect = element("button", "text-button chat-inspect", "Показать ход работы и материалы"); inspect.type = "button";
-        inspect.addEventListener("click", () => selectRun(run)); assistant.append(inspect);
+        if (isResearchTurn(run)) {
+          const inspect = element("button", "text-button chat-inspect", "Показать ход работы и материалы"); inspect.type = "button";
+          inspect.addEventListener("click", () => selectRun(run)); assistant.append(inspect);
+        } else if (!ACTIVE.has(run.status)) {
+          const remove = element("button", "text-button", "Удалить сообщение"); remove.type = "button";
+          remove.addEventListener("click", () => openDeletion("run", run)); assistant.append(remove);
+        }
       }
       turn.append(user, assistant); fragment.append(turn);
     }
@@ -2275,7 +2303,7 @@
     $("run-feedback").hidden = true;
   }
   function renderRunFeedback(run) {
-    const visible = Boolean(run && !ACTIVE.has(run.status) && run.answer && Array.isArray(run.index_ids));
+    const visible = Boolean(isResearchTurn(run) && !ACTIVE.has(run.status) && run.answer && Array.isArray(run.index_ids));
     $("run-feedback").hidden = !visible || state.needsAuth;
     if (!visible) return;
     if (feedbackState.runId !== idOf(run)) {
@@ -2298,7 +2326,7 @@
   }
   async function saveRunFeedback(rating) {
     const run = state.current;
-    if (!run || ACTIVE.has(run.status) || feedbackState.busy || state.needsAuth) return;
+    if (!isResearchTurn(run) || ACTIVE.has(run.status) || feedbackState.busy || state.needsAuth) return;
     const id = idOf(run), epoch = state.identityEpoch;
     // A response fetched before this mutation must not replace the saved rating.
     stopPolling();
@@ -2326,6 +2354,7 @@
     }
   }
   const ACTION_LABELS = {
+    route_message: "Модель читает вопрос",
     update_research_plan: "Обновление плана", request_budget: "Запрос дополнительных ресурсов",
     budget_review: "Проверка необходимого бюджета", research_round: "Проверка результатов поиска",
     goal_check: "Проверка оставшихся вопросов", answer_recovery: "Повторная подготовка ответа",
@@ -2382,7 +2411,7 @@
   }
   function runStatusLabel(run) {
     if (run.status === "queued" && run.phase === "waiting_for_gateway") return "Ожидаем шлюз модели";
-    if (run.answer_kind === "clarification") return "Ждём уточнения";
+    if (run.answer_kind === "clarification" || run.stop_reason === "routing_unavailable") return "Ждём уточнения";
     if (run.answer_kind === "verified_excerpt") return run.status === "completed" ? "Подтверждено источником" : "Частичный ответ по источнику";
     if (run.answer_kind === "restricted") return "Запрос ограничен";
     if (["partial", "failed"].includes(run.status) && Object.hasOwn(ANSWER_STOP_LABELS, run.stop_reason)) return ANSWER_STOP_LABELS[run.stop_reason];
@@ -2471,6 +2500,11 @@
     $("welcome").hidden = Boolean(conversationState.id);
     $("suggestions").hidden = Boolean(conversationState.id);
     $("run-panel").hidden = !hasRun;
+    const research = isResearchTurn(run);
+    $("evidence-card").hidden = !research;
+    $("reading-note").hidden = !research;
+    $("delete-run").textContent = research ? "Удалить запрос" : "Удалить сообщение";
+    if (!research) $("discoveries-card").hidden = true;
     $("page-label").textContent = conversationState.id ? "Чат" : "Новый чат";
     if (!run) { renderEvidence([]); renderHistory(); $("discoveries-card").hidden = true; renderRunFeedback(null); renderTranscript(); updateSubmit(); return; }
     const active = ACTIVE.has(run.status);
@@ -2495,9 +2529,9 @@
     } else {
       $("run-waiting").hidden = !active || !Number.isFinite(actionStart);
       $("run-waiting").textContent = "Текущее действие: " + (elapsed >= 60 ? Math.floor(elapsed / 60) + " мин " + elapsed % 60 + " сек" : elapsed + " сек") +
-        (["model_response", "model_call", "model_planning", "model_budget_review", "context_compaction"].includes(run.current_action?.name) ? " · Ожидаем ответ модели." : "");
+        (["model_response", "model_call", "route_message", "model_planning", "model_budget_review", "context_compaction"].includes(run.current_action?.name) ? " · Ожидаем ответ модели." : "");
     }
-    const trace = Array.isArray(run.research_trace) ? run.research_trace : [];
+    const trace = research && Array.isArray(run.research_trace) ? run.research_trace : [];
     const lastStep = trace.at(-1);
     const rejected = trace.findLast((item) => item?.name === "answer_quality_rejected");
     const showRejection = active && rejected && rejected !== lastStep;
@@ -2507,6 +2541,7 @@
     $("run-last-step").textContent = lastStep ? "Последнее действие: " + actionDescription(lastStep) + (lastStep.result ? " · " + String(lastStep.result).slice(0, 180) : "") : "";
     if (newPresentation || $("run-details").dataset.active !== String(active)) $("run-details").open = false;
     $("run-details").dataset.active = String(active);
+    $("run-details").hidden = !research;
     $("run-details-label").textContent = run.mode === "search" ? "Ход поиска" : active ? "План и ход исследования" : "Как получен ответ";
     $("run-details-summary").textContent = "Подтверждений: " + evidenceCount + (run.metrics?.tool_calls ? " · Действий: " + run.metrics.tool_calls : "");
     const phase = run.status === "cancelling" ? "Ожидаем завершения текущего действия." :
@@ -2525,12 +2560,12 @@
       (deferred ? " · Пропущено после подтверждения: " + deferred : "");
     renderResearchActivity(run);
     renderBudget(run);
-    const announcement = [currentAction || status, phase, "Найдено подтверждений: " + evidenceCount].filter(Boolean).join(". ");
+    const announcement = [currentAction || status, phase, research && "Найдено подтверждений: " + evidenceCount].filter(Boolean).join(". ");
     if ($("progress-live").textContent !== announcement) $("progress-live").textContent = announcement;
     $("cancel-run").hidden = !active;
-    $("deepen-run").hidden = active || ["failed", "interrupted"].includes(run.status);
-    $("resume-run").hidden = active || run.resumable !== true || run.mode === "search";
-    $("remember-run").hidden = active || !memoryState.available;
+    $("deepen-run").hidden = !research || active || ["failed", "interrupted"].includes(run.status);
+    $("resume-run").hidden = !research || active || run.resumable !== true || run.mode === "search";
+    $("remember-run").hidden = !research || active || !memoryState.available;
     const memories = Array.isArray(run.memory_used) ? run.memory_used : [];
     $("run-memory-used").replaceChildren(element("strong", "", "Учтено из общей памяти АС: " + memories.length), ...memories.map((item) => {
       const line = element("p", "", item.title || "Сохранённая запись");
@@ -2555,8 +2590,8 @@
     $("run-warnings").hidden = !warnings.length;
     const answer = chatAnswer(run);
     renderAnswer(answer);
-    $("answer-placeholder").hidden = Boolean(answer) || !active;
-    renderEvidence(run.evidence);
+    $("answer-placeholder").hidden = !research || Boolean(answer) || !active;
+    renderEvidence(research ? run.evidence : []);
     const milliseconds = Number(run.metrics?.duration_ms);
     const metrics = [];
     if (Number.isFinite(milliseconds) && milliseconds > 0) metrics.push(Math.max(1, Math.round(milliseconds / 1000)) + " сек.");
@@ -2571,7 +2606,7 @@
     renderTranscript();
     loadRunDiscoveries();
     const memorySignature = idOf(run) + ":" + run.status;
-    if (!active && state.memoryRunSignature !== memorySignature) { state.memoryRunSignature = memorySignature; loadMemory(); }
+    if (research && !active && state.memoryRunSignature !== memorySignature) { state.memoryRunSignature = memorySignature; loadMemory(); }
     if (newPresentation) appear($("run-panel"));
   }
   function stopPolling() {
@@ -2597,10 +2632,7 @@
           (id !== idOf(state.current) && !conversationState.runs.some((item) => idOf(item) === id))) return;
       const selected = id === idOf(state.current), scopeWasLoading = selected && !Array.isArray(state.current.index_ids);
       if (selected) state.current = run;
-      if (scopeWasLoading) {
-        state.selected = new Set(run.index_ids || []); state.selectedSandboxProfile = run.sandbox_profile_id || "";
-        renderSources(); renderExecutionEnvironment();
-      }
+      if (scopeWasLoading) restoreResearchScope(run);
       state.pollDelay = 1400;
       conversationState.pollError = "";
       rememberRun(run);
@@ -2616,7 +2648,7 @@
       if (generation === state.generation && !controller.signal.aborted) schedulePoll();
     }
   }
-  function selectRun(run) {
+  function selectRun(run, { refresh = true } = {}) {
     stopPolling();
     resetRunFeedback();
     state.generation += 1;
@@ -2626,14 +2658,13 @@
       Object.assign(conversationState, { id: conversationId, title: run.question || "Чат", runs: [run], total: 1, offset: 0, truncated: false, pollError: "", loading: false, controller: null, signature: null });
     }
     state.current = run;
-    if (Array.isArray(run.index_ids)) { state.selected = new Set(run.index_ids); renderSources(); }
-    state.selectedSandboxProfile = run.sandbox_profile_id || ""; renderExecutionEnvironment();
+    restoreResearchScope(run);
     discoveryState.current = []; discoveryState.signature = null;
     $("discovery-feedback").textContent = ""; renderDiscoveries();
     state.pollDelay = 1400;
     showError("");
     renderRun();
-    refreshRun(idOf(run), state.generation);
+    if (refresh) refreshRun(idOf(run), state.generation);
   }
   function resetWorkspace() {
     stopPolling();
@@ -2700,24 +2731,18 @@
     const sandboxSource = usesSandbox(mode) && sandboxApiIndex();
     const researchSources = selected.filter((id) => !id.startsWith("sandbox-api:"));
     if (sandboxSource) researchSources.push(sandboxSource);
-    if (!parent && indexes().length && !researchSources.length) {
-      showError(mode === "quick" ? "Выберите базу знаний, граф или MCP для быстрого ответа." : "Выберите хотя бы один источник в области поиска.");
-      setPanelCollapsed("context", false);
-      const summary = $("sources-disclosure").querySelector("summary");
-      if (summary.getAttribute("aria-expanded") !== "true") summary.click();
-      $("source-list").querySelector("input")?.focus();
-      return;
-    }
     const payload = {
       question,
       mode,
+      routing: parent ? "research" : "auto",
       effort: parent ? "high" : $("effort").value,
       index_ids: researchSources,
+      ...(!researchSources.length && indexes().length ? { use_default_sources: false } : {}),
       ...(followup ? { parent_run_id: idOf(followup) } : {}),
     };
-    if (payload.mode === "autonomous" && state.status?.limits?.autonomous_enabled === false) { showError("Автопилот отключён администратором. Выберите другой режим."); return; }
+    if (payload.routing === "research" && payload.mode === "autonomous" && state.status?.limits?.autonomous_enabled === false) { showError("Автопилот отключён администратором. Выберите другой режим."); return; }
     payload.sandbox_profile_id = usesSandbox(mode) ? state.selectedSandboxProfile : "";
-    if (payload.sandbox_profile_id && !state.sandboxProfiles.some((profile) => profile.id === payload.sandbox_profile_id)) {
+    if (payload.routing === "research" && payload.sandbox_profile_id && !state.sandboxProfiles.some((profile) => profile.id === payload.sandbox_profile_id)) {
       showError("Выбранная среда выполнения недоступна. Выберите другую среду или вариант по умолчанию."); return;
     }
     state.submitting = true;
@@ -2734,7 +2759,7 @@
         $("response-mode").value = mode; $("effort").value = payload.effort;
         renderEffortDescription();
       }
-      selectRun(run);
+      selectRun(run, { refresh: ACTIVE.has(run.status) });
       $("composer-options").open = false;
       $("question").value = "";
       updateCharacterCount();

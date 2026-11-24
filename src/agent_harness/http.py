@@ -35,6 +35,7 @@ from agent_harness.runtime import HarnessRuntime, HarnessUnavailableError, Queue
 from agent_harness.sandbox_http import create_sandbox_image_route
 from agent_harness.tls_credentials import TLSCredentialStore
 from agent_harness.tls_http import create_tls_routes
+from agent_harness.turn_router import local_reply
 
 Authenticate = Callable[[Request], Awaitable[Principal | None]]
 AuthorizeModelManager = Callable[[Request], Awaitable[bool]]
@@ -205,7 +206,8 @@ def create_app(
         if request.method == "GET":
             return _json({"runs": await runtime.list_runs(identity)})
         parsed = await _run_request(request)
-        if parsed.mode in {"investigate", "autonomous"} and parsed.sandbox_profile_id:
+        if (parsed.routing != "auto" and parsed.mode in {"investigate", "autonomous"}
+                and parsed.sandbox_profile_id and not local_reply(parsed.question)):
             available_profiles = await integrations.profiles(identity) if integrations else []
             if parsed.sandbox_profile_id not in {item["id"] for item in available_profiles}:
                 raise HTTPException(403, "Выбранная среда выполнения недоступна.")
@@ -261,6 +263,8 @@ def create_app(
                 discoveries.remove_run(identity.owner_id, deleted_id)
             return _json(deleted)
         run = await runtime.get(identity, run_id)
+        if HarnessRuntime.source_free_chat(run):
+            return _json({**run, "discoveries": []})
         discoveries.scan(identity.owner_id, run)
         available = await runtime._indexes(identity)
         run["discoveries"] = discoveries.list(

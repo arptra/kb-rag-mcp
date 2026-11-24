@@ -14,14 +14,14 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 
 from agent_harness.config import HarnessSettings
-from agent_harness.contracts import Evidence, Principal
+from agent_harness.contracts import Evidence, ModelToolFormatError, Principal
 from agent_harness.http import create_app
 from agent_harness.integrations import IntegrationHub
 from agent_harness.integrations_config import IntegrationStore
 from agent_harness.model_connection import ModelPolicyStop, ModelTransientError
 from agent_harness.runtime import HarnessRuntime
 from corporate_kb.access.http import AccessControl
-from corporate_kb.agents.activation import GigaCodeAgentController
+from corporate_kb.agents.activation import GigaCodeAgentController, GigaCodeDecisionError
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
 from corporate_kb.gigacode_runner import (
@@ -181,6 +181,8 @@ class GigaCodeDecisionModel:
             )
         except GigaCodePolicyStop:
             raise ModelPolicyStop("refusal", field="GigaCode") from None
+        except GigaCodeDecisionError:
+            raise ModelToolFormatError("GigaCode вернул некорректную структуру ответа.") from None
         except GigaCodeTimedOut:
             raise ModelTransientError("GigaCode не успел ответить на этот шаг.") from None
         except GigaCodeTransientError:

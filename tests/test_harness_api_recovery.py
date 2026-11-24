@@ -16,6 +16,7 @@ from test_harness_goal_research import OWNER, Source
 from agent_harness.config import HarnessSettings
 from agent_harness.contracts import Principal
 from agent_harness.http import create_app
+from agent_harness.material_archive import deep_agents_installed
 from agent_harness.model_connection import ModelConnection, ModelRouter
 from agent_harness.runtime import HarnessRuntime
 
@@ -322,6 +323,9 @@ async def test_autopilot_uses_library_tool_observations_for_its_next_decision(
         assert run["status"] == "completed", run["warnings"]
         assert source.queries == ["Где проходит обработка?", "ledger"]
         assert run["metrics"]["agent_rounds"] == 2 and run["metrics"]["tool_calls"] == 2
+        framework = "Deep Agents" if deep_agents_installed() else "LangChain"
+        rounds = [entry for entry in run["research_trace"] if entry["name"] == "agent_round"]
+        assert len(rounds) == 2 and all(entry["result"].startswith(framework) for entry in rounds)
         assert len(requests) == run["metrics"]["model_calls"] == 3
 
 

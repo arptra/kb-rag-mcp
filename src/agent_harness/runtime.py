@@ -8,6 +8,7 @@ import logging
 import re
 import time
 from collections import Counter
+from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from itertools import islice
 from threading import Event
@@ -53,6 +54,7 @@ from agent_harness.contracts import (
     Evidence,
     ModelDecisionError,
     ModelPort,
+    ModelToolFormatError,
     Principal,
     RunRequest,
     SourcePort,
@@ -110,6 +112,7 @@ from agent_harness.research import (
 from agent_harness.retrieval_review import REVIEW_PROMPT, REVIEW_TOOL, body_overlap, parse_review
 from agent_harness.search_results import source_passage
 from agent_harness.store import ACTIVE, RunStore, timestamp
+from agent_harness.turn_router import local_reply, needs_model_route
 
 _LOG = logging.getLogger(__name__)
 _ANSWER_TRUNCATED = "\n\n[Ответ сокращён по ограничению размера.]"
@@ -268,6 +271,8 @@ class HarnessRuntime:
                     if run_id in self._shutdown_runs and run["mode"] == "autonomous":
                         self.store.interrupt_autopilot(run)
                     else:
+                        if self.source_free_chat(run):
+                            self._close_source_free_scope(run)
                         run.update(status="cancelled", phase="finished", completed_at=timestamp())
                     self.store.save(principal.owner_id, run)
                 queue.task_done()
@@ -287,11 +292,17 @@ class HarnessRuntime:
             if request.parent_run_id else None
         )
         controls = self.control_store.load()
-        if request.mode == "autonomous" and not controls.autonomy.enabled:
+        reply = local_reply(request.question)
+        if not reply and request.mode == "autonomous" and not controls.autonomy.enabled:
             raise ValueError("Режим «Автопилот» отключён администратором.")
         queue = self._queues["quick" if request.mode == "quick" else "investigate"]
-        if queue.full():
+        if not reply and queue.full():
             raise QueueFullError("Очередь заполнена; повторите запрос позже.")
+        prior_chat = bool(parent and self._conversation_parent(parent))
+        pending_route = request.routing != "research" and needs_model_route(
+            request.question, automatic=request.routing == "auto", followup=bool(parent),
+            after_chat=prior_chat,
+        )
         run_id, now = uuid4().hex, timestamp()
         run = {
             "id": run_id,
@@ -301,7 +312,8 @@ class HarnessRuntime:
             ),
             **request.model_dump(),
             "status": "queued",
-            "phase": "queued",
+            "phase": "routing",
+            "_awaiting_route": pending_route,
             "answer": "",
             "evidence": [],
             "warnings": [],
@@ -312,6 +324,10 @@ class HarnessRuntime:
             "started_at": None,
             "completed_at": None,
             "parent_question": None,
+            "_research_parent_id": (parent.get("_research_parent_id")
+                                    if parent and parent["status"] not in ACTIVE
+                                    and self.source_free_chat(parent)
+                                    else request.parent_run_id),
             "memory_used": [],
             "context_index_ids": [],
             "resume_count": 0,
@@ -320,6 +336,8 @@ class HarnessRuntime:
             "research_trace": [],
         }
         self._initialize_budget(run, controls)
+        if reply:
+            self._finish_conversation(run, reply)
         self.store.settings = self.store.settings.model_copy(update={
             field: getattr(controls.runtime, field)
             for field in ("retention_days", "max_runs_per_owner", "max_total_runs")
@@ -329,9 +347,28 @@ class HarnessRuntime:
             self.store.prune()
         except Exception as exc:
             _LOG.warning("Harness retention deferred (%s)", type(exc).__name__)
-        self._signals[run_id] = Event()
-        queue.put_nowait((principal, run_id, self._signals[run_id]))
-        return {key: value for key, value in run.items() if not key.startswith("_")}
+        if not reply:
+            self._signals[run_id] = Event()
+            queue.put_nowait((principal, run_id, self._signals[run_id]))
+        return self._public_run(run)
+
+    def _finish_conversation(self, run: dict[str, Any], answer: str) -> None:
+        if not self._routing_without_sources(run):
+            raise ValueError("Cannot publish a source-free reply after investigation has started")
+        self._close_source_free_scope(run)
+        run.update(answer=answer, answer_kind="conversation", status="completed",
+                   phase="finished", stop_reason="completed", completed_at=timestamp(),
+                   started_at=run.get("started_at") or run["created_at"])
+        limit = self._runtime_limits(run).answer_chars
+        if len(answer) > limit:
+            run["answer"] = answer[:limit - len(_ANSWER_TRUNCATED)] + _ANSWER_TRUNCATED
+            run.update(status="partial", stop_reason="answer_limit")
+
+    @staticmethod
+    def _close_source_free_scope(run: dict[str, Any]) -> None:
+        run.pop("_awaiting_route", None)
+        run.setdefault("requested_index_ids", list(run["index_ids"]))
+        run.update(index_ids=[], source_free=True, resumable=False)
 
     def _initialize_budget(self, run: dict[str, Any], controls: ControlSettings) -> None:
         if controls.model_profile == "deepseek_v4_flash":
@@ -454,7 +491,7 @@ class HarnessRuntime:
             if wait_reason and run["status"] == "interrupted":
                 run["answer"] = wait_reason
         run["resumable"] = await self._can_resume(principal, run)
-        return self._visible(run, await self._indexes(principal))
+        return await self._run_for_reader(principal, run)
 
     async def delete_run(self, principal: Principal, run_id: str) -> dict[str, Any]:
         deleted = self.store.delete(principal.owner_id, run_id)
@@ -467,6 +504,7 @@ class HarnessRuntime:
         if (
             self._graph is None
             or run.get("mode") == "search"
+            or run.get("source_free") or run.get("answer_kind") == "conversation"
             or run["status"] not in {"interrupted", "timed_out", "failed", "partial", "cancelled"}
             or run.get("stop_reason") in {"model_policy_stop", "model_refusal_text"}
             or not {"mode", "effort", "metrics"} <= run.keys()
@@ -496,8 +534,13 @@ class HarnessRuntime:
             not index_ids or len(index_ids) > self._runtime_limits(run).max_indexes
         ):
             raise ValueError("Выберите допустимую область источников.")
-        allowed = {item["id"] for item in await self._indexes(principal)}
         selected = set(index_ids if index_ids is not None else run["index_ids"])
+        # A pre-retrieval interruption has no source data to authorize. prepare
+        # resolves the owner's current permissions if the decision requests research.
+        pending_route = self._pending_route(run)
+        allowed = selected if pending_route else {
+            item["id"] for item in await self._indexes(principal)
+        }
         if not selected <= allowed:
             raise ValueError("Доступ к одному из выбранных источников отсутствует.")
         queue = self._queues["quick" if run["mode"] == "quick" else "investigate"]
@@ -539,7 +582,7 @@ class HarnessRuntime:
         run.pop("_accepted_with_warnings", None)
         run.update(
             status="queued",
-            phase="queued",
+            phase="routing" if pending_route else "queued",
             completed_at=None,
             answer="",
             index_ids=sorted(selected),
@@ -556,7 +599,7 @@ class HarnessRuntime:
             self._schedule_dispatch(principal, run)
         else:
             queue.put_nowait((principal, run_id, self._signals[run_id]))
-        return {key: value for key, value in run.items() if not key.startswith("_")}
+        return self._public_run(run)
 
     async def list_memory(self, principal: Principal, *, offset: int = 0) -> dict[str, Any]:
         if offset < 0 or offset > 1_000_000:
@@ -611,12 +654,13 @@ class HarnessRuntime:
         run = self.store.get(principal.owner_id, run_id)
         if run["status"] in ACTIVE:
             raise ValueError("Дождитесь завершения ответа, чтобы оценить результат.")
-        allowed = {item["id"] for item in await self._indexes(principal)}
         scope = self._run_scope(run)
-        if not scope <= allowed:
+        if scope and not scope <= {item["id"] for item in await self._indexes(principal)}:
             raise ValueError("Доступ к источникам этого ответа отсутствует.")
         run["feedback"] = request.model_dump()
         self.store.save(principal.owner_id, run)
+        if self.source_free_chat(run):
+            return {"feedback": run["feedback"], "memory": None}
         memory = self.memory.record_feedback(
             principal.owner_id, run, rating=request.rating, comment=request.comment,
             index_ids=sorted(scope),
@@ -631,13 +675,66 @@ class HarnessRuntime:
             | {item["index_id"] for item in run.get("evidence", [])}
         )
 
+    @staticmethod
+    def _no_research_data(run: dict[str, Any]) -> bool:
+        return (not any(run.get(key) for key in (
+                    "context_index_ids", "evidence", "coverage", "memory_used", "research_plan",
+                    "parent_question", "context_summary", "_completed_effects", "_inflight_action",
+                ))
+                and not any(step.get("args") for step in run.get("research_trace", []))
+                and not any(run.get("metrics", {}).get(key) for key in (
+                    "source_calls", "bootstrap_calls", "document_reads", "tool_calls",
+                )))
+
+    @classmethod
+    def _pending_route(cls, run: dict[str, Any]) -> bool:
+        return run.get("_awaiting_route") is True and cls._no_research_data(run)
+
+    @classmethod
+    def _routing_without_sources(cls, run: dict[str, Any]) -> bool:
+        routing = run.get("phase") == "routing" or (
+            run.get("phase") == "authentication_required"
+            and (run.get("current_action") or {}).get("name") == "route_message"
+        )
+        return (routing and not run.get("answer") and cls._no_research_data(run)
+                and (not run.get("resume_count") or run.get("_awaiting_route") is True))
+
+    @classmethod
+    def source_free_chat(cls, run: dict[str, Any]) -> bool:
+        return cls._pending_route(run) or cls._routing_without_sources(run) or (
+            (run.get("source_free") is True or run.get("answer_kind") == "conversation")
+            and not cls._run_scope(run) and cls._no_research_data(run)
+        )
+
+    @classmethod
+    def _conversation_parent(cls, run: dict[str, Any]) -> bool:
+        return (run.get("answer_kind") == "conversation" and run.get("status") == "completed"
+                and not cls._run_scope(run) and cls._no_research_data(run))
+
+    @staticmethod
+    def _public_run(run: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in run.items() if not key.startswith("_")}
+
+    async def _run_for_reader(
+        self, principal: Principal, run: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self.source_free_chat(run):
+            public = self._public_run(run)
+            # Keep the original selection in SQLite until a parked turn resumes.
+            # The reader only sees it as picker state, never as a dependency.
+            public.setdefault("requested_index_ids", list(public["index_ids"]))
+            public.update(index_ids=[], source_free=True)
+            return public
+        return self._visible(run, await self._indexes(principal))
+
     def _parent_context(
         self, principal: Principal, run: dict[str, Any], allowed: set[str]
     ) -> dict[str, Any] | None:
-        if not run.get("parent_run_id"):
+        parent_id = run.get("_research_parent_id", run.get("parent_run_id"))
+        if not parent_id:
             return None
         try:
-            parent = self.store.get(principal.owner_id, run["parent_run_id"])
+            parent = self.store.get(principal.owner_id, parent_id)
         except KeyError:
             return None
         scope = self._run_scope(parent)
@@ -828,6 +925,8 @@ class HarnessRuntime:
         run = self.store.get(principal.owner_id, run_id)
         self._shutdown_runs.discard(run_id)
         if run["status"] == "interrupted" and run.pop("_continue_after_restart", None):
+            if self.source_free_chat(run):
+                self._close_source_free_scope(run)
             run.update(status="cancelled", stop_reason="cancelled", completed_at=timestamp(),
                        answer="Запрос остановлен.", answer_kind="incomplete")
             self.store.save(principal.owner_id, run)
@@ -836,6 +935,8 @@ class HarnessRuntime:
             if event is not None:
                 event.set()
             if run["status"] == "queued":
+                if self.source_free_chat(run):
+                    self._close_source_free_scope(run)
                 timer = self._gateway_waiters.get(run_id)
                 if timer is not None:
                     timer.cancel()
@@ -848,7 +949,7 @@ class HarnessRuntime:
                 run["status"] = "cancelling"
                 self._warn(run, "Запрошена отмена; ожидается завершение текущего вызова.")
                 self.store.save(principal.owner_id, run)
-        return self._visible(run, await self._indexes(principal))
+        return await self._run_for_reader(principal, run)
 
     async def status(self, principal: Principal) -> dict[str, Any]:
         indexes = await self._indexes(principal)
@@ -937,7 +1038,7 @@ class HarnessRuntime:
             if "budget" in run:
                 run["budget"]["events"] = []
             run["warnings"].append("Результат скрыт: доступ к части источников отсутствует.")
-        return {key: value for key, value in run.items() if not key.startswith("_")}
+        return HarnessRuntime._public_run(run)
 
     async def _model_status(self) -> dict[str, Any]:
         if self.model is None:
@@ -995,6 +1096,8 @@ class HarnessRuntime:
                     continue
                 if (run["status"] == "queued" and run["phase"] == "waiting_for_gateway"
                         and not self.control_store.load().autonomy.enabled):
+                    if self._pending_route(run):
+                        self._close_source_free_scope(run)
                     run.update(status="partial", phase="finished", completed_at=timestamp(),
                                stop_reason="autonomy_disabled", current_action=None,
                                answer="Продолжение отключено администратором.",
@@ -1009,6 +1112,8 @@ class HarnessRuntime:
                 # the lane's only worker and leave all subsequent chats queued.
                 _LOG.warning("Harness run finalization failed (%s)", type(exc).__name__)
                 if run is not None:
+                    if self._pending_route(run):
+                        self._close_source_free_scope(run)
                     if run["status"] in ACTIVE:
                         run["status"] = "partial" if run.get("evidence") else "failed"
                     self._warn(run, "Обработка запроса завершилась ошибкой. Повторите запрос.")
@@ -1047,7 +1152,13 @@ class HarnessRuntime:
             self._runtime_limits(run).authentication_timeout_seconds,
             principal.owner_id,
         )
-        run.update(status="running", phase="searching", started_at=timestamp())
+        if run.get("resume_count") and run.get("_resume_checkpoint") is False:
+            # Interrupted while still queued. Scope was checked on resume and
+            # this is the first actual prepare, including its source-free exits.
+            run["_awaiting_route"] = True
+        restored_research = run.get("_resume_checkpoint") and not self._pending_route(run)
+        phase = "searching" if run["mode"] == "search" or restored_research else "routing"
+        run.update(status="running", phase=phase, started_at=timestamp())
         self.store.save(principal.owner_id, run)
         operation = asyncio.create_task(self._research(principal, run, event, deadline))
         terminal: str | None = None
@@ -1085,6 +1196,8 @@ class HarnessRuntime:
             if current is not None and current.cancelling():
                 raise
         except ModelPolicyStop as exc:
+            if self._routing_without_sources(run):
+                self._close_source_free_scope(run)
             terminal = "partial" if run["evidence"] else "failed"
             model_stop = exc.stop_reason
             message = str(exc)
@@ -1104,7 +1217,11 @@ class HarnessRuntime:
             terminal = "partial" if run["evidence"] else "failed"
             run["warnings"].append(f"Исследование не завершено ({type(exc).__name__}).")
         finally:
-            if self.tools is not None and run["mode"] != "search":
+            if (not deferred and run["id"] not in self._shutdown_runs
+                    and (self._pending_route(run) or self._routing_without_sources(run))):
+                self._close_source_free_scope(run)
+            if (self.tools is not None and run["mode"] != "search"
+                    and not self.source_free_chat(run)):
                 try:
                     closing = asyncio.create_task(self.tools.close_run(run["id"]))
                     await self._cleanup(closing, run)
@@ -1172,9 +1289,8 @@ class HarnessRuntime:
         self.store.save(principal.owner_id, run)
 
     def _record_run_outcome(self, owner: str, run: dict[str, Any]) -> None:
-        if run.get("mode") == "search":
-            # Retrieval alone does not confirm an answer or a successful route.
-            # Explicit feedback can still teach the shared memory about this run.
+        if run.get("mode") == "search" or self.source_free_chat(run):
+            # Only research outcomes contribute evidence to shared system memory.
             return
         try:
             contribution = self.memory.record_outcome(
@@ -1963,8 +2079,17 @@ class HarnessRuntime:
         deadline: float | None = None,
     ) -> dict[str, Any]:
         """Retry a provider decision while preserving completed tool receipts."""
-        if not isinstance(self.model, ModelRouter):
+        async def invoke() -> dict[str, Any]:
             return await self._decide(principal, run, event, tools, exchange, deadline)
+
+        return await self._with_transport_retry(run, event, deadline, invoke)
+
+    async def _with_transport_retry(
+        self, run: dict[str, Any], event: Event, deadline: float | None,
+        invoke: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        if not isinstance(self.model, ModelRouter):
+            return await invoke()
 
         limit = self._budget(run).model_calls
         if run.get("phase") == "synthesizing":
@@ -1974,7 +2099,7 @@ class HarnessRuntime:
         attempts = min(self._runtime_limits(run).max_decision_errors,
                        limit - self._decision_calls(run))
         if attempts < 2:
-            return await self._decide(principal, run, event, tools, exchange, deadline)
+            return await invoke()
 
         previous: ModelTransientError | None = None
 
@@ -1995,7 +2120,7 @@ class HarnessRuntime:
                             "Повторяем вызов. Результаты проверок сохранены.")
             before = self._decision_calls(run)
             try:
-                return await self._decide(principal, run, event, tools, exchange, deadline)
+                return await invoke()
             except ModelTransientError as exc:
                 previous = exc
                 raise
@@ -2578,7 +2703,7 @@ class HarnessRuntime:
         self, principal: Principal, run: dict[str, Any], event: Event,
         messages: list[dict[str, Any]], tools: list[dict[str, Any]], *,
         deadline: float | None = None, included_memory_ids: list[str] | None = None,
-        summary: bool = False,
+        summary: bool = False, source_free_routing: bool = False,
     ) -> dict[str, Any]:
         assert self.model is not None
         self._budget(run)
@@ -2620,8 +2745,10 @@ class HarnessRuntime:
             raise asyncio.CancelledError
         # Compaction may await several model calls. Recheck access immediately
         # before every provider invocation, not only before preparing history.
-        allowed = {item["id"] for item in await self._indexes(principal)}
-        if not self._run_scope(run) <= allowed:
+        if source_free_routing and not self._routing_without_sources(run):
+            raise ValueError("Source-free routing requires a fresh turn without source context")
+        if (not source_free_routing
+                and not self._run_scope(run) <= {i["id"] for i in await self._indexes(principal)}):
             raise ValueError("Source access changed during the investigation")
         metrics = run["metrics"]
         limits = run["budget"]["current"]
@@ -2648,12 +2775,15 @@ class HarnessRuntime:
                          if summary else run["_control"]["context"]["response_reserve_tokens"])
         if run.get("phase") == "assessing_search":
             output_tokens = min(output_tokens, 768)
+        elif source_free_routing:
+            output_tokens = min(output_tokens, 1200)
         options = (
             {"max_output_tokens": output_tokens} if isinstance(self.model, ModelRouter) else {}
         )
         action_name = "context_compaction" if summary else {
             "investigating": "model_planning", "budget_review": "model_budget_review",
             "assessing_search": "search_assessment",
+            "routing": "route_message",
         }.get(run.get("phase", ""), "model_response")
         run["current_action"] = {"name": action_name, "started_at": timestamp()}
         self._checkpoint(principal, run, event)
@@ -2681,6 +2811,7 @@ class HarnessRuntime:
                      "model_budget_review": "Проверка бюджета",
                      "context_compaction": "Сжатие истории",
                      "search_assessment": "Проверка найденных фрагментов",
+                     "route_message": "Выбор ответа или исследования",
                      "model_response": "Подготовка ответа"}[action_name]
             exc.args = (f"{stage}. {exc}",)
             run["provider_diagnostic"] = {
@@ -2725,13 +2856,16 @@ class HarnessRuntime:
         if (not summary and not result.get("tool_calls")
                 and isinstance(result.get("content"), str)):
             result = {**result, "content": format_source_reference(run, result["content"])}
-        if result.get("incomplete_tool_calls"):
+        reason = result.get("finish_reason")
+        if result.get("incomplete_tool_calls") or (
+            result.get("tool_calls") and reason in INCOMPLETE_FINISH_REASONS
+        ):
+            if reason in {"length", "max_tokens", "max_output_tokens"}:
+                raise ModelToolFormatError("Модель не завершила описание действия.")
             raise ModelDecisionError("Модель не завершила описание действия.")
         if (not result.get("tool_calls") and
                 (not isinstance(result.get("content"), str) or not result["content"].strip())):
             raise ModelDecisionError("Модель вернула пустой ответ.")
-        if result.get("tool_calls") and result.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
-            raise ModelDecisionError("Модель не завершила описание действия.")
         metrics["output_tokens_estimated"] = metrics.get("output_tokens_estimated", 0) + (
             self._count_tokens(run, result)
         )

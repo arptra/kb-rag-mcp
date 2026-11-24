@@ -13,6 +13,71 @@ TOOLS = [{"type": "function", "function": {"name": name, "parameters": {"type": 
          for name in ("lookup", "verify")]
 
 
+async def test_deep_agent_uses_only_scoped_tools_and_no_extra_model_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("deepagents", minversion="0.7.39")
+    import json
+
+    from agent_harness import library_agent
+
+    bindings = []
+    original = library_agent._HarnessChatModel.bind_tools
+
+    def capture(model: Any, tools: Any, **kwargs: Any) -> Any:
+        bindings.append({tool.name for tool in tools})
+        return original(model, tools, **kwargs)
+
+    monkeypatch.setattr(library_agent._HarnessChatModel, "bind_tools", capture)
+    framework, agent = library_agent._agent(json.dumps(TOOLS, ensure_ascii=False, sort_keys=True))
+    assert framework == "Deep Agents"
+    assert agent.config["metadata"]["ls_integration"] == "deepagents"
+    decisions, dispatched = [], []
+    large_receipt = "evidence " * 10000
+
+    async def decide(observations: list[dict[str, Any]]) -> dict[str, Any]:
+        decisions.append(len(observations))
+        if observations:
+            assert observations[0]["result"] == large_receipt
+            return {"content": "Checked"}
+        return {"tool_calls": [{"name": "lookup", "args": {}}]}
+
+    async def dispatch(calls: list[dict[str, Any]]) -> list[str]:
+        dispatched.extend(call["name"] for call in calls)
+        return [large_receipt]
+
+    started: list[str] = []
+    result = await run_agent_round(tools=TOOLS, decide=decide, dispatch=dispatch,
+                                   on_start=started.append)
+    assert started == [framework]
+    assert result["content"] == "Checked" and dispatched == ["lookup"]
+    assert decisions == [0, 1] and bindings and all(b == {"lookup", "verify"} for b in bindings)
+
+
+@pytest.mark.parametrize(("installed", "name"), [(False, "base_lookup"), (True, "grep")])
+async def test_base_or_conflicting_tool_uses_langchain(
+    monkeypatch: pytest.MonkeyPatch, installed: bool, name: str,
+) -> None:
+    from agent_harness import library_agent
+
+    monkeypatch.setattr(library_agent, "deep_agents_installed", lambda: installed)
+    catalog = [{"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}]
+    started: list[str] = []
+
+    async def decide(observations: list[dict[str, Any]]) -> dict[str, Any]:
+        if observations:
+            return {"content": observations[0]["result"]}
+        return {"tool_calls": [{"name": name, "args": {}}]}
+
+    async def dispatch(batch: list[dict[str, Any]]) -> list[str]:
+        assert started == ["LangChain"] and batch[0]["name"] == name
+        return ["authorized tool result"]
+
+    result = await run_agent_round(tools=catalog, decide=decide, dispatch=dispatch,
+                                   on_start=started.append)
+    assert result["content"] == "authorized tool result"
+
+
 async def test_native_tools_run_in_order_and_feed_the_next_provider_decision() -> None:
     calls = [{"name": name, "args": {"document": "payments"}, "id": str(i)}
              for i, name in enumerate(("lookup", "verify", "lookup"))]

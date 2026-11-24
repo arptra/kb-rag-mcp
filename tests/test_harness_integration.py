@@ -323,6 +323,14 @@ async def test_existing_launcher_activates_harness_without_profile_and_keeps_log
                         raise GigaCodeCancelled("Cancelled")
                 kwargs["authentication_complete"]()
                 payload = {"ready": True}
+            elif "RouteTurn" in kwargs["prompt"]:
+                assert "payments-service checks daily limits" not in kwargs["prompt"]
+                payload = {"content": "", "tool_calls": [{
+                    "name": "RouteTurn", "args": {"route": "chat", "answer": "56"},
+                }]}
+                if a2a_enabled and len(calls) == 2:
+                    # A truncated tool argument is rejected by the actual CLI controller.
+                    payload["tool_calls"][0]["args"] = {"answer": "56"}
             else:
                 assert "payments-service checks daily limits" in kwargs["prompt"]
                 if policy_stop:
@@ -361,6 +369,16 @@ async def test_existing_launcher_activates_harness_without_profile_and_keeps_log
                     return response.json()
                 await asyncio.sleep(0.01)
 
+    async def finished_run(client: httpx.AsyncClient, run_id: str) -> dict[str, Any]:
+        async with asyncio.timeout(5):
+            while True:
+                response = await client.get(f"/harness/api/runs/{run_id}", headers=reader)
+                assert response.status_code == 200
+                result: dict[str, Any] = response.json()
+                if result["status"] not in {"queued", "running", "cancelling"}:
+                    return result
+                await asyncio.sleep(0.01)
+
     async with (
         app.router.lifespan_context(app),
         httpx.AsyncClient(
@@ -377,6 +395,11 @@ async def test_existing_launcher_activates_harness_without_profile_and_keeps_log
         assert status.status_code == 200
         assert status.json()["model"]["state"] == "disabled"
         assert "не настроена" not in status.text
+        greeting = await client.post("/harness/api/runs", headers=reader, json={
+            "question": "Привет, как дела?", "routing": "auto", "mode": "autonomous",
+        })
+        assert greeting.json()["status"] == "completed"
+        assert greeting.json()["metrics"]["source_calls"] == 0
         assert not calls  # Starting the host never starts a CLI or OAuth flow.
         assert (await client.post("/harness/api/model/enable", headers=reader)).status_code == 403
 
@@ -401,20 +424,21 @@ async def test_existing_launcher_activates_harness_without_profile_and_keeps_log
 
         authorization.set()
         assert (await wait_state(client, "ready"))["available"] is True
+        chat = await client.post("/harness/api/runs", headers=reader, json={
+            "question": "Сколько будет семь раз восемь?", "routing": "auto",
+        })
+        assert chat.status_code == 202
+        social = await finished_run(client, chat.json()["id"])
+        assert social["answer"] == "56" and social["status"] == "completed"
+        chat_calls = 2 if a2a_enabled else 1
+        assert social["metrics"]["model_calls"] == chat_calls
+        assert social["metrics"]["source_calls"] == 0
         response = await client.post(
             "/harness/api/runs", headers=reader,
             json={"question": "payments daily limits", "mode": "quick", "effort": "low"},
         )
         assert response.status_code == 202, response.text
-        run_id = response.json()["id"]
-        async with asyncio.timeout(5):
-            while True:
-                response = await client.get(f"/harness/api/runs/{run_id}", headers=reader)
-                assert response.status_code == 200
-                result = response.json()
-                if result["status"] not in {"queued", "running", "cancelling"}:
-                    break
-                await asyncio.sleep(0.01)
+        result = await finished_run(client, response.json()["id"])
         if policy_stop:
             assert result["status"] == "partial", result
             assert result["stop_reason"] == "model_policy_stop"
@@ -426,7 +450,7 @@ async def test_existing_launcher_activates_harness_without_profile_and_keeps_log
             assert result["answer"] == answer
         assert result["evidence"]
         assert result["metrics"]["model_calls"] == 1
-        assert len(calls) == 2  # One activation probe, one answer from actual RAG evidence.
+        assert len(calls) == 2 + chat_calls  # Activation, chat and an answer from RAG evidence.
         assert controller.stop_count == 0
     assert controllers[0].stop_count == 1
     assert controllers[0].status()["state"] == "disabled"

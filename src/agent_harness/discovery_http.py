@@ -26,13 +26,18 @@ def create_discovery_routes(
     integrations: IntegrationHub | None,
 ) -> list[Route]:
     async def entries(identity: Principal, run_id: str | None = None) -> list[dict[str, Any]]:
+        if run_id:
+            run = await runtime.get(identity, run_id)
+            if HarnessRuntime.source_free_chat(run):
+                return []
         available = await runtime._indexes(identity)
         # Read through runtime's visibility filter before looking at source text.
         if run_id:
-            store.scan(identity.owner_id, await runtime.get(identity, run_id))
+            store.scan(identity.owner_id, run)
         else:
             for row in runtime.store.list(identity.owner_id):
-                store.scan(identity.owner_id, runtime._visible(row, available))
+                if not HarnessRuntime.source_free_chat(row):
+                    store.scan(identity.owner_id, runtime._visible(row, available))
         settings = integrations.store.load() if integrations else IntegrationSettings()
         return store.list(
             identity.owner_id, {item["id"] for item in available}, settings, run_id=run_id

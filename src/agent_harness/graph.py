@@ -8,11 +8,12 @@ import asyncio
 import copy
 import hashlib
 import json
+from contextlib import suppress
 from dataclasses import dataclass
 from threading import Event
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
-from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
@@ -70,6 +71,12 @@ from agent_harness.research import (
 )
 from agent_harness.retrieval_review import body_overlap
 from agent_harness.store import timestamp
+from agent_harness.turn_router import (
+    InvalidRouteDecision,
+    local_reply,
+    needs_model_route,
+    route_turn,
+)
 
 if TYPE_CHECKING:
     from agent_harness.runtime import HarnessRuntime
@@ -155,7 +162,9 @@ class HarnessGraph:
         config = self.config(context.principal, context.run["id"])
         config["recursion_limit"] = self.engine._runtime_limits(context.run).graph_recursion_limit
         state: GraphState | None = {"run": copy.deepcopy(context.run)}
-        if resume:
+        # An interrupted routing call has no research to replay. Re-enter prepare
+        # from the persisted owner turn rather than jumping ahead to collection.
+        if resume and not self.engine._pending_route(context.run):
             context.run.pop("_question_bound_mcp_call", None)
             context.run.pop("_goal_review_requested", None)
             # A resumed graph searches the current corpus. A quote, negative judgment or
@@ -266,9 +275,118 @@ class HarnessGraph:
     def _deadline(self, context: ExecutionContext) -> float:
         return context.started + self.engine._run_timeout(context.run)
 
+    async def _route_message(self, context: ExecutionContext) -> bool:
+        """Decide about retrieval before accessing the catalog or any research data."""
+        run, engine = context.run, self.engine
+        if (run["mode"] == "search" or run.get("routing") == "research"
+                or (run.get("resume_count") and not engine._pending_route(run))):
+            return False
+        parent = None
+        if run.get("parent_run_id"):
+            with suppress(KeyError):
+                parent = engine.store.get(context.principal.owner_id, run["parent_run_id"])
+        prior_chat = parent if parent and engine._conversation_parent(parent) else None
+        prior_research = bool(run.get("_research_parent_id")) and (
+            not prior_chat or local_reply(prior_chat["question"]) is not None
+        )
+        if not needs_model_route(run["question"], automatic=run.get("routing") == "auto",
+                                 followup=prior_research, after_chat=bool(prior_chat)):
+            return False
+
+        deadline = self._deadline(context)
+        route_started = engine._now(run)
+        repair = False
+
+        async def decide(
+            messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+        ) -> dict[str, Any]:
+            async def invoke() -> dict[str, Any]:
+                return await engine._invoke_model(
+                    context.principal, run, context.cancel, messages, tools,
+                    source_free_routing=True, deadline=deadline,
+                )
+
+            if repair:
+                try:
+                    return await invoke()
+                except TimeoutError as exc:
+                    if type(exc) is TimeoutError:
+                        # The shorter repair window elapsed. The whole run is still live.
+                        raise ModelDecisionError("Не осталось времени на исправление.") from exc
+                    raise
+            return await engine._with_transport_retry(run, context.cancel, deadline, invoke)
+
+        async def choose(_: None) -> str | None:
+            nonlocal repair, deadline
+            if repair:
+                run["_route_format_repaired"] = True
+                engine._trace(run, "model_retry", {}, "Уточняю формат выбора маршрута.")
+            try:
+                return await route_turn(
+                    run["question"],
+                    previous_question=prior_chat["question"] if prior_chat else None,
+                    previous_answer=prior_chat["answer"] if prior_chat else None,
+                    research_followup=prior_research, decide=decide, repair_format=repair,
+                )
+            except InvalidRouteDecision:
+                # Keep one model decision for research and one for its final answer.
+                # Split the remaining pre-synthesis time between repair and research.
+                now = engine._now(run)
+                left = engine._budget(run).model_calls - engine._decision_calls(run)
+                research_time = self._reserve_deadline(context) - now
+                if (run.get("_route_format_repaired") or context.cancel.is_set()
+                        or left < 3 or research_time / 2 <= now - route_started):
+                    raise ModelDecisionError("Не удалось определить маршрут сообщения.") from None
+                repair = True
+                deadline = now + research_time / 2
+                raise
+
+        try:
+            if engine.model is None or not (await engine._model_status())["available"]:
+                # A classifier outage is not authorization to search all selected sources.
+                raise ModelDecisionError("Выбор маршрута временно недоступен.")
+            action = RunnableLambda[None, str | None](choose, name="harness_turn_route").with_retry(
+                retry_if_exception_type=(InvalidRouteDecision,), stop_after_attempt=2,
+                wait_exponential_jitter=False,
+            )
+            answer = await action.ainvoke(None)
+        except (ModelDecisionError, ModelTransientError):
+            if context.cancel.is_set():
+                raise asyncio.CancelledError from None
+            engine._finish_conversation(run, "Нужен общий ответ или проверить конкретные данные "
+                                        "в вашей системе?")
+            run.update(status="partial", stop_reason="routing_unavailable")
+            return True
+        if answer is None:
+            return False
+        if context.cancel.is_set():
+            raise asyncio.CancelledError
+        engine._finish_conversation(run, answer)
+        return True
+
     async def prepare(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
         context = self._context(state, runtime)
         run, principal = context.run, context.principal
+        if await self._route_message(context):
+            return self._result(context, "done")
+        if (run.get("routing") == "auto" and run["mode"] != "quick"
+                and run.get("sandbox_profile_id")):
+            list_profiles = getattr(self.engine.tools, "profiles", None)
+            profiles = await list_profiles(principal) if list_profiles else []
+            if run["sandbox_profile_id"] not in {profile["id"] for profile in profiles}:
+                self.engine._finish_conversation(run, "Выбранная среда выполнения недоступна.")
+                run.update(status="failed", stop_reason="sandbox_unavailable",
+                           answer_kind="clarification")
+                return self._result(context, "done")
+        if (not run.get("use_default_sources", True) and not run["index_ids"]
+                and not (run["mode"] != "quick" and run.get("sandbox_profile_id"))):
+            self.engine._finish_conversation(run, "Для проверки нужны источники. "
+                                             "Выберите их в «Области поиска» и повторите запрос.")
+            run.update(status="partial", stop_reason="no_sources", answer_kind="clarification")
+            return self._result(context, "done")
+        run.pop("_awaiting_route", None)
+        run["phase"] = "planning"
+        self.engine._checkpoint(principal, run, context.cancel)
         catalog = await self.engine._indexes(principal, self.engine._source_timeout(run))
         available = {item["id"] for item in catalog}
         requested = list(dict.fromkeys(run["index_ids"]))
@@ -276,8 +394,10 @@ class HarnessGraph:
             run["status"] = "failed"
             self.engine._warn(run, "Один или несколько выбранных индексов недоступны.")
             return self._result(context, "done")
-        selected = requested or sorted(item["id"] for item in catalog
-                                       if run["mode"] != "quick" or item["quick_search"])
+        selected = requested
+        if not selected and run.get("use_default_sources", True):
+            selected = sorted(item["id"] for item in catalog
+                              if run["mode"] != "quick" or item["quick_search"])
         # The environment picker binds service checks to one profile even when the
         # caller selected all sources. Keep the selected environment inside the budget.
         api = sandbox_api_index(run.get("sandbox_profile_id", ""))
@@ -971,13 +1091,16 @@ class HarnessGraph:
         context = self._context(state, runtime)
         if context.cancel.is_set():
             return self._result(context, "done", calls=[], agent_batch=False)
-        metrics = context.run["metrics"]
-        metrics["agent_rounds"] = metrics.get("agent_rounds", 0) + 1
-        self.engine._trace(context.run, "agent_round", {},
-                           "Агент выполняет выбранные действия и проверяет результат.")
-        working: GraphState = {**state, "agent_batch": False, "run": copy.deepcopy(context.run)}
+        working: GraphState = {**state, "agent_batch": False}
         first = True
         dispatched = 0
+
+        def started(framework: str) -> None:
+            metrics = context.run["metrics"]
+            metrics["agent_rounds"] = metrics.get("agent_rounds", 0) + 1
+            self.engine._trace(context.run, "agent_round", {},
+                               f"{framework} выполняет выбранные действия и проверяет результат.")
+            working["run"] = copy.deepcopy(context.run)
 
         async def decide(observations: list[dict[str, Any]]) -> dict[str, Any]:
             nonlocal first, working
@@ -1028,7 +1151,7 @@ class HarnessGraph:
             return [exchange[-1]["result"]] if exchange else None
 
         try:
-            await run_agent_round(tools=catalog, decide=decide, dispatch=dispatch)
+            await run_agent_round(tools=catalog, decide=decide, dispatch=dispatch, on_start=started)
         except ModelDecisionError:
             return self._result(context, "replan", calls=[], agent_batch=False,
                                 branch_reason="Агент не смог продолжить проверку этим действием.")

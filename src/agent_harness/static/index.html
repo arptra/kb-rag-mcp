@@ -130,7 +130,7 @@
                   <button id="personal-open" class="text-button" type="button" aria-haspopup="dialog">Мои доступы к Git и Gradle</button>
                 </div>
                 <div id="composer-environment" class="composer-environment" hidden><label class="environment-select" for="sandbox-profile">Среда выполнения<select id="sandbox-profile" name="sandbox_profile_id" disabled><option value="">По умолчанию</option></select></label><p id="environment-description"></p><div class="sandbox-check"><button id="sandbox-check" type="button" class="secondary-button">Проверить среду</button><span id="sandbox-check-result" role="status" aria-live="polite"></span></div></div>
-                <p id="effort-description" class="effort-description">Проверяем все выбранные базы знаний. Усилие определяет глубину разбора.</p>
+                <p id="effort-description" class="effort-description">Усилие определяет глубину исследования.</p>
                 </details>
                 <div class="composer-footer">
                   <div class="composer-mode">
@@ -140,7 +140,7 @@
                       <option value="investigate">Исследование</option>
                       <option id="mode-autonomous" value="autonomous">Автопилот</option>
                     </select>
-                    <p id="mode-description">Ответ по базам знаний и MCP.</p>
+                    <p id="mode-description">Ответ в чате. Источники — при необходимости.</p>
                   </div>
                   <button id="submit-question" class="primary-button" type="submit"><span>Отправить</span><span aria-hidden="true">↗</span></button>
                 </div>
@@ -176,7 +176,7 @@
               <details id="sources-disclosure" class="sources-card" aria-labelledby="sources-heading" open>
                 <summary class="card-heading sources-summary"><span id="sources-heading" class="card-title">Область поиска</span><span class="disclosure-meta"><span id="source-count" class="count-badge">0</span><svg class="disclosure-chevron" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m5 7 5 5 5-5"/></svg></span></summary>
                 <div class="disclosure-content">
-                <p class="card-description">Выберите источники для этого запроса.</p>
+                <p class="card-description">Выберите, где агент может искать сведения для исследования.</p>
                 <label class="source-select-all"><input id="select-all-sources" type="checkbox" aria-checked="false" disabled><span>Выбрать все источники</span></label>
                 <div id="source-list" class="source-list"></div>
                 <p id="sources-empty" class="empty-description">Загружаем доступные источники…</p>
@@ -184,7 +184,7 @@
                 </div>
               </details>
 
-              <section id="evidence-card" class="evidence-card" aria-labelledby="evidence-heading">
+              <section id="evidence-card" class="evidence-card" aria-labelledby="evidence-heading" hidden>
                 <div class="card-heading"><h2 id="evidence-heading">Подтверждения</h2><span id="evidence-count" class="count-badge">0</span></div>
                 <p id="evidence-empty" class="empty-description">Здесь появятся материалы, найденные для вашего запроса.</p>
                 <div id="evidence-list" class="evidence-list" role="region" aria-label="Найденные подтверждения" tabindex="0"></div>
@@ -195,7 +195,7 @@
                 <div id="run-discoveries" class="discovery-list"></div>
                 <p id="discovery-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
               </section>
-              <p class="reading-note">Проверяйте важные выводы по первоисточникам. Если данных недостаточно, это будет видно в ответе.</p>
+              <p id="reading-note" class="reading-note" hidden>Проверяйте важные выводы по первоисточникам. Если данных недостаточно, это будет видно в ответе.</p>
             </div>
           </aside>
         </div>

@@ -24,7 +24,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from agent_harness.contracts import ModelDecisionError, ModelPort
+from agent_harness.contracts import ModelDecisionError, ModelPort, ModelToolFormatError
 from agent_harness.model_profiles import (
     ModelProfile,
     ResolvedModelProfile,
@@ -578,7 +578,7 @@ class ModelRouter:
             if calls is None:
                 calls = []
             if not isinstance(calls, list) or len(calls) > 32:
-                raise ModelDecisionError("Модель вернула некорректный список действий.")
+                raise ModelToolFormatError("Модель вернула некорректный список действий.")
             incomplete_calls = bool(calls) and reason in INCOMPLETE_FINISH_REASONS
             if incomplete_calls:
                 # A length stop may cut arguments in the middle of JSON. Never
@@ -599,7 +599,7 @@ class ModelRouter:
                 # A valid API envelope can contain a bad model decision. Let the
                 # existing bounded repair loop ask for corrected actions; never
                 # execute a partially accepted batch or expose raw arguments.
-                raise ModelDecisionError(
+                raise ModelToolFormatError(
                     "Модель вернула недопустимый инструмент или некорректные аргументы действия."
                 ) from None
 

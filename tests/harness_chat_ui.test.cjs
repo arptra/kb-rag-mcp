@@ -371,6 +371,7 @@ test("deepening an autonomous run preserves the mode and selected sandbox", asyn
   ui.state.selectedSandboxProfile = "java";
   await ui.submitRun(run("first", { mode: "autonomous" }));
   assert.equal(submitted.mode, "autonomous");
+  assert.equal(submitted.routing, "research");
   assert.equal(submitted.sandbox_profile_id, "java");
   assert.equal(submitted.parent_run_id, "first");
 });
@@ -384,6 +385,7 @@ test("composer offers three answer modes, selects read-only MCP for quick replie
   let submitted;
   const { ui, nodes } = fixture(t, ({ path: route, method, body }) => {
     if (route === "runs" && method === "POST") submitted = JSON.parse(body);
+    if (!submitted?.index_ids.length) return run("greeting", { ...submitted, index_ids: [], answer_kind: "conversation" });
     return run("found", { ...submitted });
   });
   const choose = (value) => { nodes.get("response-mode").value = value; nodes.get("response-mode").listeners.change(); };
@@ -404,15 +406,19 @@ test("composer offers three answer modes, selects read-only MCP for quick replie
   assert.equal(nodes.get("source-count").textContent, "2 / 5");
   assert.equal(nodes.get("composer-environment").hidden, false);
   choose("quick");
-  nodes.get("question").value = "В каком статусе PAY-42?";
+  nodes.get("question").value = "Привет, как дела?";
   nodes.get("question-form").listeners.submit({ preventDefault() {} });
-  assert.equal(submitted, undefined);
-  assert.match(nodes.get("error-banner").textContent, /MCP/);
+  await new Promise(setImmediate);
+  assert.deepEqual(submitted.index_ids, []);
+  assert.equal(submitted.use_default_sources, false);
+  assert.equal(nodes.get("error-banner").hidden, true);
   const jira = nodes.get("source-list").children[2].firstElementChild;
   jira.checked = true; jira.listeners.change();
+  nodes.get("question").value = "В каком статусе PAY-42?";
   nodes.get("question-form").listeners.submit({ preventDefault() {} });
   await new Promise(setImmediate);
   assert.equal(submitted.mode, "quick");
+  assert.equal(submitted.routing, "auto");
   assert.deepEqual(submitted.index_ids, ["connection:jira"]);
   assert.equal(submitted.sandbox_profile_id, "");
 });
@@ -426,6 +432,112 @@ test("a disconnected model shows a connection warning and keeps the selected ans
   assert.match(nodes.get("notice").textContent, /подключение/);
   assert.match(nodes.get("connection-state").className, /warning/);
   assert.equal(nodes.get("response-mode").value, "investigate");
+});
+
+test("routing and conversational replies stay in chat without reading evidence or resetting the next question", async (t) => {
+  const routing = run("hello", { status: "queued", phase: "routing", answer: "", mode: "autonomous" });
+  const complete = { ...routing, status: "completed", phase: "finished", answer_kind: "conversation",
+    answer: "Привет! Чем помочь?", requested_index_ids: ["a"], index_ids: [], sandbox_profile_id: "java" };
+  let current = { ...routing, status: "running", phase: "responding" };
+  const { ui, nodes, requests } = fixture(t, ({ path, method, body }) => {
+    if (path === "runs" && method === "POST") {
+      assert.equal(JSON.parse(body).routing, "auto");
+      return routing;
+    }
+    if (path === "runs/hello") return current;
+    if (path === "memory") return { memories: [] };
+    throw new Error("Unexpected request: " + path);
+  });
+  // Stale settings in an open tab must not preempt the server's routing decision.
+  ui.state.status.limits = { autonomous_enabled: false };
+  ui.state.selectedSandboxProfile = "java";
+  nodes.get("response-mode").value = "autonomous";
+  nodes.get("question").value = "Привет! Как дела?";
+  await ui.submitRun();
+  await new Promise(setImmediate);
+  assert.equal(nodes.get("run-phase").textContent, "Готовим ответ.");
+  assert.equal(nodes.get("run-progress").hidden, false);
+  assert.equal(nodes.get("answer-placeholder").hidden, true);
+  assert.equal(nodes.get("run-details").hidden, true);
+  current = complete;
+  await ui.refreshRun("hello", ui.state.generation);
+  assert.equal(nodes.get("answer").textContent, complete.answer);
+  for (const id of ["run-details", "run-feedback", "evidence-card", "discoveries-card", "deepen-run", "remember-run", "reading-note"]) {
+    assert.equal(nodes.get(id).hidden, true, id);
+  }
+  assert.doesNotMatch(nodes.get("progress-live").textContent, /подтверждений/);
+  assert.deepEqual([...ui.state.selected], ["a"]);
+  assert.equal(nodes.get("response-mode").value, "autonomous");
+  assert.equal(ui.state.selectedSandboxProfile, "java");
+  assert.deepEqual(requests.map((call) => call.path), ["runs", "runs/hello", "runs/hello"]);
+  await ui.loadMemory();
+  assert.equal(nodes.get("remember-run").hidden, true);
+});
+
+test("reopening a mixed chat restores only accessible preferences, and older research still opens its own evidence", async (t) => {
+  const research = run("release", { evidence: [{ id: "note", index_id: "a", title: "Журнал выпусков", text: "Выпуск 42" }] });
+  const greeting = run("thanks", { mode: "autonomous", effort: "high", index_ids: [],
+    requested_index_ids: ["b", "removed"], sandbox_profile_id: "java", answer_kind: "conversation", answer: "Рад помочь!" });
+  const { ui, nodes, requests } = fixture(t, ({ path }) => {
+    if (path.startsWith("conversations/chat?")) return { runs: [research, greeting], total_runs: 2 };
+    if (path === "runs/release") return research;
+    return {};
+  });
+  ui.state.status.indexes.push({ id: "b" });
+  ui.state.sandboxProfiles = [{ id: "java" }];
+  await ui.loadConversation({ id: "chat" });
+  assert.deepEqual([...ui.state.selected], ["b"]);
+  assert.equal(nodes.get("response-mode").value, "autonomous");
+  assert.equal(nodes.get("effort").value, "high");
+  assert.equal(ui.state.selectedSandboxProfile, "java");
+  assert.equal(nodes.get("run-details").hidden, true);
+  assert.equal(nodes.get("answer").textContent, "Рад помочь!");
+  assert.equal(requests.length, 1);
+  const old = nodes.get("conversation-messages").children[0];
+  old.children[1].children[0].children.find((item) => item.attributes["aria-controls"] === "evidence-list").click();
+  await new Promise(setImmediate);
+  assert.equal(nodes.get("evidence-card").hidden, false);
+  assert.match(nodes.get("evidence-list").textContent, /Выпуск 42/);
+  assert.equal(nodes.get("run-details").hidden, false);
+  assert.equal(nodes.get("run-feedback").hidden, false);
+  const archivedGreeting = nodes.get("conversation-messages").children[1];
+  assert.match(archivedGreeting.textContent, /Рад помочь!/);
+  assert.doesNotMatch(archivedGreeting.textContent, /материалы|ход работы/);
+});
+
+test("archived small talk respects an explicit empty selection and never restores missing sources", async (t) => {
+  const variants = [
+    { saved: { requested_index_ids: [], use_default_sources: false }, expected: [] },
+    { saved: { requested_index_ids: ["inaccessible"] }, expected: ["a"] },
+    { saved: {}, expected: ["a"] },
+  ];
+  for (const { saved, expected } of variants) {
+    const hello = run("hello", { answer_kind: "conversation", index_ids: [], ...saved });
+    const { ui } = fixture(t, () => ({ runs: [hello], total_runs: 1 }));
+    await ui.loadConversation({ id: "chat" });
+    assert.deepEqual([...ui.state.selected], expected);
+  }
+});
+
+test("a gateway wait or restriction before retrieval stays visible without opening research panels", (t) => {
+  const { ui, nodes, requests } = fixture(t);
+  const routing = run("route", { status: "running", phase: "routing", source_free: true, answer: "",
+    current_action: { name: "route_message", started_at: new Date().toISOString() } });
+  ui.conversationState.id = "chat"; ui.conversationState.runs = [routing]; ui.state.current = routing;
+  ui.renderRun();
+  assert.equal(nodes.get("run-status").textContent, "Модель читает вопрос");
+  const parked = { ...routing, status: "queued", phase: "waiting_for_gateway", current_action: null };
+  ui.conversationState.runs = [parked]; ui.state.current = parked; ui.renderRun();
+  assert.equal(nodes.get("run-status").textContent, "Ожидаем шлюз модели");
+  assert.equal(nodes.get("run-details").hidden, true);
+  assert.equal(nodes.get("evidence-card").hidden, true);
+  const restricted = { ...parked, status: "failed", phase: "finished", answer_kind: "restricted",
+    answer: "Корпоративный шлюз ограничил ответ на этот запрос." };
+  ui.conversationState.runs = [restricted]; ui.state.current = restricted; ui.renderRun();
+  assert.equal(nodes.get("answer").textContent, restricted.answer);
+  assert.match(nodes.get("conversation-messages").textContent, /Запрос ограничен/);
+  assert.equal(nodes.get("deepen-run").hidden, true);
+  assert.equal(requests.length, 0);
 });
 
 test("a model asking for a missing identifier keeps the chat open for a follow-up", (t) => {

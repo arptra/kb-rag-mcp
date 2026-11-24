@@ -35,7 +35,7 @@ ARCHIVE_TOOL = {
 
 
 @cache
-def _installed() -> bool:
+def deep_agents_installed() -> bool:
     # Keep the base portal and existing Harness installations usable before setup.
     try:
         return Version(version("deepagents")) >= Version("0.7.39")
@@ -47,7 +47,9 @@ def available(run: dict[str, Any]) -> bool:
     if run["mode"] != "autonomous" or not run.get("research_plan", {}).get("current_branch"):
         return False
     sources = [e for e in run["evidence"] if is_answer_source(e) and not e.get("tool_outcome")]
-    return _installed() and (len(sources) > 8 or any(len(e["text"]) > 3200 for e in sources))
+    return deep_agents_installed() and (
+        len(sources) > 8 or any(len(e["text"]) > 3200 for e in sources)
+    )
 
 
 class _ArchiveState(TypedDict, total=False):
