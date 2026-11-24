@@ -85,9 +85,19 @@
                 <div id="answer" class="answer"></div>
                 <div id="answer-placeholder" class="answer-placeholder" hidden><p>Ответ появится здесь.<br><span>Ход работы обновляется автоматически. Найденные материалы доступны в «Источниках».</span></p></div>
                 <section id="run-feedback" class="run-feedback" aria-labelledby="run-feedback-title" hidden>
-                  <div class="feedback-heading"><h3 id="run-feedback-title">Ответ помог?</h3><div class="resource-actions"><button id="feedback-helpful" class="secondary-button" type="button" aria-pressed="false">Помогло</button><button id="feedback-unhelpful" class="secondary-button" type="button" aria-pressed="false">Не помогло</button></div></div>
-                  <details id="feedback-comment-details" class="feedback-comment"><summary>Добавить комментарий</summary><label class="settings-field"><span class="sr-only">Комментарий к оценке</span><textarea id="run-feedback-comment" rows="2" maxlength="1000" placeholder="Что получилось или что нужно исправить?"></textarea></label></details>
-                  <p id="run-feedback-status" class="settings-field-help" role="status" aria-live="polite"></p>
+                  <div class="feedback-heading">
+                    <h3 id="run-feedback-title">Ответ помог?</h3>
+                    <button id="feedback-helpful" class="secondary-button" type="button" aria-pressed="false">Да</button>
+                    <button id="feedback-unhelpful" class="secondary-button" type="button" aria-pressed="false">Нет</button>
+                    <button id="feedback-toggle" type="button" aria-label="Комментарий к оценке" title="Комментарий к оценке" aria-controls="feedback-comment-details" aria-expanded="false">
+                      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
+                  </div>
+                  <div id="feedback-comment-details" class="feedback-comment" hidden>
+                    <label class="settings-field"><span>Комментарий к оценке</span><textarea id="run-feedback-comment" rows="2" maxlength="1000" placeholder="Что получилось или что нужно исправить?"></textarea></label>
+                    <button id="feedback-save-comment" type="button" class="secondary-button" hidden>Сохранить комментарий</button>
+                    <p id="run-feedback-status" class="settings-field-help" role="status" aria-live="polite"></p>
+                  </div>
                 </section>
                 <details id="run-details" class="run-details">
                   <summary><span id="run-details-label">Как получен ответ</span><span id="run-details-summary" class="run-details-summary"></span></summary>

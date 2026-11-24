@@ -1807,10 +1807,15 @@
     target.replaceChildren(fragment);
     if (selected && text) appear(target);
   }
+  function expandFeedback(open) {
+    $("feedback-comment-details").hidden = !open;
+    $("feedback-toggle").setAttribute("aria-expanded", String(open));
+  }
   function resetRunFeedback() {
     feedbackState.controller?.abort();
     Object.assign(feedbackState, { controller: null, busy: false, runId: null, message: "" });
     $("run-feedback-comment").value = "";
+    expandFeedback(false);
     $("run-feedback-status").textContent = "";
     $("run-feedback").hidden = true;
   }
@@ -1822,7 +1827,7 @@
       feedbackState.runId = idOf(run);
       feedbackState.message = "";
       $("run-feedback-comment").value = run.feedback?.comment || "";
-      $("feedback-comment-details").open = Boolean(run.feedback?.comment);
+      expandFeedback(false);
     }
     for (const rating of ["helpful", "unhelpful"]) {
       const button = $("feedback-" + rating);
@@ -1830,9 +1835,11 @@
       button.setAttribute("aria-pressed", String(run.feedback?.rating === rating));
     }
     $("run-feedback-comment").disabled = feedbackState.busy;
+    $("feedback-save-comment").hidden = !run.feedback?.rating;
+    $("feedback-save-comment").disabled = feedbackState.busy ||
+      $("run-feedback-comment").value.trim() === (run.feedback?.comment || "");
     $("run-feedback-status").textContent = feedbackState.busy ? "Сохраняем оценку…" : feedbackState.message ||
-      (run.feedback?.rating ? "Оценка сохранена. Её можно изменить." :
-        memoryState.enabled ? "Оценка поможет уточнить общий опыт АС." : "Оценка сохранится в вашем чате.");
+      (run.feedback?.rating ? "Оценка сохранена." : "Выберите «Да» или «Нет», чтобы отправить оценку с комментарием.");
   }
   async function saveRunFeedback(rating) {
     const run = state.current;
@@ -1852,7 +1859,10 @@
       feedbackState.message = response.memory ? "Оценка сохранена. Общий опыт АС обновлён для следующих похожих запросов." : "Оценка сохранена в вашем чате.";
       loadMemory();
     } catch (error) {
-      if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch && generation === state.generation && id === idOf(state.current)) feedbackState.message = errorMessage(error);
+      if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch && generation === state.generation && id === idOf(state.current)) {
+        feedbackState.message = errorMessage(error);
+        expandFeedback(true);
+      }
     } finally {
       if (feedbackState.controller === controller) {
         feedbackState.controller = null; feedbackState.busy = false;
@@ -2312,6 +2322,11 @@
   $("memory-enabled").addEventListener("change", changeMemoryPreference);
   $("feedback-helpful").addEventListener("click", () => saveRunFeedback("helpful"));
   $("feedback-unhelpful").addEventListener("click", () => saveRunFeedback("unhelpful"));
+  $("feedback-toggle").addEventListener("click", () => expandFeedback($("feedback-comment-details").hidden));
+  $("run-feedback-comment").addEventListener("input", () => renderRunFeedback(state.current));
+  $("feedback-save-comment").addEventListener("click", () => {
+    if (state.current?.feedback?.rating) saveRunFeedback(state.current.feedback.rating);
+  });
   $("remember-run").addEventListener("click", () => { if (state.current) { openMemory(); editMemory(null, state.current); } });
   $("delete-run").addEventListener("click", () => { if (state.current) openDeletion("run", state.current); });
   $("delete-form").addEventListener("submit", confirmDeletion);

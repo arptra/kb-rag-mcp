@@ -271,15 +271,17 @@ svg { width: 22px; height: 22px; flex-shrink: 0; }
 .run-status-dot.completed { background: #c6c6c6; box-shadow: 0 0 0 5px #333333; }
 .run-status-dot.failed { background: #a8a8a8; }
 .run-coverage { margin: 18px 0 0; color: #c6c6c6; font-size: 16px; line-height: 1.75; }
-.run-feedback { margin-top: 27px; padding-top: 23px; border-top: 1px solid #454545; }
-.run-feedback h3 { margin: 0; font-size: 15px; font-weight: 550; }
+.run-feedback { margin-top: 18px; padding: 7px 0; border-top: 1px solid #363639; }
+.run-feedback:not([hidden]) + .run-details { margin-top: 0; }
+.run-feedback h3 { margin: 0 4px 0 0; font-size: 14px; font-weight: 550; }
 .run-feedback textarea { min-height: 84px; }
-.run-feedback .resource-actions { margin: 0; gap: 8px; }
-.feedback-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; justify-content: space-between; }
-.run-feedback .secondary-button { font-size: 14px; padding: 7px 11px; min-height: 36px; background: transparent; border-color: #48484b; }
-.feedback-comment { margin-top: 12px; }
-.feedback-comment > summary { font-size: 14px; color: #a8a8ad; cursor: pointer; }
-.feedback-comment textarea { margin-top: 12px; }
+.feedback-heading { display: flex; align-items: center; gap: 6px; }
+.run-feedback .secondary-button { font-size: 14px; padding: 4px 9px; min-height: 30px; background: transparent; border-color: #48484b; }
+#feedback-toggle { display: grid; place-items: center; width: 30px; height: 30px; padding: 0; background: transparent; color: #bdbdc2; border-radius: 8px; }
+#feedback-toggle:hover { background: #303033; }
+#feedback-toggle svg { width: 16px; height: 16px; }
+#feedback-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
+.feedback-comment { margin: 10px 0; }
 .run-feedback .settings-field-help { font-size: 13px; margin-bottom: 0; }
 .run-feedback button[aria-pressed="true"] { background: #e8e8ed; border-color: #e8e8ed; color: #111111; }
 .text-button { font-size: 18px; color: #c6c6c6; padding: 10px 0; background: transparent; line-height: 1.5; }
