@@ -53,6 +53,23 @@ an index build. New attachment versions refresh the current document even if the
 version has not changed. Text or image changes publish only to the source's selected index.
 Cloud traversal follows paginated `direct-children` recursively through pages, folders,
 databases, whiteboards and embeds, avoiding the depth limit of the descendants API.
+Data Center likewise follows each page's paginated `/child/page` collection. Both
+deployments traverse every nesting level using a queue, without a depth cutoff or
+Python recursion. The separate `max_pages` safety limit bounds the total number of
+discovered items (50,000 by default); reaching it reports an incomplete tree rather
+than a successful full import. A page that did not change is still checked for new
+children during every synchronization.
+Data Center pagination preserves the server's query options when switching from a
+next link to an offset. Repeated child listings that make no progress are reported
+and retried as an incomplete branch instead of looping indefinitely.
+
+The source journal records each checked parent (`page_id`), children returned,
+new branches, completed branches and branches still unresolved. `depth_limit: null`
+means no depth limit; `page_limit` is the total-item safety limit. After updating the
+backend, use **Проверить** on an existing source to rescan its entire tree. Previously
+downloaded unchanged pages reuse their saved content. A branch that fails after
+retries remains in the failure report, and its old descendants are not removed.
+
 Only page content is indexed. Cloud attachment downloads use the supported REST
 attachment download endpoint with an explicit version; Data Center attachment lists
 request `expand=version` to detect image-only updates.

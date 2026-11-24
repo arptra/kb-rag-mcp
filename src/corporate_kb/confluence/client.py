@@ -379,11 +379,14 @@ class ConfluenceClient:
         category: str = "pagination",
     ) -> Iterator[dict[str, Any]]:
         seen: set[str] = set()
+        seen_children: set[str] = set()
         while url:
             self._check_cancel()
             identity = url + repr(params)
             if identity in seen:
-                raise ConfluenceError("Confluence pagination loop detected")
+                raise ConfluenceError(
+                    "Confluence pagination loop detected", error_code="pagination"
+                )
             seen.add(identity)
             response = self._request(url, params=params)
             try:
@@ -395,25 +398,52 @@ class ConfluenceClient:
             rows = payload.get("results")
             if not isinstance(rows, list):
                 raise self._invalid_response(category, "results")
+            child_ids: set[str] = set()
             for row in rows:
                 if not isinstance(row, dict):
                     raise self._invalid_response(category, "results entry")
+                if category == "children":
+                    child_ids.add(self._content_id(row.get("id"), category))
                 yield row
+            if child_ids:
+                # Some gateways ignore start/cursor while returning successful
+                # responses. New request URLs alone cannot detect this loop.
+                # Overlapping pages remain valid as long as they add a new child.
+                if child_ids <= seen_children:
+                    raise ConfluenceError(
+                        "Confluence child pagination made no progress: repeated child pages",
+                        error_code="pagination",
+                    )
+                seen_children.update(child_ids)
             links = self._mapping(payload.get("_links"), category, "_links")
             next_url = self._optional_text(links.get("next"), category, "_links.next")
             if not next_url:
                 next_url = response.links.get("next", {}).get("url")
             # DC may omit next but provide start/limit/size; never guess on Cloud cursor APIs.
             if not next_url and not self.cloud:
-                limit = self._integer(payload.get("limit", 100), category, "limit")
+                request_params = response.url.params
+                limit = self._integer(
+                    payload.get("limit", request_params.get("limit", 100)), category, "limit"
+                )
                 if len(rows) == limit:
+                    requested_start = self._integer(
+                        request_params.get("start", 0), category, "start", minimum=0
+                    )
                     start = self._integer(
-                        payload.get("start", (params or {}).get("start", 0)),
+                        payload.get("start", requested_start),
                         category,
                         "start",
                         minimum=0,
                     )
-                    params = {**(params or {}), "start": start + len(rows)}
+                    if start != requested_start:
+                        raise ConfluenceError(
+                            "Confluence pagination returned an unexpected start offset",
+                            error_code="pagination",
+                        )
+                    # Passing params={start: ...} would replace the whole query
+                    # from the previous next link, losing limit and filters.
+                    url = str(response.url.copy_set_param("start", start + len(rows)))
+                    params = None
                     continue
             if next_url:
                 next_text = str(next_url)

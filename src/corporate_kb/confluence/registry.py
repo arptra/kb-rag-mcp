@@ -771,6 +771,12 @@ class ConfluenceRegistry:
             "recovered_pages",
             "discovery_complete",
             "completed_branches",
+            "branches_remaining",
+            "children_found",
+            "new_branches",
+            "depth_limit",
+            "page_limit",
+            "content_kind",
             "authentication_required",
         }
         summary = _json({key: value for key, value in details.items() if key in progress_keys})
@@ -1369,13 +1375,14 @@ class ConfluenceRegistry:
             job_id, "discovery", "@root", "root", url=self._report_url(config, "@root")
         )
         with self._db() as connection:
-            known = {
-                row[0]
-                for row in connection.execute(
-                    "SELECT page_id FROM sync_items WHERE job_id=? AND task_kind='discovery' "
-                    "AND page_id!='@root'",
-                    (job_id,),
-                )
+            branches = connection.execute(
+                "SELECT page_id,status FROM sync_items WHERE job_id=? AND task_kind='discovery' "
+                "AND page_id!='@root'",
+                (job_id,),
+            ).fetchall()
+            known = {row["page_id"] for row in branches}
+            completed_branches = {
+                row["page_id"] for row in branches if row["status"] == "done"
             }
             discovered_pages = {
                 row[0]
@@ -1404,7 +1411,15 @@ class ConfluenceRegistry:
                 discovered_pages.add(page_id)
 
         counts = self._queue_counts(job_id)
-        self._log(job_id, "discovery", "Resolving root and discovering page tree")
+        self._log(
+            job_id,
+            "discovery",
+            "Resolving root and discovering all nesting levels of the page tree",
+            depth_limit=None,
+            page_limit=config.max_pages,
+            completed_branches=len(completed_branches),
+            branches_remaining=len(known) - len(completed_branches),
+        )
         for retry_round in range(self.RETRY_ROUNDS + 1):
             if retry_round and self._next_item(job_id, "discovery", retry_round):
                 self._retry_pause(job_id, cancel, retry_round)
@@ -1412,6 +1427,8 @@ class ConfluenceRegistry:
                 self._check_cancel(cancel)
                 self._begin_item(item)
                 next_status = "done"
+                children_found = 0
+                previous_count = len(known)
                 try:
                     kind, page_id = item["content_kind"], item["page_id"]
                     if kind == "root":
@@ -1423,12 +1440,16 @@ class ConfluenceRegistry:
                             # Keep yielded pages even if a later pagination request fails.
                             for found_id in client.page_ids(root_id):
                                 self._check_cancel(cancel)
+                                children_found += 1
                                 discover(found_id, "page", traverse=False)
                     elif kind != "leaf":
                         for child_id, child_kind in client.children(page_id, kind=kind):
                             self._check_cancel(cancel)
+                            children_found += 1
                             discover(child_id, child_kind, traverse=True)
                     self._complete_item(item)
+                    if page_id != "@root":
+                        completed_branches.add(page_id)
                 except SyncCancelled:
                     raise
                 except Exception as exc:
@@ -1446,7 +1467,15 @@ class ConfluenceRegistry:
                 self._log(
                     job_id,
                     "discovery_retry" if retry_round else "discovery",
-                    "Page tree discovery progress",
+                    "Page tree branch checked"
+                    if next_status == "done"
+                    else "Page tree branch incomplete; descendants may be missing",
+                    page_id=item["page_id"],
+                    content_kind=item["content_kind"],
+                    children_found=children_found,
+                    new_branches=len(known) - previous_count,
+                    completed_branches=len(completed_branches),
+                    branches_remaining=len(known) - len(completed_branches),
                     retry_round=retry_round,
                     discovered=len(discovered_pages),
                     failed_branches=counts["failed_branches"],
@@ -1461,6 +1490,8 @@ class ConfluenceRegistry:
             if counts["discovery_complete"]
             else "Page tree is incomplete; existing pages will be retained",
             pages_total=counts["discovered"],
+            completed_branches=len(completed_branches),
+            branches_remaining=len(known) - len(completed_branches),
             **counts,
         )
 
