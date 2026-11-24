@@ -176,6 +176,41 @@ def create_app(
         run = await runtime.submit(identity, parsed)
         return _json(run, status=202)
 
+    def conversation_page(request: Request) -> dict[str, int]:
+        if set(request.query_params) - {"offset", "limit"}:
+            raise HTTPException(400, "Invalid conversation page")
+        try:
+            offset = int(request.query_params.get("offset", "0"))
+            limit = int(request.query_params.get("limit", "200"))
+        except ValueError:
+            raise HTTPException(400, "Invalid conversation page") from None
+        if not 0 <= offset <= 1_000_000 or not 1 <= limit <= 200:
+            raise HTTPException(400, "Invalid conversation page")
+        return {"offset": offset, "limit": limit}
+
+    async def conversations(request: Request) -> Response:
+        identity = await principal(request)
+        return _json(await runtime.list_conversations(identity, **conversation_page(request)))
+
+    async def conversation(request: Request) -> Response:
+        identity = await principal(request, mutate=request.method == "DELETE")
+        conversation_id = str(request.path_params["conversation_id"])
+        if not conversation_id or len(conversation_id) > 80:
+            raise HTTPException(404, "Conversation not found")
+        if request.method == "DELETE":
+            if (await _body(request)).strip() not in {b"", b"{}"}:
+                raise HTTPException(400, "Delete does not accept a request body")
+            try:
+                deleted = await runtime.delete_conversation(identity, conversation_id)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            for run_id in deleted["deleted_ids"]:
+                discoveries.remove_run(identity.owner_id, run_id)
+            return _json(deleted)
+        return _json(
+            await runtime.get_conversation(identity, conversation_id, **conversation_page(request))
+        )
+
     async def get_run(request: Request) -> Response:
         identity = await principal(request, mutate=request.method == "DELETE")
         run_id = _run_id(request)
@@ -375,6 +410,8 @@ def create_app(
             Route("/api/settings", integration_settings, methods=["GET", "PUT"]),
             Route("/api/settings/probe", probe_integration, methods=["POST"]),
             Route("/api/runs", runs, methods=["GET", "POST"]),
+            Route("/api/conversations", conversations),
+            Route("/api/conversations/{conversation_id}", conversation, methods=["GET", "DELETE"]),
             Route("/api/runs/{run_id}", get_run, methods=["GET", "DELETE"]),
             Route("/api/runs/{run_id}/cancel", cancel_run, methods=["POST"]),
             Route("/api/runs/{run_id}/resume", resume_run, methods=["POST"]),

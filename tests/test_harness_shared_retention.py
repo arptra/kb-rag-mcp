@@ -187,3 +187,35 @@ def test_run_store_can_delete_and_prune_without_optional_memory_tables(tmp_path:
     runs.save("alice", {"id": "standalone", "status": "completed", "created_at": timestamp()})
     assert runs.delete("alice", "standalone") == ["standalone"]
     runs.prune()
+
+
+def test_consumer_outcome_links_expire_without_rewriting_shared_quality(tmp_path: Path) -> None:
+    memory = memory_store(tmp_path)
+    case = save_case(memory, save_run(memory, "origin"))
+    save_run(memory, "bob-consumer", owner="bob")
+    save_run(memory, "expired-consumer", owner="alice", created_at="2000-01-01T00:00:00+00:00")
+    quality = {"uses": 2, "completed": 1, "incomplete": 1, "helpful": 1, "unhelpful": 1}
+    with memory.runs._connect() as db:
+        db.executemany(
+            "INSERT INTO memory_outcomes VALUES (?,?,?,?,?)",
+            [
+                (case["id"], "bob-consumer", "bob", "completed", "helpful"),
+                (case["id"], "expired-consumer", "alice", "partial", "unhelpful"),
+                ("missing-memory", "bob-consumer", "bob", "completed", "helpful"),
+            ],
+        )
+        item = json.loads(
+            db.execute("SELECT data FROM memories WHERE id=?", (case["id"],)).fetchone()[0]
+        )
+        item["quality"] = quality
+        db.execute("UPDATE memories SET data=? WHERE id=?", (json.dumps(item), case["id"]))
+    memory.runs.prune()
+    with memory.runs._connect() as db:
+        assert db.execute("SELECT memory_id,run_id,owner FROM memory_outcomes").fetchall() == [
+            (case["id"], "bob-consumer", "bob")
+        ]
+    assert memory_row(memory, case["id"])[2]["quality"] == quality
+    memory.runs.delete("bob", "bob-consumer")
+    with memory.runs._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM memory_outcomes").fetchone()[0] == 0
+    assert memory_row(memory, case["id"])[2]["quality"] == quality

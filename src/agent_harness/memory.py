@@ -141,6 +141,11 @@ class MemoryStore:
                 "(memory_id TEXT NOT NULL, run_id TEXT NOT NULL, owner TEXT NOT NULL, "
                 "PRIMARY KEY(memory_id, run_id))"
             )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS memory_outcomes "
+                "(memory_id TEXT NOT NULL, run_id TEXT NOT NULL, owner TEXT NOT NULL, "
+                "status TEXT NOT NULL, rating TEXT NOT NULL, PRIMARY KEY(memory_id,run_id))"
+            )
 
     def enabled(self, owner: str) -> bool:
         with self.runs._connect() as db:
@@ -225,6 +230,8 @@ class MemoryStore:
             "failures",
             "sources",
             "strategy",
+            "research_plan",
+            "quality",
             "usage_count",
             "last_used_at",
             "_last_used_run_id",
@@ -264,6 +271,7 @@ class MemoryStore:
             if not deleted.rowcount:
                 raise KeyError("Memory not found")
             db.execute("DELETE FROM memory_usages WHERE memory_id=?", (memory_id,))
+            db.execute("DELETE FROM memory_outcomes WHERE memory_id=?", (memory_id,))
 
     def retrieve(
         self,
@@ -299,11 +307,15 @@ class MemoryStore:
                     if rating == "helpful"
                     else 0
                 )
-                ranked.append((score * 4 + priority, item))
+                quality = self._quality(item)
+                # Relevance remains primary. Ratings break ties; completion alone is not truth.
+                rating_bonus = max(-3, min(3, quality["helpful"] - quality["unhelpful"]))
+                ranked.append((score * 16 + priority * 2 + rating_bonus, item))
         ranked.sort(key=lambda pair: (pair[0], pair[1]["updated_at"]), reverse=True)
         remaining = 2400
         result = []
         for _, item in ranked[:3]:
+            quality = self._quality(item)
             prefix = ""
             if item["status"] == "experience":
                 prefix = "НЕПОДТВЕРЖДЁННЫЙ ОПЫТ. Это подсказка для проверки, не источник фактов. "
@@ -312,6 +324,17 @@ class MemoryStore:
                         "Пользователь отметил прошлый ответ как неудачный. "
                         "Повторять этот ответ нельзя. "
                     )
+            if quality["unhelpful"]:
+                prefix += (
+                    "Этот опыт использовался в запусках, получивших отрицательную оценку. "
+                    "Это не доказывает ошибку самого опыта: перепроверьте применимость и выводы. "
+                )
+            elif quality["incomplete"]:
+                prefix += (
+                    "Этот опыт использовался при незавершённых запусках; "
+                    "это не доказывает ошибочность опыта. "
+                    "Проверьте, каких подтверждений не хватает. "
+                )
             text = (prefix + item["text"])[: min(1000, remaining)]
             if not text:
                 break
@@ -327,6 +350,10 @@ class MemoryStore:
                     "feedback": item.get("feedback"),
                     "usage_count": item.get("usage_count", 0),
                     "last_used_at": item.get("last_used_at"),
+                    "quality": quality,
+                    "learning_state": self._learning_state(item),
+                    "research_plan": item.get("research_plan", {}),
+                    "strategy": {"tools": item.get("strategy", {}).get("tools", [])},
                 }
             )
             remaining -= len(text)
@@ -361,6 +388,91 @@ class MemoryStore:
                     usage_count=item.get("usage_count", 0) + 1,
                     last_used_at=now,
                 )
+                item["quality"] = self._quality(item)
+                db.execute(
+                    "UPDATE memories SET data=? WHERE id=?",
+                    (json.dumps(item, ensure_ascii=False), memory_id),
+                )
+
+    @staticmethod
+    def _quality(item: dict[str, Any]) -> dict[str, int]:
+        saved = item.get("quality") or {}
+        return {
+            "uses": int(item.get("usage_count", 0)),
+            **{
+                key: max(0, int(saved.get(key, 0)))
+                for key in (
+                    "helpful",
+                    "unhelpful",
+                    "completed",
+                    "incomplete",
+                )
+            },
+        }
+
+    @staticmethod
+    def _learning_state(item: dict[str, Any]) -> str:
+        quality = MemoryStore._quality(item)
+        own_rating = (item.get("feedback") or {}).get("rating")
+        helpful = quality["helpful"] > 0 or own_rating == "helpful"
+        unhelpful = quality["unhelpful"] > 0 or own_rating == "unhelpful"
+        if helpful and unhelpful:
+            return "mixed"
+        if unhelpful:
+            return "needs_review"
+        if helpful:
+            return "helpful"
+        return "observed" if quality["uses"] else "unreviewed"
+
+    def _record_learning(self, owner: str, run: dict[str, Any]) -> None:
+        """Remember numeric outcomes of proven reuse, without copying consumer content."""
+        status = str(run.get("status", ""))
+        if status not in {"completed", "partial", "failed", "timed_out", "interrupted"}:
+            return
+        rating = (run.get("feedback") or {}).get("rating", "")
+        rating = rating if rating in {"helpful", "unhelpful"} else ""
+        with self.runs._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            stored = db.execute(
+                "SELECT data FROM runs WHERE id=? AND owner=?", (run["id"], owner)
+            ).fetchone()
+            if stored is None or int(json.loads(stored[0]).get("resume_count", 0)) != int(
+                run.get("resume_count", 0)
+            ):
+                return
+            rows = db.execute(
+                "SELECT memories.id,memories.data FROM memories JOIN memory_usages "
+                "ON memory_usages.memory_id=memories.id "
+                "WHERE memory_usages.run_id=? AND memory_usages.owner=? "
+                "AND memories.status IN ('active','experience')",
+                (run["id"], owner),
+            ).fetchall()
+            for memory_id, data in rows:
+                item = json.loads(data)
+                previous = db.execute(
+                    "SELECT status,rating FROM memory_outcomes WHERE memory_id=? AND run_id=?",
+                    (memory_id, run["id"]),
+                ).fetchone()
+                current_rating = rating or (previous[1] if previous is not None else "")
+                if previous is not None and tuple(previous) == (status, current_rating):
+                    continue
+                quality = self._quality(item)
+                if previous is not None:
+                    old_status, old_rating = previous
+                    category = "completed" if old_status == "completed" else "incomplete"
+                    quality[category] = max(0, quality[category] - 1)
+                    if old_rating in {"helpful", "unhelpful"}:
+                        quality[old_rating] = max(0, quality[old_rating] - 1)
+                quality["completed" if status == "completed" else "incomplete"] += 1
+                if current_rating:
+                    quality[current_rating] += 1
+                db.execute(
+                    "INSERT INTO memory_outcomes VALUES (?,?,?,?,?) ON CONFLICT(memory_id,run_id) "
+                    "DO UPDATE SET status=excluded.status,rating=excluded.rating "
+                    "WHERE memory_outcomes.owner=excluded.owner",
+                    (memory_id, run["id"], owner, status, current_rating),
+                )
+                item["quality"] = quality
                 db.execute(
                     "UPDATE memories SET data=? WHERE id=?",
                     (json.dumps(item, ensure_ascii=False), memory_id),
@@ -382,6 +494,7 @@ class MemoryStore:
         for key in candidates[:needed]:
             db.execute("DELETE FROM memories WHERE id=?", (key,))
             db.execute("DELETE FROM memory_usages WHERE memory_id=?", (key,))
+            db.execute("DELETE FROM memory_outcomes WHERE memory_id=?", (key,))
         return True
 
     @staticmethod
@@ -402,6 +515,7 @@ class MemoryStore:
             return None
         if not self.enabled(owner) or not index_ids:
             return None
+        self._record_learning(owner, run)
         existing = self._automatic(owner, run["id"])
         if existing and existing["status"] == "active":
             return self.public(existing)
@@ -424,7 +538,28 @@ class MemoryStore:
             raise ValueError("Сначала дождитесь завершения исследования.")
         # Feedback corrects previously collected experience even while reuse is disabled.
         updated = {**run, "feedback": {**feedback.model_dump(), "updated_at": timestamp()}}
+        self._record_learning(owner, updated)
         return self._save_experience(owner, updated, index_ids=index_ids, existing=existing)
+
+    @staticmethod
+    def _research_plan(run: dict[str, Any]) -> dict[str, Any]:
+        raw = run.get("research_plan")
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, Any] = {
+            key: value[:500] if isinstance(value := raw.get(key), str) else ""
+            for key in ("goal", "next_action")
+        }
+        for key in ("questions", "completed", "gaps"):
+            values = raw.get(key)
+            result[key] = (
+                [value[:250] for value in values[:8] if isinstance(value, str)]
+                if isinstance(values, list)
+                else []
+            )
+        round_number = raw.get("round", 0)
+        result["round"] = max(0, min(1000, round_number)) if isinstance(round_number, int) else 0
+        return result
 
     def _save_experience(
         self,
@@ -435,12 +570,14 @@ class MemoryStore:
         existing: dict[str, Any] | None,
         failures: builtins.list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
+        failure_update = failures is not None
         now = timestamp()
         failures = failures if failures is not None else (existing or {}).get("failures", [])
         feedback = run.get("feedback") or (existing or {}).get("feedback")
         bad = (feedback or {}).get("rating") == "unhelpful"
         outcome = run.get("status", "failed")
         incomplete = outcome != "completed"
+        research_plan = self._research_plan(run)
         question = str(run.get("question", ""))[:2000]
         sources = [
             {
@@ -495,6 +632,15 @@ class MemoryStore:
             text += (
                 "Ранее использованные инструменты: " + ", ".join(strategy["tools"])[:250] + ".\n"
             )
+        if research_plan:
+            if research_plan.get("completed"):
+                text += (
+                    "Ранее выполненные проверки: "
+                    + "; ".join(research_plan["completed"])[:300]
+                    + ".\n"
+                )
+            if research_plan.get("gaps"):
+                text += "Непроверенные вопросы: " + "; ".join(research_plan["gaps"])[:300] + ".\n"
         recommendations = {
             "search": "Перепроверьте доступ к индексу и повторите поиск другим запросом.",
             "read": "Повторно найдите документ и проверьте актуальный идентификатор и доступ.",
@@ -539,17 +685,27 @@ class MemoryStore:
             "failures": failures[:MAX_FAILURES],
             "sources": sources,
             "strategy": strategy,
+            "research_plan": research_plan,
             "created_at": (existing or {}).get("created_at", now),
             "updated_at": now,
             "usage_count": (existing or {}).get("usage_count", 0),
             "last_used_at": (existing or {}).get("last_used_at"),
+            "quality": self._quality(existing or {}),
             "_match_question": question,
         }
         with self.runs._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if not db.execute(
-                "SELECT 1 FROM runs WHERE id=? AND owner=?", (run["id"], owner)
-            ).fetchone():
+            stored = db.execute(
+                "SELECT status,data FROM runs WHERE id=? AND owner=?", (run["id"], owner)
+            ).fetchone()
+            if stored is None or int(json.loads(stored[1]).get("resume_count", 0)) != int(
+                run.get("resume_count", 0)
+            ):
+                return None
+            # A detached operation can finish after cancellation or a new resume.
+            # Check the producer inside the write transaction, not before reading
+            # the existing case. Final outcome/feedback writes remain permitted.
+            if failure_update and (stored[0] != "running" or run.get("status") != "running"):
                 return None
             if existing is None and not self._make_room(db):
                 return None
@@ -603,6 +759,8 @@ class MemoryStore:
             visibility="private" if item["status"] == "draft" else "shared",
             can_edit=editable,
             can_delete=editable,
+            quality=MemoryStore._quality(item),
+            learning_state=MemoryStore._learning_state(item),
         )
         if not editable:
             result.pop("source_run_id", None)

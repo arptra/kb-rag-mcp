@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from corporate_kb.agents.activation import GigaCodeAgentController
-from corporate_kb.gigacode_runner import GigaCodeCancelled
+from corporate_kb.gigacode_runner import GigaCodeCancelled, GigaCodeInvalidOutput, GigaCodeTimedOut
 
 _VERSION = "corporate-gigacode 26.11"
 _URL = "https://login.example.test/device?code=private-device-secret"
@@ -279,6 +279,7 @@ def test_decision_schema_tools_and_context_are_enforced(settings_factory):
         ({"content": "", "tool_calls": [{"name": "read_document", "args": {"id": 1}}]}, _TOOLS),
         ({"content": "", "tool_calls": [{"name": "read_document", "args": {"id": "1"}}]}, []),
         ({"content": "private-result", "tool_calls": [], "extra": "private"}, _TOOLS),
+        ({"content": "   ", "tool_calls": []}, _TOOLS),
     ],
 )
 def test_invalid_model_output_never_reaches_runtime(settings_factory, decision, tools):
@@ -291,6 +292,41 @@ def test_invalid_model_output_never_reaches_runtime(settings_factory, decision, 
     assert controller.status()["available"]
     runner.decision = {"content": "Corrected answer", "tool_calls": []}
     assert asyncio.run(decide(controller))["content"] == "Corrected answer"
+    controller.stop()
+
+
+@pytest.mark.parametrize("error", [GigaCodeInvalidOutput(_URL), GigaCodeTimedOut(_URL)])
+def test_incomplete_or_timed_out_reply_does_not_disable_authenticated_model(
+    settings_factory, error,
+):
+    controller, runner = activated(settings_factory)
+    runner.error = error
+    expected = ValueError if isinstance(error, GigaCodeInvalidOutput) else GigaCodeTimedOut
+    with pytest.raises(expected) as caught:
+        asyncio.run(decide(controller))
+    assert _URL not in str(caught.value)
+    assert controller.status()["available"] and controller.status()["state"] == "ready"
+    runner.error = None
+    assert asyncio.run(decide(controller)) == runner.decision
+    controller.stop()
+
+
+@pytest.mark.parametrize("error", [GigaCodeInvalidOutput(_URL), GigaCodeTimedOut(_URL)])
+def test_incomplete_reply_during_pending_authentication_requires_reauthorization(
+    settings_factory, monkeypatch, error,
+):
+    controller, runner = activated(settings_factory)
+
+    def pending_auth(**kwargs):
+        kwargs["authentication_url"](_URL)
+        raise error
+
+    monkeypatch.setattr(runner, "run_json", pending_auth)
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(decide(controller))
+    assert _URL not in str(caught.value)
+    assert controller.status()["state"] == "error"
+    assert not controller.status()["available"]
     controller.stop()
 
 

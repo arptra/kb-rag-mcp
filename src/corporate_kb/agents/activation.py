@@ -28,6 +28,7 @@ from corporate_kb.config import Settings
 from corporate_kb.gigacode_runner import (
     CancellationSignal,
     GigaCodeCancelled,
+    GigaCodeInvalidOutput,
     GigaCodeJsonResult,
     GigaCodeRunner,
     GigaCodeTimedOut,
@@ -365,6 +366,8 @@ class GigaCodeAgentController:
             decision = copy.deepcopy(result.payload)
             try:
                 _DECISION_VALIDATOR.validate(decision)
+                if not decision["content"].strip() and not decision["tool_calls"]:
+                    raise ValueError("GigaCode returned an empty decision")
                 for call in decision["tool_calls"]:
                     validator = validators.get(call["name"])
                     if validator is None:
@@ -379,6 +382,31 @@ class GigaCodeAgentController:
                 generation, "ready", "Некорректный ответ модели. GigaCode готов к повтору."
             )
             raise
+        except GigaCodeInvalidOutput:
+            with self._lock:
+                if self._current(generation) and self._state == "authentication_required":
+                    self._set_state(
+                        "error", "Авторизация GigaCode не завершена. "
+                        "Нажмите «Включить агента» для повторного входа.",
+                    )
+                    raise RuntimeError("GigaCode authentication did not complete") from None
+            self._update(
+                generation, "ready", "Ответ GigaCode не завершён. Можно повторить запрос."
+            )
+            raise GigaCodeDecisionError("GigaCode returned an incomplete response") from None
+        except GigaCodeTimedOut:
+            with self._lock:
+                if self._current(generation):
+                    if self._state == "authentication_required":
+                        self._set_state(
+                            "error", "Истекло время авторизации GigaCode. "
+                            "Нажмите «Включить агента» для повторного входа.",
+                        )
+                    else:
+                        self._set_state(
+                            "ready", "GigaCode не успел ответить. Можно повторить запрос.",
+                        )
+            raise GigaCodeTimedOut("GigaCode did not respond within the request timeout") from None
         except GigaCodeCancelled:
             with self._lock:
                 if self._current(generation):

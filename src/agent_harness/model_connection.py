@@ -291,7 +291,11 @@ class ModelRouter:
                     return [redact(item) for item in value]
                 return value
 
-            return {"content": redact(content[:50000]), "tool_calls": redact(parsed_calls)}
+            decision = {"content": redact(content[:50000]), "tool_calls": redact(parsed_calls)}
+            reason = decoded["choices"][0].get("finish_reason")
+            if reason in {"length", "max_tokens", "content_filter"} or len(content) > 50000:
+                decision["finish_reason"] = reason if len(content) <= 50000 else "length"
+            return decision
         except ModelConnectionError:
             raise
         except httpx.TimeoutException:

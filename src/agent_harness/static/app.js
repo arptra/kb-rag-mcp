@@ -13,6 +13,12 @@
   const PHASE_LABELS = {
     queued: "Ожидаем свободное место для запуска.", searching: "Ищем подтверждения в выбранных источниках.",
     reading: "Читаем документы и проверяем подробности за пределами поисковых фрагментов.",
+    planning: "Определяем, какие сведения нужны для ответа.",
+    refining: "Уточняем запросы и проверяем оставшиеся вопросы.",
+    reading_code: "Изучаем код подключённых сервисов.",
+    running_code: "Проверяем код в песочнице.",
+    checking: "Проверяем гипотезы по найденным материалам.",
+    authentication_required: "Ожидаем подключения модели.",
     investigating: "Проверяем связи и уточняем найденные сведения.",
     synthesizing: "Сопоставляем материалы и готовим ответ.", finished: "",
   };
@@ -38,6 +44,8 @@
   const feedbackState = { controller: null, busy: false, runId: null, message: "" };
   const modelConnectionState = { settings: null, saved: "", controller: null, busy: false, dirty: false };
   const tlsState = { credentials: [], controller: null, busy: false, editingId: null, generation: 0 };
+  const conversationState = { id: null, title: "", runs: [], total: 0, offset: 0, truncated: false, pollError: "", loading: false, controller: null,
+    list: [], nextOffset: null, listLoading: false, listController: null, signature: null };
   try {
     const saved = JSON.parse(sessionStorage.getItem(AUTH_KEY) || "null");
     if (saved && ["bearer", "admin"].includes(saved.kind) && typeof saved.value === "string") {
@@ -132,41 +140,50 @@
     state.modelDetails = null;
     resetSettingsAccess();
     resetPersonalData();
+    conversationState.listController?.abort();
+    Object.assign(conversationState, { list: [], nextOffset: null, listLoading: false, listController: null });
+    state.runs = []; resetWorkspace();
     renderModel();
     connection("Требуется вход", "warning");
     showError("Для входа в Harness войдите в портал или укажите ключ доступа к порталу.");
     openAuth();
     updateSubmit();
   }
-  async function api(path, { method = "GET", body, signal } = {}) {
+  async function api(path, { method = "GET", body, signal, timeoutMs } = {}) {
     const identityEpoch = state.identityEpoch;
     const headers = { Accept: "application/json" };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (state.auth) headers[state.auth.kind === "admin" ? "X-KB-Admin-Password" : "Authorization"] =
       state.auth.kind === "admin" ? state.auth.value : "Bearer " + state.auth.value;
-    const response = await fetch(new URL("./api/" + path, document.baseURI), {
-      method, headers, credentials: "same-origin", signal,
-      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-    });
-    if (response.status === 401) {
-      if (identityEpoch === state.identityEpoch) requireAuth();
-      const error = new Error("Требуется вход в Harness.");
-      error.status = 401;
+    const controller = new AbortController(), abort = () => controller.abort();
+    let timedOut = false;
+    if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
+    const wait = timeoutMs || (path === "model/connection/probe" ? Math.min(300, Number(body?.timeout_seconds || modelConnectionState.settings?.timeout_seconds) || 60) * 1000 + 5000 : method === "GET" ? 20000 : 45000);
+    const timer = window.setTimeout(() => { timedOut = true; abort(); }, wait);
+    try {
+      const response = await fetch(new URL("./api/" + path, document.baseURI), {
+        method, headers, credentials: "same-origin", signal: controller.signal,
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      });
+      if (response.status === 401) {
+        if (identityEpoch === state.identityEpoch) requireAuth();
+        const error = new Error("Требуется вход в Harness."); error.status = 401; throw error;
+      }
+      let result;
+      try { result = await response.json(); }
+      catch (_) { const error = new Error("Не удалось прочитать ответ сервера. Обновите чат."); error.status = response.status; throw error; }
+      if (!response.ok) {
+        const error = new Error(typeof result.error === "string" ? result.error : "Не удалось выполнить запрос."); error.status = response.status; throw error;
+      }
+      return result;
+    } catch (error) {
+      if (timedOut) {
+        const timeout = new Error(method === "GET" ? "Сервер не ответил вовремя. Последние данные сохранены; можно обновить чат." : "Не дождались подтверждения сервера. Действие могло выполниться — обновите чат перед повторной отправкой.");
+        timeout.name = "RequestTimeoutError"; timeout.uncertainMutation = method !== "GET"; throw timeout;
+      }
+      if (method !== "GET" && error instanceof TypeError) error.uncertainMutation = true;
       throw error;
-    }
-    let result;
-    try { result = await response.json(); }
-    catch (_) {
-      const error = new Error("Не удалось прочитать ответ сервера. Попробуйте ещё раз.");
-      error.status = response.status;
-      throw error;
-    }
-    if (!response.ok) {
-      const error = new Error(typeof result.error === "string" ? result.error : "Не удалось выполнить запрос.");
-      error.status = response.status;
-      throw error;
-    }
-    return result;
+    } finally { window.clearTimeout(timer); signal?.removeEventListener("abort", abort); }
   }
   function errorMessage(error) {
     return error instanceof TypeError ? "Не удалось связаться с сервером. Проверьте подключение." :
@@ -980,6 +997,12 @@
       if (record.outcome) details.push("Исход запроса: " + (STATUS_LABELS[record.outcome] || record.outcome));
       if (record.feedback?.rating) details.push("Оценка автора запроса: " + (record.feedback.rating === "helpful" ? "помогло" : "не помогло"));
       details.push("Использовано всеми пользователями: " + Math.max(0, Number(record.usage_count) || 0));
+      if (record.quality && typeof record.quality === "object") {
+        details.push("Помогло: " + Math.max(0, Number(record.quality.helpful) || 0));
+        details.push("Не помогло: " + Math.max(0, Number(record.quality.unhelpful) || 0));
+      }
+      const learning = { unreviewed: "Повторное использование ещё не оценено", observed: "Опыт использован, оценок пока нет", helpful: "Есть положительные оценки", needs_review: "Есть отрицательные оценки: нужна повторная проверка", mixed: "Оценки различаются" };
+      if (learning[record.learning_state]) details.push(learning[record.learning_state]);
       if (record.last_used_at) details.push("Последний раз: " + dateLabel(record.last_used_at, true));
       card.append(element("p", "memory-usage", details.join(" · ")));
       return card;
@@ -1078,11 +1101,11 @@
   function openDeletion(kind, item) {
     if (deletionState.controller || state.needsAuth) return;
     if (kind === "memory" && item.can_delete !== true) { memoryError("Удалить запись может только её автор."); return; }
-    const active = kind === "run" && ACTIVE.has(item.status);
+    const active = (kind === "run" || kind === "conversation") && ACTIVE.has(item.status);
     const sharedMemory = kind === "memory" && item.visibility === "shared";
     deletionState.target = { kind, item, active };
-    $("delete-title").textContent = kind === "run" ? active ? "Сначала остановить запрос?" : "Удалить запрос?" : kind === "memory" ? sharedMemory ? "Удалить общую запись памяти?" : "Удалить личный черновик?" : kind === "tls" ? "Удалить сертификаты?" : "Удалить SSH-ключ?";
-    $("delete-description").textContent = kind === "run" ? active ? "Исследование ещё выполняется. Остановите его, затем удалите запрос из истории." :
+    $("delete-title").textContent = kind === "conversation" ? active ? "Остановить исследование в чате?" : "Удалить весь чат?" : kind === "run" ? active ? "Сначала остановить запрос?" : "Удалить запрос?" : kind === "memory" ? sharedMemory ? "Удалить общую запись памяти?" : "Удалить личный черновик?" : kind === "tls" ? "Удалить сертификаты?" : "Удалить SSH-ключ?";
+    $("delete-description").textContent = kind === "conversation" ? active ? "В этом чате ещё идёт исследование. Остановите его, затем удалите чат." : "Вся переписка, ответы, материалы и личные черновики этого чата будут удалены без восстановления. Общий опыт АС сохранится. Свои записи общей памяти можно удалить отдельно." : kind === "run" ? active ? "Исследование ещё выполняется. Остановите его, затем удалите запрос из истории." :
       "Этот личный запрос, его продолжения, ответы, найденные материалы и связанные личные черновики будут удалены без восстановления. Общие записи памяти АС сохранятся; удалить свои общие записи можно отдельно в памяти." : kind === "memory" ? sharedMemory ?
       "Запись будет удалена из общей памяти АС и перестанет учитываться в новых ответах для всех пользователей. Ранее сохранённые ответы и личные чаты останутся в истории." :
       "Ваш личный черновик будет удалён без восстановления. Общая память АС и чаты сохранятся." : kind === "tls" ?
@@ -1100,21 +1123,34 @@
     const epoch = state.identityEpoch, controller = new AbortController(); deletionState.controller = controller;
     $("delete-confirm").disabled = true;
     const id = target.kind === "run" ? idOf(target.item) : target.item.id;
-    const path = target.kind === "run" ? "runs/" + encodeURIComponent(id) + (target.active ? "/cancel" : "") :
+    const path = target.kind === "conversation" ? target.active ? "runs/" + encodeURIComponent(target.item.last_run_id) + "/cancel" : "conversations/" + encodeURIComponent(id) : target.kind === "run" ? "runs/" + encodeURIComponent(id) + (target.active ? "/cancel" : "") :
       target.kind === "memory" ? "memory/" + encodeURIComponent(id) : "credentials/" + (target.kind === "tls" ? "tls" : "ssh") + "/" + encodeURIComponent(id);
     try {
       const result = await api(path, { method: target.active ? "POST" : "DELETE", signal: controller.signal });
       if (controller.signal.aborted || epoch !== state.identityEpoch) return;
       $("delete-dialog").close();
-      if (target.kind === "run") {
+      if (target.kind === "conversation") {
+        if (target.active) { rememberRun(result); if (idOf(state.current) === idOf(result)) { state.current = result; renderRun(); } schedulePoll(); }
+        else {
+          const deletedIds = new Set(Array.isArray(result.deleted_ids) ? result.deleted_ids : []);
+          state.runs = state.runs.filter((run) => !deletedIds.has(idOf(run)));
+          conversationState.list = conversationState.list.filter((item) => item.id !== id);
+          if (conversationState.id === id) resetWorkspace();
+          renderHistory(); loadMemory();
+        }
+        loadConversations();
+      } else if (target.kind === "run") {
         if (target.active) { rememberRun(result); if (idOf(state.current) === id) { state.current = result; renderRun(); schedulePoll(); } }
         else {
           const deletedIds = new Set([id, ...(Array.isArray(result.deleted_ids) ? result.deleted_ids.filter((value) => typeof value === "string") : [])]);
           state.refreshController?.abort();
           state.runs = state.runs.filter((run) => !deletedIds.has(idOf(run)));
-          if (deletedIds.has(idOf(state.current))) resetWorkspace();
+          if (conversationState.runs.some((run) => deletedIds.has(idOf(run)))) {
+            const remaining = conversationState.runs.filter((run) => !deletedIds.has(idOf(run)));
+            if (remaining.length) loadConversation({ id: conversationState.id, title: conversationState.title }); else resetWorkspace();
+          }
           if (deletedIds.has(memoryState.editing?.source_run_id)) clearMemoryEditor();
-          renderHistory(); loadMemory();
+          renderHistory(); loadMemory(); loadConversations();
         }
       } else if (target.kind === "memory") { if (memoryState.editing?.id === id) clearMemoryEditor(); loadMemory(); }
       else if (target.kind === "tls") loadTlsBundles();
@@ -1195,7 +1231,7 @@
     return match?.name || "Источник";
   }
   function updateSubmit() {
-    const disabled = state.submitting || state.needsAuth || !state.status || state.status.enabled === false;
+    const disabled = state.submitting || state.needsAuth || !state.status || state.status.enabled === false || conversationState.loading || Boolean(activeConversationRun());
     $("submit-question").disabled = disabled;
     $("submit-question").firstElementChild.textContent = state.submitting ? "Отправляем…" : "Отправить";
     const scopeLoading = Boolean(state.current && !Array.isArray(state.current.index_ids));
@@ -1242,13 +1278,11 @@
   }
   function renderStatus({ refreshSources = true } = {}) {
     const status = state.status;
-    const shared = status.identity_scope === "shared";
-    $("identity-label").textContent = shared ? "Общая история" : "Личная история";
-    $("history-title").textContent = shared ? "Общая история" : "Личная история";
-    $("history-list").setAttribute("aria-label", shared ? "Общая история" : "Личная история");
-    $("history-empty").textContent = shared ?
-      "Здесь появятся запросы пользователей с общим доступом. К любому из них можно вернуться." :
-      "Здесь появятся ваши исследования. К любому из них можно вернуться.";
+    const sharedIdentity = status.identity_scope === "shared";
+    $("identity-label").textContent = (sharedIdentity ? "Общие чаты" : "Личные чаты") + " · общая память АС";
+    $("history-title").textContent = sharedIdentity ? "Общие чаты" : "Ваши чаты";
+    $("history-list").setAttribute("aria-label", sharedIdentity ? "Общие чаты" : "Ваши чаты");
+    $("history-empty").textContent = sharedIdentity ? "Чаты видны всем, кто входит через эту общую учётную запись." : "Начните разговор о системе. Вопросы, ответы и исследования сохранятся в одном чате.";
     let notice = "";
     if (status.enabled === false) {
       notice = "Harness сейчас выключен. Сохранённые запросы остаются в истории.";
@@ -1420,39 +1454,153 @@
   function rememberRun(run) {
     const id = idOf(run);
     if (!id) return;
+    const known = state.runs.some((item) => idOf(item) === id);
     state.runs = [run, ...state.runs.filter((item) => idOf(item) !== id)]
       .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+    const conversationId = String(run.conversation_id || run.parent_run_id || id);
+    if (conversationState.id === conversationId) {
+      const index = conversationState.runs.findIndex((item) => idOf(item) === id);
+      if (index >= 0) conversationState.runs[index] = run;
+      else { conversationState.runs.push(run); conversationState.total += 1; }
+    }
+    const previous = conversationState.list.find((item) => item.id === conversationId);
+    const latest = conversationState.id === conversationId ? conversationState.runs.at(-1) || run : run;
+    const entry = { ...previous, id: conversationId, conversation_id: conversationId,
+      title: previous?.title || (conversationState.id === conversationId ? conversationState.runs[0]?.question : "") || run.question,
+      created_at: previous?.created_at || run.created_at, updated_at: latest.updated_at || latest.created_at,
+      status: latest.status, last_run_id: idOf(latest), run_count: Math.max(conversationState.id === conversationId ? conversationState.total : 1,
+        (previous?.run_count || 0) + (!known && previous && previous.last_run_id !== id ? 1 : 0)) };
+    conversationState.list = [entry, ...conversationState.list.filter((item) => item.id !== conversationId)]
+      .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
     renderHistory();
   }
   function renderHistory() {
-    const signature = JSON.stringify([idOf(state.current), state.runs.map((run) =>
-      [idOf(run), run.question, run.created_at, run.mode, run.status])]);
+    $("history-more").hidden = conversationState.nextOffset === null;
+    $("history-more").disabled = conversationState.listLoading;
+    $("history-more").textContent = conversationState.listLoading ? "Загружаем…" : "Ещё чаты";
+    const signature = JSON.stringify([conversationState.id, conversationState.list]);
     if (signature === state.historySignature) return;
     state.historySignature = signature;
     const fragment = document.createDocumentFragment();
-    for (const run of state.runs) {
+    for (const run of conversationState.list) {
       const row = element("div", "history-row");
       const button = element("button", "history-item");
       button.type = "button";
-      button.setAttribute("aria-current", String(idOf(run) === idOf(state.current)));
-      button.title = run.question || "Запрос";
+      button.setAttribute("aria-current", String(run.id === conversationState.id));
+      button.title = run.title || run.question || "Чат";
       const meta = element("span", "history-item-meta");
       const kind = ACTIVE.has(run.status) ? "active" : run.status === "completed" ? "completed" :
         ["failed", "timed_out"].includes(run.status) ? "failed" : "";
       const dot = element("span", "history-state-dot " + kind);
       dot.setAttribute("aria-hidden", "true");
-      meta.append(dot, document.createTextNode(dateLabel(run.created_at) + " · " + modeLabel(run.mode)));
-      button.append(element("span", "history-item-title", run.question || "Запрос"), meta);
-      button.addEventListener("click", () => selectRun(run));
+      meta.append(dot, document.createTextNode(dateLabel(run.updated_at || run.created_at) + " · Запросов: " + (run.run_count || run.turn_count || 1)));
+      button.append(element("span", "history-item-title", run.title || run.question || "Чат"), meta);
+      button.addEventListener("click", () => loadConversation(run));
       const remove = element("button", "history-delete", "×"); remove.type = "button";
-      remove.setAttribute("aria-label", "Удалить запрос: " + (run.question || "Запрос"));
-      remove.title = "Удалить запрос";
-      remove.addEventListener("click", () => openDeletion("run", run));
+      remove.setAttribute("aria-label", "Удалить чат: " + (run.title || run.question || "Чат"));
+      remove.title = "Удалить чат";
+      remove.addEventListener("click", () => openDeletion("conversation", run));
       row.append(button, remove); fragment.append(row);
     }
     $("history-list").replaceChildren(fragment);
-    $("history-count").textContent = String(state.runs.length);
-    $("history-empty").hidden = state.runs.length > 0;
+    $("history-count").textContent = String(conversationState.list.length);
+    $("history-empty").hidden = conversationState.list.length > 0;
+  }
+  async function loadConversations(append = false) {
+    if (state.needsAuth || (append && (conversationState.listLoading || conversationState.nextOffset === null))) return;
+    const offset = append ? conversationState.nextOffset : 0;
+    conversationState.listController?.abort();
+    const controller = new AbortController(), epoch = state.identityEpoch;
+    conversationState.listController = controller; conversationState.listLoading = true; renderHistory();
+    try {
+      const result = await api("conversations?limit=100&offset=" + offset, { signal: controller.signal });
+      if (controller.signal.aborted || epoch !== state.identityEpoch) return;
+      const entries = Array.isArray(result.conversations) ? result.conversations : [];
+      conversationState.list = [...new Map([...(append ? conversationState.list : []), ...entries].map((item) => [item.id, item])).values()];
+      conversationState.nextOffset = Number.isInteger(result.next_offset) ? result.next_offset : null;
+    } catch (error) { if (!controller.signal.aborted && error.status !== 401 && epoch === state.identityEpoch) showError(errorMessage(error)); }
+    finally { if (conversationState.listController === controller) { conversationState.listController = null; conversationState.listLoading = false; renderHistory(); } }
+  }
+  async function loadConversation(conversation, previous = false) {
+    if (!conversation?.id || state.needsAuth || (previous && (conversationState.loading || conversationState.offset <= 0))) return;
+    conversationState.controller?.abort();
+    const sameConversation = conversationState.id === conversation.id, selectedId = sameConversation ? idOf(state.current) : null;
+    if (!previous) {
+      stopPolling(); state.generation += 1;
+      if (!sameConversation) {
+        resetRunFeedback(); state.current = null;
+        Object.assign(conversationState, { id: conversation.id, title: conversation.title || conversation.question || "Чат", runs: [], total: 0, offset: 0, truncated: false, pollError: "", signature: null });
+      }
+    }
+    const controller = new AbortController(), epoch = state.identityEpoch, generation = state.generation;
+    conversationState.controller = controller; conversationState.loading = true;
+    renderRun();
+    const offset = previous ? Math.max(0, conversationState.offset - 200) : 0;
+    const limit = previous ? Math.min(200, conversationState.offset) : 200;
+    const valid = () => !controller.signal.aborted && epoch === state.identityEpoch && generation === state.generation && conversationState.id === conversation.id;
+    try {
+      let result = await api("conversations/" + encodeURIComponent(conversation.id) + "?offset=" + offset + "&limit=" + limit, { signal: controller.signal });
+      if (!valid()) return;
+      if (!previous && result.has_more && result.total_runs > 200) {
+        result = await api("conversations/" + encodeURIComponent(conversation.id) + "?offset=" + (result.total_runs - 200) + "&limit=200", { signal: controller.signal });
+        if (!valid()) return;
+      }
+      const runs = Array.isArray(result.runs) ? result.runs : [];
+      conversationState.runs = [...new Map([...runs, ...(previous ? conversationState.runs : [])].map((run) => [idOf(run), run])).values()];
+      conversationState.total = result.total_runs || conversationState.runs.length;
+      conversationState.offset = result.offset || 0;
+      conversationState.truncated = result.history_truncated === true;
+      conversationState.title = result.conversation?.title || conversationState.title;
+      state.runs = [...new Map([...state.runs, ...runs].map((run) => [idOf(run), run])).values()];
+      if (!previous) {
+        state.current = conversationState.runs.find((run) => idOf(run) === selectedId) || conversationState.runs.at(-1) || null;
+        if (state.current) { state.selected = new Set(state.current.index_ids || []); state.selectedSandboxProfile = state.current.sandbox_profile_id || ""; renderSources(); renderExecutionEnvironment(); }
+        $("composer-options").open = false;
+      }
+      conversationState.pollError = ""; showError(""); renderRun(); schedulePoll();
+      if (!previous) $("conversation-messages").lastElementChild?.scrollIntoView({ block: "start", behavior: "auto" });
+    } catch (error) { if (valid() && error.status !== 401) showError(errorMessage(error)); }
+    finally { if (conversationState.controller === controller) { conversationState.controller = null; conversationState.loading = false; renderTranscript(); updateSubmit(); schedulePoll(); } }
+  }
+  function activeConversationRun() {
+    return [...conversationState.runs].reverse().find((run) => ACTIVE.has(run.status)) || (ACTIVE.has(state.current?.status) ? state.current : null);
+  }
+  function renderTranscript() {
+    const panel = $("run-panel"), hasConversation = Boolean(conversationState.id);
+    $("conversation-panel").hidden = !hasConversation;
+    $("conversation-title").textContent = conversationState.title || "Чат";
+    $("conversation-loading").hidden = !conversationState.loading;
+    $("conversation-history-note").hidden = !conversationState.truncated;
+    $("conversation-sync").textContent = conversationState.pollError;
+    $("conversation-sync").hidden = !conversationState.pollError;
+    $("conversation-more").hidden = conversationState.offset <= 0;
+    $("conversation-more").disabled = conversationState.loading;
+    $("delete-conversation").disabled = conversationState.loading;
+    $("refresh-conversation").disabled = conversationState.loading;
+    $("composer-section").classList.toggle("in-conversation", hasConversation);
+    $("question").placeholder = hasConversation ? "Уточните вопрос или продолжите исследование…" : "Что хотите узнать о системе?";
+    const signature = JSON.stringify([idOf(state.current), conversationState.runs.map((run) => [idOf(run), run.question, run.answer, run.phase, run.status, run.evidence?.length, run.research_plan, run.memory_used])]);
+    if (signature === conversationState.signature) return;
+    conversationState.signature = signature;
+    const fragment = document.createDocumentFragment();
+    for (const run of conversationState.runs) {
+      const turn = element("article", "chat-turn"); turn.dataset.runId = idOf(run);
+      const user = element("div", "chat-user");
+      user.append(element("span", "chat-role", "Вы"), element("p", "chat-user-text", run.question || "Сообщение"));
+      const assistant = element("div", "chat-assistant");
+      assistant.append(element("div", "chat-role", "Harness"));
+      if (idOf(run) === idOf(state.current)) assistant.append(panel);
+      else {
+        const status = element("p", "chat-turn-status", ACTIVE.has(run.status) ? (PHASE_LABELS[run.phase] || STATUS_LABELS[run.status]) : STATUS_LABELS[run.status] || "Ответ");
+        assistant.append(status);
+        const answer = element("div", "answer chat-answer"); renderAnswer(typeof run.answer === "string" ? run.answer : "", answer); assistant.append(answer);
+        const inspect = element("button", "text-button chat-inspect", "Материалы, ход работы и оценка"); inspect.type = "button";
+        inspect.addEventListener("click", () => selectRun(run)); assistant.append(inspect);
+      }
+      turn.append(user, assistant); fragment.append(turn);
+    }
+    if (!state.current) { panel.hidden = true; fragment.append(panel); }
+    $("conversation-messages").replaceChildren(fragment);
   }
   function renderEvidence(evidence) {
     const items = Array.isArray(evidence) ? evidence : [];
@@ -1503,9 +1651,10 @@
     }
     target.append(document.createTextNode(text.slice(start)));
   }
-  function renderAnswer(text) {
-    if (text === state.answerSignature) return;
-    state.answerSignature = text;
+  function renderAnswer(text, target = $("answer")) {
+    const selected = target === $("answer");
+    if (selected && text === state.answerSignature) return;
+    if (selected) state.answerSignature = text;
     const fragment = document.createDocumentFragment();
     let paragraph = [], list = null, code = null;
     const flush = () => {
@@ -1546,8 +1695,8 @@
     }
     flush();
     if (code !== null) { const pre = element("pre"); pre.append(element("code", "", code.join("\n"))); fragment.append(pre); }
-    $("answer").replaceChildren(fragment);
-    if (text) appear($("answer"));
+    target.replaceChildren(fragment);
+    if (selected && text) appear(target);
   }
   function resetRunFeedback() {
     feedbackState.controller?.abort();
@@ -1601,22 +1750,68 @@
       }
     }
   }
+  function renderResearchActivity(run) {
+    const plan = run.research_plan && typeof run.research_plan === "object" ? run.research_plan : {};
+    const trace = Array.isArray(run.research_trace) ? run.research_trace.filter((item) => item && typeof item.name === "string") : [];
+    const strings = (items) => Array.isArray(items) ? items.filter((item) => typeof item === "string").slice(0, 16) : [];
+    const questions = strings(plan.questions), completed = strings(plan.completed), gaps = strings(plan.gaps);
+    const currentAction = ACTIVE.has(run.status) && typeof run.current_action?.name === "string" ? run.current_action.name : "";
+    $("research-activity").hidden = !trace.length && !plan.goal && !questions.length && !gaps.length && !currentAction;
+    $("research-goal").textContent = typeof plan.goal === "string" ? "Цель: " + plan.goal : "";
+    $("research-goal").hidden = !plan.goal;
+    const next = ACTIVE.has(run.status) && typeof plan.next_action === "string" ? plan.next_action :
+      !ACTIVE.has(run.status) && typeof plan.completion_reason === "string" ? plan.completion_reason : "";
+    $("research-next").textContent = (ACTIVE.has(run.status) ? "Следующий шаг: " : "Результат проверки: ") + next;
+    $("research-next").hidden = !next;
+    const blocks = [];
+    if (Number.isInteger(plan.round) && plan.round > 0) blocks.push(element("p", "research-round", "Раунд исследования: " + plan.round));
+    for (const [label, values] of [["Вопросы исследования", questions], ["Проверено", completed], ["Осталось выяснить", gaps]]) {
+      if (!values.length) continue;
+      const block = element("section", "research-plan-group"), list = element("ul");
+      block.append(element("h4", "", label));
+      for (const value of values) list.append(element("li", "", value));
+      block.append(list); blocks.push(block);
+    }
+    $("research-plan").replaceChildren(...blocks);
+    const toolLabel = (name) => {
+      const steps = { update_research_plan: "Обновление плана", research_round: "Проверка результатов поиска", goal_check: "Проверка оставшихся вопросов", answer_recovery: "Повторная подготовка ответа", model_response: "Проверка ответа модели" };
+      if (steps[name]) return steps[name];
+      if (/search.*(knowledge|index|document)|^search$/.test(name)) return "Поиск в базе знаний";
+      if (/read.*document/.test(name)) return "Чтение документа";
+      if (/clone|prepare.*repository/.test(name)) return "Подготовка репозитория";
+      if (/search.*(code|repository|repo)|read.*(code|file)|repository/.test(name)) return "Изучение кода сервиса";
+      if (/execute|sandbox|run_code|run_command/.test(name)) return "Проверка в песочнице";
+      if (/a2a|agent/.test(name)) return "Запрос подключённому агенту";
+      if (/mcp/.test(name)) return "Запрос подключённому инструменту";
+      return "Проверка источника";
+    };
+    $("research-current").textContent = currentAction ? "Сейчас: " + toolLabel(currentAction) : "";
+    $("research-current").hidden = !currentAction;
+    $("research-timeline").replaceChildren(...trace.slice(-18).map((item) => {
+      const row = element("li", "research-event"), identifiers = item.args && typeof item.args === "object" ? item.args : {};
+      const label = toolLabel(item.name), scope = identifiers.index_id ? sourceName(identifiers.index_id) : identifiers.repository_id || identifiers.connection_id || "";
+      row.append(element("strong", "", label + (scope ? " · " + scope : "")));
+      if (typeof item.result === "string" && item.result) row.append(element("p", "", item.result.slice(0, 400)));
+      if (item.timestamp) row.append(element("time", "", dateLabel(item.timestamp, true)));
+      return row;
+    }));
+    $("research-details").hidden = !trace.length && !blocks.length;
+  }
   function renderRun() {
     const run = state.current;
     const hasRun = Boolean(run);
     const newPresentation = hasRun && idOf(run) !== state.presentedRunId;
     state.presentedRunId = hasRun ? idOf(run) : null;
-    $("welcome").hidden = hasRun;
-    $("suggestions").hidden = hasRun;
+    $("welcome").hidden = Boolean(conversationState.id);
+    $("suggestions").hidden = Boolean(conversationState.id);
     $("run-panel").hidden = !hasRun;
-    $("page-label").textContent = hasRun ? modeLabel(run.mode) : "Новый запрос";
-    if (!run) { renderEvidence([]); renderHistory(); $("discoveries-card").hidden = true; renderRunFeedback(null); return; }
+    $("page-label").textContent = conversationState.id ? "Чат" : "Новый чат";
+    if (!run) { renderEvidence([]); renderHistory(); $("discoveries-card").hidden = true; renderRunFeedback(null); renderTranscript(); updateSubmit(); return; }
     const active = ACTIVE.has(run.status);
     $("run-mode").textContent = modeLabel(run.mode) + " · Усилие: " + effortLabel(run.effort);
     $("run-date").textContent = dateLabel(run.created_at, true);
     $("run-question").textContent = run.question || "Запрос";
-    $("parent-note").hidden = !run.parent_run_id;
-    $("parent-note").textContent = "Продолжение предыдущего исследования с повторной проверкой источников.";
+    $("parent-note").hidden = true;
     const evidenceCount = Array.isArray(run.evidence) ? run.evidence.length : 0;
     const status = run.status === "partial" && !evidenceCount ? "Недостаточно данных" :
       STATUS_LABELS[run.status] || "Состояние запроса обновляется";
@@ -1635,6 +1830,7 @@
     $("run-coverage").hidden = !coverage.length;
     $("run-coverage").textContent = "Поиск по базам знаний: " + searched + " / " + coverage.length +
       (failed ? " · Недоступно: " + failed : "") + (pending ? " · Ещё не проверено: " + pending : "");
+    renderResearchActivity(run);
     const announcement = [status, phase, "Найдено подтверждений: " + evidenceCount].filter(Boolean).join(". ");
     if ($("progress-live").textContent !== announcement) $("progress-live").textContent = announcement;
     $("cancel-run").hidden = !active;
@@ -1643,7 +1839,8 @@
     $("remember-run").hidden = active || !memoryState.available;
     const memories = Array.isArray(run.memory_used) ? run.memory_used : [];
     $("run-memory-used").replaceChildren(element("strong", "", "Учтено из общей памяти АС: " + memories.length), ...memories.map((item) => element("p", "", item.title || "Сохранённая запись")));
-    $("run-memory-used").hidden = !memories.length;
+    if (run.memory_contribution?.updated) $("run-memory-used").append(element("p", "memory-contribution", "Опыт этого запроса добавлен в общую память АС. Оцените ответ, чтобы уточнить, что помогло и что нужно исправить."));
+    $("run-memory-used").hidden = !memories.length && !run.memory_contribution?.updated;
     renderRunEnvironment(run);
     const warnings = Array.isArray(run.warnings) ? run.warnings.filter((item) => typeof item === "string") : [];
     $("run-warnings").replaceChildren(...warnings.map((text) => element("p", "", text)));
@@ -1663,6 +1860,7 @@
     renderRunFeedback(run);
     updateSubmit();
     renderHistory();
+    renderTranscript();
     loadRunDiscoveries();
     const memorySignature = idOf(run) + ":" + run.status;
     if (!active && state.memoryRunSignature !== memorySignature) { state.memoryRunSignature = memorySignature; loadMemory(); }
@@ -1676,8 +1874,9 @@
   }
   function schedulePoll(delay = state.pollDelay) {
     window.clearTimeout(state.pollTimer);
-    if (!document.hidden && !state.needsAuth && state.current && ACTIVE.has(state.current.status)) {
-      state.pollTimer = window.setTimeout(() => refreshRun(idOf(state.current), state.generation), delay);
+    const active = activeConversationRun();
+    if (!document.hidden && !state.needsAuth && active) {
+      state.pollTimer = window.setTimeout(() => refreshRun(idOf(active), state.generation), delay);
     }
   }
   async function refreshRun(id, generation) {
@@ -1686,19 +1885,22 @@
     state.pollController = controller;
     try {
       const run = await api("runs/" + encodeURIComponent(id), { signal: controller.signal });
-      if (controller.signal.aborted || epoch !== state.identityEpoch || generation !== state.generation || id !== idOf(state.current)) return;
-      const scopeWasLoading = !Array.isArray(state.current.index_ids);
-      state.current = run;
+      if (controller.signal.aborted || epoch !== state.identityEpoch || generation !== state.generation ||
+          (id !== idOf(state.current) && !conversationState.runs.some((item) => idOf(item) === id))) return;
+      const selected = id === idOf(state.current), scopeWasLoading = selected && !Array.isArray(state.current.index_ids);
+      if (selected) state.current = run;
       if (scopeWasLoading) {
         state.selected = new Set(run.index_ids || []); state.selectedSandboxProfile = run.sandbox_profile_id || "";
         renderSources(); renderExecutionEnvironment();
       }
       state.pollDelay = 1400;
+      conversationState.pollError = "";
       rememberRun(run);
-      renderRun();
+      if (selected) renderRun(); else { renderTranscript(); updateSubmit(); }
     } catch (error) {
       if (error.name !== "AbortError" && error.status !== 401 && generation === state.generation) {
-        showError(errorMessage(error));
+        conversationState.pollError = "Обновление временно недоступно. " + errorMessage(error) + " Повторим проверку автоматически.";
+        renderTranscript();
         state.pollDelay = Math.min(10000, state.pollDelay * 2);
       }
     } finally {
@@ -1710,6 +1912,11 @@
     stopPolling();
     resetRunFeedback();
     state.generation += 1;
+    const conversationId = String(run.conversation_id || run.parent_run_id || idOf(run));
+    if (conversationState.id !== conversationId) {
+      conversationState.controller?.abort();
+      Object.assign(conversationState, { id: conversationId, title: run.question || "Чат", runs: [run], total: 1, offset: 0, truncated: false, pollError: "", loading: false, controller: null, signature: null });
+    }
     state.current = run;
     if (Array.isArray(run.index_ids)) { state.selected = new Set(run.index_ids); renderSources(); }
     state.selectedSandboxProfile = run.sandbox_profile_id || ""; renderExecutionEnvironment();
@@ -1722,6 +1929,9 @@
   }
   function resetWorkspace() {
     stopPolling();
+    conversationState.controller?.abort();
+    Object.assign(conversationState, { id: null, title: "", runs: [], total: 0, offset: 0, truncated: false, pollError: "", loading: false, controller: null, signature: null });
+    $("composer-options").open = true;
     resetRunFeedback();
     state.generation += 1;
     state.current = null;
@@ -1747,6 +1957,8 @@
     state.status = null;
     state.sourcesInitialized = false;
     state.runs = [];
+    conversationState.listController?.abort();
+    Object.assign(conversationState, { list: [], nextOffset: null, listLoading: false, listController: null });
     state.selected = new Set();
     state.submitting = false;
     state.cancelling = false;
@@ -1768,6 +1980,8 @@
   async function submitRun(parent = null) {
     if (state.submitting) return;
     if (state.needsAuth) { openAuth(); return; }
+    if (conversationState.loading || activeConversationRun()) { showError("Дождитесь ответа или остановите текущее исследование."); return; }
+    const followup = parent || conversationState.runs.at(-1) || null;
     const question = parent ? parent.question : $("question").value.trim();
     if (!question) { $("question").focus(); return; }
     const selected = parent ? (Array.isArray(parent.index_ids) ? parent.index_ids : []) : [...state.selected];
@@ -1783,7 +1997,7 @@
       mode: parent ? "investigate" : document.querySelector('input[name="mode"]:checked').value,
       effort: parent ? "high" : $("effort").value,
       index_ids: selected,
-      ...(parent ? { parent_run_id: idOf(parent) } : {}),
+      ...(followup ? { parent_run_id: idOf(followup) } : {}),
     };
     payload.sandbox_profile_id = payload.mode === "investigate" ? state.selectedSandboxProfile : "";
     if (payload.sandbox_profile_id && !state.sandboxProfiles.some((profile) => profile.id === payload.sandbox_profile_id)) {
@@ -1800,9 +2014,16 @@
       rememberRun(run);
       if (generation !== state.generation) return;
       selectRun(run);
+      $("composer-options").open = false;
       $("question").value = "";
       updateCharacterCount();
-    } catch (error) { if (error.status !== 401 && identityEpoch === state.identityEpoch) showError(errorMessage(error)); }
+      $("question").scrollIntoView({ block: "end", behavior: motionPreference.matches ? "auto" : "smooth" });
+    } catch (error) {
+      if (error.status !== 401 && identityEpoch === state.identityEpoch) {
+        showError(error.uncertainMutation ? "Не получено подтверждение отправки. Запрос мог быть принят; проверьте историю чатов перед повторной отправкой." : errorMessage(error));
+        if (error.uncertainMutation) loadConversations();
+      }
+    }
     finally { if (identityEpoch === state.identityEpoch) { state.submitting = false; updateSubmit(); } }
   }
   async function cancelRun() {
@@ -1838,16 +2059,14 @@
     state.refreshController = controller;
     connection("Подключаемся", "");
     try {
-      const [status, history] = await Promise.all([
-        api("status", { signal: controller.signal }), api("runs", { signal: controller.signal }),
-      ]);
+      const status = await api("status", { signal: controller.signal });
       if (controller.signal.aborted) return;
       state.status = status;
-      state.runs = Array.isArray(history.runs) ? history.runs : [];
       state.needsAuth = false;
       showError("");
       renderStatus();
       renderHistory();
+      loadConversations();
       if (state.current) refreshRun(idOf(state.current), state.generation);
       if (refreshModelState) refreshModel({ refreshPublic: false });
       loadSettings();
@@ -1863,6 +2082,13 @@
   }
 
   $("new-run").addEventListener("click", resetWorkspace);
+  $("history-more").addEventListener("click", () => loadConversations(true));
+  $("refresh-conversation").addEventListener("click", () => loadConversation({ id: conversationState.id, title: conversationState.title }));
+  $("conversation-more").addEventListener("click", () => loadConversation({ id: conversationState.id, title: conversationState.title }, true));
+  $("delete-conversation").addEventListener("click", () => {
+    const latest = conversationState.runs.at(-1);
+    if (conversationState.id) openDeletion("conversation", { id: conversationState.id, title: conversationState.title, status: latest?.status, last_run_id: idOf(latest) });
+  });
   $("settings-open").addEventListener("click", openSettings);
   $("settings-close").addEventListener("click", () => $("settings-dialog").close());
   $("settings-dialog").addEventListener("close", () => { clearSshEditor(); clearTlsEditor(); });
@@ -1946,7 +2172,7 @@
   $("question-form").addEventListener("submit", (event) => { event.preventDefault(); submitRun(); });
   $("question").addEventListener("input", updateCharacterCount);
   $("question").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+    if (event.key === "Enter" && !event.isComposing && (!event.shiftKey || event.metaKey || event.ctrlKey)) {
       event.preventDefault();
       if (!$("submit-question").disabled) $("question-form").requestSubmit();
     }
@@ -1998,7 +2224,8 @@
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { stopPolling(); stopModelPolling(); }
     else {
-      if (state.current && ACTIVE.has(state.current.status)) refreshRun(idOf(state.current), state.generation);
+      const active = activeConversationRun();
+      if (active) refreshRun(idOf(active), state.generation);
       refreshModel();
     }
   });
@@ -2007,6 +2234,7 @@
     stopModelPolling();
     if (state.modelActionController) state.modelActionController.abort();
     if (state.refreshController) state.refreshController.abort();
+    conversationState.controller?.abort(); conversationState.listController?.abort();
     if (settingsState.controller) settingsState.controller.abort();
     for (const controller of [sshState.controller, tlsState.controller, modelConnectionState.controller, memoryState.controller, discoveryState.controller, discoveryState.adminController, deletionState.controller, feedbackState.controller, state.sandboxProfilesController]) controller?.abort();
     clearSshEditor(); clearTlsEditor();

@@ -282,6 +282,7 @@ async def test_repository_only_investigation_without_rag_and_cleanup(tmp_path: P
         assert result["metrics"]["tool_calls"] == 1
         assert integrations._sandbox.closed == [run["id"]]
         assert {t["function"]["name"] for t in model.requests[0]["tools"]} == {
+            "update_research_plan",
             "clone_repository",
             "search_repository",
             "read_repository",

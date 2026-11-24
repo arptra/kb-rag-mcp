@@ -111,10 +111,12 @@ async def test_real_langgraph_nodes_checkpoints_and_delete(tmp_path: Path) -> No
         assert set(graph.graph.get_graph().nodes) == {
             "__start__",
             "prepare",
+            "plan",
             "collect",
             "inspect",
             "decide",
             "tools",
+            "reflect",
             "synthesize",
             "__end__",
         }

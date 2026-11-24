@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TextIO
@@ -60,6 +61,10 @@ _AUTH_HINT_PATTERN: re.Pattern[str] = re.compile(
     r"sign[ -]?in|verify|verification|open)\b",
     re.IGNORECASE,
 )
+_RESULT_DRAIN_SECONDS = 1.0
+_SUPERVISOR_GRACE_SECONDS = 10.0
+_STREAM_LINE_LIMIT = 2_000_000
+_OUTPUT_LIMIT = 8_000_000
 
 
 def browser_authentication_url(value: str) -> str | None:
@@ -100,6 +105,10 @@ class GigaCodeCancelled(RuntimeError):
 
 class GigaCodeTimedOut(RuntimeError):
     """Raised when GigaCode does not stop within the configured deadline."""
+
+
+class GigaCodeInvalidOutput(RuntimeError):
+    """The CLI ran but returned an incomplete or unusable model response."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,33 +484,36 @@ class GigaCodeRunner:
             bufsize=1,
             **creation,
         )
-        events: queue.Queue[tuple[str, str | None]] = queue.Queue()
+        events: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=8)
+        streams_stop = threading.Event()
         readers = [
             threading.Thread(
                 target=self._read_stream,
-                args=("stdout", process.stdout, events),
+                args=("stdout", process.stdout, events, streams_stop),
                 daemon=True,
             ),
             threading.Thread(
                 target=self._read_stream,
-                args=("stderr", process.stderr, events),
+                args=("stderr", process.stderr, events, streams_stop),
                 daemon=True,
             ),
         ]
-        for reader in readers:
-            reader.start()
-        assert process.stdin is not None
-        try:
-            process.stdin.write(bounded_prompt)
-            if not bounded_prompt.endswith("\n"):
-                process.stdin.write("\n")
-            process.stdin.close()
-        except BrokenPipeError:
-            pass
-
-        deadline = time.monotonic() + self._settings.gigacode_timeout_seconds + 10
-        open_streams = {"stdout", "stderr"}
+        writer = threading.Thread(
+            target=self._write_stream,
+            args=(process.stdin, bounded_prompt, events, streams_stop),
+            daemon=True,
+        )
+        deadline = (
+            time.monotonic() + self._settings.gigacode_timeout_seconds + _SUPERVISOR_GRACE_SECONDS
+        )
+        authentication_deadline: float | None = None
+        open_streams = {"stdout", "stderr", "stdin"}
         result_event: dict[str, Any] | None = None
+        result_deadline: float | None = None
+        cleanup_deadline: float | None = None
+        process_cleaned = False
+        stopped_after_result = False
+        output_chars = 0
         stderr_tail: list[str] = []
         stdout_tail: list[str] = []
         assistant_messages: list[str] = []
@@ -510,16 +522,29 @@ class GigaCodeRunner:
         waiting_for_authentication = False
         debug_stdout: TextIO | None = None
         debug_stderr: TextIO | None = None
-        if debug_directory is not None:
-            debug_stdout = (debug_directory / "stdout.jsonl").open("w", encoding="utf-8")
-            debug_stderr = (debug_directory / "stderr.log").open("w", encoding="utf-8")
         try:
-            while process.poll() is None or open_streams:
+            for reader in readers:
+                reader.start()
+            writer.start()
+            if debug_directory is not None:
+                debug_stdout = (debug_directory / "stdout.jsonl").open("w", encoding="utf-8")
+                debug_stderr = (debug_directory / "stderr.log").open("w", encoding="utf-8")
+            while process.poll() is None or open_streams or not events.empty():
                 if cancel is not None and cancel.is_set():
-                    self._stop(process)
                     raise GigaCodeCancelled("GigaCode analysis was cancelled")
-                if time.monotonic() >= deadline:
-                    self._stop(process)
+                now = time.monotonic()
+                if cleanup_deadline is not None and now >= cleanup_deadline:
+                    break
+                if result_deadline is not None and now >= result_deadline:
+                    # A final response does not require a well-behaved CLI shutdown.
+                    # Keep a short drain window for a later error/native-tool event.
+                    running = process.poll() is None
+                    signalled = self._stop(process)
+                    stopped_after_result = running and signalled
+                    process_cleaned = True
+                    result_deadline = None
+                    cleanup_deadline = time.monotonic() + 0.5
+                elif result_event is None and now >= deadline:
                     raise GigaCodeTimedOut(
                         "GigaCode exceeded "
                         f"{self._settings.gigacode_timeout_seconds} seconds"
@@ -528,21 +553,28 @@ class GigaCodeRunner:
                     source, line = events.get(timeout=0.1)
                 except queue.Empty:
                     continue
+                if source == "overflow":
+                    raise GigaCodeInvalidOutput("GigaCode output exceeded the safe size limit")
                 if line is None:
                     open_streams.discard(source)
                     continue
+                output_chars += len(line)
+                if output_chars > _OUTPUT_LIMIT:
+                    raise GigaCodeInvalidOutput("GigaCode output exceeded the safe size limit")
                 auth_url = self._authentication_url(line)
                 authentication_started = False
                 if auth_url is not None and auth_url not in reported_auth_urls:
                     reported_auth_urls.add(auth_url)
                     waiting_for_authentication = True
                     authentication_started = True
-                    deadline = (
-                        time.monotonic()
-                        + self._settings.gigacode_auth_timeout_seconds
-                        + self._settings.gigacode_timeout_seconds
-                        + 10
-                    )
+                    if authentication_deadline is None:
+                        authentication_deadline = (
+                            time.monotonic()
+                            + self._settings.gigacode_auth_timeout_seconds
+                            + self._settings.gigacode_timeout_seconds
+                            + _SUPERVISOR_GRACE_SECONDS
+                        )
+                    deadline = authentication_deadline
                     if progress is not None:
                         progress(f"GigaCode waits for browser authentication: {auth_url}")
                     if authentication_url is not None:
@@ -572,7 +604,13 @@ class GigaCodeRunner:
                         "invocation aborted. The tool may already have executed."
                     )
                 if event.get("type") == "result":
-                    result_event = event
+                    # A later success must never erase an already reported terminal error.
+                    if result_event is None or not (
+                        result_event.get("is_error") or self._incomplete_result(result_event)
+                    ):
+                        result_event = event
+                    if result_deadline is None and cleanup_deadline is None:
+                        result_deadline = min(deadline, time.monotonic() + _RESULT_DRAIN_SECONDS)
                 elif event.get("type") == "assistant":
                     assistant_text = self._assistant_message_text(event)
                     if assistant_text:
@@ -587,7 +625,11 @@ class GigaCodeRunner:
                     and self._signals_analysis_activity(event)
                 ):
                     waiting_for_authentication = False
-                    deadline = time.monotonic() + self._settings.gigacode_timeout_seconds + 10
+                    deadline = (
+                        time.monotonic()
+                        + self._settings.gigacode_timeout_seconds
+                        + _SUPERVISOR_GRACE_SECONDS
+                    )
                     if progress is not None:
                         progress("GigaCode browser authentication completed; analysis resumed")
                     if authentication_complete is not None:
@@ -595,18 +637,28 @@ class GigaCodeRunner:
                 if progress is not None:
                     progress(self._event_summary(event))
         except BaseException as exc:
-            self._stop(process)
             self._write_debug_failure(debug_directory, exc)
             raise
         finally:
-            for reader in readers:
-                reader.join(timeout=1)
+            if not process_cleaned:
+                self._stop(process)
+            streams_stop.set()
+            for worker in [writer, *readers]:
+                if worker.ident is not None:
+                    worker.join(timeout=1)
             if debug_stdout is not None:
                 debug_stdout.close()
             if debug_stderr is not None:
                 debug_stderr.close()
         return_code = process.wait(timeout=2)
-        if return_code != 0:
+        if result_event is not None and self._incomplete_result(result_event):
+            error: RuntimeError = GigaCodeInvalidOutput(
+                "GigaCode stopped before completing the response"
+            )
+            self._write_debug_failure(debug_directory, error)
+            raise error
+        shutdown_codes = {-2, -9, -15, 130, 137, 143}
+        if return_code != 0 and not (stopped_after_result and return_code in shutdown_codes):
             detail_lines = [*stderr_tail[-20:], *stdout_tail[-10:]]
             detail = "\n".join(detail_lines)
             error = RuntimeError(
@@ -616,7 +668,7 @@ class GigaCodeRunner:
             self._write_debug_failure(debug_directory, error)
             raise error
         if result_event is None:
-            error = RuntimeError("GigaCode completed without a result event")
+            error = GigaCodeInvalidOutput("GigaCode completed without a result event")
             self._write_debug_failure(debug_directory, error)
             raise error
         if bool(result_event.get("is_error")):
@@ -638,7 +690,7 @@ class GigaCodeRunner:
             diagnostic = self._result_diagnostic(result_event, assistant_messages)
             if progress is not None:
                 progress(f"GigaCode output contract failed: {diagnostic}")
-            error = RuntimeError(
+            error = GigaCodeInvalidOutput(
                 "GigaCode result did not contain usable output for the requested contract; "
                 + diagnostic
             )
@@ -989,20 +1041,73 @@ class GigaCodeRunner:
         return shutil.which(command)
 
     @staticmethod
+    def _publish(
+        events: queue.Queue[tuple[str, str | None]],
+        item: tuple[str, str | None],
+        stop: threading.Event,
+    ) -> None:
+        while not stop.is_set():
+            try:
+                events.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    @classmethod
+    def _write_stream(
+        cls,
+        stream: TextIO | None,
+        prompt: str,
+        events: queue.Queue[tuple[str, str | None]],
+        stop: threading.Event,
+    ) -> None:
+        try:
+            if stream is not None:
+                stream.write(prompt if prompt.endswith("\n") else prompt + "\n")
+                stream.flush()
+        except (BrokenPipeError, OSError):
+            # The CLI may fail before accepting input; its exit/result is authoritative.
+            pass
+        finally:
+            if stream is not None:
+                with suppress(BrokenPipeError, OSError):
+                    stream.close()
+            cls._publish(events, ("stdin", None), stop)
+
+    @classmethod
     def _read_stream(
+        cls,
         source: str,
         stream: TextIO | None,
         events: queue.Queue[tuple[str, str | None]],
+        stop: threading.Event,
     ) -> None:
         if stream is None:
-            events.put((source, None))
+            cls._publish(events, (source, None), stop)
             return
         try:
-            for line in stream:
-                events.put((source, line.rstrip("\r\n")))
+            while not stop.is_set():
+                line = stream.readline(_STREAM_LINE_LIMIT + 1)
+                if not line:
+                    break
+                if len(line) > _STREAM_LINE_LIMIT:
+                    cls._publish(events, ("overflow", None), stop)
+                    break
+                cls._publish(events, (source, line.rstrip("\r\n")), stop)
         finally:
             stream.close()
-            events.put((source, None))
+            cls._publish(events, (source, None), stop)
+
+    @staticmethod
+    def _incomplete_result(event: dict[str, Any]) -> bool:
+        subtype = event.get("subtype")
+        return (isinstance(subtype, str) and subtype in {
+            "error_max_turns", "error_max_output_tokens", "error_max_tokens",
+        }) or any(
+            isinstance(event.get(key), str)
+            and event[key] in {"max_tokens", "max_output_tokens", "length", "max_turns"}
+            for key in ("stop_reason", "finish_reason")
+        )
 
     @staticmethod
     def _parse_event(line: str) -> dict[str, Any] | None:
@@ -1140,7 +1245,10 @@ class GigaCodeRunner:
                 summary += f"; error={error[:2000]}"
             return summary
         if kind == "assistant":
-            content = event.get("message", {}).get("content", [])
+            message = event.get("message")
+            content = message.get("content", []) if isinstance(message, dict) else []
+            if not isinstance(content, list):
+                content = []
             tool_names = [
                 str(item.get("name"))
                 for item in content
@@ -1210,27 +1318,47 @@ class GigaCodeRunner:
         return [*lines[-(limit - 1) :], line]
 
     @staticmethod
-    def _stop(process: subprocess.Popen[str]) -> None:
-        if process.poll() is not None:
-            return
+    def _stop(process: subprocess.Popen[str]) -> bool:
+        """Bound cleanup and stop the entire CLI group, including an orphaned pipe holder."""
+        signalled = False
+        if os.name != "nt":
+            for action in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+                try:
+                    # The parent may already be gone while a child still owns stdout/stdin.
+                    os.killpg(process.pid, action)
+                    signalled = True
+                except OSError:
+                    break
+                until = time.monotonic() + 0.4
+                while time.monotonic() < until:
+                    process.poll()
+                    try:
+                        os.killpg(process.pid, 0)
+                    except ProcessLookupError:
+                        return signalled
+                    except PermissionError:
+                        # Some process sandboxes disallow existence probes while
+                        # allowing signals to children. Keep cleanup bounded.
+                        break
+                    time.sleep(0.02)
+        else:
+            actions: tuple[Callable[[], None], ...] = (
+                lambda: process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM)),
+                process.terminate,
+                process.kill,
+            )
+            for stop_action in actions:
+                if process.poll() is not None:
+                    break
+                try:
+                    stop_action()
+                    signalled = True
+                    process.wait(timeout=0.4)
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
         try:
-            if os.name != "nt":
-                os.killpg(process.pid, signal.SIGINT)
-            else:
-                process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
-            process.wait(timeout=3)
-            return
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        try:
-            process.terminate()
-        except OSError:
-            return
-        try:
-            process.wait(timeout=2)
+            process.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
-            try:
-                process.kill()
-                process.wait(timeout=2)
-            except OSError:
-                return
+            process.kill()
+            process.wait(timeout=0.5)
+        return signalled

@@ -335,7 +335,8 @@ async def test_repeated_tools_have_global_budget(tmp_path: Path) -> None:
         )
         run = await finished(runtime, submitted["id"])
         assert run["metrics"]["model_calls"] == 4
-        assert run["metrics"]["source_calls"] == 5
+        assert run["metrics"]["source_calls"] == 3
+        assert any("Повтор без новых данных" in item["result"] for item in run["research_trace"])
         assert model.requests[-1]["tools"] == []
     finally:
         await runtime.stop()

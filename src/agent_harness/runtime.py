@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from contextlib import AsyncExitStack
@@ -28,6 +29,8 @@ from agent_harness.memory import LIST_LIMIT, MAX_TOTAL, MemoryFeedback, MemoryIn
 from agent_harness.model_connection import ModelConnectionError
 from agent_harness.policy import BUDGETS, QUICK_BUDGETS, SYSTEM_PROMPT
 from agent_harness.store import ACTIVE, RunStore, timestamp
+
+_LOG = logging.getLogger(__name__)
 
 
 class QueueFullError(RuntimeError):
@@ -93,6 +96,7 @@ class HarnessRuntime:
         self._clocks: dict[str, _RunClock] = {}
         self._last_checkpoints: dict[str, float] = {}
         self._checkpoint_evidence_counts: dict[str, int] = {}
+        self._detached_tasks: set[asyncio.Task[Any]] = set()
         self._started = False
 
     @property
@@ -160,8 +164,10 @@ class HarnessRuntime:
             raise HarnessUnavailableError("Harness is disabled or stopped")
         if not principal.owner_id.strip():
             raise ValueError("Principal is required")
-        if request.parent_run_id:
+        parent = (
             self.store.get(principal.owner_id, request.parent_run_id)
+            if request.parent_run_id else None
+        )
         queue = self._queues[request.mode]
         if queue.full():
             raise QueueFullError("Очередь заполнена; повторите запрос позже.")
@@ -169,6 +175,9 @@ class HarnessRuntime:
         run = {
             "id": run_id,
             "run_id": run_id,
+            "conversation_id": (parent or {}).get("conversation_id") or (
+                parent["id"] if parent else run_id
+            ),
             **request.model_dump(),
             "status": "queued",
             "phase": "queued",
@@ -190,7 +199,10 @@ class HarnessRuntime:
             "research_trace": [],
         }
         self.store.save(principal.owner_id, run)
-        self.store.prune()
+        try:
+            self.store.prune()
+        except Exception as exc:
+            _LOG.warning("Harness retention deferred (%s)", type(exc).__name__)
         self._signals[run_id] = Event()
         queue.put_nowait((principal, run_id))
         return run
@@ -249,6 +261,11 @@ class HarnessRuntime:
             run["evidence"], run["answer"], run["memory_used"] = [], "", []
             run["context_index_ids"], run["parent_question"] = [], None
             run["research_trace"], run["coverage"], run["context_summary"] = [], {}, {}
+            run["research_plan"], run["memory_contribution"], run["current_action"] = {}, None, None
+            for key in (
+                "_seen_tool_calls", "_round_evidence", "_stalled_rounds", "_gap_review_requested",
+            ):
+                run.pop(key, None)
             self._warn(run, "Область изменилась; прежние данные исключены из продолжения.")
         run.update(
             status="queued",
@@ -340,7 +357,7 @@ class HarnessRuntime:
 
     def _parent_context(
         self, principal: Principal, run: dict[str, Any], allowed: set[str]
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any] | None:
         if not run.get("parent_run_id"):
             return None
         try:
@@ -351,7 +368,30 @@ class HarnessRuntime:
         if parent["status"] in ACTIVE or not scope <= allowed & set(run["index_ids"]):
             return None
         run["context_index_ids"] = sorted(set(run.get("context_index_ids", [])) | scope)
-        return {"question": parent["question"][:1000], "answer": parent["answer"][:1600]}
+        history: list[dict[str, str]] = []
+        history_truncated = False
+        seen = {run["id"]}
+        current = parent
+        while current["id"] not in seen and len(history) < 12:
+            seen.add(current["id"])
+            current_scope = self._run_scope(current)
+            if current["status"] in ACTIVE or not current_scope <= allowed & set(run["index_ids"]):
+                break
+            run["context_index_ids"] = sorted(set(run["context_index_ids"]) | current_scope)
+            history.append({"question": current["question"][:2000],
+                            "answer": current["answer"][:4000]})
+            if not current.get("parent_run_id"):
+                break
+            if len(history) == 12:
+                history_truncated = True
+                break
+            try:
+                current = self.store.get(principal.owner_id, current["parent_run_id"])
+            except KeyError:
+                break
+        return {"question": parent["question"][:1000], "answer": parent["answer"][:1600],
+                "history": list(reversed(history)),
+                "history_truncated": history_truncated}
 
     async def list_runs(self, principal: Principal) -> list[dict[str, Any]]:
         fields = {
@@ -367,11 +407,99 @@ class HarnessRuntime:
             "started_at",
             "completed_at",
             "parent_run_id",
+            "conversation_id",
         }
         return [
             {key: value for key, value in run.items() if key in fields}
             for run in self.store.list(principal.owner_id)
         ]
+
+    def _conversation_groups(self, principal: Principal) -> dict[str, list[dict[str, Any]]]:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for run in self.store.conversations(principal.owner_id):
+            groups.setdefault(run["conversation_id"], []).append(run)
+        return groups
+
+    @staticmethod
+    def _conversation_summary(conversation_id: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
+        first, last = runs[0], runs[-1]
+        active = [run for run in runs if run["status"] in ACTIVE]
+        retained_ids = {run["id"] for run in runs}
+        return {
+            "id": conversation_id,
+            "conversation_id": conversation_id,
+            "title": first.get("question", "")[:160],
+            "question": first.get("question", ""),
+            "created_at": first["created_at"],
+            "updated_at": max(run.get("updated_at", run["created_at"]) for run in runs),
+            "last_run_id": last["id"],
+            "status": (active[-1] if active else last)["status"],
+            "run_count": len(runs),
+            "turn_count": len(runs),
+            "history_truncated": any(
+                run.get("parent_run_id") and run["parent_run_id"] not in retained_ids
+                for run in runs
+            ),
+        }
+
+    @staticmethod
+    def _conversation_page(offset: int, limit: int) -> None:
+        if not 0 <= offset <= 1_000_000 or not 1 <= limit <= 200:
+            raise ValueError("Invalid conversation page")
+
+    async def list_conversations(
+        self, principal: Principal, *, offset: int = 0, limit: int = 200
+    ) -> dict[str, Any]:
+        self._conversation_page(offset, limit)
+        summaries = [
+            self._conversation_summary(key, runs)
+            for key, runs in self._conversation_groups(principal).items()
+        ]
+        summaries.sort(key=lambda item: (item["updated_at"], item["id"]), reverse=True)
+        more = offset + limit < len(summaries)
+        return {
+            "conversations": summaries[offset:offset + limit],
+            "total": len(summaries), "offset": offset, "limit": limit,
+            "has_more": more, "next_offset": offset + limit if more else None,
+        }
+
+    async def get_conversation(
+        self, principal: Principal, conversation_id: str, *, offset: int = 0, limit: int = 200
+    ) -> dict[str, Any]:
+        self._conversation_page(offset, limit)
+        runs = self._conversation_groups(principal).get(conversation_id)
+        if not runs:
+            raise KeyError("Conversation not found")
+        semaphore = asyncio.Semaphore(8)
+
+        async def snapshot(run: dict[str, Any]) -> dict[str, Any]:
+            async with semaphore:
+                # Reuse the live ACL boundary, including memory/evidence redaction.
+                return await self.get(principal, run["id"])
+
+        selected = await asyncio.gather(*(snapshot(run) for run in runs[offset:offset + limit]))
+        more = offset + limit < len(runs)
+        summary = self._conversation_summary(conversation_id, runs)
+        return {
+            "id": conversation_id, "conversation_id": conversation_id,
+            "conversation": summary, "runs": selected,
+            "total_runs": len(runs), "offset": offset, "limit": limit,
+            "has_more": more, "next_offset": offset + limit if more else None,
+            "history_truncated": summary["history_truncated"],
+            "retention_days": self.settings.retention_days,
+        }
+
+    async def delete_conversation(
+        self, principal: Principal, conversation_id: str
+    ) -> dict[str, Any]:
+        deleted = self.store.delete_conversation(principal.owner_id, conversation_id)
+        if self._graph is not None:
+            for run_id in deleted:
+                await self._graph.delete(principal, run_id)
+        return {
+            "deleted": True, "id": conversation_id,
+            "conversation_id": conversation_id, "deleted_ids": deleted,
+        }
 
     async def cancel(self, principal: Principal, run_id: str) -> dict[str, Any]:
         run = self.store.get(principal.owner_id, run_id)
@@ -472,6 +600,7 @@ class HarnessRuntime:
             run["evidence"], run["answer"] = [], ""
             run["memory_used"], run["parent_question"] = [], None
             run["research_trace"], run["coverage"], run["context_summary"] = [], {}, {}
+            run["research_plan"], run["memory_contribution"], run["current_action"] = {}, None, None
             run["warnings"].append("Результат скрыт: доступ к части источников отсутствует.")
         return run
 
@@ -498,6 +627,7 @@ class HarnessRuntime:
         queue = self._queues[lane]
         while True:
             principal, run_id = await queue.get()
+            run: dict[str, Any] | None = None
             try:
                 try:
                     run = self.store.get(principal.owner_id, run_id)
@@ -505,6 +635,24 @@ class HarnessRuntime:
                     continue
                 if run["status"] == "queued":
                     await self._execute(principal, run)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A failed persistence/maintenance step must not silently remove
+                # the lane's only worker and leave all subsequent chats queued.
+                _LOG.warning("Harness run finalization failed (%s)", type(exc).__name__)
+                if run is not None:
+                    if run["status"] in ACTIVE:
+                        run["status"] = "partial" if run.get("evidence") else "failed"
+                    self._warn(run, "Обработка запроса завершилась ошибкой. Повторите запрос.")
+                    if not run.get("answer"):
+                        self._evidence_answer(run)
+                    run.update(phase="finished", completed_at=timestamp())
+                    try:
+                        self.store.save(principal.owner_id, run)
+                    except Exception as save_error:
+                        _LOG.warning("Harness final state unavailable (%s)",
+                                     type(save_error).__name__)
             finally:
                 self._signals.pop(run_id, None)
                 self._semaphores.pop(run_id, None)
@@ -568,27 +716,46 @@ class HarnessRuntime:
         finally:
             if self.tools is not None:
                 try:
-                    await asyncio.wait_for(
-                        self.tools.close_run(run["id"]),
-                        self.settings.cleanup_timeout_seconds,
-                    )
+                    closing = asyncio.create_task(self.tools.close_run(run["id"]))
+                    await self._cleanup(closing, run)
+                    if closing.done() and not closing.cancelled():
+                        closing.result()
+                    else:
+                        self._warn(
+                            run, "Очистка песочницы не подтверждена; сообщите администратору."
+                        )
                 except Exception:
                     self._warn(run, "Очистка песочницы не подтверждена; сообщите администратору.")
             if terminal:
                 run["status"] = terminal
+            elif run["status"] in ACTIVE:
+                run["status"] = "partial"
+                self._warn(run, "Исследование остановилось без подтверждения готового ответа.")
             if not run["answer"]:
                 self._evidence_answer(run)
             run.update(phase="finished", completed_at=timestamp())
             run["metrics"]["duration_ms"] = previous_duration + round(
                 (time.monotonic() - started) * 1000
             )
+            try:
+                contribution = self.memory.record_outcome(
+                    principal.owner_id, run, index_ids=sorted(self._run_scope(run))
+                )
+                if contribution is not None:
+                    run["memory_contribution"] = {
+                        "id": contribution["id"], "kind": contribution["kind"],
+                        "status": contribution["status"], "updated": True,
+                    }
+            except Exception as exc:
+                self._warn(run, "Ответ сохранён без нового опыта: память временно недоступна.")
+                _LOG.warning("Harness memory update deferred (%s)", type(exc).__name__)
             self.store.save(principal.owner_id, run)
-            self.memory.record_outcome(
-                principal.owner_id, run, index_ids=sorted(self._run_scope(run))
-            )
-            self.store.prune()
-            if self._graph is not None:
-                await self._graph.prune()
+            try:
+                self.store.prune()
+                if self._graph is not None:
+                    await self._graph.prune()
+            except Exception as exc:
+                _LOG.warning("Harness retention deferred (%s)", type(exc).__name__)
 
     def _run_timeout(self, run: dict[str, Any]) -> float:
         profile = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
@@ -607,7 +774,7 @@ class HarnessRuntime:
                        ("index_id", "document_id", "connection_id", "repository_id")
                        if isinstance(args, dict) and key in args}
         run["research_trace"] = [*run.get("research_trace", []), {
-            "name": name, "args": identifiers, "result": result[:1000],
+            "name": name, "args": identifiers, "result": result[:1000], "timestamp": timestamp(),
         }][-50:]
 
     def _now(self, run: dict[str, Any]) -> float:
@@ -643,25 +810,45 @@ class HarnessRuntime:
             if waiting and not was_waiting:
                 clock.previous_phase = run["phase"]
                 run["phase"] = "authentication_required"
-                self.store.save(clock.owner_id, run)
+                self.store.save_checkpoint(clock.owner_id, run)
             elif was_waiting and not waiting:
                 if run["phase"] == "authentication_required":
                     run["phase"] = clock.previous_phase
-                    self.store.save(clock.owner_id, run)
+                    self.store.save_checkpoint(clock.owner_id, run)
             if clock.authentication_elapsed(time.monotonic()) >= clock.limit:
                 raise _AuthenticationTimeout
 
     async def _cleanup(self, operation: asyncio.Task[Any], run: dict[str, Any]) -> None:
+        timeout = self.settings.cleanup_timeout_seconds
+        cancelled = False
         try:
-            await asyncio.wait_for(asyncio.shield(operation), self.settings.cleanup_timeout_seconds)
-        except TimeoutError:
-            operation.cancel()
-            await asyncio.gather(operation, return_exceptions=True)
-            run["warnings"].append("Провайдер не подтвердил очистку за отведённое время.")
+            done, _ = await asyncio.wait({operation}, timeout=timeout)
+            if not done:
+                operation.cancel()
+                done, _ = await asyncio.wait({operation}, timeout=timeout)
+                self._warn(run, "Провайдер не подтвердил очистку за отведённое время.")
+            if done:
+                if not operation.cancelled():
+                    operation.exception()  # Observe failures even when cleanup is best effort.
+                return
         except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
+            operation.cancel()
+            cancelled = True
+        # A provider can ignore Task.cancel(). Never wait indefinitely for it or
+        # let its eventual exception escape unobserved. Terminal persistence also
+        # rejects late active checkpoints from this execution generation.
+        self._detached_tasks.add(operation)
+
+        def finished(task: asyncio.Task[Any]) -> None:
+            self._detached_tasks.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        operation.add_done_callback(finished)
+        if cancelled:
+            # Otherwise a worker cancelled by stop() can finish this run and
+            # return to queue.get(), leaving shutdown waiting forever.
+            raise asyncio.CancelledError
 
     async def _research(
         self, principal: Principal, run: dict[str, Any], event: Event, deadline: float
@@ -822,7 +1009,7 @@ class HarnessRuntime:
         )
         if not first_evidence and now - self._last_checkpoints.get(run["id"], 0) < minimum_interval:
             return
-        self.store.save(principal.owner_id, run)
+        self.store.save_checkpoint(principal.owner_id, run)
         self._last_checkpoints[run["id"]] = now
         self._checkpoint_evidence_counts[run["id"]] = len(run["evidence"])
 
@@ -945,6 +1132,9 @@ class HarnessRuntime:
             "history_question_not_evidence": None,
             "history_answer_not_evidence": None,
             "shared_memory_not_evidence": [],
+            "conversation_not_evidence": [],
+            "research_plan": {},
+            "research_plan_truncated": False,
             "remaining_followup_calls": max(0, profile.source_calls - self._followup_calls(run)),
         }
         messages = [
@@ -972,6 +1162,24 @@ class HarnessRuntime:
         if len(selected_tools) < len(tools):
             self._warn(run, "Часть описаний инструментов не помещается в контекст модели.")
         tools = selected_tools
+        # Plans are model output too: escaped strings can exceed the entire
+        # request budget. Fit each public field before reserving room for evidence.
+        raw_plan = run.get("research_plan", {})
+        for key in ("goal", "round", "ready_to_answer", "next_action", "gaps",
+                    "completed", "questions", "completion_reason", "model_updated"):
+            if key not in raw_plan:
+                continue
+            value = raw_plan[key]
+            bounded = (
+                [str(item)[:200] for item in value[:8]] if isinstance(value, list)
+                else value[:500] if isinstance(value, str) else value
+            )
+            candidate = {**context, "research_plan": {**context["research_plan"], key: bounded}}
+            if (len(json.dumps(candidate["research_plan"], ensure_ascii=False)) <= maximum // 8
+                    and fits(candidate)):
+                context = candidate
+            else:
+                context["research_plan_truncated"] = True
         # Keep source routing before evidence; the model must be able to target
         # sources with no initial hits, not only sources already present in context.
         for index in run["index_ids"]:
@@ -985,10 +1193,18 @@ class HarnessRuntime:
                          "history_answer_not_evidence": parent["answer"]}
             if fits(candidate):
                 context = candidate
+            for turn in reversed(parent.get("history", [])):
+                candidate = {**context, "conversation_not_evidence": [
+                    turn, *context["conversation_not_evidence"],
+                ]}
+                if (len(json.dumps(candidate["conversation_not_evidence"], ensure_ascii=False))
+                        <= maximum // 4 and fits(candidate)):
+                    context = candidate
         included_memories = []
         for item in memories:
             note = {key: item.get(key) for key in
-                    ("id", "title", "text", "kind", "status", "origin", "feedback", "outcome")}
+                    ("id", "title", "text", "kind", "status", "origin", "feedback", "outcome",
+                     "quality", "learning_state", "strategy", "research_plan")}
             candidate = {**context, "shared_memory_not_evidence": [
                 *context["shared_memory_not_evidence"], note,
             ]}
@@ -1042,6 +1258,11 @@ class HarnessRuntime:
                 bool(item.get("context_truncated")) for item in context["evidence"]
             ),
             "tools_available": len(tools),
+            "conversation_turns": len(context["conversation_not_evidence"]),
+            "conversation_truncated": parent is not None and (
+                bool(parent.get("history_truncated"))
+                or len(context["conversation_not_evidence"]) < len(parent.get("history", []))
+            ),
         }
         messages.append({"role": "user", "content": json.dumps(context, ensure_ascii=False)})
         used = {item["id"]: item for item in run.get("memory_used", [])}
@@ -1088,6 +1309,11 @@ class HarnessRuntime:
             raise ModelDecisionError("Модель вернула некорректный формат решения.") from None
         if not isinstance(result, dict) or not isinstance(result.get("tool_calls", []), list):
             raise ModelDecisionError("Модель вернула некорректный формат решения.")
+        if (not result.get("tool_calls") and
+                (not isinstance(result.get("content"), str) or not result["content"].strip())):
+            raise ModelDecisionError("Модель вернула пустой ответ.")
+        if result.get("tool_calls") and result.get("finish_reason") in {"length", "max_tokens"}:
+            raise ModelDecisionError("Модель не завершила описание действия.")
         self.memory.record_usage(
             principal.owner_id, [item["id"] for item in included_memories], run["id"]
         )
@@ -1096,22 +1322,50 @@ class HarnessRuntime:
     async def _synthesize(self, principal: Principal, run: dict[str, Any], event: Event) -> None:
         run["phase"] = "synthesizing"
         self._checkpoint(principal, run, event)
-        decision = await self._decide(principal, run, event, [])
-        if decision.get("tool_calls"):
-            self._warn(
-                run, "Модель запросила инструменты на этапе итогового ответа; вызов отклонён."
-            )
-            run["status"] = "partial"
-            return
-        if not self._answer(run, decision):
-            run["status"] = "partial"
-            self._warn(run, "Модель не вернула итоговый ответ.")
+        # One bounded formatting repair, still under the outer run deadline. No
+        # tool action is replayed and quick mode pays for it only after a failure.
+        for attempt in range(2):
+            if event.is_set():
+                return
+            try:
+                decision = await self._decide(principal, run, event, [])
+                if decision.get("tool_calls"):
+                    raise ModelDecisionError("Итоговый ответ не может запускать инструменты.")
+                incomplete = decision.get("finish_reason") in {"length", "max_tokens"}
+                if (not incomplete or attempt == 1) and self._answer(run, decision):
+                    return
+            except ModelDecisionError:
+                run["metrics"]["decision_errors"] = run["metrics"].get("decision_errors", 0) + 1
+            if attempt == 0:
+                run["metrics"]["answer_retries"] = run["metrics"].get("answer_retries", 0) + 1
+                self._trace(run, "answer_recovery", {},
+                            "Предыдущий ответ не завершён или имеет неверный формат. "
+                            "Верните законченный ответ в content без инструментов. "
+                            "Будьте краткими и явно перечислите оставшиеся ограничения.")
+                self._checkpoint(principal, run, event)
+        run["status"] = "partial"
+        self._warn(run, "Модель не сформировала законченный ответ после повторной попытки.")
 
     def _answer(self, run: dict[str, Any], decision: dict[str, Any]) -> bool:
         content = decision.get("content")
         if not isinstance(content, str) or not content.strip():
             return False
-        run["answer"] = content.strip()[: self.settings.answer_chars]
+        content = content.strip()
+        run["answer"] = content[: self.settings.answer_chars]
+        if len(content) > self.settings.answer_chars:
+            self._warn(run, "Ответ превышает настроенный размер и показан не полностью.")
+            marker = "\n\n[Ответ сокращён по ограничению размера.]"
+            run["answer"] = content[: self.settings.answer_chars - len(marker)] + marker
+        if decision.get("finish_reason") in {"length", "max_tokens", "content_filter"}:
+            self._warn(run, "Модель остановила генерацию до завершения ответа.")
+        plan = run.get("research_plan", {})
+        if plan.get("model_updated") and plan.get("gaps"):
+            self._warn(run, "План исследования содержит непроверенные вопросы.")
+        if plan:
+            plan["completion_reason"] = (
+                "Ответ подготовлен, ограничения перечислены." if run["warnings"]
+                else "Ответ подготовлен по собранным подтверждениям."
+            )
         if not any(item.get("kind", "source") == "source" for item in run["evidence"]):
             self._warn(run, "Ответ не подтверждён источниками; состояние системы не проверено.")
         run["status"] = "partial" if run["warnings"] else "completed"

@@ -26,6 +26,23 @@ class Runner:
         return {"content": "Runner answer", "tool_calls": []}
 
 
+@pytest.mark.parametrize("finish_reason", ["length", "max_tokens", "content_filter"])
+async def test_api_preserves_incomplete_generation_marker(
+    tmp_path: Path, finish_reason: str,
+) -> None:
+    router = ModelRouter(tmp_path, None)
+    router.store.save(ModelConnection(
+        provider="openai", base_url="https://models.test/v1", model="model",
+    ))
+    router.transport = httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "choices": [{"message": {"content": "Unfinished answer"},
+                     "finish_reason": finish_reason}],
+    }))
+    result = await router.decide(messages=[], tools=[], cancel=Event(), max_input_chars=10000)
+    assert result["finish_reason"] == finish_reason
+    assert result["content"] == "Unfinished answer"
+
+
 async def test_default_runner_and_persisted_direct_model_switch(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

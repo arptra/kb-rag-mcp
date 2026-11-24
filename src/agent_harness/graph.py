@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import json
 from dataclasses import dataclass
 from threading import Event
 from typing import TYPE_CHECKING, Any, TypedDict, cast
@@ -16,6 +17,7 @@ from langgraph.runtime import Runtime
 
 from agent_harness.contracts import ModelDecisionError, Principal
 from agent_harness.policy import BUDGETS, QUICK_BUDGETS, TOOLS, validate_call
+from agent_harness.research import PLAN_TOOL, evidence_signature, initialize_plan, update_plan
 
 if TYPE_CHECKING:
     from agent_harness.runtime import HarnessRuntime
@@ -45,21 +47,25 @@ class HarnessGraph:
         self.checkpointer = checkpointer
         builder = StateGraph(GraphState, context_schema=ExecutionContext)
         builder.add_node("prepare", self.prepare)
+        builder.add_node("plan", self.plan)
         builder.add_node("collect", self.collect)
         builder.add_node("inspect", self.inspect)
         builder.add_node("decide", self.decide)
         builder.add_node("tools", self.tools)
+        builder.add_node("reflect", self.reflect)
         builder.add_node("synthesize", self.synthesize)
         builder.add_edge(START, "prepare")
-        for name in ("prepare", "collect", "inspect", "decide", "tools"):
+        for name in ("prepare", "plan", "collect", "inspect", "decide", "tools", "reflect"):
             builder.add_conditional_edges(
                 name,
                 self.route,
                 {
+                    "plan": "plan",
                     "collect": "collect",
                     "inspect": "inspect",
                     "decide": "decide",
                     "tools": "tools",
+                    "reflect": "reflect",
                     "synthesize": "synthesize",
                     "done": END,
                 },
@@ -175,12 +181,20 @@ class HarnessGraph:
             run["status"] = "partial"
             self.engine._warn(run, "Нет доступных источников; состояние системы не проверено.")
             return self._result(context, "done")
-        return self._result(context, "collect", calls=[], exchange=[])
+        return self._result(context, "plan", calls=[], exchange=[])
+
+    async def plan(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
+        context = self._context(state, runtime)
+        initialize_plan(context.run)
+        context.run["phase"] = "planning"
+        return self._result(context, "collect")
 
     async def collect(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
         context = self._context(state, runtime)
         run, principal, event = context.run, context.principal, context.cancel
         engine = self.engine
+        run["phase"] = "searching"
+        engine._checkpoint(principal, run, event)
         budget = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
         engine._semaphores[run["id"]] = asyncio.Semaphore(budget.parallelism)
         available = {item["id"] for item in await engine._indexes(principal)}
@@ -258,6 +272,7 @@ class HarnessGraph:
         context = self._context(state, runtime)
         engine, run = self.engine, context.run
         run["phase"] = "reading"
+        engine._checkpoint(context.principal, run, context.cancel)
         budget = BUDGETS[run["effort"]]
         candidates = engine._ranked_evidence(run)
         count = 0
@@ -295,7 +310,8 @@ class HarnessGraph:
             return self._result(context, "synthesize")
         run["phase"] = "investigating"
         engine.store.save(context.principal.owner_id, run)
-        catalog = [*(TOOLS if state.get("knowledge_ids") else []), *state.get("external", [])]
+        catalog = [PLAN_TOOL, *(TOOLS if state.get("knowledge_ids") else []),
+                   *state.get("external", [])]
         try:
             decision = await engine._decide(
                 context.principal,
@@ -322,7 +338,21 @@ class HarnessGraph:
             return self._result(context, "synthesize")
         calls = decision.get("tool_calls", [])
         if not calls:
+            if decision.get("finish_reason") in {"length", "max_tokens"}:
+                engine._trace(run, "answer_recovery", {},
+                              "Предыдущий ответ был обрезан. Подготовьте краткий законченный итог.")
+                return self._result(context, "synthesize")
+            plan = run.get("research_plan", {})
+            if (plan.get("model_updated") and plan.get("gaps")
+                    and not plan.get("ready_to_answer")
+                    and not run.get("_gap_review_requested")):
+                run["_gap_review_requested"] = True
+                engine._trace(run, "goal_check", {},
+                              "Остались проверки. Уточните поиск или явно укажите "
+                              "недоступные проверки перед итоговым ответом.")
+                return self._result(context, "decide")
             return self._result(context, "done" if engine._answer(run, decision) else "synthesize")
+        run["_round_evidence"] = evidence_signature(run)
         return self._result(
             context,
             "tools",
@@ -343,20 +373,38 @@ class HarnessGraph:
             or run["metrics"]["tool_calls"] >= budget.tool_calls
             or engine._followup_calls(run) >= budget.source_calls
         ):
-            return self._result(context, "decide", calls=[])
+            return self._result(context, "reflect", calls=[])
         call = calls.pop(0)
         run["metrics"]["tool_calls"] += 1
         if not isinstance(call, dict):
             engine._warn(run, "Некорректный формат вызова инструмента отклонён.")
             return self._result(context, "tools" if calls else "decide", calls=calls)
         name, args = str(call.get("name", "")), call.get("args", {})
+        phases = {"search_knowledge": "refining", "read_document": "reading",
+                  "read_repository": "reading_code", "search_repository": "reading_code",
+                  "clone_repository": "reading_code", "run_in_sandbox": "running_code",
+                  "update_research_plan": "planning"}
+        run["phase"] = phases.get(name, "checking")
+        run["current_action"] = {"name": name}
+        engine._checkpoint(principal, run, event)
         try:
-            if name in {item["function"]["name"] for item in state.get("external", [])}:
+            signature = hashlib.sha256(json.dumps(
+                [name, args, evidence_signature(run)], sort_keys=True, ensure_ascii=False,
+            ).encode()).hexdigest()
+            seen = run.setdefault("_seen_tool_calls", [])
+            if name != "update_research_plan" and signature in seen:
+                result = "Повтор без новых данных пропущен. Измените запрос или источник."
+            elif name == "update_research_plan":
+                update_plan(run, args)
+                result = "План исследования обновлён. Проверки требуют подтверждений источниками."
+            elif name in {item["function"]["name"] for item in state.get("external", [])}:
+                seen.append(signature)
                 result = await engine._external_tool(
                     principal, run, event, name, args, self._reserve_deadline(context)
                 )
             else:
                 validated = validate_call(name, args, set(state.get("knowledge_ids", [])))
+                seen.append(signature)
                 result = (
                     await engine._search(
                         principal,
@@ -378,16 +426,40 @@ class HarnessGraph:
                 principal.owner_id, run, operation="invalid", index_ids=run["index_ids"]
             )
         engine._trace(run, name, args, result)
+        run["current_action"] = None
         return self._result(
             context,
-            "tools" if calls else "decide",
+            "tools" if calls else "reflect",
             calls=calls,
             exchange=[*state.get("exchange", []), {"name": name, "result": result}][-50:],
         )
 
+    async def reflect(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
+        context = self._context(state, runtime)
+        run = context.run
+        initialize_plan(run)
+        run["phase"] = "checking"
+        plan = run["research_plan"]
+        plan["round"] += 1
+        changed = evidence_signature(run) != run.get("_round_evidence")
+        run["_stalled_rounds"] = 0 if changed else run.get("_stalled_rounds", 0) + 1
+        self.engine._trace(
+            run, "research_round", {},
+            "Получены новые материалы; проверяем оставшиеся вопросы."
+            if changed else "Новых материалов нет; нужен другой запрос или источник.",
+        )
+        if run["_stalled_rounds"] >= 3:
+            plan["completion_reason"] = "Поиск не даёт новых данных."
+            self.engine._warn(run, "Повторные действия не дали новых данных; поиск ограничен.")
+            return self._result(context, "synthesize", calls=[])
+        return self._result(context, "decide", calls=[])
+
     async def synthesize(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
         context = self._context(state, runtime)
         run = context.run
+        initialize_plan(run)
+        if not run["research_plan"].get("completion_reason"):
+            run["research_plan"]["completion_reason"] = "Готовим итог по доступным подтверждениям."
         budget = (QUICK_BUDGETS if run["mode"] == "quick" else BUDGETS)[run["effort"]]
         if not context.cancel.is_set() and run["metrics"]["model_calls"] < budget.model_calls:
             await self.engine._synthesize(context.principal, run, context.cancel)

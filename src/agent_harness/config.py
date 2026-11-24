@@ -26,7 +26,7 @@ class HarnessSettings(BaseSettings):
     results_per_index: int = Field(default=5, ge=1, le=10)
     evidence_chars: int = Field(default=4000, ge=100, le=10_000)
     max_evidence: int = Field(default=1000, ge=1, le=5000)
-    answer_chars: int = Field(default=12_000, ge=1000, le=50_000)
+    answer_chars: int = Field(default=50_000, ge=1000, le=200_000)
     retention_days: int = Field(default=30, ge=1, le=3650)
     max_runs_per_owner: int = Field(default=100, ge=1, le=10_000)
     max_total_runs: int = Field(default=10_000, ge=1, le=1_000_000)
