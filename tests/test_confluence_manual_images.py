@@ -1,7 +1,8 @@
-"""Manual image jobs reuse the durable queue without changing automatic sync policy."""
+"""Only explicit image jobs may invoke GigaCode; ordinary sync preserves cached evidence."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections import Counter
@@ -15,7 +16,7 @@ from test_confluence import FakeClient, config, registry
 from corporate_kb.access.http import AccessControl
 from corporate_kb.confluence.http import register_confluence_routes
 from corporate_kb.confluence.images import ImageExtraction
-from corporate_kb.confluence.models import SyncCancelled
+from corporate_kb.confluence.models import SourceConfig, SyncCancelled
 from corporate_kb.confluence.registry import ConfluenceRegistry
 
 AUTH_URL = "https://auth.example.test/login?state=private-image-login-state"
@@ -84,6 +85,97 @@ def imported_source(tmp_path, *, extractor=None, client=None):
 
 def current_text(instance, source_id, page_id="1"):
     return instance._current_path("target", source_id, page_id).read_text()
+
+
+@pytest.mark.parametrize("legacy_enabled", [False, True])
+def test_ordinary_sync_never_starts_image_runner_even_for_legacy_saved_settings(
+    tmp_path, legacy_enabled
+):
+    extractor = Extractor()
+    instance, client, _, _, _ = registry(tmp_path, image_extractor=extractor)
+    source = instance.upsert_source(config(analyze_images=legacy_enabled).model_dump(), TOKEN)
+    # Simulate the configuration on disk from an installation predating manual-only mode.
+    with instance._db() as db:
+        raw = json.loads(
+            db.execute("SELECT config_json FROM sources WHERE id=?", (source["id"],)).fetchone()[0]
+        )
+        raw["analyze_images"] = legacy_enabled
+        db.execute("UPDATE sources SET config_json=? WHERE id=?", (json.dumps(raw), source["id"]))
+
+    imported = instance.run_job(instance.queue_sync(source["id"])["id"])
+
+    assert imported["status"] == "completed"
+    assert imported["result"]["changed"] == 2
+    assert extractor.calls == []
+    assert instance.get_source(source["id"])["analyze_images"] is False
+    assert not imported["progress"].get("authentication_required")
+    assert EVIDENCE not in current_text(instance, source["id"])
+    assert not any(
+        "Analyzing image" in item["message"] for item in instance.job_log(imported["id"])["items"]
+    )
+
+    manual = instance.run_job(instance.queue_image_analysis(source["id"])["id"])
+    assert manual["status"] == "completed"
+    assert len(extractor.calls) == 2
+    client.version = 2
+    extractor.identity = "different-model-after-restart"
+    refreshed = instance.run_job(instance.queue_sync(source["id"])["id"])
+    assert refreshed["status"] == "completed"
+    assert len(extractor.calls) == 2
+    assert EVIDENCE in current_text(instance, source["id"])
+    assert "revision 2" in current_text(instance, source["id"])
+
+
+@pytest.mark.parametrize("legacy_enabled", [False, True])
+def test_upgrade_accepts_legacy_image_fingerprint_without_refetch_or_reindex(
+    tmp_path, legacy_enabled
+):
+    instance, client, extractor, source, published, _ = imported_source(tmp_path)
+    with instance._db() as db:
+        raw = json.loads(
+            db.execute("SELECT config_json FROM sources WHERE id=?", (source["id"],)).fetchone()[0]
+        )
+        raw["analyze_images"] = legacy_enabled
+        db.execute("UPDATE sources SET config_json=? WHERE id=?", (json.dumps(raw), source["id"]))
+        for page_id in ("1", "2"):
+            page = client.page(page_id, body=False)
+            legacy_fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "version": page.version,
+                        "title": page.title,
+                        "parent_id": page.parent_id,
+                        "updated_at": page.updated_at,
+                        "assets": sorted((a.id, a.version) for a in client.attachments(page_id)),
+                        "images": legacy_enabled,
+                        "extractor": extractor.identity,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()
+            db.execute(
+                "UPDATE pages SET fingerprint=? WHERE source_id=? AND page_id=?",
+                (legacy_fingerprint, source["id"], page_id),
+            )
+    client.page_calls.clear()
+    published.clear()
+
+    unchanged = instance.run_job(instance.queue_sync(source["id"])["id"])
+
+    assert unchanged["status"] == "completed"
+    assert unchanged["result"]["changed"] == 0
+    assert unchanged["result"]["unchanged"] == 2
+    assert all(not body for _, body, _ in client.page_calls)
+    assert published == []
+    assert extractor.calls == []
+
+
+def test_legacy_automatic_recognition_field_is_accepted_but_never_enabled():
+    values = config().model_dump()
+    del values["analyze_images"]
+    assert SourceConfig.model_validate(values).analyze_images is False
+    assert SourceConfig.model_validate({**values, "analyze_images": True}).analyze_images is False
 
 
 def test_manual_images_publish_to_bound_index_without_changing_source_or_discovering_tree(tmp_path):

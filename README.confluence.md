@@ -108,11 +108,23 @@ must be running for scheduled work. A missed check is queued once after startup.
 
 Manual and scheduled requests share a durable queue. Duplicate active requests for the
 same source and operation resolve to the same job; different operations run separately.
-Only one scheduler owns a state directory. Interrupted
-jobs resume after restart, reusing saved current pages, attachments and indexing
-checkpoints. Canceling a job retains completed checkpoints. The scheduler and embedding
-worker propagate cancellation while waiting for an index lock, downloading, extracting
-images and indexing.
+Only one scheduler owns a state directory. Interrupted jobs resume after restart,
+reusing saved current pages, attachments and indexing checkpoints.
+
+**Отменить** is available on the active source card and in the operation journal.
+A queued job becomes `cancelled` immediately. A running job first becomes `cancelling`
+while its worker stops the current request or operation; the source becomes available
+for a new start once that worker has released it. Completed checkpoints are retained.
+The cancellation request is stored durably, so another backend worker can deliver it
+and a server restart does not resume a job the user explicitly cancelled. Cancelling
+an overdue scheduled synchronization advances its next scheduled check to prevent an
+immediate automatic restart; a subsequent manual start remains available.
+
+Each source response includes its authoritative `active_job`, independently of the
+recent-jobs history limit. The dashboard uses that job for source controls, so older
+active jobs remain cancellable even when the journal is filtered or contains many
+newer operations. The scheduler and embedding worker propagate cancellation while
+waiting for an index lock, downloading, extracting images and indexing.
 
 Failures loading an individual page or discovering its children do not stop the rest
 of the synchronization. Failed items enter a durable retry queue. After each initial
@@ -172,8 +184,14 @@ always normalized to `false`, including when reading older saved connections.
 Existing page archive files are not deleted during an upgrade; they are not used for
 search or agent responses. MCP and A2A retrieve current documents only.
 
-Image analysis uses the configured GigaCode runner, with one downloaded image in an
-isolated workspace, read-only tools, cancellation and a locally validated JSON result.
+Image recognition runs only after an administrator clicks **Распознать изображения**.
+Ordinary manual and scheduled synchronization downloads pages and archives attachments,
+but never starts GigaCode or asks for its browser login. The legacy `analyze_images`
+configuration field remains accepted for compatibility and is always normalized to
+`false`, including older saved connections that had automatic recognition enabled.
+
+Explicit image analysis uses the configured GigaCode runner, with one downloaded image
+in an isolated workspace, read-only tools, cancellation and a locally validated JSON result.
 It extracts visible text, descriptions, tables, diagram nodes and edges, and uncertainty.
 No Confluence credential enters the prompt. Image bytes plus extractor/model identity
 key the cache; source/version provenance is added by the server. Inline SVG diagrams are
@@ -188,9 +206,9 @@ run **Синхронизировать** first to import newly added pages. Reco
 published to the source's existing index. Successful cached results are reused, and
 an unchanged repeat does not rerun GigaCode or rebuild the index.
 
-Manual recognition does not enable automatic recognition or change the source's
-schedule. Saved successful image descriptions remain available during later ordinary
-syncs, including when automatic recognition is disabled. The cache can reuse identical
+The recognition button starts one operation; it is not an automatic-recognition switch
+and does not change the source's schedule. Saved successful image descriptions remain
+available during later ordinary syncs without invoking GigaCode again. The cache can reuse identical
 image bytes across attachment versions, including an unchanged inline SVG on an edited
 page; changed image bytes do not inherit the previous description. Source cards separate primary
 actions from settings, scheduling and cleanup actions; readers can view pages and

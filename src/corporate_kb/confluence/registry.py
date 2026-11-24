@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS jobs (
  id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES sources(id), index_id TEXT NOT NULL,
  status TEXT NOT NULL, phase TEXT NOT NULL DEFAULT 'queued', message TEXT NOT NULL,
  created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT, error TEXT,
+ cancel_requested INTEGER NOT NULL DEFAULT 0,
  progress_json TEXT NOT NULL DEFAULT '{}', result_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_source_job ON jobs(source_id)
@@ -158,6 +159,34 @@ class SourceBusyError(RuntimeError):
     """Different source operations cannot modify the same documents concurrently."""
 
 
+class _JobCancellation(threading.Event):
+    """Cooperative cancellation shared by HTTP workers through the job database."""
+
+    def __init__(self, requested: Callable[[], bool]) -> None:
+        super().__init__()
+        self._requested = requested
+        self._next_check = 0.0
+
+    def is_set(self) -> bool:
+        if super().is_set():
+            return True
+        now = monotonic()
+        if now >= self._next_check:
+            self._next_check = now + 0.1
+            if self._requested():
+                self.set()
+        return super().is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else monotonic() + timeout
+        while not self.is_set():
+            remaining = None if deadline is None else deadline - monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            super().wait(0.1 if remaining is None else min(0.1, remaining))
+        return True
+
+
 class ConfluenceRegistry:
     """Source configuration never exposes credentials; scheduler never starts in __init__."""
 
@@ -211,6 +240,13 @@ class ConfluenceRegistry:
         with self._db() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
+            connection.execute("BEGIN IMMEDIATE")
+            if "cancel_requested" not in {
+                row["name"] for row in connection.execute("PRAGMA table_info(jobs)")
+            }:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0"
+                )
         self.database_path.chmod(0o600)
 
     @contextmanager
@@ -237,6 +273,7 @@ class ConfluenceRegistry:
     def _source_payload(self, connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         payload: dict[str, Any] = json.loads(row["config_json"])
         payload["include_history"] = False
+        payload["analyze_images"] = False
         payload.update(
             {
                 key: row[key]
@@ -254,12 +291,15 @@ class ConfluenceRegistry:
         payload["paused"] = bool(row["paused"])
         payload["credential_configured"] = bool(row["credential"])
         active = connection.execute(
-            "SELECT status FROM jobs WHERE source_id=? AND status IN ('queued','running')",
+            "SELECT * FROM jobs WHERE source_id=? "
+            "AND status IN ('queued','running')",
             (row["id"],),
         ).fetchone()
+        payload["active_job"] = self._job_payload(active) if active else None
         payload["status"] = (
             "paused"
             if row["paused"] or not payload["enabled"]
+            else "cancelling" if active and active["cancel_requested"]
             else active["status"]
             if active
             else "error"
@@ -547,18 +587,27 @@ class ConfluenceRegistry:
     def queue_image_analysis(self, source_id: str) -> dict[str, Any]:
         return self._queue_operation(source_id, "analyze_images")
 
-    def _queue_operation(self, source_id: str, operation: str) -> dict[str, Any]:
+    def _queue_operation(
+        self, source_id: str, operation: str, *, scheduled: bool = False
+    ) -> dict[str, Any]:
         with self._db() as connection:
             connection.execute("BEGIN IMMEDIATE")
             source = self._source_row(connection, source_id)
+            if scheduled and (
+                source["paused"]
+                or not json.loads(source["config_json"]).get("enabled", True)
+                or not source["next_check_at"]
+                or source["next_check_at"] > _now()
+            ):
+                raise SourceBusyError("The source is no longer due for synchronization")
             existing = connection.execute(
-                "SELECT id,progress_json FROM jobs WHERE source_id=? "
+                "SELECT id,progress_json,cancel_requested FROM jobs WHERE source_id=? "
                 "AND status IN ('queued','running')",
                 (source_id,),
             ).fetchone()
             if existing:
                 active_operation = json.loads(existing["progress_json"]).get("operation", "sync")
-                if active_operation != operation:
+                if existing["cancel_requested"] or active_operation != operation:
                     raise SourceBusyError(
                         "Дождитесь завершения текущей операции Confluence или отмените её "
                         "перед запуском другой операции."
@@ -617,6 +666,11 @@ class ConfluenceRegistry:
         result["progress"] = json.loads(result.pop("progress_json"))
         result["operation"] = result["progress"].get("operation", "sync")
         result["result"] = json.loads(result.pop("result_json"))
+        if result.pop("cancel_requested", False) and result["status"] == "running":
+            result.update(
+                status="cancelling", phase="cancelling",
+                message="Отмена запрошена; ожидается завершение текущего запроса",
+            )
         if result["status"] != "running" and "authentication_required" in result["progress"]:
             result["progress"].update(
                 authentication_required=False,
@@ -921,19 +975,79 @@ class ConfluenceRegistry:
 
     def cancel_job(self, job_id: str) -> dict[str, Any]:
         logger.info("Confluence cancellation requested: job=%s", job_id)
-        with self._state_lock:
-            self._cancel.setdefault(job_id, threading.Event()).set()
-        self._authentication_finished(job_id)
         with self._db() as connection:
-            connection.execute(
-                (
-                    "UPDATE jobs SET "
-                    "status='cancelled',completed_at=?,message='Cancelled; saved "
-                    "checkpoints retained' WHERE id=? AND status='queued'"
-                ),
-                (_now(), job_id),
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if job is None:
+                raise KeyError("Unknown synchronization job")
+            if job["status"] not in {"running", "queued"} or job["cancel_requested"]:
+                return self._job_payload(job)
+            source = self._source_row(connection, job["source_id"])
+            config = SourceConfig.model_validate_json(source["config_json"])
+            progress = json.loads(job["progress_json"])
+            progress.update(
+                authentication_required=False,
+                authentication_url=None,
+                authentication_requested_at=None,
             )
+            now = _now()
+            queued = job["status"] == "queued"
+            message = (
+                "Cancelled; saved checkpoints retained" if queued
+                else "Cancellation requested; waiting for the current request to finish"
+            )
+            connection.execute(
+                "UPDATE jobs SET cancel_requested=1,status=?,phase=?,completed_at=?,"
+                "message=?,progress_json=? WHERE id=?",
+                (
+                    "cancelled" if queued else "running", "cancelled" if queued else "cancelling",
+                    now if queued else None, message, _json(progress), job_id,
+                ),
+            )
+            # Do not immediately re-queue an overdue scheduled synchronization
+            # after an explicit cancellation. Manual start remains available.
+            if progress.get("operation", "sync") == "sync":
+                connection.execute(
+                    "UPDATE sources SET next_check_at=? WHERE id=?",
+                    (
+                        config.schedule.next_at()
+                        if config.enabled and not source["paused"] else None,
+                        source["id"],
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO events(job_id,timestamp,stage,level,message) VALUES(?,?,?,?,?)",
+                (job_id, now, "cancelled" if queued else "cancelling", "info", message),
+            )
+        with self._state_lock:
+            signal = self._cancel.get(job_id)
+            if signal is not None:
+                signal.set()
+        self._wake.set()
         return self.job_status(job_id)
+
+    def _cancellation_requested(self, job_id: str) -> bool:
+        with self._db() as connection:
+            row = connection.execute(
+                "SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            return bool(row and row["cancel_requested"])
+
+    def _finish_cancelled(self, connection: sqlite3.Connection, job_id: str) -> None:
+        requested = connection.execute(
+            "SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()[0]
+        # Shutdown is resumable; a deliberate user cancellation is terminal.
+        status = "queued" if self._stop.is_set() and not requested else "cancelled"
+        connection.execute(
+            "UPDATE jobs SET status=?,phase=?,completed_at=?,message=? WHERE id=?",
+            (
+                status, status, None if status == "queued" else _now(),
+                "Paused for server shutdown; saved checkpoints retained"
+                if status == "queued" else "Cancelled; saved checkpoints retained",
+                job_id,
+            ),
+        )
 
     def source_pages(self, source_id: str) -> list[dict[str, Any]]:
         with self._db() as connection:
@@ -1021,6 +1135,12 @@ class ConfluenceRegistry:
                             (_json(progress), job["id"]),
                         )
                 connection.execute(
+                    "UPDATE jobs SET status='cancelled',phase='cancelled',completed_at=?,"
+                    "message='Cancelled; saved checkpoints retained' "
+                    "WHERE status IN ('running','queued') AND cancel_requested=1",
+                    (_now(),),
+                )
+                connection.execute(
                     "UPDATE jobs SET status='queued',phase='queued',message='Resuming after server "
                     "restart' WHERE status='running'"
                 )
@@ -1060,7 +1180,7 @@ class ConfluenceRegistry:
                         # A manual image operation must still get dispatched;
                         # the scheduled tree scan remains due for the next loop.
                         with suppress(SourceBusyError):
-                            self.queue_sync(source["id"])
+                            self._queue_operation(source["id"], "sync", scheduled=True)
                 with self._db() as connection:
                     job = connection.execute(
                         "SELECT id FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1"
@@ -1096,7 +1216,11 @@ class ConfluenceRegistry:
                 (_now(), job_id),
             )
         with self._state_lock:
-            cancel = self._cancel.setdefault(job_id, threading.Event())
+            cancel = self._cancel.setdefault(
+                job_id, _JobCancellation(lambda: self._cancellation_requested(job_id))
+            )
+            if self._stop.is_set():
+                cancel.set()
         token = ""
         client = None
         try:
@@ -1122,6 +1246,7 @@ class ConfluenceRegistry:
                 result = self._synchronize(
                     job_id, source["id"], config, client, cancel, images_only=images_only
                 )
+            self._check_cancel(cancel)
             now = _now()
             operation_label = "Image recognition" if images_only else "Synchronization"
             message = (
@@ -1132,6 +1257,14 @@ class ConfluenceRegistry:
                 else "No images require recognition" if images_only else "No changes"
             )
             with self._db() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                # Cancellation may arrive after the last cooperative check.
+                # Serialize it with completion so an accepted cancellation
+                # cannot be silently replaced by a successful result.
+                if connection.execute(
+                    "SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)
+                ).fetchone()[0]:
+                    raise SyncCancelled("Synchronization cancelled")
                 if not images_only:
                     connection.execute(
                         (
@@ -1170,35 +1303,18 @@ class ConfluenceRegistry:
                 job_id, "cancelled", "Saved checkpoints retained for the next synchronization"
             )
             with self._db() as connection:
-                # Shutdown is resumable; a deliberate user cancellation is terminal.
-                status = "queued" if self._stop.is_set() else "cancelled"
-                connection.execute(
-                    "UPDATE jobs SET status=?,completed_at=? WHERE id=?",
-                    (status, None if status == "queued" else _now(), job_id),
-                )
+                connection.execute("BEGIN IMMEDIATE")
+                self._finish_cancelled(connection, job_id)
         except Exception as exc:
-            if cancel.is_set():
-                with self._db() as connection:
-                    status = "queued" if self._stop.is_set() else "cancelled"
-                    connection.execute(
-                        "UPDATE jobs SET status=?,completed_at=?,message=? WHERE id=?",
-                        (
-                            status,
-                            None if status == "queued" else _now(),
-                            "Cancelled; saved checkpoints retained",
-                            job_id,
-                        ),
-                    )
-                return self.job_status(job_id)
             message = self._error_summary(exc)
-            self._log(
-                job_id,
-                "failed",
-                message,
-                level="error",
-            )
             with self._db() as connection:
-                if not images_only:
+                connection.execute("BEGIN IMMEDIATE")
+                cancelled = bool(connection.execute(
+                    "SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)
+                ).fetchone()[0]) or cancel.is_set() or self._stop.is_set()
+                if cancelled:
+                    self._finish_cancelled(connection, job_id)
+                elif not images_only:
                     failures = int(source["failure_count"]) + 1
                     connection.execute(
                         (
@@ -1214,9 +1330,14 @@ class ConfluenceRegistry:
                             source["id"],
                         ),
                     )
-                connection.execute(
-                    "UPDATE jobs SET status='failed',completed_at=?,error=? WHERE id=?",
-                    (_now(), message, job_id),
+                if not cancelled:
+                    connection.execute(
+                        "UPDATE jobs SET status='failed',completed_at=?,error=? WHERE id=?",
+                        (_now(), message, job_id),
+                    )
+            if not cancelled:
+                self._log(
+                    job_id, "failed", message, level="error",
                 )
         finally:
             self._authentication_finished(job_id)
@@ -1749,7 +1870,7 @@ class ConfluenceRegistry:
         identity = getattr(self.image_extractor, "identity", "unknown")
         for key in wanted:
             row = existing.get(key)
-            if row is None or not (self.root / row["path"]).is_file():
+            if row is None or row["error"] or not (self.root / row["path"]).is_file():
                 return True
             cached = self._cached_image_extraction(row)
             result = cached.get("result")
@@ -1794,19 +1915,24 @@ class ConfluenceRegistry:
             stage = "attachments"
             attachments = client.attachments(page_id)
             stage = "normalization"
-            fingerprint = hashlib.sha256(
-                _json(
-                    {
-                        "version": summary.version,
-                        "title": summary.title,
-                        "parent_id": summary.parent_id,
-                        "updated_at": summary.updated_at,
-                        "assets": sorted((a.id, a.version) for a in attachments),
-                        "images": config.analyze_images,
-                        "extractor": getattr(self.image_extractor, "identity", "none"),
-                    }
-                ).encode()
-            ).hexdigest()
+            content_identity = {
+                "version": summary.version,
+                "title": summary.title,
+                "parent_id": summary.parent_id,
+                "updated_at": summary.updated_at,
+                "assets": sorted((a.id, a.version) for a in attachments),
+            }
+            fingerprint = hashlib.sha256(_json(content_identity).encode()).hexdigest()
+            # Recognition is an explicit operation, not part of page freshness.
+            # Accept the old fingerprints in place so upgrading does not force
+            # all previously imported pages to be downloaded and indexed again.
+            compatible_fingerprints = {fingerprint}
+            for legacy_images in (False, True):
+                compatible_fingerprints.add(hashlib.sha256(_json({
+                    **content_identity,
+                    "images": legacy_images,
+                    "extractor": getattr(self.image_extractor, "identity", "none"),
+                }).encode()).hexdigest())
             with self._db() as connection:
                 previous = connection.execute(
                     "SELECT * FROM pages WHERE source_id=? AND page_id=?", (source_id, page_id)
@@ -1814,7 +1940,7 @@ class ConfluenceRegistry:
             current_path = self._current_path(config.index_id, source_id, page_id)
             changed = (
                 previous is None
-                or previous["fingerprint"] != fingerprint
+                or previous["fingerprint"] not in compatible_fingerprints
                 or previous["state"] != "current"
                 or not current_path.is_file()
                 or (analyze_images and self._page_needs_image_analysis(
@@ -1861,9 +1987,7 @@ class ConfluenceRegistry:
                     try:
                         asset, block = self._asset(
                             job_id, source_id, page_id, attachment,
-                            config.model_copy(update={"analyze_images": True})
-                            if analyze_images else config,
-                            client, cancel,
+                            config, client, cancel, analyze_images=analyze_images,
                         )
                         result["assets"] += 1
                         asset_metadata.append(
@@ -1961,8 +2085,9 @@ class ConfluenceRegistry:
                 result["unchanged"] += 1
                 with self._db() as connection:
                     connection.execute(
-                        "UPDATE pages SET last_seen_job=? WHERE source_id=? AND page_id=?",
-                        (job_id, source_id, page_id),
+                        "UPDATE pages SET last_seen_job=?,fingerprint=? "
+                        "WHERE source_id=? AND page_id=?",
+                        (job_id, fingerprint, source_id, page_id),
                     )
             if result["warnings"]:
                 stage = "attachments"
@@ -2074,6 +2199,8 @@ class ConfluenceRegistry:
         config: SourceConfig,
         client: Any,
         cancel: threading.Event,
+        *,
+        analyze_images: bool = False,
     ) -> tuple[dict[str, Any], str]:
         is_image = attachment.media_type.lower().startswith("image/") or (
             Path(attachment.title).suffix.lower() in _IMAGE_SUFFIXES
@@ -2084,7 +2211,7 @@ class ConfluenceRegistry:
                 (source_id, attachment.id, attachment.version),
             ).fetchone()
         created_at = existing["created_at"] if existing else _now()
-        if existing and config.analyze_images and is_image:
+        if existing and analyze_images and is_image:
             archived_path = self.root / existing["path"]
             try:
                 with archived_path.open("rb") as handle:
@@ -2122,7 +2249,7 @@ class ConfluenceRegistry:
             )
             if len(data) > config.max_attachment_bytes:
                 raise ConfluenceError("Attachment exceeds configured size limit")
-            if config.analyze_images and is_image:
+            if analyze_images and is_image:
                 try:
                     image_input_extension(Path(attachment.title), data)
                 except ConfluenceError as exc:
@@ -2201,13 +2328,15 @@ class ConfluenceRegistry:
         text = ""
         path = self.root / row["path"]
         if is_image:
-            cached_extraction = self._cached_image_extraction(row)
+            cached_extraction = (
+                {} if analyze_images and row.get("error") else self._cached_image_extraction(row)
+            )
             identity = getattr(self.image_extractor, "identity", "unknown")
 
             def usable(extraction: dict[str, Any]) -> bool:
                 result = extraction.get("result")
                 return (
-                    (not config.analyze_images or extraction.get("extractor") == identity)
+                    (not analyze_images or extraction.get("extractor") == identity)
                     and isinstance(result, dict)
                     and isinstance(extraction.get("markdown"), str)
                     and result.get("status") == "ok"
@@ -2221,7 +2350,7 @@ class ConfluenceRegistry:
                     previous_extractions = connection.execute(
                         "SELECT extraction_json FROM assets WHERE source_id=? "
                         "AND attachment_id=? AND sha256=? AND id!=? "
-                        "AND extraction_json IS NOT NULL ORDER BY version DESC",
+                        "AND extraction_json IS NOT NULL AND error IS NULL ORDER BY version DESC",
                         (source_id, attachment.id, row["sha256"], row["id"]),
                     ).fetchall()
                 for previous in previous_extractions:
@@ -2241,7 +2370,7 @@ class ConfluenceRegistry:
                 self._log(
                     job_id, "images", "Image extraction cache hit", attachment_id=attachment.id
                 )
-            elif config.analyze_images and self.image_extractor:
+            elif analyze_images and self.image_extractor:
                 self._log(
                     job_id, "images", "Analyzing image with GigaCode", attachment_id=attachment.id,
                     page_id=page_id, input_extension=path.suffix.lower(),
@@ -2314,14 +2443,14 @@ class ConfluenceRegistry:
                         connection.execute(
                             "UPDATE assets SET error=? WHERE id=?", (type(exc).__name__, row["id"])
                         )
-            elif config.analyze_images:
+            elif analyze_images:
                 row["extraction_status"] = "error"
                 text = "Image extraction unavailable: GigaCode image extractor is not configured."
                 self._log(
                     job_id, "images", text, level="warning", page_id=page_id,
                     attachment_id=attachment.id, error_code="image_extractor_unconfigured",
                 )
-        elif config.analyze_images:
+        elif analyze_images:
             self._log(
                 job_id, "attachments", "Attachment archived without image analysis: non-image file",
                 page_id=page_id, attachment_id=attachment.id,

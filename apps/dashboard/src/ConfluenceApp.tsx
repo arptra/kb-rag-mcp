@@ -12,6 +12,7 @@ interface ConfluenceSource {
   analyze_images: boolean; schedule: Schedule; credential_configured: boolean;
   paused: boolean; status: string; last_checked_at: string | null; last_success_at: string | null;
   next_check_at: string | null; last_error: string | null; page_count: number; asset_count: number;
+  active_job?: ConfluenceJob | null;
 }
 interface ConfluenceCredential {
   source_id: string; name: string; base_url: string; deployment: ConfluenceSource["deployment"];
@@ -202,7 +203,6 @@ function SourceForm({ source, indexes, initialIndex, request, gigacodeAvailable,
   const [username, setUsername] = useState(source?.username || "");
   const [token, setToken] = useState("");
   const [schedule, setSchedule] = useState<Schedule>(source?.schedule || { kind: "daily", interval_minutes: 60, time: "03:00", weekday: 0, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC" });
-  const [images, setImages] = useState(source?.analyze_images ?? true);
   const [busy, setBusy] = useState(false);
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState("");
@@ -261,7 +261,7 @@ function SourceForm({ source, indexes, initialIndex, request, gigacodeAvailable,
   useEffect(() => {
     ++connectionRevision.current; successfulRevision.current = null; setCheck(null); setError("");
   }, [base, root, deployment, username, token, index, credentialId, selectedCredential?.base_url, selectedCredential?.deployment, selectedCredential?.username]);
-  const payload = () => ({ name: name.trim() || `Confluence · ${new URL(base).hostname}`.slice(0, 120), index_id: index, base_url: base.trim(), root_page_url: root.trim(), deployment: selectedCredential?.deployment ?? deployment, username: selectedCredential ? selectedCredential.username : deployment === "data_center" ? null : username.trim() || null, ...(selectedCredential ? { credential_source_id: selectedCredential.source_id } : token ? { token } : {}), schedule, include_history: false, analyze_images: images, enabled: source?.enabled ?? true });
+  const payload = () => ({ name: name.trim() || `Confluence · ${new URL(base).hostname}`.slice(0, 120), index_id: index, base_url: base.trim(), root_page_url: root.trim(), deployment: selectedCredential?.deployment ?? deployment, username: selectedCredential ? selectedCredential.username : deployment === "data_center" ? null : username.trim() || null, ...(selectedCredential ? { credential_source_id: selectedCredential.source_id } : token ? { token } : {}), schedule, include_history: false, analyze_images: false, enabled: source?.enabled ?? true });
   const verifyConnection = async (body: ReturnType<typeof payload>, testedRevision: number, signal: AbortSignal) => {
     const result = await request<Record<string, unknown>>("/admin/api/confluence/test", { method: "POST", body: JSON.stringify({ ...body, ...(source ? { source_id: source.id } : {}) }), signal });
     if (signal.aborted || testedRevision !== connectionRevision.current) return false;
@@ -322,9 +322,7 @@ function SourceForm({ source, indexes, initialIndex, request, gigacodeAvailable,
         {["daily", "weekly"].includes(schedule.kind) && <label>Время<input required type="time" value={schedule.time} onChange={event => setSchedule(current => ({ ...current, time: event.target.value }))} /></label>}
         {schedule.kind !== "manual" && <label>Часовой пояс<input required list="confluence-timezones" value={schedule.timezone} onChange={event => setSchedule(current => ({ ...current, timezone: event.target.value }))} placeholder="Europe/Moscow" /><datalist id="confluence-timezones"><option value="Europe/Moscow" /><option value="UTC" /><option value="Asia/Yekaterinburg" /><option value="Asia/Novosibirsk" /></datalist></label>}
         <p className="integration-muted">Загружается только актуальное содержимое страниц. При изменениях оно обновляется в выбранном индексе.</p>
-        <label className="integration-check"><input type="checkbox" checked={images} onChange={event => setImages(event.target.checked)} /><span>Автоматически распознавать изображения<small>Через GigaCode при синхронизации · SVG, BMP, JPG, JPEG, PNG</small></span></label>
-        <small className="integration-muted">После загрузки страниц распознавание также можно запустить отдельной кнопкой в карточке источника.</small>
-        {images && <div className={`callout ${gigacodeAvailable === false ? "integration-error" : ""}`}>{gigacodeAvailable === false ? "GigaCode сейчас недоступен. Статус обработки изображений будет виден в журнале." : gigacodeAvailable ? "GigaCode доступен на сервере" : "Доступность GigaCode проверяется на сервере"}</div>}
+        <div className="callout"><b>Распознавание изображений — только по кнопке</b><p>Синхронизация загружает страницы и вложения без запуска GigaCode. После загрузки можно отдельно нажать «Распознать изображения» в карточке источника.</p><small>Поддерживаются SVG, BMP, JPG, JPEG и PNG.</small>{gigacodeAvailable === false && <p className="integration-muted">GigaCode сейчас недоступен. Загрузка страниц продолжит работать.</p>}</div>
         <small>Синхронизация выполняется на сервере. Закрытие страницы её не останавливает.</small>
       </div></div></fieldset>
       {error && <div className="form-error" role="alert">{error}</div>}{check && <div className="access-notice" role="status">{check}</div>}
@@ -343,71 +341,112 @@ export default function ConfluenceApp({ password, indexes, indexId, onChanged }:
   const [sourceFilter, setSourceFilter] = useState("");
   const [pagesSourceId, setPagesSourceId] = useState<string | null>(null);
   const [logRevisions, setLogRevisions] = useState<Record<string, number>>({});
-  const [busy, setBusy] = useState(false);
+  const [pendingActions, setPendingActions] = useState<Set<string>>(new Set());
+  const pendingActionsRef = useRef(new Set<string>());
+  const loadSequence = useRef(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [loadError, setLoadError] = useState("");
   const [notice, setNotice] = useState("");
   const load = useCallback(async (signal?: AbortSignal) => {
+    const sequence = ++loadSequence.current;
     try {
       const params = new URLSearchParams(); if (indexId) params.set("index_id", indexId);
-      const data = await request<ConfluenceCatalog>(`/admin/api/confluence?${params}`, { signal }); setCatalog(data);
+      const data = await request<ConfluenceCatalog>(`/admin/api/confluence?${params}`, { signal });
+      if (signal?.aborted || sequence !== loadSequence.current) return;
+      setCatalog(data); setLoading(false);
       if (data.enabled === false) { setJobs([]); setEditing(null); setLoadError(""); return; }
       const jobParams = new URLSearchParams({ limit: "30" }); if (sourceFilter) jobParams.set("source_id", sourceFilter); if (indexId) jobParams.set("index_id", indexId);
-      const history = await request<{ jobs: ConfluenceJob[] }>(`/admin/api/confluence/jobs?${jobParams}`, { signal }); setJobs(history.jobs.filter(job => !indexId || job.index_id === indexId)); setLoadError("");
-    } catch (caught) { if (!signal?.aborted) setLoadError(accessError(caught)); }
-    finally { if (!signal?.aborted) setLoading(false); }
+      const history = await request<{ jobs: ConfluenceJob[] }>(`/admin/api/confluence/jobs?${jobParams}`, { signal });
+      if (signal?.aborted || sequence !== loadSequence.current) return;
+      setJobs(history.jobs.filter(job => !indexId || job.index_id === indexId)); setLoadError("");
+    } catch (caught) { if (!signal?.aborted && sequence === loadSequence.current) setLoadError(accessError(caught)); }
+    finally { if (!signal?.aborted && sequence === loadSequence.current) setLoading(false); }
   }, [request, indexId, sourceFilter]);
   useEffect(() => {
     const controller = new AbortController(); let timer = 0;
     const poll = async () => { await load(controller.signal); if (!controller.signal.aborted) timer = window.setTimeout(poll, 4000); };
     void poll(); return () => { controller.abort(); window.clearTimeout(timer); };
   }, [load, revision]);
-  const mutate = async (path: string, body: unknown, success: string) => {
-    setBusy(true); setError("");
-    try { await request(path, { method: "POST", body: JSON.stringify(body) }); setNotice(success); await load(); onChanged?.(); }
-    catch (caught) { setError(accessError(caught)); } finally { setBusy(false); }
+  const beginAction = (key: string) => {
+    if (pendingActionsRef.current.has(key)) return false;
+    pendingActionsRef.current.add(key); setPendingActions(new Set(pendingActionsRef.current));
+    ++loadSequence.current;
+    setError(""); setNotice("");
+    return true;
   };
-  const analyzeImages = async (source: ConfluenceSource) => {
-    if (busy) return;
-    setBusy(true); setError(""); setNotice("");
+  const finishAction = (key: string) => {
+    pendingActionsRef.current.delete(key); setPendingActions(new Set(pendingActionsRef.current));
+  };
+  const applyMutation = (result: { job?: ConfluenceJob; source?: ConfluenceSource }) => {
+    // A response to an earlier poll must not overwrite the accepted operation.
+    ++loadSequence.current;
+    const { job, source: updatedSource } = result;
+    if (job) setJobs(current => [job, ...current.filter(item => item.id !== job.id)]);
+    setCatalog(current => current ? {
+      ...current,
+      jobs: job ? [job, ...(current.jobs ?? []).filter(item => item.id !== job.id)] : current.jobs,
+      sources: current.sources.map(source => updatedSource?.id === source.id ? updatedSource : job?.source_id === source.id ? {
+        ...source, active_job: active(job.status) ? job : null,
+        status: active(job.status) ? job.status : source.paused || !source.enabled ? "paused" : source.last_error ? "error" : "idle",
+      } : source),
+    } : current);
+  };
+  const mutate = async (key: string, path: string, body: unknown, success: string) => {
+    if (!beginAction(key)) return;
     try {
-      const { job } = await request<{ job: ConfluenceJob }>(`/admin/api/confluence/sources/${encodeURIComponent(source.id)}/images/analyze`, { method: "POST", body: JSON.stringify({}) });
-      setJobs(current => [job, ...current.filter(item => item.id !== job.id)]);
-      setSourceFilter(source.id); setExpanded(job.id);
-      setNotice(`Распознавание изображений источника «${source.name}» поставлено в очередь. Ход обработки и ссылка для входа в GigaCode появятся в задаче ниже.`);
-      await load(); onChanged?.();
+      const result = await request<{ job?: ConfluenceJob; source?: ConfluenceSource }>(path, { method: "POST", body: JSON.stringify(body) });
+      applyMutation(result); setNotice(success);
+      // Refresh in the background: a slow overview must not disable controls.
+      void load(); onChanged?.();
     } catch (caught) { setError(accessError(caught)); }
-    finally { setBusy(false); }
+    finally { finishAction(key); }
+  };
+  const cancelJob = (job: ConfluenceJob) => mutate(`cancel:${job.id}`, `/admin/api/confluence/jobs/${encodeURIComponent(job.id)}/cancel`, {}, "Отмена запрошена. Если выполняется сетевой запрос, источник освободится после его завершения.");
+  const analyzeImages = async (source: ConfluenceSource) => {
+    const key = `source:${source.id}`;
+    if (!beginAction(key)) return;
+    try {
+      const result = await request<{ job: ConfluenceJob }>(`/admin/api/confluence/sources/${encodeURIComponent(source.id)}/images/analyze`, { method: "POST", body: JSON.stringify({}) });
+      applyMutation(result);
+      setSourceFilter(source.id); setExpanded(result.job.id);
+      setNotice(`Распознавание изображений источника «${source.name}» поставлено в очередь. Ход обработки и ссылка для входа в GigaCode появятся в задаче ниже.`);
+      void load(); onChanged?.();
+    } catch (caught) { setError(accessError(caught)); }
+    finally { finishAction(key); }
   };
   const clearLogs = async (source: ConfluenceSource) => {
     if (!window.confirm(`Очистить журналы всех синхронизаций источника «${source.name}»? Страницы, настройки, результаты задач и текущая синхронизация сохранятся. Новые записи продолжат появляться.`)) return;
-    setBusy(true); setError(""); setNotice("");
+    const key = `logs:${source.id}`;
+    if (!beginAction(key)) return;
     try {
       const result = await request<{ deleted_events: number }>(`/admin/api/confluence/sources/${encodeURIComponent(source.id)}/logs/clear`, { method: "POST" });
       setLogRevisions(current => ({ ...current, [source.id]: (current[source.id] || 0) + 1 }));
       setNotice(`Журналы источника «${source.name}» очищены. Удалено записей: ${result.deleted_events}.`);
     } catch (caught) { setError(accessError(caught)); }
-    finally { setBusy(false); }
+    finally { finishAction(key); }
   };
   const sources = (catalog?.sources ?? []).filter(source => !indexId || source.index_id === indexId);
-  const allJobs = [...new Map([...(catalog?.jobs ?? []), ...jobs].map(job => [job.id, job])).values()];
-  const authenticationJobs = allJobs.filter(job => (!indexId || job.index_id === indexId) && awaitingAuthentication(job));
+  const activeSourceJob = (source: ConfluenceSource) => source.active_job !== undefined ? source.active_job : (catalog?.jobs ?? []).find(job => job.source_id === source.id && active(job.status));
+  const currentJobs = sources.map(activeSourceJob).filter((job): job is ConfluenceJob => Boolean(job));
+  const currentJobMap = new Map([...(catalog?.jobs ?? []), ...currentJobs].map(job => [job.id, job]));
+  const authenticationJobs = currentJobs.filter(awaitingAuthentication);
   const authenticationSources = [...new Set(authenticationJobs.map(job => sources.find(source => source.id === job.source_id)?.name || job.source_id))];
-  const visibleJobs = [...new Map([...authenticationJobs, ...jobs].map(job => [job.id, job])).values()].filter(job => !sourceFilter || job.source_id === sourceFilter);
+  const visibleJobs = [...new Map([...jobs.map(job => currentJobMap.get(job.id) ?? job), ...currentJobs].map(job => [job.id, job])).values()].filter(job => (!indexId || job.index_id === indexId) && (!sourceFilter || job.source_id === sourceFilter) && (!active(job.status) || currentJobs.some(current => current.id === job.id)));
   const pagesSource = sources.find(source => source.id === pagesSourceId);
-  const activeSourceJob = (source: ConfluenceSource) => allJobs.find(job => job.source_id === source.id && active(job.status));
   const sourceBusy = (source: ConfluenceSource) => active(source.status) || Boolean(activeSourceJob(source));
   if (catalog?.enabled === false) return <div className="integration-area confluence-sources"><section className="panel integration-panel"><h3>Источники Confluence</h3><p className="integration-muted" role="status">Интеграция Confluence отключена на сервере.</p></section></div>;
   return <div className="integration-area confluence-sources">
     <section className="panel"><div className="panel-header"><div><span className="eyebrow">Документация по API</span><h3>Источники Confluence</h3></div>{catalog?.can_manage && <button className="button primary" onClick={() => setEditing("new")}>＋ Подключить Confluence</button>}</div>
       {(error || loadError) && <div className="form-error" role="alert">{error || loadError}</div>}{notice && <div className="access-notice" role="status">{notice}</div>}
       {authenticationJobs.length > 0 && <div className="confluence-authentication-summary" role="status"><div><strong>Требуется вход в GigaCode</strong><p>{authenticationSources.join(", ")}. {catalog?.can_manage ? "Ссылка для входа доступна в карточке задачи ниже." : "Войдите как администратор, чтобы пройти авторизацию."}</p></div>{sourceFilter && <button className="button secondary" onClick={() => setSourceFilter("")}>Показать все задачи</button>}</div>}
-      {sources.length > 0 && <p className="confluence-source-intro integration-muted">Синхронизация обновляет страницы и вложения. Распознавание добавляет в индекс текст и описания изображений уже загруженных страниц.</p>}
+      {sources.length > 0 && <p className="confluence-source-intro integration-muted">Синхронизация обновляет страницы и вложения без запуска GigaCode. Распознавание изображений запускается только отдельной кнопкой и добавляет результат в индекс.</p>}
       {loading ? <div className="empty-state compact">Загружаем источники…</div> : sources.length ? <div className="confluence-source-list">{sources.map(source => {
         const currentJob = activeSourceJob(source);
         const status = currentJob?.status || source.status;
         const locked = sourceBusy(source);
+        const sourcePending = pendingActions.has(`source:${source.id}`);
+        const cancelling = currentJob?.status === "cancelling" || Boolean(currentJob && pendingActions.has(`cancel:${currentJob.id}`));
         const noPages = source.page_count === 0;
         const noExtractor = catalog?.gigacode?.available === false;
         return <article className="confluence-source-card" key={source.id} aria-labelledby={`confluence-source-${source.id}`}>
@@ -422,7 +461,7 @@ export default function ConfluenceApp({ password, indexes, indexId, onChanged }:
           <dl className="confluence-source-facts">
             <div><dt>Индекс</dt><dd>{indexes.find(index => index.id === source.index_id)?.name || source.index_id}</dd></div>
             <div><dt>Загружено</dt><dd>{source.page_count} страниц <span>· {source.asset_count} вложений</span></dd></div>
-            <div><dt>Автораспознавание</dt><dd>{source.analyze_images ? "При синхронизации" : "Выключено · доступен ручной запуск"}</dd></div>
+            <div><dt>Распознавание изображений</dt><dd>Только по кнопке</dd></div>
           </dl>
           <dl className="confluence-source-checks">
             <div><dt>Последняя проверка</dt><dd>{integrationDate(source.last_checked_at)}</dd></div>
@@ -432,8 +471,9 @@ export default function ConfluenceApp({ password, indexes, indexId, onChanged }:
           {source.last_error && <p className="confluence-source-error integration-error">{source.last_error}</p>}
           <div className="confluence-source-actions">
             {catalog?.can_manage && <div className="confluence-source-primary-actions">
-              <button className="button secondary" disabled={busy || locked} onClick={() => void mutate(`/admin/api/confluence/sources/${encodeURIComponent(source.id)}/sync`, {}, "Синхронизация поставлена в очередь")}>Синхронизировать</button>
-              <button className="button secondary confluence-image-button" disabled={busy || locked || noPages || noExtractor} onClick={() => void analyzeImages(source)} aria-describedby={`confluence-image-help-${source.id}`}>Распознать изображения</button>
+              <button className="button secondary" disabled={sourcePending || locked} onClick={() => void mutate(`source:${source.id}`, `/admin/api/confluence/sources/${encodeURIComponent(source.id)}/sync`, {}, "Синхронизация поставлена в очередь")}>Синхронизировать</button>
+              <button className="button secondary confluence-image-button" disabled={sourcePending || locked || noPages || noExtractor} onClick={() => void analyzeImages(source)} aria-describedby={`confluence-image-help-${source.id}`}>Распознать изображения</button>
+              {currentJob && <button className="button secondary confluence-danger" disabled={cancelling} onClick={() => void cancelJob(currentJob)}>{cancelling ? "Отменяется…" : currentJob.status === "queued" ? "Убрать из очереди" : currentJob.operation === "analyze_images" ? "Остановить распознавание" : "Остановить загрузку"}</button>}
             </div>}
             <div className="confluence-source-view-actions">
               <button className="button quiet" aria-pressed={pagesSourceId === source.id} onClick={() => setPagesSourceId(source.id)}>Страницы</button>
@@ -441,12 +481,12 @@ export default function ConfluenceApp({ password, indexes, indexId, onChanged }:
             </div>
           </div>
           {catalog?.can_manage && <>
-            <p id={`confluence-image-help-${source.id}`} className={`confluence-source-hint integration-muted${noExtractor ? " integration-error" : ""}`}>{noExtractor ? "GigaCode недоступен на сервере. Для распознавания нужно настроить его запуск." : locked ? "Дождитесь завершения текущей задачи или отмените её в журнале, чтобы запустить другую обработку." : noPages ? "Сначала синхронизируйте источник, чтобы загрузить страницы для распознавания." : "Ручной запуск обработает новые и нераспознанные изображения. Готовые результаты используются повторно; настройка автораспознавания не изменится."}</p>
+            <p id={`confluence-image-help-${source.id}`} className={`confluence-source-hint integration-muted${noExtractor ? " integration-error" : ""}`}>{cancelling ? "Отмена выполняется. Текущий сетевой запрос может завершиться перед остановкой. После отмены источник можно запустить снова." : noExtractor ? "GigaCode недоступен на сервере. Для распознавания нужно настроить его запуск." : locked ? "Дождитесь завершения задачи или остановите её кнопкой выше. Другие источники можно запускать и отменять независимо." : noPages ? "Сначала синхронизируйте источник, чтобы загрузить страницы для распознавания." : "Кнопка запускает одну задачу для новых и нераспознанных изображений. Автоматическое распознавание не включается; готовые результаты используются повторно."}</p>
             <details className="confluence-source-management">
               <summary>Настройки и управление</summary>
               <div className="confluence-source-management-actions">
-                <div><button className="button quiet" disabled={busy || locked} onClick={() => setEditing(source)}>Настроить</button><button className="button quiet" disabled={busy} onClick={() => void mutate(`/admin/api/confluence/sources/${encodeURIComponent(source.id)}/pause`, { paused: !source.paused }, source.paused ? "Расписание возобновлено" : "Расписание приостановлено")}>{source.paused ? "Возобновить расписание" : "Приостановить расписание"}</button></div>
-                <div><button className="button quiet" disabled={busy} onClick={() => void clearLogs(source)}>Очистить журнал</button><button className="button quiet confluence-danger" disabled={busy || locked} onClick={() => { if (window.confirm(`Отключить источник «${source.name}»? Сохранённые документы останутся в индексе.`)) void mutate(`/admin/api/confluence/sources/${encodeURIComponent(source.id)}/delete`, {}, "Источник отключён, документы сохранены"); }}>Отключить источник</button></div>
+                <div><button className="button quiet" disabled={sourcePending || locked} onClick={() => setEditing(source)}>Настроить</button><button className="button quiet" disabled={sourcePending} onClick={() => void mutate(`source:${source.id}`, `/admin/api/confluence/sources/${encodeURIComponent(source.id)}/pause`, { paused: !source.paused }, source.paused ? "Расписание возобновлено" : "Расписание приостановлено")}>{source.paused ? "Возобновить расписание" : "Приостановить расписание"}</button></div>
+                <div><button className="button quiet" disabled={pendingActions.has(`logs:${source.id}`)} onClick={() => void clearLogs(source)}>Очистить журнал</button><button className="button quiet confluence-danger" disabled={sourcePending || locked} onClick={() => { if (window.confirm(`Отключить источник «${source.name}»? Сохранённые документы останутся в индексе.`)) void mutate(`source:${source.id}`, `/admin/api/confluence/sources/${encodeURIComponent(source.id)}/delete`, {}, "Источник отключён, документы сохранены"); }}>Отключить источник</button></div>
               </div>
             </details>
           </>}
@@ -464,7 +504,7 @@ export default function ConfluenceApp({ password, indexes, indexId, onChanged }:
       const processedChunks = count("completed") ?? count("processed") ?? count("processed_chunks");
       const processed = processedChunks ?? count("pages_done");
       const total = processedChunks !== null ? count("total") ?? count("total_chunks") : count("pages_total");
-      return <article className="integration-job-row" key={job.id}>{imageJob && <div className="confluence-job-operation"><span className="tag">Распознавание изображений</span><p className="integration-muted">Обрабатываются изображения загруженных страниц. Описания будут добавлены в выбранный индекс.</p></div>}<div className="integration-job-head"><div><b>{stageLabels[job.phase] && ["retry_wait", "retry", "discovery_retry"].includes(job.phase) ? stageLabels[job.phase] : job.message || stageLabels[job.phase] || job.phase || "Синхронизация Confluence"}</b><small className="integration-muted"> · {labels[job.status] || job.status}</small><div className="integration-muted">{sources.find(source => source.id === job.source_id)?.name || job.source_id} · {indexes.find(index => index.id === job.index_id)?.name || job.index_id} · {integrationDate(job.completed_at || job.started_at || job.created_at)}</div></div><div className="integration-actions">{(failedItems > 0 || failuresJobId === job.id) && <button className="button secondary" aria-expanded={failuresJobId === job.id} onClick={() => setFailuresJobId(failuresJobId === job.id ? null : job.id)}>{failuresJobId === job.id ? "Скрыть ошибки" : `Ошибки загрузки (${failedItems})`}</button>}<button className="button quiet" onClick={() => setExpanded(expanded === job.id ? null : job.id)}>{expanded === job.id ? "Скрыть журнал" : "Журнал"}</button>{catalog?.can_manage && active(job.status) && <button className="button quiet" disabled={busy || job.status === "cancelling"} onClick={() => void mutate(`/admin/api/confluence/jobs/${encodeURIComponent(job.id)}/cancel`, {}, "Отмена запрошена")}>Отменить</button>}</div></div>
+      return <article className="integration-job-row" key={job.id}>{imageJob && <div className="confluence-job-operation"><span className="tag">Распознавание изображений</span><p className="integration-muted">Обрабатываются изображения загруженных страниц. Описания будут добавлены в выбранный индекс.</p></div>}<div className="integration-job-head"><div><b>{stageLabels[job.phase] && ["retry_wait", "retry", "discovery_retry"].includes(job.phase) ? stageLabels[job.phase] : job.message || stageLabels[job.phase] || job.phase || "Синхронизация Confluence"}</b><small className="integration-muted"> · {labels[job.status] || job.status}</small><div className="integration-muted">{sources.find(source => source.id === job.source_id)?.name || job.source_id} · {indexes.find(index => index.id === job.index_id)?.name || job.index_id} · {integrationDate(job.completed_at || job.started_at || job.created_at)}</div></div><div className="integration-actions">{(failedItems > 0 || failuresJobId === job.id) && <button className="button secondary" aria-expanded={failuresJobId === job.id} onClick={() => setFailuresJobId(failuresJobId === job.id ? null : job.id)}>{failuresJobId === job.id ? "Скрыть ошибки" : `Ошибки загрузки (${failedItems})`}</button>}<button className="button quiet" onClick={() => setExpanded(expanded === job.id ? null : job.id)}>{expanded === job.id ? "Скрыть журнал" : "Журнал"}</button>{catalog?.can_manage && active(job.status) && <button className="button quiet" disabled={pendingActions.has(`cancel:${job.id}`) || job.status === "cancelling"} onClick={() => void cancelJob(job)}>{pendingActions.has(`cancel:${job.id}`) || job.status === "cancelling" ? "Отменяется…" : "Отменить"}</button>}</div></div>
         {awaitingAuthentication(job) && <GigaCodeAuthentication job={job} canManage={catalog?.can_manage === true} />}
         {total !== null && total > 0 && processed !== null && <progress className="integration-progress" value={processed} max={total} aria-label={processedChunks !== null ? "Обработанные фрагменты" : "Проверенные страницы"} />}
         <div className="integration-facts">{[[processedChunks !== null ? "Обработано фрагментов" : "Проверено страниц", processed !== null ? `${processed}${total !== null ? ` / ${total}` : ""}` : null], ["Из кэша", count("reused") ?? count("reused_chunks")], ["Рассчитано", count("computed") ?? count("computed_chunks")], ["Опубликовано", count("published") ?? count("published_chunks")]].map(([label, value]) => value !== null ? <span key={String(label)}>{label}<b>{value}</b></span> : null)}</div>

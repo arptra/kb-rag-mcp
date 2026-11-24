@@ -43,11 +43,12 @@ def test_image_failure_identifies_stage_without_logging_raw_cli_error(
     instance, client, published, _, _ = registry(tmp_path, image_extractor=extractor)
     _single_page(instance, client, monkeypatch)
     source = instance.upsert_source(config(analyze_images=True).model_dump(), "pat-never-log")
+    assert instance.run_job(instance.queue_sync(source["id"])["id"])["status"] == "completed"
     with caplog.at_level(logging.INFO):
-        finished = instance.run_job(instance.queue_sync(source["id"])["id"])
+        finished = instance.run_job(instance.queue_image_analysis(source["id"])["id"])
     assert finished["status"] == "completed_with_warnings"
     assert finished["result"]["failed_pages"] == 1
-    assert published == ["target"]
+    assert published == ["target", "target"]
     journal = instance.job_log(finished["id"])
     events = [
         event for event in journal["items"] if event["details"].get("error_code") == error_code
@@ -79,8 +80,9 @@ def test_incomplete_image_result_logs_status_without_uncertainties(
     instance, client, _, _, _ = registry(tmp_path, image_extractor=extractor)
     _single_page(instance, client, monkeypatch)
     source = instance.upsert_source(config(analyze_images=True).model_dump(), "pat-never-log")
+    assert instance.run_job(instance.queue_sync(source["id"])["id"])["status"] == "completed"
     with caplog.at_level(logging.INFO):
-        finished = instance.run_job(instance.queue_sync(source["id"])["id"])
+        finished = instance.run_job(instance.queue_image_analysis(source["id"])["id"])
     assert finished["status"] == "completed_with_warnings"
     journal = instance.job_log(finished["id"])
     events = [event for event in journal["items"] if event["details"].get("image_status") == status]
@@ -94,11 +96,16 @@ def test_incomplete_image_result_logs_status_without_uncertainties(
 
 
 def test_missing_image_extractor_is_visible_in_operation_journal(tmp_path, monkeypatch, caplog):
-    instance, client, _, _, _ = registry(tmp_path)
+    instance, client, _, _, _ = registry(
+        tmp_path, image_extractor=SimpleNamespace(identity="configured-at-queue-time")
+    )
     _single_page(instance, client, monkeypatch)
-    source = instance.upsert_source(config(analyze_images=True).model_dump(), "secret")
+    source = instance.upsert_source(config().model_dump(), "secret")
+    assert instance.run_job(instance.queue_sync(source["id"])["id"])["status"] == "completed"
+    queued = instance.queue_image_analysis(source["id"])
+    instance.image_extractor = None
     with caplog.at_level(logging.INFO):
-        finished = instance.run_job(instance.queue_sync(source["id"])["id"])
+        finished = instance.run_job(queued["id"])
     assert finished["status"] == "completed_with_warnings"
     journal = instance.job_log(finished["id"])
     assert any(
@@ -139,13 +146,14 @@ def test_real_extractor_retries_incomplete_result_and_keeps_successful_cache(
             download_url="https://docs.example.com/download",
         )
     ]
-    source = instance.upsert_source(config(analyze_images=True).model_dump(), "pat-never-log")
-    finished = instance.run_job(instance.queue_sync(source["id"])["id"])
+    source = instance.upsert_source(config().model_dump(), "pat-never-log")
+    assert instance.run_job(instance.queue_sync(source["id"])["id"])["status"] == "completed"
+    finished = instance.run_job(instance.queue_image_analysis(source["id"])["id"])
     assert finished["status"] == "completed"
     assert finished["result"]["recovered_pages"] == 1
     assert finished["result"]["failed_pages"] == 0
     assert len(calls) == 2
-    assert published == ["target"]
+    assert published == ["target", "target"]
     loaded = FileSystemDocumentLoader().load_directory(tmp_path / "knowledge" / "target")
     assert len(loaded) == 1
     assert "recovered diagram evidence" in loaded[0].content
@@ -181,8 +189,9 @@ def test_invalid_downloaded_image_is_diagnosed_before_running_gigacode(
     _single_page(instance, client, monkeypatch)
     client.download = lambda attachment: payload
     source = instance.upsert_source(config(analyze_images=True).model_dump(), "secret")
+    assert instance.run_job(instance.queue_sync(source["id"])["id"])["status"] == "completed"
     with caplog.at_level(logging.INFO):
-        finished = instance.run_job(instance.queue_sync(source["id"])["id"])
+        finished = instance.run_job(instance.queue_image_analysis(source["id"])["id"])
     assert finished["status"] == "completed_with_warnings"
     assert error_code in caplog.text
     assert any(
@@ -268,8 +277,10 @@ def test_nonimage_attachment_is_archived_without_calling_image_runner(tmp_path, 
             download_url="https://docs.example.com/download",
         )
     ]
-    source = instance.upsert_source(config(analyze_images=True).model_dump(), "secret")
-    finished = instance.run_job(instance.queue_sync(source["id"])["id"])
+    source = instance.upsert_source(config().model_dump(), "secret")
+    assert instance.run_job(instance.queue_sync(source["id"])["id"])["status"] == "completed"
+    client.version = 2
+    finished = instance.run_job(instance.queue_image_analysis(source["id"])["id"])
     assert finished["status"] == "completed"
     journal = instance.job_log(finished["id"])
     assert any("non-image file" in event["message"] for event in journal["items"])
@@ -298,9 +309,11 @@ def test_bad_image_response_is_redownloaded_on_retry_then_analyzed(
     extractor = GigaCodeImageExtractor(SimpleNamespace(run_json=run), tmp_path / "images")
     instance, client, _, _, _ = registry(tmp_path, image_extractor=extractor)
     _single_page(instance, client, monkeypatch, retries=2)
+    client.download = lambda attachment: bad_payload
+    source = instance.upsert_source(config().model_dump(), "secret")
+    assert instance.run_job(instance.queue_sync(source["id"])["id"])["status"] == "completed"
     client.download = download
-    source = instance.upsert_source(config(analyze_images=True).model_dump(), "secret")
-    finished = instance.run_job(instance.queue_sync(source["id"])["id"])
+    finished = instance.run_job(instance.queue_image_analysis(source["id"])["id"])
     assert finished["status"] == "completed"
     assert finished["result"]["recovered_pages"] == 1
     assert downloads == ["asset-1", "asset-1"]
@@ -358,8 +371,7 @@ def test_legacy_html_image_archive_is_repaired_without_reusing_old_extraction(
         return good_payload
 
     client.download = download
-    instance.upsert_source({"analyze_images": True}, source_id=source["id"])
-    finished = instance.run_job(instance.queue_sync(source["id"])["id"])
+    finished = instance.run_job(instance.queue_image_analysis(source["id"])["id"])
     assert finished["status"] == "completed"
     assert downloads == ["asset-1"]
     assert analyses == [good_payload]

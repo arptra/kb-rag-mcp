@@ -540,8 +540,10 @@ def test_image_failure_retains_original_and_retries_then_model_change_invalidate
 
     extractor = Extractor()
     instance, _, _, _, _ = registry(tmp_path, image_extractor=extractor)
-    source = instance.upsert_source(config(analyze_images=True).model_dump(), "secret")
-    first = instance.run_job(instance.queue_sync(source["id"])["id"])
+    source = instance.upsert_source(config().model_dump(), "secret")
+    assert instance.run_job(instance.queue_sync(source["id"])["id"])["status"] == "completed"
+    assert calls == []
+    first = instance.run_job(instance.queue_image_analysis(source["id"])["id"])
     assert first["status"] == "completed"
     assert first["result"]["recovered_pages"] == 1
     assert first["result"]["failed_pages"] == 0
@@ -550,6 +552,8 @@ def test_image_failure_retains_original_and_retries_then_model_change_invalidate
     assert len(calls) == 3
     extractor.identity = "model-v2"
     instance.run_job(instance.queue_sync(source["id"])["id"])
+    assert len(calls) == 3
+    instance.run_job(instance.queue_image_analysis(source["id"])["id"])
     assert len(calls) == 5
 
 

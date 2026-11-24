@@ -27,9 +27,7 @@ def test_image_extractor_forwards_browser_auth_callbacks_but_cache_does_not_prom
         calls.append(kwargs)
         kwargs["authentication_url"](AUTH_URL)
         kwargs["authentication_complete"]()
-        return SimpleNamespace(
-            payload={"status": "ok", "analyzed_files": ["attachment.svg"]}
-        )
+        return SimpleNamespace(payload={"status": "ok", "analyzed_files": ["attachment.svg"]})
 
     extractor = GigaCodeImageExtractor(SimpleNamespace(run_json=run), tmp_path / "images")
     callbacks = {
@@ -53,7 +51,7 @@ def test_image_extractor_forwards_browser_auth_callbacks_but_cache_does_not_prom
         ("cancel_error", "cancelled"),
     ],
 )
-def test_sync_exposes_live_browser_auth_and_clears_it_on_every_exit(
+def test_manual_images_expose_live_browser_auth_and_clear_it_on_every_exit(
     tmp_path, monkeypatch, caplog, outcome, expected_status
 ):
     observed = []
@@ -87,8 +85,9 @@ def test_sync_exposes_live_browser_auth_and_clears_it_on_every_exit(
     client.page_ids = lambda root: iter([root])
     monkeypatch.setattr(instance, "RETRY_ROUNDS", 0)
     monkeypatch.setattr(instance, "RETRY_DELAY_SECONDS", 0)
-    source = instance.upsert_source(config(analyze_images=True).model_dump(), "secret-pat")
-    job = instance.queue_sync(source["id"])
+    source = instance.upsert_source(config().model_dump(), "secret-pat")
+    assert instance.run_job(instance.queue_sync(source["id"])["id"])["status"] == "completed"
+    job = instance.queue_image_analysis(source["id"])
     with caplog.at_level(logging.INFO):
         finished = instance.run_job(job["id"])
     assert len(observed) == 1, finished
@@ -157,9 +156,7 @@ async def test_only_manager_sees_browser_auth_link_in_live_jobs_and_operation_lo
     with instance._db() as db:
         db.execute("UPDATE jobs SET status='running' WHERE id=?", (job["id"],))
     with caplog.at_level(logging.INFO):
-        instance._authentication_required(
-            job["id"], AUTH_URL, page_id="1", attachment_id="asset-1"
-        )
+        instance._authentication_required(job["id"], AUTH_URL, page_id="1", attachment_id="asset-1")
         for message in (
             f"GigaCode waits for browser authentication: {AUTH_URL}",
             f"GigaCode stderr | Open {AUTH_URL}",
@@ -167,8 +164,7 @@ async def test_only_manager_sees_browser_auth_link_in_live_jobs_and_operation_lo
             "GigaCode stderr | " + json.dumps({"authentication_url": AUTH_URL}),
             f"GigaCode result: is_error=True; error=Login failed: {AUTH_URL}",
             f"GigaCode result: is_error=True; error=Login failed: {AUTH_URL.upper()}",
-            "GigaCode result: is_error=True; error=Login failed: "
-            + AUTH_URL.replace("/", r"\/"),
+            "GigaCode result: is_error=True; error=Login failed: " + AUTH_URL.replace("/", r"\/"),
         ):
             instance._image_progress(job["id"], message, attachment_id="asset-1")
     assert "auth.example.test" not in caplog.text

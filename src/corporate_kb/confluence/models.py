@@ -65,7 +65,7 @@ class SourceConfig(BaseModel):
     username: str | None = Field(default=None, max_length=320)
     enabled: bool = True
     include_history: bool = False
-    analyze_images: bool = True
+    analyze_images: bool = False
     schedule: Schedule = Field(default_factory=Schedule)
     max_pages: int = Field(default=50000, ge=1, le=500000)
     max_attachment_bytes: int = Field(default=25_000_000, ge=1, le=100_000_000)
@@ -74,6 +74,13 @@ class SourceConfig(BaseModel):
     @classmethod
     def disable_legacy_history(cls, value: bool) -> bool:
         # Accept saved configurations and old clients without requesting old versions.
+        return False
+
+    @field_validator("analyze_images")
+    @classmethod
+    def disable_legacy_automatic_images(cls, value: bool) -> bool:
+        # Old saved settings remain readable, but only an explicit image job may
+        # start GigaCode. A normal or scheduled import never enables recognition.
         return False
 
     @property
