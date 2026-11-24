@@ -37,6 +37,13 @@
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (state.auth) headers[state.auth.kind === "admin" ? "X-KB-Admin-Password" : "Authorization"] = state.auth.kind === "admin" ? state.auth.value : "Bearer " + state.auth.value;
     try {
+      if (method !== "GET") {
+        // Cookie-based portal admins must supply the session's CSRF token.
+        // Standalone/header authentication has no access session endpoint.
+        const session = await fetch(new URL("../../access/api/session", document.baseURI), { credentials: "same-origin", signal: controller.signal, headers: { Accept: "application/json" } });
+        if (session.ok) { const data = await session.json(); if (typeof data.csrf_token === "string") headers["X-CSRF-Token"] = data.csrf_token; }
+        if (epoch !== state.epoch) { const error = new Error("Identity changed"); error.name = "AbortError"; throw error; }
+      }
       const response = await fetch(new URL("../api/control/" + path, document.baseURI), { method, headers, credentials: "same-origin", signal: controller.signal, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
       if ([401, 403].includes(response.status)) { if (epoch === state.epoch) resetAccess(); const error = new Error("Нужен доступ администратора Harness."); error.status = response.status; throw error; }
       let payload; try { payload = await response.json(); } catch (_) { throw new Error("Не удалось прочитать ответ сервера."); }

@@ -127,6 +127,7 @@ def create_app(
     manage_lifespan: bool = True,
     model_control: ModelControl | None = None,
     authorize_model_manager: AuthorizeModelManager | None = None,
+    authorize_control_manager: AuthorizeModelManager | None = None,
     integrations: IntegrationHub | None = None,
 ) -> Starlette:
     """Create an app usable alone or mounted under a host-owned authenticated path.
@@ -142,6 +143,10 @@ def create_app(
     model_router = ModelRouter(runtime.settings.state_dir, runtime.model)
     runtime.model = model_router
     tls_credentials = TLSCredentialStore(runtime.settings.state_dir)
+    control_manager = (
+        authorize_control_manager
+        if authorize_control_manager is not None else authorize_model_manager
+    )
 
     async def principal(request: Request, *, mutate: bool = False) -> Principal:
         identity = await authenticate(request)
@@ -157,6 +162,10 @@ def create_app(
             {
                 **await runtime.status(identity),
                 "identity_scope": "shared" if identity.shared else "personal",
+                "can_manage_control": bool(
+                    getattr(runtime.settings, "control_enabled", True)
+                    and control_manager is not None and await control_manager(request)
+                ),
             }
         )
 
@@ -315,6 +324,10 @@ def create_app(
         await principal(request, mutate=request.method != "GET")
         return bool(authorize_model_manager and await authorize_model_manager(request))
 
+    async def control_access(request: Request) -> bool:
+        await principal(request, mutate=request.method != "GET")
+        return bool(control_manager and await control_manager(request))
+
     async def integration_settings(request: Request) -> Response:
         permitted = await settings_access(request)
         if not permitted:
@@ -416,7 +429,7 @@ def create_app(
             Route("/api/runs/{run_id}", get_run, methods=["GET", "DELETE"]),
             Route("/api/runs/{run_id}/cancel", cancel_run, methods=["POST"]),
             Route("/api/runs/{run_id}/resume", resume_run, methods=["POST"]),
-            *(create_control_routes(runtime, authorize=manager_access, read_body=_body)
+            *(create_control_routes(runtime, authorize=control_access, read_body=_body)
               if getattr(runtime.settings, "control_enabled", True) else []),
             *create_memory_routes(runtime, principal),
             *create_discovery_routes(

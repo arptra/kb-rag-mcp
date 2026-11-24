@@ -150,6 +150,28 @@ def test_control_api_authorization_revision_validation_and_csrf(tmp_path: Path) 
         assert metrics["summary"]["input_tokens_reported"] is None
 
 
+@pytest.mark.parametrize("manager_configured", [False, True])
+def test_control_denies_missing_or_explicitly_rejected_admin_authority(
+    tmp_path: Path, manager_configured: bool,
+) -> None:
+    async def deny(_: Request) -> bool:
+        return False
+
+    runtime = HarnessRuntime(settings(tmp_path))
+    app = create_app(
+        runtime, authenticate,
+        authorize_model_manager=manager if manager_configured else None,
+        authorize_control_manager=deny if manager_configured else None,
+    )
+    with TestClient(app) as client:
+        headers = {"x-owner": "operator"}
+        assert client.get("/api/status", headers=headers).json()["can_manage_control"] is False
+        for method, path in (("GET", "settings"), ("PUT", "settings"),
+                             ("GET", "metrics"), ("POST", "runs/unknown/cancel")):
+            response = client.request(method, "/api/control/" + path, headers=headers)
+            assert response.status_code == 403
+
+
 def test_metrics_aggregate_real_saved_runs_without_private_contents(tmp_path: Path) -> None:
     store = RunStore(settings(tmp_path))
     now = datetime(2026, 11, 24, 12, tzinfo=UTC)

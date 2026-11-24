@@ -1,4 +1,4 @@
-"""Run the detachable harness with one explicitly configured shared account."""
+"""Run the detachable harness with separate shared reader and administrator tokens."""
 
 from __future__ import annotations
 
@@ -48,16 +48,26 @@ def _providers(specification: str) -> tuple[Any, Any]:
 
 
 def build_app(environ: Mapping[str, str] | None = None) -> Starlette:
-    """Build an isolated single-account app; shared tokens share history and access."""
+    """Build an isolated app; each shared token owns its history and access scope."""
     environment = os.environ if environ is None else environ
     token = environment.get("HARNESS_API_TOKEN", "")
     if len(token) < 32 or token != token.strip():
         raise ValueError("HARNESS_API_TOKEN must contain at least 32 non-padded characters")
     token_bytes = token.encode("utf-8")
+    admin_token = environment.get("HARNESS_ADMIN_TOKEN", "")
+    if admin_token and (len(admin_token) < 32 or admin_token != admin_token.strip()
+                        or hmac.compare_digest(admin_token.encode("utf-8"), token_bytes)):
+        raise ValueError(
+            "HARNESS_ADMIN_TOKEN must be a separate non-padded secret of at least 32 characters"
+        )
+    admin_bytes = admin_token.encode("utf-8")
     identity = Principal(
         owner_id="standalone:" + hashlib.sha256(token_bytes).hexdigest(),
         shared=True,
     )
+    administrator = Principal(
+        owner_id="standalone-admin:" + hashlib.sha256(admin_bytes).hexdigest(), shared=True,
+    ) if admin_token else None
 
     async def authenticate(request: Request) -> Principal | None:
         values = request.headers.getlist("authorization")
@@ -68,6 +78,8 @@ def build_app(environ: Mapping[str, str] | None = None) -> Starlette:
             return None
         if hmac.compare_digest(supplied.encode("utf-8"), token_bytes):
             return identity
+        if administrator is not None and hmac.compare_digest(supplied.encode("utf-8"), admin_bytes):
+            return administrator
         return None
 
     state_dir = environment.get("HARNESS_STATE_DIR")
@@ -80,11 +92,11 @@ def build_app(environ: Mapping[str, str] | None = None) -> Starlette:
     control = getattr(model, "model_control", None)
 
     async def manager(request: Request) -> bool:
-        # This entrypoint has one explicitly configured operator account.
-        return await authenticate(request) is not None
+        # Reader tokens never imply administrative access, including legacy installs.
+        return administrator is not None and await authenticate(request) == administrator
 
     async def authorized(principal: Principal) -> bool:
-        return principal == identity
+        return principal in (identity, administrator)
 
     integrations = IntegrationHub(IntegrationStore(settings.state_dir), authorized)
 

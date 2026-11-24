@@ -136,6 +136,64 @@ async def test_enabled_module_runs_real_rag_separately_and_hides_other_owners(
     assert settings.harness_state_dir.exists()
 
 
+@pytest.mark.parametrize("admin_password", [None, ADMIN])
+async def test_control_requires_explicit_admin_authority_even_in_legacy_reader_mode(
+    settings_factory: Any, admin_password: str | None,
+) -> None:
+    settings, service = _service(
+        settings_factory, harness_enabled=True, admin_password=admin_password,
+    )
+    app: Any = create_http_app(service, settings)
+    reader = {"authorization": f"Bearer {TOKEN}"}
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://localhost",
+        ) as client,
+    ):
+        status = await client.get("/harness/api/status", headers=reader)
+        assert status.status_code == 200
+        assert status.json()["can_manage_control"] is False
+        for endpoint in ("settings", "metrics"):
+            assert (
+                await client.get(f"/harness/api/control/{endpoint}", headers=reader)
+            ).status_code == 403
+        assert (
+            await client.put("/harness/api/control/settings", json={}, headers=reader)
+        ).status_code == 403
+        assert (
+            await client.post("/harness/api/control/runs/unknown/cancel", json={}, headers=reader)
+        ).status_code == 403
+        assert (
+            await client.get(
+                "/harness/api/control/settings",
+                headers={**reader, "x-kb-admin-password": "invented-administrator-password"},
+            )
+        ).status_code == 403
+        if admin_password is not None:
+            admin = {"x-kb-admin-password": admin_password}
+            status = await client.get("/harness/api/status", headers=admin)
+            assert status.status_code == 200
+            assert status.json()["can_manage_control"] is True
+            response = await client.get("/harness/api/control/settings", headers=admin)
+            assert response.status_code == 200
+            assert response.json()["can_manage"] is True
+            assert (
+                await client.get("/harness/api/control/metrics", headers=admin)
+            ).status_code == 200
+            payload = response.json()
+            assert (
+                await client.put("/harness/api/control/settings", headers=admin,
+                                 json={"revision": payload["revision"],
+                                       "settings": payload["settings"]})
+            ).status_code == 200
+            assert (
+                await client.post(
+                    "/harness/api/control/runs/unknown/cancel", json={}, headers=admin,
+                )
+            ).status_code == 404
+
+
 @pytest.mark.parametrize("a2a_enabled", [False, True])
 async def test_existing_launcher_activates_harness_without_profile_and_keeps_login_private(
     settings_factory: Any, monkeypatch: pytest.MonkeyPatch, a2a_enabled: bool,

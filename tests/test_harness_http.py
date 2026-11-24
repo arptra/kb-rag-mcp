@@ -484,6 +484,38 @@ def test_standalone_starts_real_runtime_without_inventing_providers(tmp_path: Pa
         assert status["source_available"] is False
         assert status["model"]["available"] is False
         assert status["indexes"] == []
+        assert status["can_manage_control"] is False
+        assert client.get("/api/control/settings", headers={
+            "authorization": f"Bearer {token}",
+        }).status_code == 403
+
+
+@pytest.mark.parametrize("admin", ["short", "a" * 32, " " + "b" * 32])
+def test_standalone_admin_token_must_be_separate_and_valid(admin: str) -> None:
+    with pytest.raises(ValueError, match="HARNESS_ADMIN_TOKEN"):
+        standalone.build_app({"HARNESS_API_TOKEN": "a" * 32, "HARNESS_ADMIN_TOKEN": admin})
+
+
+def test_standalone_reader_cannot_use_admin_controls(tmp_path: Path) -> None:
+    reader, admin = "reader-token-" + "a" * 32, "admin-token-" + "b" * 32
+    app = standalone.build_app({
+        "HARNESS_API_TOKEN": reader, "HARNESS_ADMIN_TOKEN": admin,
+        "HARNESS_STATE_DIR": str(tmp_path),
+    })
+    with TestClient(app) as client:
+        headers = {"authorization": f"Bearer {reader}"}
+        assert client.get("/api/status", headers=headers).json()["can_manage_control"] is False
+        assert client.get("/api/control/settings", headers=headers).status_code == 403
+        assert client.get("/api/control/metrics", headers=headers).status_code == 403
+        assert client.put("/api/control/settings", json={}, headers=headers).status_code == 403
+        assert client.post("/api/control/runs/absent/cancel", json={},
+                           headers=headers).status_code == 403
+        admin_headers = {"authorization": f"Bearer {admin}"}
+        assert client.get("/api/status", headers=admin_headers).json()["can_manage_control"] is True
+        saved = client.get("/api/control/settings", headers=admin_headers).json()
+        update = {"revision": saved["revision"], "settings": saved["settings"]}
+        assert client.put("/api/control/settings", json=update,
+                          headers=admin_headers).status_code == 200
 
 
 async def test_standalone_only_bearer_auth_and_unconfigured_status(

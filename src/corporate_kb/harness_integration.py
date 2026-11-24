@@ -194,6 +194,16 @@ def create_embedded_harness(
         original = grants.get(principal.owner_id)
         return original is not None and await identity(original) == principal
 
+    async def control_authorized(request: Request) -> bool:
+        # Control-plane authority is explicit even in legacy reader/development
+        # deployments. A shared RAG token is never an administrator credential.
+        if access is not None:
+            return await asyncio.to_thread(access.administrator, request) is not None
+        password = settings.admin_password
+        expected = password.get_secret_value() if password is not None else ""
+        supplied = request.headers.get("x-kb-admin-password", "")
+        return len(expected) >= 16 and bool(supplied) and secrets.compare_digest(supplied, expected)
+
     model = build_model(settings, controller=controller)
     integrations = IntegrationHub(IntegrationStore(settings.harness_state_dir), check)
     runtime = HarnessRuntime(
@@ -211,6 +221,7 @@ def create_embedded_harness(
         authenticate,
         model_control=model.model_control,
         authorize_model_manager=manager_authorized,
+        authorize_control_manager=control_authorized,
         integrations=integrations,
     )
     original_lifespan = app.router.lifespan_context

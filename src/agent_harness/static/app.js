@@ -251,7 +251,7 @@
   function updateSettingsChrome() {
     const busy = Boolean(settingsState.busy);
     $("settings-open").hidden = !settingsState.canManage || state.needsAuth;
-    $("control-open").hidden = !settingsState.canManage || state.needsAuth || state.status?.control_enabled === false;
+    $("control-open").hidden = state.status?.can_manage_control !== true || state.needsAuth;
     $("settings-fields").disabled = busy || !settingsState.canManage;
     $("settings-save").disabled = busy || !settingsState.canManage || !settingsState.dirty;
     $("settings-discard").disabled = busy || !settingsState.dirty;
@@ -1326,7 +1326,7 @@
     $("model-heading").textContent = direct ? model.name || "Модель" : "GigaCode";
     const current = modelState();
     const canManage = (direct ? settingsState.canManage : state.modelDetails?.can_manage === true) && !state.needsAuth;
-    $("control-open").hidden = !(settingsState.canManage || canManage) || state.needsAuth || state.status?.control_enabled === false;
+    $("control-open").hidden = state.status?.can_manage_control !== true || state.needsAuth;
     const labels = { disabled: "Выключен", starting: "Запускается", authentication_required: "Нужен вход", ready: "Готов", error: "Ошибка запуска" };
     const messages = {
       disabled: direct ? "Подключите модель в настройках, чтобы получать ответы на основе найденных материалов." : "Подключите GigaCode, чтобы получать ответы на основе найденных материалов.",

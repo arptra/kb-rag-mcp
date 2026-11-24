@@ -39,7 +39,7 @@ function fixture(t, handler = () => metrics()) {
   const timers = new Set(), calls = [], charts = [];
   const document = { baseURI: "http://localhost/harness/control/", hidden: false, getElementById(id) { assert(nodes.has(id), "Missing element " + id); return nodes.get(id); }, createElement: (tag) => new Element(tag), createDocumentFragment: () => new Element("fragment"), addEventListener() {} };
   const window = { addEventListener() {}, matchMedia: () => ({ matches: true }), setTimeout(callback, delay) { const timer = setTimeout(callback, delay); timers.add(timer); return timer; }, clearTimeout(timer) { clearTimeout(timer); timers.delete(timer); }, Chart: class { constructor(element, config) { this.config = config; charts.push(this); } destroy() { this.destroyed = true; } } };
-  const context = vm.createContext({ document, window, URL, AbortController, console, sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} }, async fetch(url, options) { const request = { route: url.pathname.replace("/harness/api/control/", "") + url.search, ...options }; calls.push(request); const response = await handler(request); return { ok: !response.status || response.status < 400, status: response.status || 200, json: async () => response.payload || response }; } });
+  const context = vm.createContext({ document, window, URL, AbortController, console, sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} }, async fetch(url, options) { const request = { route: url.pathname.replace("/harness/api/control/", "") + url.search, ...options }; calls.push(request); const response = url.pathname === "/access/api/session" ? { csrf_token: "test-admin-csrf" } : await handler(request); return { ok: !response.status || response.status < 400, status: response.status || 200, json: async () => response.payload || response }; } });
   const script = fs.readFileSync(path.join(directory, "app.js"), "utf8").replace(/  loadSettings\(\);\s*\}\)\(\);\s*$/, "globalThis.ui = { state, api, applySettings, renderMetrics, refreshMetrics, saveSettings, cancelRun, resetAccess, dirty };\n})();");
   vm.runInContext(script, context); assert(context.ui);
   const ui = context.ui; ui.applySettings(settings());
@@ -57,7 +57,10 @@ test("edits a typed profile, keeps other profiles, and saves the server revision
   assert.equal(ui.state.settings.profiles.investigate.medium.model_calls, 8);
   const pending = ui.saveSettings();
   assert.equal(edit.disabled, true);
-  const submitted = JSON.parse(calls[0].body); assert.equal(submitted.revision, 7); assert.equal("revision" in submitted.settings, false);
+  await new Promise(setImmediate);
+  const mutation = calls.find((item) => item.method === "PUT");
+  assert.equal(mutation.headers["X-CSRF-Token"], "test-admin-csrf");
+  const submitted = JSON.parse(mutation.body); assert.equal(submitted.revision, 7); assert.equal("revision" in submitted.settings, false);
   release(); await pending;
   assert.equal(ui.state.revision, 8); assert.equal(ui.dirty(), false);
   assert.equal(input(nodes, "profiles.autonomous.medium.model_calls").disabled, false);
@@ -80,6 +83,18 @@ test("charts use actual aggregates, unknown billed tokens stay unknown, and olde
   await ui.cancelRun("older-active");
   const request = calls.find((item) => item.route === "runs/older-active/cancel");
   assert.equal(request.method, "POST"); assert.equal(request.body, "{}");
+  assert.equal(request.headers["X-CSRF-Token"], "test-admin-csrf");
+});
+
+test("access revoked on the server clears the dashboard and all cached metrics", async (t) => {
+  const { ui, nodes, charts } = fixture(t, () => ({ status: 403 }));
+  ui.renderMetrics(metrics());
+  await ui.refreshMetrics();
+  assert.equal(nodes.get("workspace").hidden, true);
+  assert.equal(nodes.get("access-panel").hidden, false);
+  assert.equal(nodes.get("active-runs").textContent, "");
+  assert.equal(ui.state.settings, null);
+  assert(charts.every((chart) => chart.destroyed));
 });
 
 test("late metrics from an old identity cannot restore private administrative state", async (t) => {

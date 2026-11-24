@@ -86,6 +86,17 @@ function run(id, extra = {}) {
     created_at: "2026-11-24T10:00:00Z", evidence: [], warnings: [], metrics: {}, ...extra };
 }
 
+test("management link requires explicit server administrator permission", (t) => {
+  const { ui, nodes } = fixture(t);
+  ui.state.modelDetails = { can_manage: true };
+  ui.state.status.can_manage_control = false;
+  ui.renderStatus();
+  assert.equal(nodes.get("control-open").hidden, true);
+  ui.state.status.can_manage_control = true;
+  ui.renderStatus();
+  assert.equal(nodes.get("control-open").hidden, false);
+});
+
 test("opens latest 200 turns, loads older history, and submits after the latest turn", async (t) => {
   const runs = Array.from({ length: 201 }, (_, index) => run(String(index)));
   let submitted;
