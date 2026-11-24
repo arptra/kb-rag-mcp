@@ -12,7 +12,13 @@ class Node {
     this.tagName = tag; this.children = []; this.parent = null; this.text = "";
     this.dataset = {}; this.attributes = {}; this.listeners = {};
     this.value = ""; this.hidden = false; this.disabled = false;
-    this.classList = { toggle() {}, add() {}, remove() {} };
+    const classes = new Set();
+    this.classList = {
+      toggle(name, force) { const present = force === undefined ? !classes.has(name) : force; if (present) classes.add(name); else classes.delete(name); return present; },
+      add(...names) { for (const name of names) classes.add(name); },
+      remove(...names) { for (const name of names) classes.delete(name); },
+      contains(name) { return classes.has(name); },
+    };
   }
   set textContent(value) { this.text = String(value); this.children = []; }
   get textContent() { return this.text + this.children.map((child) => child.textContent).join(""); }
@@ -32,32 +38,41 @@ class Node {
   addEventListener(type, callback) { this.listeners[type] = callback; }
   querySelectorAll() { return []; }
   querySelector() { return new Node(); }
-  focus() {} scrollIntoView() {} close() {} showModal() {}
+  contains(node) { return node === this || this.children.some((child) => child.contains(node)); }
+  focus() { if (this.ownerDocument) this.ownerDocument.activeElement = this; }
+  scrollIntoView() {} close() {} showModal() {}
   get firstElementChild() { return this.children[0]; }
   get lastElementChild() { return this.children.at(-1); }
 }
 
-function fixture(t, handler = () => ({}), { session = () => ({ ok: false, status: 404 }), baseURI = "http://localhost/harness/" } = {}) {
+function fixture(t, handler = () => ({}), { session = () => ({ ok: false, status: 404 }), baseURI = "http://localhost/harness/",
+  viewportWidth = 1440, storage = new Map(), storageUnavailable = false } = {}) {
   const nodes = new Map([...fs.readFileSync(path.join(staticPath, "index.html"), "utf8")
     .matchAll(/\bid="([^"]+)"/g)].map((match) => [match[1], new Node()]));
   nodes.get("submit-question").append(new Node("span"));
   nodes.get("effort").value = "medium";
   const timers = new Set();
   const document = {
-    baseURI, hidden: false,
+    baseURI, hidden: false, activeElement: null,
     getElementById(id) { assert(nodes.has(id), "Missing DOM element: " + id); return nodes.get(id); },
     createElement: (tag) => new Node(tag), createDocumentFragment: () => new Node("fragment"),
     createTextNode(text) { const node = new Node("text"); node.textContent = text; return node; },
     querySelector: () => ({ value: "quick" }), querySelectorAll: () => [], addEventListener() {},
   };
+  for (const node of nodes.values()) node.ownerDocument = document;
   const window = {
-    matchMedia: () => ({ matches: true, addEventListener() {} }), addEventListener() {},
+    matchMedia: (query) => ({ matches: query.includes("prefers-reduced-motion") ||
+      (query.includes("max-width") && viewportWidth <= Number(query.match(/max-width:\s*(\d+)/)[1])), addEventListener() {} }), addEventListener() {},
     setTimeout(callback, delay) { const id = setTimeout(callback, delay); timers.add(id); return id; },
     clearTimeout(id) { clearTimeout(id); timers.delete(id); },
   };
   const requests = [];
   const context = vm.createContext({
     document, window, AbortController, URL, console, setTimeout, clearTimeout,
+    localStorage: {
+      getItem(key) { if (storageUnavailable) throw new Error("Storage unavailable"); return storage.get(key) ?? null; },
+      setItem(key, value) { if (storageUnavailable) throw new Error("Storage unavailable"); storage.set(key, value); },
+    },
     sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     async fetch(url, options) {
       const call = { path: url.pathname.replace(new URL("./api/", baseURI).pathname, "") + url.search, ...options };
@@ -71,7 +86,7 @@ function fixture(t, handler = () => ({}), { session = () => ({ ok: false, status
     /  updateSubmit\(\);\s+renderHistory\(\);\s+loadWorkspace\(\);\s+\}\)\(\);\s*$/,
     "globalThis.ui = { state, conversationState, api, loadConversation, loadConversations, " +
     "selectRun, refreshRun, submitRun, resetWorkspace, renderResearchActivity, renderStatus, renderBudget, modelConnectionValue, applyModelConnection, " +
-    "settingsState, modelConnectionState, tlsState, changeModelConnection, saveTlsBundle };\n})();",
+    "settingsState, modelConnectionState, tlsState, changeModelConnection, saveTlsBundle, layoutState, setPanelCollapsed, initLayout, renderTranscript };\n})();",
   );
   vm.runInContext(source, context);
   assert(context.ui, "The test must expose the actual shipped script");
@@ -79,7 +94,7 @@ function fixture(t, handler = () => ({}), { session = () => ({ ok: false, status
   ui.state.status = { enabled: true, indexes: [{ id: "a", name: "Documents" }], model: { available: true } };
   ui.state.selected.add("a");
   t.after(() => { for (const timer of timers) clearTimeout(timer); });
-  return { ui, nodes, requests };
+  return { ui, nodes, requests, storage, document };
 }
 
 function run(id, extra = {}) {
@@ -87,6 +102,89 @@ function run(id, extra = {}) {
     index_ids: ["a"], mode: "quick", effort: "medium", status: "completed", phase: "finished",
     created_at: "2026-11-24T10:00:00Z", evidence: [], warnings: [], metrics: {}, ...extra };
 }
+
+test("panels collapse independently without losing the message draft or leaving hidden keyboard focus", (t) => {
+  const { ui, nodes, document } = fixture(t);
+  nodes.get("question").value = "My unfinished follow-up";
+  nodes.get("history-content").append(nodes.get("new-run"));
+  nodes.get("new-run").focus();
+  ui.setPanelCollapsed("history", true);
+  assert.equal(nodes.get("history-content").hidden, true);
+  assert.equal(nodes.get("history-toggle").attributes["aria-expanded"], "false");
+  assert.equal(nodes.get("history-toggle").attributes["aria-label"], "Показать список чатов");
+  assert.equal(document.activeElement, nodes.get("history-toggle"));
+  assert.equal(nodes.get("workspace").classList.contains("history-collapsed"), true);
+  assert.equal(nodes.get("context-content").hidden, false);
+  nodes.get("context-toggle").listeners.click();
+  assert.equal(nodes.get("context-content").hidden, true);
+  assert.equal(nodes.get("context-toggle").attributes["aria-expanded"], "false");
+  assert.equal(nodes.get("context-toggle").attributes["aria-label"], "Показать источники");
+  nodes.get("context-toggle").listeners.click();
+  assert.equal(nodes.get("context-content").hidden, false);
+  assert.equal(nodes.get("context-toggle").attributes["aria-expanded"], "true");
+  assert.equal(nodes.get("context-toggle").attributes["aria-label"], "Свернуть источники");
+  assert.equal(nodes.get("history-content").hidden, true);
+  nodes.get("history-toggle").listeners.click();
+  assert.equal(nodes.get("history-content").hidden, false);
+  assert.equal(nodes.get("history-toggle").attributes["aria-expanded"], "true");
+  assert.equal(nodes.get("question").value, "My unfinished follow-up");
+});
+
+test("panel defaults leave room for the chat on narrow screens and remain reversible", (t) => {
+  const tablet = fixture(t, undefined, { viewportWidth: 881 });
+  assert.equal(tablet.nodes.get("history-content").hidden, false);
+  assert.equal(tablet.nodes.get("context-content").hidden, true);
+  const phone = fixture(t, undefined, { viewportWidth: 390 });
+  assert.equal(phone.nodes.get("history-content").hidden, true);
+  assert.equal(phone.nodes.get("context-content").hidden, true);
+  phone.nodes.get("context-shortcut").listeners.click();
+  assert.equal(phone.nodes.get("context-content").hidden, false);
+  assert.equal(phone.nodes.get("history-content").hidden, true);
+});
+
+test("explicit panel preferences survive reload even when the viewport changes", (t) => {
+  const first = fixture(t, undefined, { viewportWidth: 1440 });
+  first.ui.setPanelCollapsed("history", true);
+  first.ui.setPanelCollapsed("context", false);
+  const restored = fixture(t, undefined, { viewportWidth: 881, storage: first.storage });
+  assert.equal(restored.nodes.get("history-content").hidden, true);
+  assert.equal(restored.nodes.get("context-content").hidden, false);
+  assert.equal(restored.nodes.get("history-toggle").attributes["aria-expanded"], "false");
+  assert.equal(restored.nodes.get("context-toggle").attributes["aria-expanded"], "true");
+});
+
+test("blocked or malformed preference storage never disables panel controls or chat requests", async (t) => {
+  for (const options of [{ storageUnavailable: true }, { storage: new Map([["agent-harness.layout.v1", "{broken"]]) }]) {
+    const { ui, nodes } = fixture(t, () => ({ accepted: true }), options);
+    ui.setPanelCollapsed("history", true);
+    ui.setPanelCollapsed("context", true);
+    nodes.get("history-toggle").listeners.click();
+    assert.equal(nodes.get("history-content").hidden, false);
+    assert.equal(nodes.get("context-content").hidden, true);
+    assert.equal((await ui.api("runs", { method: "POST", body: { question: "Follow-up" } })).accepted, true);
+  }
+});
+
+test("transcript updates preserve older reading position and follow new content only from the bottom", (t) => {
+  const { ui, nodes } = fixture(t);
+  const scroll = nodes.get("chat-scroll"), messages = nodes.get("conversation-messages");
+  scroll.scrollHeight = 2000; scroll.clientHeight = 500; scroll.scrollTop = 240;
+  scroll.scrollTo = ({ top }) => { scroll.scrollTop = Math.min(top, scroll.scrollHeight - scroll.clientHeight); };
+  const replace = messages.replaceChildren.bind(messages);
+  messages.replaceChildren = (...items) => {
+    replace(...items);
+    // Rebuilding the message tree can temporarily reset browser scroll anchoring.
+    scroll.scrollTop = 0; scroll.scrollHeight += 400;
+  };
+  ui.conversationState.id = "chat";
+  ui.conversationState.runs = [run("old"), run("new", { status: "running", answer: "Partial answer" })];
+  ui.renderTranscript();
+  assert.equal(scroll.scrollTop, 240);
+  scroll.scrollTop = scroll.scrollHeight - scroll.clientHeight;
+  ui.conversationState.runs.at(-1).answer += " with more evidence";
+  ui.renderTranscript();
+  assert.equal(scroll.scrollTop, scroll.scrollHeight - scroll.clientHeight);
+});
 
 test("management link requires explicit server administrator permission", (t) => {
   const { ui, nodes } = fixture(t);

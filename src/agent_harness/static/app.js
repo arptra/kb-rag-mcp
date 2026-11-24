@@ -2,6 +2,7 @@
 
 (() => {
   const AUTH_KEY = "agent-harness.auth.v1";
+  const LAYOUT_KEY = "agent-harness.layout.v1";
   const ACTIVE = new Set(["queued", "running", "cancelling"]);
   const MODEL_PENDING = new Set(["starting", "authentication_required"]);
   const SETTINGS_TABS = ["repositories", "connections", "sandbox", "ssh", "discoveries", "model"];
@@ -25,6 +26,40 @@
     synthesizing: "Сопоставляем материалы и готовим ответ.", finished: "",
   };
   const $ = (id) => document.getElementById(id);
+  const layoutState = { historyCollapsed: false, contextCollapsed: false };
+  function setPanelCollapsed(panel, collapsed, { persist = true } = {}) {
+    const content = $(panel + "-content"), toggle = $(panel + "-toggle");
+    if (collapsed && content.contains(document.activeElement)) toggle.focus();
+    layoutState[panel + "Collapsed"] = collapsed;
+    content.hidden = collapsed;
+    $("workspace").classList.toggle(panel + "-collapsed", collapsed);
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    const label = (collapsed ? "Показать " : "Свернуть ") + (panel === "history" ? "список чатов" : "источники");
+    toggle.setAttribute("aria-label", label); toggle.title = label;
+    if (panel === "context") $("context-shortcut").hidden = !collapsed;
+    if (persist) {
+      try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(layoutState)); } catch (_) { /* The layout still works without storage. */ }
+    }
+  }
+  function initLayout() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(LAYOUT_KEY) || "null"); } catch (_) { /* Use the viewport defaults. */ }
+    for (const [panel, query] of [["history", "(max-width: 760px)"], ["context", "(max-width: 1200px)"]]) {
+      const key = panel + "Collapsed";
+      setPanelCollapsed(panel, typeof saved?.[key] === "boolean" ? saved[key] : window.matchMedia(query).matches, { persist: false });
+      $(panel + "-toggle").addEventListener("click", () => setPanelCollapsed(panel, !layoutState[key]));
+      $(panel + "-panel").addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && !layoutState[key]) { setPanelCollapsed(panel, true); $(panel + "-toggle").focus(); }
+      });
+    }
+    $("context-shortcut").addEventListener("click", () => {
+      setPanelCollapsed("context", false); $("context-toggle").focus();
+    });
+  }
+  function scrollChatToLatest() {
+    const scroll = $("chat-scroll");
+    scroll.scrollTo?.({ top: scroll.scrollHeight, behavior: "auto" });
+  }
   const state = {
     status: null, runs: [], current: null, selected: new Set(), sourcesInitialized: false,
     submitting: false, cancelling: false, needsAuth: false, auth: null, generation: 0, identityEpoch: 0,
@@ -1572,6 +1607,7 @@
     const controller = new AbortController(), epoch = state.identityEpoch, generation = state.generation;
     conversationState.controller = controller; conversationState.loading = true;
     renderRun();
+    const scroll = $("chat-scroll"), previousHeight = scroll.scrollHeight || 0, previousTop = scroll.scrollTop || 0;
     const offset = previous ? Math.max(0, conversationState.offset - 200) : 0;
     const limit = previous ? Math.min(200, conversationState.offset) : 200;
     const valid = () => !controller.signal.aborted && epoch === state.identityEpoch && generation === state.generation && conversationState.id === conversation.id;
@@ -1602,7 +1638,8 @@
         $("composer-options").open = false;
       }
       conversationState.pollError = ""; showError(""); renderRun(); schedulePoll();
-      if (!previous) $("conversation-messages").lastElementChild?.scrollIntoView({ block: "start", behavior: "auto" });
+      if (previous) scroll.scrollTop = previousTop + (scroll.scrollHeight || 0) - previousHeight;
+      else scrollChatToLatest();
     } catch (error) { if (valid() && error.status !== 401) showError(errorMessage(error)); }
     finally { if (conversationState.controller === controller) { conversationState.controller = null; conversationState.loading = false; renderTranscript(); updateSubmit(); schedulePoll(); } }
   }
@@ -1611,6 +1648,8 @@
   }
   function renderTranscript() {
     const panel = $("run-panel"), hasConversation = Boolean(conversationState.id);
+    const scroll = $("chat-scroll"), previousTop = scroll.scrollTop || 0;
+    const wasAtBottom = (scroll.scrollHeight || 0) - (scroll.clientHeight || 0) - previousTop < 80;
     $("conversation-panel").hidden = !hasConversation;
     $("conversation-title").textContent = conversationState.title || "Чат";
     $("conversation-loading").hidden = !conversationState.loading;
@@ -1645,6 +1684,8 @@
     }
     if (!state.current) { panel.hidden = true; fragment.append(panel); }
     $("conversation-messages").replaceChildren(fragment);
+    if (wasAtBottom && hasConversation) scrollChatToLatest();
+    else scroll.scrollTop = previousTop;
   }
   function renderEvidence(evidence) {
     const items = Array.isArray(evidence) ? evidence : [];
@@ -1997,7 +2038,7 @@
     stopPolling();
     conversationState.controller?.abort();
     Object.assign(conversationState, { id: null, title: "", runs: [], total: 0, offset: 0, truncated: false, pollError: "", loading: false, controller: null, signature: null });
-    $("composer-options").open = true;
+    $("composer-options").open = false;
     resetRunFeedback();
     state.generation += 1;
     state.current = null;
@@ -2008,6 +2049,7 @@
     $("question").value = "";
     updateCharacterCount();
     renderRun();
+    $("chat-scroll").scrollTop = 0;
     $("question").focus();
   }
   function resetIdentity() {
@@ -2053,6 +2095,7 @@
     const selected = parent ? (Array.isArray(parent.index_ids) ? parent.index_ids : []) : [...state.selected];
     if (!parent && indexes().length && !selected.length) {
       showError("Выберите хотя бы один источник в области поиска.");
+      setPanelCollapsed("context", false);
       const summary = $("sources-disclosure").querySelector("summary");
       if (summary.getAttribute("aria-expanded") !== "true") summary.click();
       $("source-list").querySelector("input")?.focus();
@@ -2084,7 +2127,7 @@
       $("composer-options").open = false;
       $("question").value = "";
       updateCharacterCount();
-      $("question").scrollIntoView({ block: "end", behavior: motionPreference.matches ? "auto" : "smooth" });
+      scrollChatToLatest();
     } catch (error) {
       if (error.status !== 401 && identityEpoch === state.identityEpoch) {
         showError(error.uncertainMutation ? "Не получено подтверждение отправки. Запрос мог быть принят; проверьте историю чатов перед повторной отправкой." : errorMessage(error));
@@ -2109,7 +2152,7 @@
   }
   async function resumeRun() {
     if (!state.current?.resumable || state.submitting || state.needsAuth) return;
-    if (!state.selected.size) { showError("Выберите источники для продолжения исследования."); return; }
+    if (!state.selected.size) { showError("Выберите источники для продолжения исследования."); setPanelCollapsed("context", false); return; }
     const epoch = state.identityEpoch, generation = state.generation, id = idOf(state.current);
     state.submitting = true; showError(""); updateSubmit();
     try {
@@ -2306,6 +2349,7 @@
     for (const controller of [sshState.controller, tlsState.controller, modelConnectionState.controller, memoryState.controller, discoveryState.controller, discoveryState.adminController, deletionState.controller, feedbackState.controller, state.sandboxProfilesController]) controller?.abort();
     clearSshEditor(); clearTlsEditor();
   });
+  initLayout();
   updateSubmit();
   renderHistory();
   loadWorkspace();

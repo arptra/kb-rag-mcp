@@ -11,17 +11,24 @@
   </head>
   <body>
     <a class="skip-link" href="#question">Перейти к запросу</a>
-    <div class="workspace">
-      <aside class="sidebar" aria-label="Ваши чаты">
-        <a class="brand" href="./" aria-label="Harness — новый запрос">Harness</a>
-        <button id="new-run" class="new-run" type="button">Новый чат</button>
-        <div class="history-heading"><h2 id="history-title">Ваши чаты</h2><span id="history-count">0</span></div>
-        <nav id="history-list" class="history-list" aria-label="Ваши чаты"></nav>
-        <button id="history-more" class="text-button" type="button" hidden>Ещё чаты</button>
-        <p id="history-empty" class="history-empty">Здесь появятся ваши исследования. К любому из них можно вернуться.</p>
-        <div class="sidebar-footer">
-          <a id="portal-link" class="portal-link" hidden>Открыть портал <span aria-hidden="true">↗</span></a>
-          <div class="personal-note"><span class="personal-dot" aria-hidden="true"></span><span id="identity-label">История запросов</span></div>
+    <div id="workspace" class="workspace">
+      <aside id="history-panel" class="sidebar" aria-label="Ваши чаты">
+        <div class="sidebar-heading">
+          <a class="brand" href="./" aria-label="Harness — новый запрос">Harness</a>
+          <button id="history-toggle" class="panel-toggle" type="button" aria-label="Свернуть список чатов" title="Свернуть список чатов" aria-expanded="true" aria-controls="history-content">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16m6-11-3 3 3 3"/></svg>
+          </button>
+        </div>
+        <div id="history-content" class="sidebar-content">
+          <button id="new-run" class="new-run" type="button">Новый чат</button>
+          <div class="history-heading"><h2 id="history-title">Ваши чаты</h2><span id="history-count">0</span></div>
+          <nav id="history-list" class="history-list" aria-label="Ваши чаты"></nav>
+          <button id="history-more" class="text-button" type="button" hidden>Ещё чаты</button>
+          <p id="history-empty" class="history-empty">Здесь появятся ваши исследования. К любому из них можно вернуться.</p>
+          <div class="sidebar-footer">
+            <a id="portal-link" class="portal-link" hidden>Открыть портал <span aria-hidden="true">↗</span></a>
+            <div class="personal-note"><span class="personal-dot" aria-hidden="true"></span><span id="identity-label">История запросов</span></div>
+          </div>
         </div>
       </aside>
 
@@ -41,28 +48,65 @@
 
         <div class="workspace-body">
           <div class="content-column">
-            <section id="welcome" class="welcome" aria-labelledby="welcome-title">
-              <h1 id="welcome-title">Разберёмся в системе</h1>
-              <p>От вопроса — к ответу с подтверждениями.</p>
-            </section>
+            <div id="chat-scroll" class="chat-scroll" role="region" aria-label="Переписка и ход исследования" tabindex="0">
+              <section id="welcome" class="welcome" aria-labelledby="welcome-title">
+                <h1 id="welcome-title">Разберёмся в системе</h1>
+                <p>От вопроса — к ответу с подтверждениями.</p>
+              </section>
 
-            <div id="notice" class="notice" role="status" hidden></div>
-            <div id="error-banner" class="error-banner" role="alert" hidden></div>
+              <div id="notice" class="notice" role="status" hidden></div>
+              <div id="error-banner" class="error-banner" role="alert" hidden></div>
 
-            <section id="conversation-panel" class="conversation-panel" aria-label="Переписка" hidden>
-              <div class="conversation-heading"><h1 id="conversation-title">Чат</h1><div class="conversation-actions"><button id="refresh-conversation" class="text-button" type="button">Обновить</button><button id="delete-conversation" class="text-button" type="button">Удалить чат</button></div></div>
-              <p id="conversation-loading" class="settings-field-help" role="status" hidden>Загружаем переписку…</p>
-              <p id="conversation-sync" class="settings-field-help" role="status" aria-live="polite" hidden></p>
-              <p id="conversation-history-note" class="settings-field-help" hidden>Часть ранних сообщений уже удалена по сроку хранения. Показана доступная переписка.</p>
-              <button id="conversation-more" class="text-button" type="button" hidden>Показать предыдущие сообщения</button>
-              <div id="conversation-messages" class="conversation-messages" aria-label="Сообщения чата"></div>
-            </section>
+              <section id="conversation-panel" class="conversation-panel" aria-label="Переписка" hidden>
+                <div class="conversation-heading"><h1 id="conversation-title">Чат</h1><div class="conversation-actions"><button id="refresh-conversation" class="text-button" type="button">Обновить</button><button id="delete-conversation" class="text-button" type="button">Удалить чат</button></div></div>
+                <p id="conversation-loading" class="settings-field-help" role="status" hidden>Загружаем переписку…</p>
+                <p id="conversation-sync" class="settings-field-help" role="status" aria-live="polite" hidden></p>
+                <p id="conversation-history-note" class="settings-field-help" hidden>Часть ранних сообщений уже удалена по сроку хранения. Показана доступная переписка.</p>
+                <button id="conversation-more" class="text-button" type="button" hidden>Показать предыдущие сообщения</button>
+                <div id="conversation-messages" class="conversation-messages" aria-label="Сообщения чата"></div>
+              </section>
 
+              <section id="suggestions" class="suggestions" aria-label="Примеры запросов">
+                <button type="button" data-question="Как устроена система и какие сервисы отвечают за основные процессы?"><span>Разобраться в системе<small>Сервисы, роли и связи</small></span><span class="suggestion-arrow" aria-hidden="true">↗</span></button>
+                <button type="button" data-question="Где документация и реализация расходятся? Покажи подтверждения и неизвестное."><span>Сопоставить сведения<small>Подтверждения и расхождения</small></span><span class="suggestion-arrow" aria-hidden="true">↗</span></button>
+              </section>
+
+              <section id="run-panel" class="run-panel" aria-labelledby="run-question" hidden>
+                <div class="run-topline"><span id="run-mode" class="eyebrow">Исследование</span><span id="run-date" class="muted"></span></div>
+                <h2 id="run-question" class="sr-only"></h2>
+                <p id="parent-note" class="parent-note" hidden></p>
+                <div class="run-progress">
+                  <div class="progress-description"><span id="run-status-dot" class="run-status-dot" aria-hidden="true"></span><div><strong id="run-status">Запрос принят</strong><p id="run-phase"></p></div></div>
+                  <button id="cancel-run" class="text-button" type="button" hidden>Остановить</button>
+                </div>
+                <div id="progress-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+                <p id="run-coverage" class="run-coverage" hidden></p>
+                <section id="research-activity" class="research-activity" aria-label="Ход исследования" hidden>
+                  <p id="research-current" class="research-next" role="status" aria-live="polite" hidden></p>
+                  <p id="research-goal" class="research-goal" hidden></p>
+                  <p id="research-next" class="research-next" hidden></p>
+                  <details id="research-details"><summary>Что проверено и что ещё нужно выяснить</summary><div id="research-plan" class="research-plan"></div><ol id="research-timeline" class="research-timeline"></ol></details>
+                </section>
+                <div id="run-warnings" class="run-warnings" hidden></div>
+                <details id="run-budget" class="run-budget" hidden><summary>Ресурсы и управление контекстом</summary><p id="run-context-summary" class="muted"></p><div id="run-budget-values" class="budget-values"></div><ol id="run-budget-events" class="research-timeline"></ol></details>
+                <div id="answer" class="answer"></div>
+                <div id="answer-placeholder" class="answer-placeholder" hidden><p>Сведения появятся здесь.<br><span>Найденные материалы доступны в блоке подтверждений уже во время работы.</span></p></div>
+                <div id="run-memory-used" class="run-memory-used" hidden></div>
+                <p id="run-environment" class="run-environment" hidden></p>
+                <section id="run-feedback" class="run-feedback" aria-labelledby="run-feedback-title" hidden>
+                  <h3 id="run-feedback-title">Ответ помог?</h3>
+                  <label class="settings-field"><span class="settings-field-label">Комментарий · необязательно</span><textarea id="run-feedback-comment" rows="2" maxlength="1000" placeholder="Что получилось или что нужно исправить?"></textarea></label>
+                  <div class="resource-actions"><button id="feedback-helpful" class="secondary-button" type="button" aria-pressed="false">Помогло</button><button id="feedback-unhelpful" class="secondary-button" type="button" aria-pressed="false">Не помогло</button></div>
+                  <p id="run-feedback-status" class="settings-field-help" role="status" aria-live="polite"></p>
+                </section>
+                <div class="run-footer"><span id="run-metrics" class="muted"></span><div class="run-actions"><button id="remember-run" class="text-button" type="button" hidden>Запомнить уточнение</button><button id="resume-run" class="secondary-button" type="button" hidden>Продолжить с выбранными источниками</button><button id="deepen-run" class="secondary-button" type="button" hidden>Исследовать глубже</button><button id="delete-run" class="text-button" type="button">Удалить этот запрос</button></div></div>
+              </section>
+            </div>
             <section id="composer-section" class="composer-section" aria-label="Сообщение в чат">
               <form id="question-form" class="composer">
                 <label class="sr-only" for="question">Вопрос или задача</label>
-                <textarea id="question" name="question" placeholder="Что хотите узнать о системе?" rows="4" maxlength="8000" required></textarea>
-                <details id="composer-options" class="composer-options" open><summary>Режим и глубина исследования</summary>
+                <textarea id="question" name="question" placeholder="Что хотите узнать о системе?" rows="2" maxlength="8000" required></textarea>
+                <details id="composer-options" class="composer-options"><summary>Режим и глубина исследования</summary>
                 <div class="composer-settings">
                   <fieldset class="mode-options">
                     <legend class="sr-only">Режим работы</legend>
@@ -80,80 +124,55 @@
               <div class="composer-hint"><span>Enter — отправить · Shift + Enter — новая строка</span><span id="character-count">0 / 8 000</span></div>
             </section>
 
-            <section id="suggestions" class="suggestions" aria-label="Примеры запросов">
-              <button type="button" data-question="Как устроена система и какие сервисы отвечают за основные процессы?"><span>Разобраться в системе<small>Сервисы, роли и связи</small></span><span class="suggestion-arrow" aria-hidden="true">↗</span></button>
-              <button type="button" data-question="Где документация и реализация расходятся? Покажи подтверждения и неизвестное."><span>Сопоставить сведения<small>Подтверждения и расхождения</small></span><span class="suggestion-arrow" aria-hidden="true">↗</span></button>
-            </section>
-
-            <section id="run-panel" class="run-panel" aria-labelledby="run-question" hidden>
-              <div class="run-topline"><span id="run-mode" class="eyebrow">Исследование</span><span id="run-date" class="muted"></span></div>
-              <h2 id="run-question" class="sr-only"></h2>
-              <p id="parent-note" class="parent-note" hidden></p>
-              <div class="run-progress">
-                <div class="progress-description"><span id="run-status-dot" class="run-status-dot" aria-hidden="true"></span><div><strong id="run-status">Запрос принят</strong><p id="run-phase"></p></div></div>
-                <button id="cancel-run" class="text-button" type="button" hidden>Остановить</button>
-              </div>
-              <div id="progress-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
-              <p id="run-coverage" class="run-coverage" hidden></p>
-              <section id="research-activity" class="research-activity" aria-label="Ход исследования" hidden>
-                <p id="research-current" class="research-next" role="status" aria-live="polite" hidden></p>
-                <p id="research-goal" class="research-goal" hidden></p>
-                <p id="research-next" class="research-next" hidden></p>
-                <details id="research-details"><summary>Что проверено и что ещё нужно выяснить</summary><div id="research-plan" class="research-plan"></div><ol id="research-timeline" class="research-timeline"></ol></details>
-              </section>
-              <div id="run-warnings" class="run-warnings" hidden></div>
-              <details id="run-budget" class="run-budget" hidden><summary>Ресурсы и управление контекстом</summary><p id="run-context-summary" class="muted"></p><div id="run-budget-values" class="budget-values"></div><ol id="run-budget-events" class="research-timeline"></ol></details>
-              <div id="answer" class="answer"></div>
-              <div id="answer-placeholder" class="answer-placeholder" hidden><p>Сведения появятся здесь.<br><span>Найденные материалы доступны в блоке подтверждений уже во время работы.</span></p></div>
-              <div id="run-memory-used" class="run-memory-used" hidden></div>
-              <p id="run-environment" class="run-environment" hidden></p>
-              <section id="run-feedback" class="run-feedback" aria-labelledby="run-feedback-title" hidden>
-                <h3 id="run-feedback-title">Ответ помог?</h3>
-                <label class="settings-field"><span class="settings-field-label">Комментарий · необязательно</span><textarea id="run-feedback-comment" rows="2" maxlength="1000" placeholder="Что получилось или что нужно исправить?"></textarea></label>
-                <div class="resource-actions"><button id="feedback-helpful" class="secondary-button" type="button" aria-pressed="false">Помогло</button><button id="feedback-unhelpful" class="secondary-button" type="button" aria-pressed="false">Не помогло</button></div>
-                <p id="run-feedback-status" class="settings-field-help" role="status" aria-live="polite"></p>
-              </section>
-              <div class="run-footer"><span id="run-metrics" class="muted"></span><div class="run-actions"><button id="remember-run" class="text-button" type="button" hidden>Запомнить уточнение</button><button id="resume-run" class="secondary-button" type="button" hidden>Продолжить с выбранными источниками</button><button id="deepen-run" class="secondary-button" type="button" hidden>Исследовать глубже</button><button id="delete-run" class="text-button" type="button">Удалить этот запрос</button></div></div>
-            </section>
           </div>
 
-          <aside class="context-column" aria-label="Источники и подтверждения">
-            <section id="model-card" class="model-card" aria-labelledby="model-heading">
-              <div class="card-heading"><h2 id="model-heading">GigaCode</h2><span id="model-state-badge" class="model-state-badge">Проверяем</span></div>
-              <p id="model-message" class="model-message" role="status" aria-live="polite">Проверяем готовность модели.</p>
-              <p id="model-manager-hint" class="model-manager-hint" hidden>Для включения GigaCode обратитесь к администратору.</p>
-              <div id="model-error" class="model-error" role="alert" hidden></div>
-              <div id="model-actions" class="model-actions" hidden>
-                <button id="model-enable" class="secondary-button" type="button">Включить GigaCode</button>
-                <a id="model-auth-link" class="secondary-button model-auth-link" hidden>Войти в GigaCode <span aria-hidden="true">↗</span></a>
-                <p id="model-shared-note" class="model-manager-hint" hidden>Выключение общего исполнителя затронет подключённых агентов.</p>
-                <button id="model-disable" class="text-button" type="button" hidden>Выключить</button>
-              </div>
-              <details id="model-events" class="model-events" hidden><summary>Ход подключения<svg class="disclosure-chevron" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m5 7 5 5 5-5"/></svg></summary><div class="disclosure-content"><ol id="model-events-list"></ol></div></details>
-            </section>
-            <details id="sources-disclosure" class="sources-card" aria-labelledby="sources-heading" open>
-              <summary class="card-heading sources-summary"><span id="sources-heading" class="card-title">Область поиска</span><span class="disclosure-meta"><span id="source-count" class="count-badge">0</span><svg class="disclosure-chevron" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m5 7 5 5 5-5"/></svg></span></summary>
-              <div class="disclosure-content">
-              <p class="card-description">Выберите источники для этого запроса.</p>
-              <label class="source-select-all"><input id="select-all-sources" type="checkbox" aria-checked="false" disabled><span>Выбрать все источники</span></label>
-              <div id="source-list" class="source-list"></div>
-              <p id="sources-empty" class="empty-description">Загружаем доступные источники…</p>
-              <div class="source-footnote"><span aria-hidden="true">↳</span><span>Ответ опирается на доступные вам сведения.</span></div>
-              </div>
-            </details>
+          <aside id="context-panel" class="context-column" aria-label="Источники и подтверждения">
+            <div class="context-heading">
+              <h2 class="context-title">Источники</h2>
+              <button id="context-toggle" class="panel-toggle" type="button" aria-label="Свернуть источники" title="Свернуть источники" aria-expanded="true" aria-controls="context-content">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M15 4v16m-6-11 3 3-3 3"/></svg>
+              </button>
+            </div>
+            <button id="context-shortcut" class="panel-shortcut" type="button" aria-label="Показать источники" aria-controls="context-content" hidden>Источники</button>
+            <div id="context-content" class="context-scroll">
 
-            <section id="evidence-card" class="evidence-card" aria-labelledby="evidence-heading">
-              <div class="card-heading"><h2 id="evidence-heading">Подтверждения</h2><span id="evidence-count" class="count-badge">0</span></div>
-              <p id="evidence-empty" class="empty-description">Здесь появятся материалы, найденные для вашего запроса.</p>
-              <div id="evidence-list" class="evidence-list"></div>
-            </section>
-            <section id="discoveries-card" class="evidence-card" aria-labelledby="discoveries-heading" hidden>
-              <div class="card-heading"><h2 id="discoveries-heading">Обнаруженные</h2><span id="discoveries-count" class="count-badge">0</span></div>
-              <p class="card-description">Ссылки из материалов. Подключение требует настройки и разрешения доступа.</p>
-              <div id="run-discoveries" class="discovery-list"></div>
-              <p id="discovery-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
-            </section>
-            <p class="reading-note">Проверяйте важные выводы по первоисточникам. Если данных недостаточно, это будет видно в ответе.</p>
+              <section id="model-card" class="model-card" aria-labelledby="model-heading">
+                <div class="card-heading"><h2 id="model-heading">GigaCode</h2><span id="model-state-badge" class="model-state-badge">Проверяем</span></div>
+                <p id="model-message" class="model-message" role="status" aria-live="polite">Проверяем готовность модели.</p>
+                <p id="model-manager-hint" class="model-manager-hint" hidden>Для включения GigaCode обратитесь к администратору.</p>
+                <div id="model-error" class="model-error" role="alert" hidden></div>
+                <div id="model-actions" class="model-actions" hidden>
+                  <button id="model-enable" class="secondary-button" type="button">Включить GigaCode</button>
+                  <a id="model-auth-link" class="secondary-button model-auth-link" hidden>Войти в GigaCode <span aria-hidden="true">↗</span></a>
+                  <p id="model-shared-note" class="model-manager-hint" hidden>Выключение общего исполнителя затронет подключённых агентов.</p>
+                  <button id="model-disable" class="text-button" type="button" hidden>Выключить</button>
+                </div>
+                <details id="model-events" class="model-events" hidden><summary>Ход подключения<svg class="disclosure-chevron" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m5 7 5 5 5-5"/></svg></summary><div class="disclosure-content"><ol id="model-events-list"></ol></div></details>
+              </section>
+              <details id="sources-disclosure" class="sources-card" aria-labelledby="sources-heading" open>
+                <summary class="card-heading sources-summary"><span id="sources-heading" class="card-title">Область поиска</span><span class="disclosure-meta"><span id="source-count" class="count-badge">0</span><svg class="disclosure-chevron" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m5 7 5 5 5-5"/></svg></span></summary>
+                <div class="disclosure-content">
+                <p class="card-description">Выберите источники для этого запроса.</p>
+                <label class="source-select-all"><input id="select-all-sources" type="checkbox" aria-checked="false" disabled><span>Выбрать все источники</span></label>
+                <div id="source-list" class="source-list"></div>
+                <p id="sources-empty" class="empty-description">Загружаем доступные источники…</p>
+                <div class="source-footnote"><span aria-hidden="true">↳</span><span>Ответ опирается на доступные вам сведения.</span></div>
+                </div>
+              </details>
+
+              <section id="evidence-card" class="evidence-card" aria-labelledby="evidence-heading">
+                <div class="card-heading"><h2 id="evidence-heading">Подтверждения</h2><span id="evidence-count" class="count-badge">0</span></div>
+                <p id="evidence-empty" class="empty-description">Здесь появятся материалы, найденные для вашего запроса.</p>
+                <div id="evidence-list" class="evidence-list" role="region" aria-label="Найденные подтверждения" tabindex="0"></div>
+              </section>
+              <section id="discoveries-card" class="evidence-card" aria-labelledby="discoveries-heading" hidden>
+                <div class="card-heading"><h2 id="discoveries-heading">Обнаруженные</h2><span id="discoveries-count" class="count-badge">0</span></div>
+                <p class="card-description">Ссылки из материалов. Подключение требует настройки и разрешения доступа.</p>
+                <div id="run-discoveries" class="discovery-list"></div>
+                <p id="discovery-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
+              </section>
+              <p class="reading-note">Проверяйте важные выводы по первоисточникам. Если данных недостаточно, это будет видно в ответе.</p>
+            </div>
           </aside>
         </div>
       </main>
