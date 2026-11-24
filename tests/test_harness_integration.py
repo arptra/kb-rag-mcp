@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 from typing import Any
 
 import httpx
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from corporate_kb.access.http import USER_COOKIE
+from corporate_kb.access.store import AccessStore
+from corporate_kb.access.tls import identity_from_der
 from corporate_kb.agents import activation
 from corporate_kb.config import Settings
 from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
@@ -192,6 +200,99 @@ async def test_control_requires_explicit_admin_authority_even_in_legacy_reader_m
                     "/harness/api/control/runs/unknown/cancel", json={}, headers=admin,
                 )
             ).status_code == 404
+
+
+async def test_cookie_admin_saves_model_and_tls_only_with_session_csrf(
+    settings_factory: Any, tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Harness test CA")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name).issuer_name(ca_name).public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1)).not_valid_after(now + timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+    client_key = ec.generate_private_key(ec.SECP256R1())
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "harness-user")]))
+        .issuer_name(ca_name).public_key(client_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1)).not_valid_after(now + timedelta(days=10))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    settings, service = _service(
+        settings_factory, harness_enabled=True, access_enabled=True, mcp_tls_enabled=True,
+        access_db_path=tmp_path / "access.sqlite3", access_bootstrap_admin_password=ADMIN,
+    )
+    app: Any = create_http_app(service, settings)
+    issued = AccessStore(settings.access_db_path).enroll(
+        identity_from_der(certificate.public_bytes(serialization.Encoding.DER)), purpose="browser",
+    )
+    bundle = {
+        "id": "corporate-model", "name": "Corporate model",
+        "ca_certificate": ca.public_bytes(serialization.Encoding.PEM).decode(),
+        "client_certificate": certificate.public_bytes(serialization.Encoding.PEM).decode(),
+        "client_key": client_key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode(),
+    }
+    connection = {
+        "provider": "openai", "base_url": "https://model.example.test/v1",
+        "model": "corporate-model", "tls_bundle_id": bundle["id"],
+    }
+    model_path, tls_path = "/harness/api/model/connection", "/harness/api/credentials/tls"
+    origin = {"origin": "https://testserver"}
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="https://testserver",
+        ) as client,
+    ):
+        client.cookies.set(USER_COOKIE, issued.token)
+        assert (await client.get("/harness/api/status")).status_code == 200
+        for path in (model_path, tls_path):
+            assert (await client.get(path)).status_code == 403
+        login = await client.post(
+            "/access/api/login", json={"username": "admin", "password": ADMIN}, headers=origin,
+        )
+        assert login.status_code == 200, login.text
+        assert (await client.get(model_path)).status_code == 200
+        assert (await client.get(tls_path)).json()["credentials"] == []
+        # Admin cookies authorize reads, but every write also needs the session CSRF token.
+        assert (await client.put(model_path, json=connection, headers=origin)).status_code == 403
+        assert (await client.post(tls_path, json=bundle, headers=origin)).status_code == 403
+        session = await client.get("/access/api/session")
+        assert session.status_code == 200
+        headers = {**origin, "x-csrf-token": session.json()["csrf_token"]}
+        uploaded = await client.post(tls_path, json=bundle, headers=headers)
+        assert uploaded.status_code == 201, uploaded.text
+        saved = await client.put(model_path, json=connection, headers=headers)
+        assert saved.status_code == 200, saved.text
+        reread = (await client.get(model_path)).json()["settings"]
+        assert all(reread[key] == value for key, value in connection.items())
+        assert reread["api_key_env"] == ""  # Certificate-only access needs no API key.
+        certificates = await client.get(tls_path)
+        assert certificates.json()["credentials"][0]["id"] == bundle["id"]
+        assert certificates.json()["credentials"][0]["has_client_certificate"] is True
+        assert "client_key" not in certificates.json()["credentials"][0]
+        assert bundle["client_key"].splitlines()[1] not in certificates.text
+        assert (
+            await client.post("/access/api/logout", json={}, headers=headers)
+        ).status_code == 200
+        # Personal access and a formerly valid CSRF token never grant admin rights.
+        assert (await client.get("/harness/api/status")).status_code == 200
+        for path in (model_path, tls_path):
+            assert (await client.get(path)).status_code == 403
+        assert (await client.put(model_path, json=connection, headers=headers)).status_code == 403
+        assert (await client.post(tls_path, json=bundle, headers=headers)).status_code == 403
 
 
 @pytest.mark.parametrize("a2a_enabled", [False, True])

@@ -153,19 +153,41 @@
   }
   async function api(path, { method = "GET", body, signal, timeoutMs } = {}) {
     const identityEpoch = state.identityEpoch;
+    // Credential editors clear their input objects immediately after calling api.
+    // Capture the payload before awaiting the administrator session.
+    const payload = body !== undefined ? JSON.stringify(body) : undefined;
     const headers = { Accept: "application/json" };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (state.auth) headers[state.auth.kind === "admin" ? "X-KB-Admin-Password" : "Authorization"] =
       state.auth.kind === "admin" ? state.auth.value : "Bearer " + state.auth.value;
     const controller = new AbortController(), abort = () => controller.abort();
-    let timedOut = false;
+    let timedOut = false, mutationStarted = false;
     if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
     const wait = timeoutMs || (path === "model/connection/probe" ? Math.min(300, Number(body?.timeout_seconds || modelConnectionState.settings?.timeout_seconds) || 60) * 1000 + 5000 : method === "GET" ? 20000 : 45000);
     const timer = window.setTimeout(() => { timedOut = true; abort(); }, wait);
     try {
+      if (method !== "GET" && /^(settings|model|credentials)(\/|$)/.test(path)) {
+        // Portal cookie admins need CSRF proof even when a reader Bearer token
+        // supplies their personal identity. Header-only hosts have no session API.
+        const session = await fetch(new URL("../access/api/session", document.baseURI), {
+          credentials: "same-origin", cache: "no-store", signal: controller.signal,
+          headers: { Accept: "application/json" },
+        });
+        if (session.ok) {
+          const data = await session.json();
+          if (typeof data.csrf_token !== "string" || !data.csrf_token) throw new Error("Не удалось подтвердить сессию администратора. Обновите вход в портал.");
+          headers["X-CSRF-Token"] = data.csrf_token;
+        } else if (![401, 403, 404].includes(session.status)) {
+          throw new Error("Не удалось проверить сессию администратора. Изменения не отправлены. Повторите попытку.");
+        }
+      }
+      if (identityEpoch !== state.identityEpoch || controller.signal.aborted) {
+        const error = new Error("Запрос отменён."); error.name = "AbortError"; throw error;
+      }
+      mutationStarted = method !== "GET";
       const response = await fetch(new URL("./api/" + path, document.baseURI), {
         method, headers, credentials: "same-origin", signal: controller.signal,
-        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        ...(payload !== undefined ? { body: payload } : {}),
       });
       if (response.status === 401) {
         if (identityEpoch === state.identityEpoch) requireAuth();
@@ -175,15 +197,20 @@
       try { result = await response.json(); }
       catch (_) { const error = new Error("Не удалось прочитать ответ сервера. Обновите чат."); error.status = response.status; throw error; }
       if (!response.ok) {
-        const error = new Error(typeof result.error === "string" ? result.error : "Не удалось выполнить запрос."); error.status = response.status; throw error;
+        const message = response.status === 403 && ["Harness administrator access required", "Model administrator access required"].includes(result.error)
+          ? "Нужны права администратора Harness. Войдите в портал как администратор или укажите администраторский ключ/пароль в окне «Вход в Harness», затем повторите действие."
+          : typeof result.error === "string" ? result.error : "Не удалось выполнить запрос.";
+        const error = new Error(message); error.status = response.status; throw error;
       }
       return result;
     } catch (error) {
       if (timedOut) {
-        const timeout = new Error(method === "GET" ? "Сервер не ответил вовремя. Последние данные сохранены; можно обновить чат." : "Не дождались подтверждения сервера. Действие могло выполниться — обновите чат перед повторной отправкой.");
-        timeout.name = "RequestTimeoutError"; timeout.uncertainMutation = method !== "GET"; throw timeout;
+        const timeout = new Error(method === "GET" ? "Сервер не ответил вовремя. Последние данные сохранены; можно обновить чат." : mutationStarted
+          ? "Не дождались подтверждения сервера. Действие могло выполниться — обновите чат перед повторной отправкой."
+          : "Не удалось подтвердить сессию администратора вовремя. Изменения не отправлены. Повторите попытку.");
+        timeout.name = "RequestTimeoutError"; timeout.uncertainMutation = mutationStarted; throw timeout;
       }
-      if (method !== "GET" && error instanceof TypeError) error.uncertainMutation = true;
+      if (method !== "GET" && error instanceof TypeError) error.uncertainMutation = mutationStarted;
       throw error;
     } finally { window.clearTimeout(timer); signal?.removeEventListener("abort", abort); }
   }

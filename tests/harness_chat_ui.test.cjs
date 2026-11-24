@@ -37,14 +37,14 @@ class Node {
   get lastElementChild() { return this.children.at(-1); }
 }
 
-function fixture(t, handler = () => ({})) {
+function fixture(t, handler = () => ({}), { session = () => ({ ok: false, status: 404 }), baseURI = "http://localhost/harness/" } = {}) {
   const nodes = new Map([...fs.readFileSync(path.join(staticPath, "index.html"), "utf8")
     .matchAll(/\bid="([^"]+)"/g)].map((match) => [match[1], new Node()]));
   nodes.get("submit-question").append(new Node("span"));
   nodes.get("effort").value = "medium";
   const timers = new Set();
   const document = {
-    baseURI: "http://localhost/harness/", hidden: false,
+    baseURI, hidden: false,
     getElementById(id) { assert(nodes.has(id), "Missing DOM element: " + id); return nodes.get(id); },
     createElement: (tag) => new Node(tag), createDocumentFragment: () => new Node("fragment"),
     createTextNode(text) { const node = new Node("text"); node.textContent = text; return node; },
@@ -60,16 +60,18 @@ function fixture(t, handler = () => ({})) {
     document, window, AbortController, URL, console, setTimeout, clearTimeout,
     sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     async fetch(url, options) {
-      const call = { path: url.pathname.replace("/harness/api/", "") + url.search, ...options };
+      const call = { path: url.pathname.replace(new URL("./api/", baseURI).pathname, "") + url.search, ...options };
       requests.push(call);
-      const data = await handler(call);
+      const data = await (url.pathname.endsWith("/access/api/session") ? session(call) : handler(call));
+      if (typeof data?.ok === "boolean") return { json: async () => ({}), ...data };
       return { ok: true, status: 200, json: async () => data };
     },
   });
   const source = fs.readFileSync(path.join(staticPath, "app.js"), "utf8").replace(
     /  updateSubmit\(\);\s+renderHistory\(\);\s+loadWorkspace\(\);\s+\}\)\(\);\s*$/,
     "globalThis.ui = { state, conversationState, api, loadConversation, loadConversations, " +
-    "selectRun, refreshRun, submitRun, resetWorkspace, renderResearchActivity, renderStatus, renderBudget, modelConnectionValue, applyModelConnection };\n})();",
+    "selectRun, refreshRun, submitRun, resetWorkspace, renderResearchActivity, renderStatus, renderBudget, modelConnectionValue, applyModelConnection, " +
+    "settingsState, modelConnectionState, tlsState, changeModelConnection, saveTlsBundle };\n})();",
   );
   vm.runInContext(source, context);
   assert(context.ui, "The test must expose the actual shipped script");
@@ -203,4 +205,113 @@ test("API model output limit survives load and save", (t) => {
   ui.applyModelConnection({ provider: "openai", base_url: "https://models.test/v1", output_tokens: 12000 });
   assert.equal(Number(nodes.get("model-output-tokens").value), 12000);
   assert.equal(ui.modelConnectionValue().output_tokens, 12000);
+});
+
+test("administrator mutations use the current portal CSRF token without slowing chat requests", async (t) => {
+  let token = 0;
+  const { ui, requests } = fixture(t, () => ({}), { session: () => ({ csrf_token: "session-" + ++token }) });
+  // A personal Bearer token can coexist with the portal's admin cookie.
+  ui.state.auth = { kind: "bearer", value: "personal-reader-token" };
+  await ui.api("model/connection");
+  await ui.api("runs", { method: "POST", body: { question: "Question" } });
+  assert.equal(token, 0);
+  for (const [path, method] of [["model/connection", "PUT"], ["model/connection/probe", "POST"],
+    ["credentials/tls", "POST"], ["credentials/tls/cert", "DELETE"], ["credentials/ssh", "POST"],
+    ["settings", "PUT"], ["settings/probe", "POST"], ["model/enable", "POST"]]) {
+    await ui.api(path, { method, body: {} });
+    const [sessionRequest, mutation] = requests.slice(-2);
+    assert.equal(sessionRequest.path, "/access/api/session");
+    assert.equal(sessionRequest.headers.Authorization, undefined);
+    assert.equal(sessionRequest.credentials, "same-origin");
+    assert.equal(mutation.headers["X-CSRF-Token"], "session-" + token);
+    assert.equal(mutation.headers.Authorization, "Bearer personal-reader-token");
+    assert.equal(mutation.path, path);
+    assert.equal(mutation.method, method);
+  }
+});
+
+test("TLS editor uploads the original certificates after awaiting the admin session", async (t) => {
+  let release, uploaded;
+  const waiting = new Promise((resolve) => { release = resolve; });
+  const { ui, nodes, requests } = fixture(t, ({ path, method, body }) => {
+    if (path === "credentials/tls" && method === "POST") uploaded = JSON.parse(body);
+    return { credentials: [] };
+  }, { session: async () => { await waiting; return { csrf_token: "admin-csrf" }; } });
+  ui.settingsState.canManage = true;
+  nodes.get("tls-name").value = "Corporate model";
+  nodes.get("tls-ca").value = "test-ca-pem";
+  nodes.get("tls-cert").value = "test-client-pem";
+  nodes.get("tls-key").value = "test-private-key";
+  const saving = ui.saveTlsBundle();
+  assert.equal(nodes.get("tls-key").value, "");
+  assert.equal(uploaded, undefined);
+  release(); await saving;
+  assert.equal(uploaded.client_key, "test-private-key");
+  assert.equal(uploaded.client_certificate, "test-client-pem");
+  assert.equal(uploaded.ca_certificate, "test-ca-pem");
+  assert.equal(requests.find((request) => request.method === "POST").headers["X-CSRF-Token"], "admin-csrf");
+  assert.match(nodes.get("tls-feedback").textContent, /Сертификаты сохранены/);
+});
+
+test("model URL and keyless TLS selection survive saving and probing with cookie auth", async (t) => {
+  const { ui, requests } = fixture(t, ({ body }) => ({ settings: JSON.parse(body) }),
+    { session: () => ({ csrf_token: "admin-csrf" }) });
+  ui.applyModelConnection({ provider: "openai", base_url: "https://models.test/v1", tls_bundle_id: "corporate-tls" });
+  const config = ui.modelConnectionValue();
+  for (const [path, method] of [["model/connection", "PUT"], ["model/connection/probe", "POST"]]) {
+    const response = await ui.api(path, { method, body: config });
+    assert.equal(response.settings.base_url, "https://models.test/v1");
+    assert.equal(response.settings.tls_bundle_id, "corporate-tls");
+    assert.equal(response.settings.api_key_env, "");
+    assert.equal(requests.at(-1).headers["X-CSRF-Token"], "admin-csrf");
+  }
+});
+
+test("header authentication still works without a portal session endpoint", async (t) => {
+  for (const [kind, status, baseURI] of [["admin", 401, "http://localhost/harness/"],
+    ["bearer", 404, "http://localhost/"]]) {
+    const { ui, requests } = fixture(t, () => ({ saved: true }), { session: () => ({ ok: false, status }), baseURI });
+    ui.state.auth = { kind, value: "administrator-credential" };
+    await ui.api("model/connection", { method: "PUT", body: {} });
+    assert.equal(requests.at(-1).headers[kind === "admin" ? "X-KB-Admin-Password" : "Authorization"],
+      kind === "admin" ? "administrator-credential" : "Bearer administrator-credential");
+    assert.equal(requests.at(-1).headers["X-CSRF-Token"], undefined);
+  }
+});
+
+test("changed identity or cancellation while checking the session never sends credentials", async (t) => {
+  for (const changeIdentity of [true, false]) {
+    let release;
+    const waiting = new Promise((resolve) => { release = resolve; });
+    const { ui, requests } = fixture(t, () => ({}), { session: async () => { await waiting; return { csrf_token: "old-session" }; } });
+    const controller = new AbortController();
+    const saving = ui.api("credentials/tls", { method: "POST", body: { client_key: "private" }, signal: controller.signal });
+    if (changeIdentity) ui.state.identityEpoch += 1; else controller.abort();
+    release();
+    await assert.rejects(saving, { name: "AbortError" });
+    assert.equal(requests.length, 1);
+  }
+});
+
+test("session timeout does not claim that settings may have been saved", async (t) => {
+  const { ui, requests } = fixture(t, () => ({}), { session: ({ signal }) => new Promise((_, reject) => {
+    signal.addEventListener("abort", () => { const error = new Error("Aborted"); error.name = "AbortError"; reject(error); });
+  }) });
+  await assert.rejects(ui.api("model/connection", { method: "PUT", body: {}, timeoutMs: 5 }),
+    (error) => error.name === "RequestTimeoutError" && error.uncertainMutation === false && /не отправлены/.test(error.message));
+  assert.equal(requests.length, 1);
+});
+
+test("missing administrator rights give an actionable error and keep unsaved model fields", async (t) => {
+  const { ui, nodes, requests } = fixture(t, () => ({ ok: false, status: 403,
+    json: async () => ({ error: "Harness administrator access required" }) }),
+  { session: () => ({ ok: false, status: 401 }) });
+  ui.settingsState.canManage = true;
+  ui.applyModelConnection({ provider: "openai", base_url: "https://old.test/v1" });
+  nodes.get("direct-model-url").value = "https://new.test/v1";
+  await ui.changeModelConnection();
+  assert.match(nodes.get("model-connection-feedback").textContent, /Войдите в портал как администратор/);
+  assert.equal(nodes.get("direct-model-url").value, "https://new.test/v1");
+  assert.equal(ui.modelConnectionState.dirty, true);
+  assert.equal(requests.filter((request) => request.method === "PUT").length, 1);
 });

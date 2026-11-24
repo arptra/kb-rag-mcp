@@ -290,6 +290,7 @@
       <form id="auth-form">
         <div class="dialog-heading"><h2 id="auth-title">Вход в Harness</h2><button id="auth-close" class="icon-button" type="button" aria-label="Закрыть">×</button></div>
         <p>Если вы уже вошли в портал, дополнительный вход обычно не нужен. Здесь можно указать ключ доступа к порталу или пароль администратора. Ключ от модели не требуется.</p>
+        <p>Настройки модели и сертификатов доступны администратору. При отдельном запуске Harness выберите «Ключ доступа» и укажите ключ администратора (HARNESS_ADMIN_TOKEN). Обычный ключ пользователя не даёт прав на изменение настроек.</p>
         <label for="auth-kind">Способ входа</label>
         <select id="auth-kind"><option value="bearer">Ключ доступа</option><option value="admin">Пароль администратора</option></select>
         <label for="auth-secret">Ключ или пароль</label>
