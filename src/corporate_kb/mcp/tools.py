@@ -6,13 +6,14 @@ import json
 import math
 import secrets
 import time
+from functools import partial
 from threading import Lock
 from typing import Any
 
 from corporate_kb.context import ContextCompressor, ContextExcerpt
 from corporate_kb.evaluation.evaluator import load_evaluation_questions
 from corporate_kb.history import utc_datetime, version_fields
-from corporate_kb.models import Document, SearchFilters, SearchResult
+from corporate_kb.models import Document, SearchFilters, SearchResult, is_legacy_graph_item
 from corporate_kb.service import KnowledgeService
 from corporate_kb.ssot import SsotContextBuilder
 from corporate_kb.usage import UsageTracker
@@ -67,13 +68,8 @@ class KnowledgeTools:
         authority: str | None = None,
         source_type: str | None = None,
     ) -> dict[str, Any]:
-        if not 1 <= top_k <= 20:
-            raise ValueError("top_k must be between 1 and 20")
-        candidate_k = min(20, max(top_k, self._service.settings.search_candidate_k))
-        results = self._service.search(
-            query,
-            top_k=candidate_k,
-            min_score=min_score,
+        results = self.search_candidates(
+            query, top_k, min_score=min_score,
             filters=SearchFilters(
                 service=service,
                 domain=domain,
@@ -83,7 +79,6 @@ class KnowledgeTools:
                 source_type=source_type,
             ),
         )
-        results = [result for result in results if not self._is_legacy_graph_item(result)]
         packed_results, context_token_count = self._pack_search_results(
             query=query,
             results=results,
@@ -103,6 +98,35 @@ class KnowledgeTools:
         )
         return payload
 
+    def search_candidates(
+        self, query: str, top_k: int, *, filters: SearchFilters, min_score: float | None = None,
+        full_text: bool = False,
+    ) -> list[SearchResult]:
+        """Current visible chunks before a caller applies its own context budget."""
+        if not 1 <= top_k <= 20:
+            raise ValueError("top_k must be between 1 and 20")
+        candidate_k = min(20, max(top_k, self._service.settings.search_candidate_k))
+        search = self._service.search
+        if full_text:
+            search = partial(search, full_text=True)
+        results = search(query, top_k=candidate_k, min_score=min_score, filters=filters)
+        return [result for result in results if not is_legacy_graph_item(result)]
+
+    def read_current_document(
+        self, *, document_id: str | None = None, page_id: str | None = None,
+    ) -> Document:
+        """Enforce the same current-page and graph visibility on full and compact reads."""
+        if bool(document_id) == bool(page_id):
+            raise ValueError("Provide exactly one of document_id or page_id")
+        document = (
+            self._service.get_document(document_id)
+            if document_id
+            else self._service.read_page(str(page_id))
+        )
+        if is_legacy_graph_item(document):
+            raise KeyError(f"Unknown document: {document_id}")
+        return document
+
     def get_document(
         self,
         document_id: str | None = None,
@@ -112,15 +136,7 @@ class KnowledgeTools:
         source_version: str | None = None,
         as_of: str | None = None,
     ) -> dict[str, Any]:
-        if bool(document_id) == bool(page_id):
-            raise ValueError("Provide exactly one of document_id or page_id")
-        document = (
-            self._service.get_document(document_id)
-            if document_id
-            else self._service.read_page(str(page_id))
-        )
-        if self._is_legacy_graph_item(document):
-            raise KeyError(f"Unknown document: {document_id}")
+        document = self.read_current_document(document_id=document_id, page_id=page_id)
         excerpt = self._excerpt(
             query=document.title,
             text=document.content,
@@ -142,7 +158,7 @@ class KnowledgeTools:
     def get_chunk(self, chunk_id: str, max_tokens: int | None = None) -> dict[str, Any]:
         """Return a bounded, lazily requested source chunk from a search result."""
         chunk = self._service.get_chunk(chunk_id)
-        if self._is_legacy_graph_item(chunk):
+        if is_legacy_graph_item(chunk):
             raise KeyError(f"Unknown chunk: {chunk_id}")
         excerpt = self._excerpt(
             query=f"{chunk.title} {chunk.heading_path}",
@@ -210,7 +226,7 @@ class KnowledgeTools:
             top_k=min(20, max(top_k, self._service.settings.search_candidate_k)),
             min_score=min_score,
         )
-        results = [item for item in results if not self._is_legacy_graph_item(item)]
+        results = [item for item in results if not is_legacy_graph_item(item)]
         packed, token_count = self._pack_search_results(
             query=query, results=results, requested_top_k=top_k
         )
@@ -257,7 +273,7 @@ class KnowledgeTools:
             ),
             limit=limit,
         )
-        documents = [document for document in documents if not self._is_legacy_graph_item(document)]
+        documents = [document for document in documents if not is_legacy_graph_item(document)]
         payload = {
             "document_count": len(documents),
             "documents": [self._document_metadata(document) for document in documents],
@@ -272,15 +288,6 @@ class KnowledgeTools:
         payload["cache_directory"] = str(self._service.settings.cache_dir)
         self.usage.record("kb_stats")
         return payload
-
-    @staticmethod
-    def _is_legacy_graph_item(item: Document | SearchResult | Any) -> bool:
-        metadata = item.metadata if isinstance(item.metadata, dict) else {}
-        return (
-            metadata.get("document_type") == "system_graph"
-            or metadata.get("authority") == "source-derived-graph"
-            or str(item.source_path).replace("\\", "/").startswith("system-graph/")
-        )
 
     def run_context_benchmark(self, password: str) -> dict[str, Any]:
         """Compare legacy full chunks with packed excerpts after secondary authentication."""

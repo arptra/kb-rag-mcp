@@ -631,6 +631,8 @@ class HistoryStore:
                 clauses.append(f"r.source_updated_at{operator}?")
                 args.append(utc_datetime(bound).isoformat())
         best: list[tuple[float, str, Chunk]] = []
+        active_filters = filters.active()
+        excluded_pages = set(filters.excluded_page_ids)
         with self._db() as db:
             cursor = db.execute(
                 "SELECT c.payload,r.is_latest,e.vector FROM chunks c "
@@ -643,7 +645,9 @@ class HistoryStore:
                     chunk = Chunk.model_validate_json(payload).model_copy(
                         update={"is_latest": bool(is_latest)}
                     )
-                    if not InMemoryKnowledgeStore._matches(chunk, filters):
+                    if not InMemoryKnowledgeStore._matches(
+                        chunk, filters, active_filters, excluded_pages,
+                    ):
                         continue
                     vector = np.frombuffer(raw, dtype=np.float32)
                     if vector.shape != query.shape:

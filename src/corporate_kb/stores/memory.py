@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
@@ -10,26 +12,33 @@ from numpy.typing import NDArray
 from corporate_kb.embeddings.base import matrix_is_finite
 from corporate_kb.history import utc_datetime, version_fields
 from corporate_kb.models import Chunk, Document, SearchFilters, SearchResult
+from corporate_kb.stores.fulltext import ChunkTextIndex, fuse_ranks
+
+
+@dataclass(frozen=True)
+class _Snapshot:
+    documents: dict[str, Document]
+    chunks: list[Chunk]
+    chunk_index: dict[str, int]
+    embeddings: NDArray[np.float32]
+    text_index: ChunkTextIndex
 
 
 class InMemoryKnowledgeStore:
     def __init__(self) -> None:
-        self._documents: dict[str, Document] = {}
-        self._chunks: list[Chunk] = []
-        self._chunk_index: dict[str, int] = {}
-        self._embeddings = np.empty((0, 0), dtype=np.float32)
+        self._snapshot = _Snapshot({}, [], {}, np.empty((0, 0), dtype=np.float32), ChunkTextIndex())
 
     @property
     def document_count(self) -> int:
-        return len(self._documents)
+        return len(self._snapshot.documents)
 
     @property
     def chunk_count(self) -> int:
-        return len(self._chunks)
+        return len(self._snapshot.chunks)
 
     @property
     def embedding_dimension(self) -> int:
-        return self._embeddings.shape[1] if self._embeddings.ndim == 2 else 0
+        return int(self._snapshot.embeddings.shape[1])
 
     def replace_index(
         self,
@@ -50,12 +59,12 @@ class InMemoryKnowledgeStore:
         if any(chunk.document_id not in document_ids for chunk in chunks):
             raise ValueError("Chunk references an unknown document")
 
-        self._documents = {document.document_id: document for document in documents}
-        self._chunks = list(chunks)
-        self._chunk_index = {chunk.chunk_id: index for index, chunk in enumerate(chunks)}
-        # The store never mutates the matrix. Keeping the caller's array avoids a second
-        # full copy of large indexes during startup (which can otherwise trigger swapping).
-        self._embeddings = matrix
+        # Publish all lookup structures together. An in-flight search can finish on
+        # its original snapshot while the replacement builds its own FTS postings.
+        self._snapshot = _Snapshot(
+            {document.document_id: document for document in documents}, list(chunks),
+            {chunk.chunk_id: i for i, chunk in enumerate(chunks)}, matrix, ChunkTextIndex(),
+        )
 
     def search(
         self,
@@ -64,25 +73,33 @@ class InMemoryKnowledgeStore:
         top_k: int,
         min_score: float | None,
         filters: SearchFilters,
+        text: str | None = None,
+        exclude: Callable[[Chunk], bool] | None = None,
     ) -> list[SearchResult]:
         if not 1 <= top_k <= 20:
             raise ValueError("top_k must be between 1 and 20")
         if min_score is not None and not math.isfinite(min_score):
             raise ValueError("min_score must be finite")
+        snapshot = self._snapshot
+        chunks = snapshot.chunks
+        dimension = snapshot.embeddings.shape[1]
         query = np.asarray(query_vector, dtype=np.float32).reshape(-1)
-        if query.shape != (self.embedding_dimension,):
+        if query.shape != (dimension,):
             raise ValueError(
                 f"Query embedding dimension {query.shape[0]} does not match index dimension "
-                f"{self.embedding_dimension}"
+                f"{dimension}"
             )
         if not np.isfinite(query).all():
             raise ValueError("Query embedding contains NaN or infinite values")
-        if not self._chunks:
+        if not chunks:
             return []
 
         active_filters = filters.active()
+        excluded_pages = set(filters.excluded_page_ids)
         if (
-            active_filters
+            exclude is not None
+            or active_filters
+            or excluded_pages
             or filters.page_id
             or filters.updated_from
             or filters.updated_to
@@ -91,22 +108,34 @@ class InMemoryKnowledgeStore:
             candidate_indices = np.asarray(
                 [
                     index
-                    for index, chunk in enumerate(self._chunks)
-                    if self._matches(chunk, filters)
+                    for index, chunk in enumerate(chunks)
+                    if self._matches(chunk, filters, active_filters, excluded_pages)
+                    and (exclude is None or not exclude(chunk))
                 ],
                 dtype=np.intp,
             )
         else:
-            candidate_indices = np.arange(len(self._chunks), dtype=np.intp)
+            candidate_indices = np.arange(len(chunks), dtype=np.intp)
         if candidate_indices.size == 0:
             return []
 
-        scores = self._embeddings[candidate_indices] @ query
+        # With an all-current index the filter commonly selects every row.
+        # Fancy indexing would copy the entire embedding matrix on each question.
+        matrix = snapshot.embeddings
+        if candidate_indices.size != matrix.shape[0]:
+            matrix = matrix[candidate_indices]
+        scores = matrix @ query
         eligible_positions = np.arange(scores.shape[0], dtype=np.intp)
         if min_score is not None:
             eligible_positions = np.flatnonzero(scores >= min_score).astype(np.intp, copy=False)
         if eligible_positions.size == 0:
             return []
+
+        lexical = []
+        if text:
+            eligible = np.zeros(len(chunks), dtype=np.bool_)
+            eligible[candidate_indices[eligible_positions]] = True
+            lexical = snapshot.text_index.search(text, chunks, eligible, top_k)
 
         if eligible_positions.size > top_k:
             top_positions = np.argpartition(-scores[eligible_positions], top_k - 1)[:top_k]
@@ -119,13 +148,17 @@ class InMemoryKnowledgeStore:
             )
             for position in eligible_positions
         ]
-        ranked.sort(key=lambda item: (-item[1], self._chunks[item[0]].chunk_id))
-        selected = ranked[:top_k]
+        ranked.sort(key=lambda item: (-item[1], chunks[item[0]].chunk_id))
+        selected = ranked
+        if lexical:
+            order = fuse_ranks([index for index, _ in ranked], lexical)
+            selected = [(i, float(scores[np.searchsorted(candidate_indices, i)]))
+                        for i in order[:top_k]]
         results: list[SearchResult] = []
         for rank, (chunk_index, score) in enumerate(selected, start=1):
             if not math.isfinite(score):
                 raise ValueError("Cosine similarity produced a non-finite score")
-            chunk = self._chunks[chunk_index]
+            chunk = chunks[chunk_index]
             results.append(
                 SearchResult(
                     rank=rank,
@@ -144,11 +177,12 @@ class InMemoryKnowledgeStore:
         return results
 
     def get_document(self, document_id: str) -> Document | None:
-        return self._documents.get(document_id)
+        return self._snapshot.documents.get(document_id)
 
     def get_chunk(self, chunk_id: str) -> Chunk | None:
-        index = self._chunk_index.get(chunk_id)
-        return self._chunks[index] if index is not None else None
+        snapshot = self._snapshot
+        index = snapshot.chunk_index.get(chunk_id)
+        return snapshot.chunks[index] if index is not None else None
 
     def list_documents(self, filters: SearchFilters, *, limit: int) -> list[Document]:
         documents, _total = self.browse_documents(
@@ -172,10 +206,12 @@ class InMemoryKnowledgeStore:
         if offset < 0:
             raise ValueError("offset must be zero or greater")
         needle = query.strip().casefold()
+        active_filters = filters.active()
+        excluded_pages = set(filters.excluded_page_ids)
         documents = [
             document
-            for document in self._documents.values()
-            if self._matches_document(document, filters)
+            for document in self._snapshot.documents.values()
+            if self._matches_document(document, filters, active_filters, excluded_pages)
             and (
                 not needle
                 or needle in document.title.casefold()
@@ -195,8 +231,10 @@ class InMemoryKnowledgeStore:
         return False
 
     @classmethod
-    def _matches(cls, chunk: Chunk, filters: SearchFilters) -> bool:
-        if not cls._matches_version(chunk, filters):
+    def _matches(
+        cls, chunk: Chunk, filters: SearchFilters, active: dict[str, str], excluded: set[str],
+    ) -> bool:
+        if not cls._matches_version(chunk, filters, excluded):
             return False
         return all(
             cls._value_matches(
@@ -207,29 +245,35 @@ class InMemoryKnowledgeStore:
             )
             if key == "source_type" and "source_type" not in chunk.metadata
             else cls._value_matches(chunk.metadata.get(key), expected)
-            for key, expected in filters.active().items()
+            for key, expected in active.items()
         )
 
     @classmethod
-    def _matches_document(cls, document: Document, filters: SearchFilters) -> bool:
-        if not cls._matches_version(document, filters):
+    def _matches_document(
+        cls, document: Document, filters: SearchFilters, active: dict[str, str], excluded: set[str],
+    ) -> bool:
+        if not cls._matches_version(document, filters, excluded):
             return False
         return all(
             cls._value_matches(
                 document.source_type if key == "source_type" else document.metadata.get(key),
                 expected,
             )
-            for key, expected in filters.active().items()
+            for key, expected in active.items()
         )
 
     @staticmethod
-    def _matches_version(item: Chunk | Document, filters: SearchFilters) -> bool:
-        if item.page_id in filters.excluded_page_ids:
+    def _matches_version(
+        item: Chunk | Document, filters: SearchFilters, excluded: set[str],
+    ) -> bool:
+        if item.page_id in excluded:
             return False
         if filters.version_scope == "latest" and not item.is_latest:
             return False
         if filters.page_id and item.page_id != filters.page_id:
             return False
+        if not (filters.updated_from or filters.updated_to):
+            return True
         updated = utc_datetime(item.source_updated_at)
         if filters.updated_from and (
             updated is None or updated < utc_datetime(filters.updated_from)

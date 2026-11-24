@@ -14,10 +14,10 @@ import re
 import shutil
 import signal
 import time
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncIterator, Iterator
+from contextlib import ExitStack, asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from threading import Event
 from typing import Any, Literal
 from uuid import uuid4
@@ -29,11 +29,24 @@ from agent_harness.contracts import (
     Principal,
 )
 from agent_harness.credentials import CredentialStore
-from agent_harness.integrations_config import RepositoryConfig, SandboxConfig
+from agent_harness.integrations_config import DockerEngineConfig, RepositoryConfig, SandboxConfig
+from agent_harness.tls_credentials import TLSCredentialStore
+
+_HELPER_IMAGE = "harness-sandbox:local"
 
 
 class SandboxError(RuntimeError):
     """A bounded, user-safe sandbox failure without subprocess output or secrets."""
+
+
+PROBE_TOOLS_SCRIPT = """
+import json, shutil, sys
+names = ("git", "ssh", "sleep", "java", "gradle", "mvn")
+tools = {name: bool(shutil.which(name)) for name in names}
+tools["python"] = "%d.%d" % sys.version_info[:2]
+print(json.dumps(tools))
+sys.exit(0 if sys.version_info >= (3, 9) else 1)
+"""
 
 
 # These programs are supplied by the server, never loaded from the repository.
@@ -209,6 +222,7 @@ class _Result:
 class _Checkout:
     volume: str
     fingerprint: tuple[str, ...]
+    engine: DockerEngineConfig = field(default_factory=DockerEngineConfig)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     commit: str = ""
     dirty: bool = False
@@ -219,6 +233,7 @@ class _Checkout:
 @dataclass
 class _Run:
     owner_id: str
+    shared: bool = False
     cancel: Event = field(default_factory=Event)
     repositories: dict[str, _Checkout] = field(default_factory=dict)
     tasks: set[asyncio.Task[Any]] = field(default_factory=set)
@@ -228,8 +243,14 @@ class _Run:
 
 
 class SandboxBackend:
-    def __init__(self, credentials: CredentialStore | None = None) -> None:
+    def __init__(
+        self,
+        credentials: CredentialStore | None = None,
+        *,
+        tls_credentials: TLSCredentialStore | None = None,
+    ) -> None:
         self.credentials = credentials
+        self.tls_credentials = tls_credentials
         self._runs: dict[str, _Run] = {}
         self._capacity = asyncio.Condition()
         self._active = 0
@@ -281,27 +302,65 @@ class SandboxBackend:
     def _docker() -> str:
         executable = shutil.which("docker")
         if not executable:
-            raise SandboxError("Docker is unavailable; repository tools require the sandbox")
+            raise SandboxError("Установите Docker CLI на сервер Harness.")
         return executable
 
-    async def _cleanup_command(self, args: list[str]) -> None:
+    @contextmanager
+    def _client_environment(
+        self, engine: DockerEngineConfig, token: str = ""
+    ) -> Iterator[dict[str, str]]:
+        env = self._environment(token)
+        with ExitStack() as stack:
+            if engine.mode != "default":
+                for key in (
+                    "DOCKER_HOST",
+                    "DOCKER_CONTEXT",
+                    "DOCKER_TLS_VERIFY",
+                    "DOCKER_CERT_PATH",
+                ):
+                    env.pop(key, None)
+            if engine.mode == "context":
+                env["DOCKER_CONTEXT"] = engine.context
+            elif engine.mode == "tls":
+                if self.tls_credentials is None:
+                    raise SandboxError("Хранилище сертификатов Docker недоступно.")
+                try:
+                    directory = stack.enter_context(
+                        self.tls_credentials.docker_client_directory(engine.tls_id)
+                    )
+                except (ValueError, KeyError, OSError):
+                    raise SandboxError(
+                        "Проверьте CA, сертификат и ключ клиента Docker API."
+                    ) from None
+                host = f"[{engine.host}]" if ":" in engine.host else engine.host
+                env.update(
+                    DOCKER_HOST=f"tcp://{host}:{engine.port}",
+                    DOCKER_TLS_VERIFY="1",
+                    DOCKER_CERT_PATH=str(directory),
+                )
+            yield env
+
+    async def _cleanup_command(self, args: list[str], engine: DockerEngineConfig) -> None:
         """Cleanup has its own deadline and never inherits a cancelled run signal."""
-        proc = await asyncio.create_subprocess_exec(
-            self._docker(),
-            *args,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=self._environment(),
-            start_new_session=True,
+        result = await self._exec(
+            args,
+            engine=engine,
+            cancel=Event(),
+            run=_Run("cleanup"),
+            deadline=time.monotonic() + 10,
+            output_limit=1500,
         )
-        try:
-            await asyncio.wait_for(proc.wait(), 10)
-        except BaseException:
-            self._kill(proc)
-            await proc.wait()
-            raise
-        if proc.returncode:
-            raise SandboxError("Docker cleanup failed; retry closing this run")
+        if not result.code:
+            return
+        if args[0] == "rm" and not result.truncated:
+            name = re.escape(args[-1])
+            if re.fullmatch(
+                rf"(?:Error(?: response from daemon)?: )?No such container: {name}",
+                result.stderr.strip(),
+                re.IGNORECASE,
+            ):
+                return
+        raise SandboxError("Docker cleanup failed; retry closing this run")
 
     @staticmethod
     def _kill(proc: asyncio.subprocess.Process) -> None:
@@ -315,6 +374,7 @@ class SandboxBackend:
         *,
         cancel: Event,
         run: _Run,
+        engine: DockerEngineConfig,
         deadline: float,
         output_limit: int,
         container: str = "",
@@ -322,20 +382,44 @@ class SandboxBackend:
         stdin_data: bytes | None = None,
     ) -> _Result:
         self._check(cancel, run, deadline)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                self._docker(),
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.PIPE
-                if stdin_data is not None
-                else asyncio.subprocess.DEVNULL,
-                env=self._environment(token),
-                start_new_session=True,
+        with self._client_environment(engine, token) as env:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    self._docker(),
+                    *args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.PIPE
+                    if stdin_data is not None
+                    else asyncio.subprocess.DEVNULL,
+                    env=env,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise SandboxError("Сервер Harness не смог запустить Docker CLI.") from exc
+            return await self._communicate(
+                proc,
+                engine=engine,
+                cancel=cancel,
+                run=run,
+                deadline=deadline,
+                output_limit=output_limit,
+                container=container,
+                stdin_data=stdin_data,
             )
-        except OSError as exc:
-            raise SandboxError("Docker could not start; no host execution was attempted") from exc
+
+    async def _communicate(
+        self,
+        proc: asyncio.subprocess.Process,
+        *,
+        engine: DockerEngineConfig,
+        cancel: Event,
+        run: _Run,
+        deadline: float,
+        output_limit: int,
+        container: str,
+        stdin_data: bytes | None,
+    ) -> _Result:
         buffers = [bytearray(), bytearray()]
         truncated = False
 
@@ -372,16 +456,14 @@ class SandboxBackend:
             await asyncio.wait_for(asyncio.gather(*readers), max(0, deadline - time.monotonic()))
             await asyncio.wait_for(writer, max(0, deadline - time.monotonic()))
         except BaseException:
-            if container:
-                with suppress(SandboxError, OSError, TimeoutError):
-                    await self._cleanup_command(["rm", "-f", container])
             self._kill(proc)
             await waiter
             for reader in readers:
                 reader.cancel()
             writer.cancel()
-            await asyncio.gather(*readers, return_exceptions=True)
-            await asyncio.gather(writer, return_exceptions=True)
+            await asyncio.gather(*readers, writer, return_exceptions=True)
+            if container:
+                await self._cleanup_command(["rm", "-f", "-v", container], engine)
             raise
         out, err = (bytes(buf).decode("utf-8", "replace") for buf in buffers)
         truncated |= len(out) + len(err) > output_limit
@@ -392,32 +474,155 @@ class SandboxBackend:
             truncated,
         )
 
+    @asynccontextmanager
+    async def probe_slot(
+        self,
+        config: SandboxConfig,
+        cancel: Event,
+        deadline: float,
+    ) -> AsyncIterator[None]:
+        async with self._slot(config.max_parallel, cancel, _Run("probe"), deadline):
+            yield
+
+    async def engine_command(
+        self,
+        config: SandboxConfig,
+        args: list[str],
+        *,
+        cancel: Event,
+        deadline: float,
+        output_limit: int = 1000,
+        container: str = "",
+    ) -> _Result:
+        return await self._exec(
+            args,
+            engine=config.engine,
+            cancel=cancel,
+            run=_Run("probe"),
+            deadline=deadline,
+            output_limit=output_limit,
+            container=container,
+        )
+
+    async def remove_container(self, config: SandboxConfig, name: str) -> None:
+        await self._cleanup_command(["rm", "-f", "-v", name], config.engine)
+
+    async def list_images(self, engine: DockerEngineConfig) -> dict[str, Any]:
+        config = SandboxConfig(engine=engine)
+        cancel, deadline = Event(), time.monotonic() + 15
+        async with self.probe_slot(config, cancel, deadline):
+            result = await self.engine_command(
+                config,
+                [
+                    "image",
+                    "ls",
+                    "--no-trunc",
+                    "--format",
+                    "{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}",
+                ],
+                cancel=cancel,
+                deadline=deadline,
+                output_limit=512 * 1024,
+            )
+        if result.code:
+            raise SandboxError("Docker не вернул список образов. Проверьте подключение к Engine.")
+        images: dict[str, dict[str, str]] = {}
+        truncated = result.truncated
+        rows = result.stdout.splitlines()
+        if truncated and not result.stdout.endswith("\n"):
+            rows = rows[:-1]
+        for row in rows:
+            columns = row.split("\t")
+            if len(columns) != 4:
+                continue
+            repository, tag, image_id, size = columns
+            reference = f"{repository}:{tag}" if "<none>" not in (repository, tag) else image_id
+            if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,250}", reference):
+                continue
+            if len(images) >= 1000 and reference not in images:
+                truncated = True
+                break
+            images[reference] = {"reference": reference, "id": image_id, "size": size}
+        return {"images": [images[key] for key in sorted(images)], "truncated": truncated}
+
+    async def _probe_image(
+        self,
+        config: SandboxConfig,
+        *,
+        cancel: Event,
+        deadline: float,
+    ) -> dict[str, Any]:
+        inspected = await self.engine_command(
+            config,
+            ["image", "inspect", "--format", "{{.Id}}", config.image],
+            cancel=cancel,
+            deadline=deadline,
+        )
+        if inspected.code:
+            raise SandboxError(f"Образ {config.image} отсутствует на выбранном Docker Engine.")
+        # A readiness check needs no persistent volume.
+        checkout = _Checkout("", (), config.engine)
+        name, args = self._command(
+            config, checkout, ["python", "-I", "-S", "-c", PROBE_TOOLS_SCRIPT], clone=False
+        )
+        mount = args.index("--mount")
+        args[mount : mount + 2] = ["--tmpfs", "/workspace:rw,nosuid,nodev,size=1m"]
+        args[args.index("--workdir") + 1] = "/workspace"
+        output = await self.engine_command(
+            config,
+            args,
+            cancel=cancel,
+            deadline=deadline,
+            container=name,
+        )
+        if output.code:
+            raise SandboxError(f"Контейнеру {config.image} требуется рабочий python 3.9+.")
+        capabilities = self._json(output)
+        python = capabilities.get("python")
+        optional = ("git", "ssh", "sleep", "java", "gradle", "mvn")
+        if (
+            not isinstance(python, str)
+            or not re.fullmatch(r"[0-9]{1,2}\.[0-9]{1,2}", python)
+            or any(type(capabilities.get(tool)) is not bool for tool in optional)
+        ):
+            raise SandboxError(f"Образ {config.image} вернул некорректный результат проверки.")
+        return {tool: capabilities[tool] for tool in ("python", *optional)}
+
     async def probe(self, config: SandboxConfig) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "enabled": config.enabled,
-            "available": False,
-            "image": config.image,
-        }
-        run = _Run(owner_id="probe")
+        result = {"enabled": config.enabled, "available": False, "image": config.image}
+        cancel, deadline = Event(), time.monotonic() + 30
         try:
-            for args in (
-                ["version", "--format", "{{.Server.Version}}"],
-                ["image", "inspect", "--format", "{{.Id}}", config.image],
-            ):
-                output = await self._exec(
-                    args, cancel=Event(), run=run, deadline=time.monotonic() + 10, output_limit=1000
+            async with self.probe_slot(config, cancel, deadline):
+                version = await self.engine_command(
+                    config,
+                    ["version", "--format", "{{.Server.Version}}"],
+                    cancel=cancel,
+                    deadline=deadline,
                 )
-                if output.code:
-                    raise SandboxError("Docker engine or the configured local image is unavailable")
-        except (SandboxError, OSError, TimeoutError):
-            return {**result, "reason": "Docker или выбранный локальный образ недоступны"}
-        return {
-            **result,
-            "available": True,
-            "reason": (
-                "Песочница готова" if config.enabled else "Песочница готова; выполнение выключено"
-            ),
-        }
+                if version.code:
+                    raise SandboxError("Проверьте подключение к Docker Engine.")
+                helper = config.model_copy(update={"image": _HELPER_IMAGE})
+                tools = await self._probe_image(helper, cancel=cancel, deadline=deadline)
+                missing = [tool for tool in ("git", "ssh", "sleep") if not tools[tool]]
+                if missing:
+                    raise SandboxError(
+                        f"Образу {_HELPER_IMAGE} требуются {', '.join(missing)}."
+                    )
+                if config.image != _HELPER_IMAGE:
+                    tools = await self._probe_image(config, cancel=cancel, deadline=deadline)
+        except SandboxError as exc:
+            return {**result, "reason": str(exc)}
+        except (TimeoutError, OSError):
+            return {**result, "reason": "Docker не ответил вовремя или недоступен."}
+        installed = ["Python " + tools["python"]]
+        labels = {"git": "Git", "java": "Java", "gradle": "Gradle", "mvn": "Maven"}
+        installed.extend(label for key, label in labels.items() if tools[key])
+        reason = "Контейнер проверен. Доступны " + ", ".join(installed) + "."
+        if tools["java"] and not tools["gradle"]:
+            reason += " Gradle отсутствует. Установите Gradle при сборке образа."
+        if not config.enabled:
+            reason += " Сейчас выполнение выключено."
+        return {**result, "available": True, "capabilities": tools, "reason": reason}
 
     @staticmethod
     def _validate(name: str, args: dict[str, Any], repository: RepositoryConfig) -> None:
@@ -558,6 +763,7 @@ class SandboxBackend:
         )
         result = await self._exec(
             args,
+            engine=checkout.engine,
             cancel=cancel,
             run=run,
             deadline=deadline,
@@ -601,8 +807,8 @@ class SandboxBackend:
         if not repository.allows(principal.owner_id):
             raise PermissionError("Repository is unavailable to this user")
         self._validate(name, args, repository)
-        run = self._runs.setdefault(run_id, _Run(principal.owner_id))
-        if run.owner_id != principal.owner_id:
+        run = self._runs.setdefault(run_id, _Run(principal.owner_id, shared=principal.shared))
+        if (run.owner_id, run.shared) != (principal.owner_id, principal.shared):
             raise PermissionError("Sandbox run belongs to another user")
         if run.closing:
             raise SandboxError("Sandbox run is already closing")
@@ -617,9 +823,10 @@ class SandboxBackend:
             repository.credential_env,
             repository.ssh_key_id,
             config.image,
+            config.engine.model_dump_json(),
         )
         checkout = run.repositories.setdefault(
-            repository.id, _Checkout("harness-" + uuid4().hex, fingerprint)
+            repository.id, _Checkout("harness-" + uuid4().hex, fingerprint, config.engine)
         )
         abort = False
         try:
@@ -659,14 +866,23 @@ class SandboxBackend:
             raise SandboxError("Repository credential has an invalid format")
         stdin_data = None
         if not repository.url.startswith("https://"):
-            if not repository.ssh_key_id or self.credentials is None:
-                raise SandboxError("Выберите SSH-ключ и known_hosts в настройках репозитория.")
+            if self.credentials is None:
+                raise SandboxError("Добавьте SSH-ключ и known_hosts для этого репозитория.")
             try:
-                stdin_data = self.credentials.load(repository.ssh_key_id).clone_input()
+                if not run.shared:
+                    stdin_data = self.credentials.personal.clone_input(
+                        run.owner_id, repository.id, repository.url
+                    )
+                if stdin_data is None and repository.ssh_key_id:
+                    stdin_data = self.credentials.load(repository.ssh_key_id).clone_input()
+                if stdin_data is None:
+                    raise KeyError
             except (KeyError, ValueError):
                 raise SandboxError(
                     "SSH-ключ недоступен. Проверьте настройки репозитория."
                 ) from None
+        if checkout.keeper or checkout.created:
+            await self._remove_volume(checkout)
         # Mark before spawning: an interrupted Docker client may have created the volume.
         checkout.created = True
         try:
@@ -686,6 +902,7 @@ class SandboxBackend:
                     f"o=size={config.workspace_mb}m,uid=65532,gid=65532,mode=0700,nosuid,nodev",
                     checkout.volume,
                 ],
+                engine=checkout.engine,
                 cancel=cancel,
                 run=run,
                 deadline=deadline,
@@ -695,12 +912,14 @@ class SandboxBackend:
                 raise SandboxError("Docker could not create a sandbox volume")
             # Local-driver tmpfs is unmounted when no container holds it. Keep a
             # trusted, networkless sleeper alive between clone/search/read calls.
-            keeper, keeper_args = self._command(config, checkout, ["sleep", "7500"], clone=False)
+            helper = config.model_copy(update={"image": _HELPER_IMAGE})
+            keeper, keeper_args = self._command(helper, checkout, ["sleep", "7500"], clone=False)
             keeper_args.insert(1, "--detach")
             keeper_args[keeper_args.index("--workdir") + 1] = "/workspace"
             checkout.keeper = keeper
             kept = await self._exec(
                 keeper_args,
+                engine=checkout.engine,
                 cancel=cancel,
                 run=run,
                 deadline=deadline,
@@ -712,7 +931,7 @@ class SandboxBackend:
                     "Docker cannot mount the bounded workspace or start the local image"
                 )
             output = await self._container(
-                config,
+                helper,
                 checkout,
                 ["python", "-I", "-S", "-c", CLONE_SCRIPT, repository.url, repository.ref],
                 cancel=cancel,
@@ -729,6 +948,49 @@ class SandboxBackend:
         except (SandboxError, ValueError):
             await self._remove_volume(checkout)
             raise
+
+    async def _repository_command(
+        self, command: list[str], repository: RepositoryConfig, config: SandboxConfig,
+        checkout: _Checkout, cancel: Event, run: _Run, deadline: float,
+    ) -> _Result:
+        access = None
+        if command[0] in {"gradle", "./gradlew"} and self.credentials and not run.shared:
+            access = self.credentials.personal.gradle_access(run.owner_id, repository.id,
+                                                             repository.url)
+        if access is None:
+            return await self._container(
+                config, checkout, command, cancel=cancel, run=run, deadline=deadline
+            )
+        url, username, password = access
+        # The two processes use the same Docker volume and different PID, network and tmp mounts.
+        # No host path is required, including on remote Docker Engines.
+        program = Path(__file__).with_name("gradle_relay.py").read_text(encoding="utf-8")
+        runner = ["python", "-I", "-S", "-c", program]
+        socket_path = "/workspace/.maven-" + uuid4().hex + ".sock"
+        limits = [str(config.workspace_mb * 1024 * 1024), str(config.timeout_seconds)]
+        credentials = json.dumps({"url": url, "username": username.get_secret_value(),
+                                  "password": password.get_secret_value()}).encode()
+        helper = config.model_copy(update={"image": _HELPER_IMAGE})
+        registry = asyncio.create_task(self._container(
+            helper, checkout, [*runner, "registry", socket_path, *limits],
+            cancel=cancel, run=run, deadline=deadline, clone=True, stdin_data=credentials,
+        ))
+        build = asyncio.create_task(self._container(
+            config, checkout, [*runner, "build", socket_path, *limits, *command],
+            cancel=cancel, run=run, deadline=deadline,
+        ))
+        try:
+            done, _ = await asyncio.wait((registry, build), return_when=asyncio.FIRST_COMPLETED)
+            if registry in done:
+                with suppress(SandboxError):
+                    await registry
+                raise SandboxError("Maven-репозиторий недоступен для Gradle.")
+            return await build
+        finally:
+            for task in (registry, build):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(registry, build, return_exceptions=True)
 
     async def _tool(
         self,
@@ -763,8 +1025,8 @@ class SandboxBackend:
         elif name == "run_in_sandbox":
             # Commands can edit the volume even if their exit status is nonzero.
             checkout.dirty = True
-            output = await self._container(
-                config, checkout, args["command"], cancel=cancel, run=run, deadline=deadline
+            output = await self._repository_command(
+                args["command"], repository, config, checkout, cancel, run, deadline
             )
             suffix = "command/" + uuid4().hex
             if output.code:
@@ -829,16 +1091,17 @@ class SandboxBackend:
         ]
 
     async def _remove_volume(self, checkout: _Checkout) -> None:
-        if checkout.keeper:
-            # A failed start can leave no container to remove. The volume removal
-            # below must still succeed; a live mount makes Docker reject it.
-            with suppress(SandboxError):
-                await self._cleanup_command(["rm", "-f", checkout.keeper])
-        if checkout.created:
-            await self._cleanup_command(["volume", "rm", "-f", checkout.volume])
-            checkout.created = False
-            checkout.commit = ""
-        checkout.keeper = ""
+        try:
+            if checkout.keeper:
+                await self._cleanup_command(["rm", "-f", "-v", checkout.keeper], checkout.engine)
+                checkout.keeper = ""
+        finally:
+            if checkout.created:
+                await self._cleanup_command(
+                    ["volume", "rm", "-f", checkout.volume], checkout.engine
+                )
+                checkout.created = False
+                checkout.commit = ""
 
     async def close_run(self, run_id: str) -> None:
         run = self._runs.get(run_id)

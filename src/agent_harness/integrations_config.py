@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from ipaddress import IPv6Address
 from pathlib import Path
 from threading import RLock
 from typing import Literal, Self
@@ -137,9 +138,59 @@ def normalize_repository_url(value: str) -> str:
     return RepositoryConfig.endpoint(value)
 
 
-class SandboxConfig(BaseModel):
+class DockerEngineConfig(BaseModel):
+    """The default is the Docker client already configured on the Harness host."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    mode: Literal["default", "context", "tls"] = "default"
+    context: str = Field(default="", pattern=r"^([a-zA-Z0-9][a-zA-Z0-9._-]{0,127})?$")
+    host: str = Field(default="", max_length=253)
+    port: int = Field(default=2376, ge=1, le=65535)
+    tls_id: str = Field(default="", pattern=r"^([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})?$")
+
+    @model_validator(mode="after")
+    def complete_endpoint(self) -> Self:
+        if self.mode == "context" and not self.context:
+            raise ValueError("Укажите имя настроенного Docker context.")
+        if self.mode != "context" and self.context:
+            raise ValueError("Выберите режим Docker context.")
+        if self.mode != "tls":
+            if self.host or self.tls_id:
+                raise ValueError("Для удалённого Docker API выберите TLS.")
+            return self
+        if not self.tls_id:
+            raise ValueError("Выберите сертификаты Docker API.")
+        if ":" in self.host:
+            try:
+                if "%" in self.host:
+                    raise ValueError
+                IPv6Address(self.host)
+            except ValueError:
+                raise ValueError("Укажите IPv6-адрес без скобок или имени интерфейса.") from None
+        elif not all(
+            re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label)
+            for label in self.host.rstrip(".").split(".")
+        ) or self.host.endswith(".."):
+            raise ValueError("Укажите имя или IP Docker Engine без схемы, порта и пути.")
+        return self
+
+
+class SandboxServiceConfig(BaseModel):
+    service_port: int | None = Field(default=None, ge=1, le=65535)
+    service_health_path: str = Field(default="/", max_length=512, pattern=r"^/[A-Za-z0-9/_~.-]*$")
+
+    @field_validator("service_health_path")
+    @classmethod
+    def local_path(cls, path: str) -> str:
+        if "//" in path or any(segment in {".", ".."} for segment in path.split("/")):
+            raise ValueError("Укажите путь внутри сервиса, например /health.")
+        return path
+
+
+class SandboxConfig(SandboxServiceConfig):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False
+    engine: DockerEngineConfig = Field(default_factory=DockerEngineConfig)
     image: str = Field(
         default="harness-sandbox:local", pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,250}$"
     )
@@ -152,15 +203,26 @@ class SandboxConfig(BaseModel):
     max_parallel: int = Field(default=2, ge=1, le=8)
 
 
-class SandboxProfileConfig(BaseModel):
+class SandboxProfileConfig(SandboxServiceConfig):
     """An administrator-built image; requesters can choose only an allowed profile ID."""
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
     id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
     name: str = Field(min_length=1, max_length=160)
     image: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,250}$")
+    engine: DockerEngineConfig | None = None
     enabled: bool = True
     allowed_owners: list[str] = Field(default_factory=list, max_length=1000)
+
+    def apply_to(self, base: SandboxConfig) -> SandboxConfig:
+        return base.model_copy(
+            update={
+                "image": self.image,
+                "engine": self.engine or base.engine,
+                "service_port": self.service_port,
+                "service_health_path": self.service_health_path,
+            }
+        )
 
     @field_validator("allowed_owners")
     @classmethod
@@ -187,6 +249,14 @@ class IntegrationSettings(BaseModel):
     sandbox_profiles: list[SandboxProfileConfig] = Field(
         default_factory=_default_sandbox_profiles, max_length=20
     )
+
+    def docker_tls_users(self, key_id: str) -> list[str]:
+        users = ["sandbox"] if self.sandbox.engine.tls_id == key_id else []
+        return users + [
+            profile.id
+            for profile in self.sandbox_profiles
+            if profile.engine and profile.engine.tls_id == key_id
+        ]
 
     @model_validator(mode="after")
     def unique_ids(self) -> Self:

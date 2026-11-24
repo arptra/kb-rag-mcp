@@ -74,11 +74,12 @@ class AgentSources:
             details["truncated"] = True
         return Evidence(
             id=doc_id,
+            document_id=doc_id,
             title=str(item.get("title", doc_id)),
             index_id=index_id,
             text=text,
             url=item.get("source_url") or None,
-            revision=str(item.get("source_version") or "") or None,
+            revision=str(item.get("source_version") or item.get("revision_id") or "") or None,
         )
 
     async def search(
@@ -108,9 +109,11 @@ class AgentSources:
             raise asyncio.CancelledError
         self.log(principal, "read", f"Чтение документа {document_id} в индексе {index_id}")
         tools = KnowledgeTools(self.catalog.service_for(index_id), usage=UsageTracker())
-        result = await asyncio.to_thread(tools.get_document, document_id=document_id)
+        document = await asyncio.to_thread(tools.read_current_document, document_id=document_id)
         self.check(principal, index_id)
-        return self.evidence(principal, index_id, result)
+        if cancel.is_set():
+            raise asyncio.CancelledError
+        return self.evidence(principal, index_id, document.model_dump(mode="json"))
 
 
 class ResearchBridge:

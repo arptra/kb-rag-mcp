@@ -49,12 +49,13 @@ def needs_source_check(run: dict[str, Any]) -> bool:
     """Autopilot needs a retained result from a follow-up source check."""
     if run["mode"] != "autonomous":
         return False
-    checked = [item for item in run["evidence"] if item.get("checked_with")]
+    candidates = [item for item in run["evidence"]
+                  if item.get("retrieval_relevance") != "irrelevant"]
     if service_inventory_question(run["question"]):
         return not any(inventory_source_score(item) >= 2
                        and (item.get("checked_with") or item.get("read_document"))
-                       for item in run["evidence"])
-    return not checked
+                       for item in candidates)
+    return not any(item.get("checked_with") for item in candidates)
 
 
 _SERVICE = re.compile(r"\b(?:микро)?сервис\w*|\b(?:micro)?services?\b", re.I)
@@ -101,12 +102,13 @@ def inventory_source_score(item: dict[str, Any]) -> int:
 
 
 def inventory_citation_issue(run: dict[str, Any], content: str) -> str | None:
-    from agent_harness.answer_quality import cited_evidence_ids
+    from agent_harness.answer_quality import cited_evidence_refs
 
     if not service_inventory_question(run["question"]):
         return None
-    citations = cited_evidence_ids(content, run["evidence"], question=run["question"])
-    relevant = [item for item in run["evidence"] if item["id"] in citations
+    citations = cited_evidence_refs(content, run["evidence"], question=run["question"])
+    relevant = [item for item in run["evidence"]
+                if (str(item.get("index_id", "")), item["id"]) in citations
                 and (run["mode"] != "autonomous" or item.get("checked_with")
                      or item.get("read_document"))
                 and inventory_source_score(item) >= 2]

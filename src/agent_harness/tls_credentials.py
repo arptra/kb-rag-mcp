@@ -7,6 +7,8 @@ import os
 import re
 import ssl
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
@@ -218,6 +220,34 @@ class TLSCredentialStore:
             except (ssl.SSLError, KeyError, TypeError, ValueError):
                 raise ValueError("Ошибка загрузки TLS-сертификатов. Проверьте настройки.") from None
             return context
+
+    @contextmanager
+    def docker_client_directory(self, key_id: str) -> Iterator[Path]:
+        """Docker reads PEM files from its client host. Containers never mount them."""
+        with self._lock:
+            data = self._load(key_id)
+        try:
+            _certificates(data["ca_certificate"], ca=True)
+            _certificates(data["client_certificate"], ca=False)
+            materials = (
+                ("ca.pem", data["ca_certificate"]),
+                ("cert.pem", data["client_certificate"]),
+                ("key.pem", data["client_key"]),
+            )
+            if not data["client_key"]:
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(
+                "Для Docker API нужны действующие CA, сертификат и ключ клиента."
+            ) from None
+        with tempfile.TemporaryDirectory(prefix=".docker-", dir=self.directory) as directory:
+            for filename, value in materials:
+                descriptor = os.open(
+                    Path(directory) / filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+                with os.fdopen(descriptor, "w") as stream:
+                    stream.write(value)
+            yield Path(directory)
 
     def delete(self, key_id: str) -> None:
         with self._lock:

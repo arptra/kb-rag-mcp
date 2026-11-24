@@ -4,6 +4,7 @@
 
 import json
 import re
+from collections import Counter
 from decimal import Decimal
 from typing import Any, Self
 
@@ -125,7 +126,8 @@ _SEARCH_RECEIPT = re.compile(
 
 def is_answer_source(item: dict[str, Any]) -> bool:
     """Exclude tool descriptions, empty excerpts and repository checkout receipts."""
-    if (item.get("kind", "source") != "source" or item.get("tool_outcome") in {"failed", "empty"}
+    if (item.get("retrieval_relevance") == "irrelevant" or item.get("kind", "source") != "source"
+            or item.get("tool_outcome") in {"failed", "empty"}
             or not item.get("text", "").strip()):
         return False
     # Retained runs predate the distinction between a checkout receipt and file content.
@@ -317,18 +319,24 @@ def decode_writer_answer(
     return f"{text} {suffix}".strip()
 
 
-def _source_references(evidence: list[dict[str, Any]]) -> dict[str, str]:
+def _reference_pairs(evidence: list[dict[str, Any]]) -> dict[str, tuple[str, str]]:
     # Ordinals match the numbered cards in this run's UI. A real ID, even that
     # of an unavailable source, always takes precedence over an ordinal.
-    ids = {item.get("id") for item in evidence}
+    counts = Counter(item.get("id") for item in evidence)
     refs = {}
     for number, item in enumerate(evidence, start=1):
         if item.get("id") and is_answer_source(item):
             ref = str(item["id"])
-            refs[ref] = ref
-            if str(number) not in ids:
-                refs[str(number)] = ref
+            pair = (str(item.get("index_id", "")), ref)
+            if counts[ref] == 1:
+                refs[ref] = pair
+            if str(number) not in counts:
+                refs[str(number)] = pair
     return refs
+
+
+def _source_references(evidence: list[dict[str, Any]]) -> dict[str, str]:
+    return {alias: pair[1] for alias, pair in _reference_pairs(evidence).items()}
 
 
 def answer_quality_issue(run: dict[str, Any], content: str) -> str | None:
@@ -343,12 +351,15 @@ def answer_quality_issue(run: dict[str, Any], content: str) -> str | None:
     if not issue and _unexpected_writing(run, content):
         return ("В русском объяснении появились посторонние слова. Ответьте кратко и простыми "
                 "предложениями. Точные имена компонентов скопируйте из источников.")
+    def cited_passages() -> list[dict[str, Any]]:
+        refs = cited_evidence_refs(content, run["evidence"], question=run.get("question", ""))
+        return [item for item in run["evidence"]
+                if (str(item.get("index_id", "")), item.get("id")) in refs]
+
     if (not issue and sources and _SERVICE_NAME.search(content)
             and not _DESIGN_REQUEST.search(run.get("question", ""))):
         names = set(_SERVICE_NAME.findall(_REFERENCE.sub("", content)))
-        cited = cited_evidence_ids(content, run["evidence"], question=run.get("question", ""))
-        confirmed = {name for item in run["evidence"] if item["id"] in cited
-                     and is_answer_source(item) for key in ("title", "text", "source_path")
+        confirmed = {name for item in cited_passages() for key in ("title", "text", "source_path")
                      for name in _SERVICE_NAME.findall(item.get(key) or "")}
         if confirmed and names - confirmed:
             return "Название сервиса расходится с приведёнными источниками. Скопируйте его точно."
@@ -359,18 +370,16 @@ def answer_quality_issue(run: dict[str, Any], content: str) -> str | None:
     if not issue and run.get("mode") in {"quick", "investigate"} and sources:
         options = named_values(run.get("question", ""), run["evidence"])
         if options:
-            cited = cited_evidence_ids(content, run["evidence"])
+            cited_options = named_values(run.get("question", ""), cited_passages())
             body = _REFERENCE.sub("", content)
             if not any(re.search(r"(?<![\w.-])" + re.escape(name) + r"(?![\w-]|\.\w)", body)
-                       and cited.intersection(refs) for name, refs in options.items()):
+                       for name in cited_options):
                 return "В ответе отсутствует точное название из указанного источника."
     if issue or not sources or not _DURATION_QUESTION.search(run.get("question", "")):
         return issue
     findings = {_seconds(m) for m in _DURATION.finditer(_REFERENCE.sub("", content))}
     if len(findings) == 1:
-        cited = cited_evidence_ids(content, run["evidence"], question=run.get("question", ""))
-        measured = {_seconds(m) for item in run["evidence"]
-                    if item["id"] in cited and is_answer_source(item)
+        measured = {_seconds(m) for item in cited_passages()
                     for m in _DURATION.finditer(item["text"])}
         if len(measured) == 1 and findings != measured:
             return "Указанное время расходится со значением в приведённом источнике."
@@ -651,10 +660,16 @@ def _draft_issue(
 def cited_evidence_ids(
     content: str, evidence: list[dict[str, Any]], *, question: str = "",
 ) -> set[str]:
-    """Credit the same literal source references the answer validator recognizes."""
+    return {ref for _, ref in cited_evidence_refs(content, evidence, question=question)}
+
+
+def cited_evidence_refs(
+    content: str, evidence: list[dict[str, Any]], *, question: str = "",
+) -> set[tuple[str, str]]:
+    """Resolve each Markdown/JSON citation to its unambiguous source and evidence ID."""
     if "[" not in content:
         return set()
-    aliases = _source_references(evidence)
+    aliases = _reference_pairs(evidence)
     _, _, references, _ = _inspect_markdown(
         content, set(aliases), requested_json=requested_json(question),
     )

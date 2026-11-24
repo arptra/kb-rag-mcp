@@ -30,9 +30,9 @@ BUDGETS = {
 QUICK_BUDGETS = {
     # RAG-only answers go straight to the writer. MCP may need several
     # decisions to inspect an unfamiliar contract and follow up on its result.
-    "low": Budget(5, 5, 5, 8, 2 / 3, 1, 1000),
-    "medium": Budget(8, 8, 8, 12, 5 / 6, 2, 1500),
-    "high": Budget(12, 12, 12, 16, 1, 3, 2000),
+    "low": Budget(5, 5, 5, 8, 2 / 3, 1, 1000, document_reads=1),
+    "medium": Budget(8, 8, 8, 12, 5 / 6, 2, 1500, document_reads=1),
+    "high": Budget(12, 12, 12, 16, 1, 3, 2000, document_reads=1),
 }
 
 

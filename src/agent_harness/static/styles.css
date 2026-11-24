@@ -632,6 +632,15 @@ summary[aria-expanded="true"] .disclosure-chevron { transform: rotate(0deg); }
 .run-memory-used p { margin: 8px 0 0; }
 .tls-section-heading { margin-top: 35px; }
 .sandbox-profiles-heading { margin-top: 35px; }
+.sandbox-image-actions, .sandbox-check, .personal-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.sandbox-image-actions { justify-content: space-between; }
+.sandbox-check { padding-block: 8px; color: #bdbdbd; font-size: 14px; }
+.personal-dialog { width: min(680px, calc(100vw - 32px)); }
+.personal-dialog .settings-fields { padding-block: 10px; }
+.personal-dialog .resource-actions { margin-top: 12px; }
+.personal-row { border-top: 1px solid #393939; padding-block: 12px; }
+.personal-row > div { flex: 1; min-width: 140px; overflow-wrap: anywhere; }
+.personal-row small { display: block; color: #bdbdbd; font-size: 14px; }
 .run-environment { color: #a8a8a8; font-size: 15px; line-height: 1.7; margin: 24px 0 0; }
 #direct-model-fields { margin-top: 0; }
 .settings-dialog [role="tabpanel"], .settings-items, .memory-dialog form, .memory-dialog > div { min-width: 0; }

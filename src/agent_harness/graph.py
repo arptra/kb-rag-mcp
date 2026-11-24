@@ -17,9 +17,14 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
-from agent_harness.answer_quality import requested_field, requested_field_label
+from agent_harness.answer_quality import is_answer_source, requested_field, requested_field_label
 from agent_harness.budgets import BUDGET_TOOL, BudgetChanges, BudgetRequest
-from agent_harness.contracts import ConversationUnavailable, ModelDecisionError, Principal
+from agent_harness.contracts import (
+    ConversationUnavailable,
+    ModelDecisionError,
+    Principal,
+    sandbox_api_index,
+)
 from agent_harness.material_archive import ARCHIVE_TOOL, search_materials
 from agent_harness.material_archive import available as archive_available
 from agent_harness.mcp_catalog import (
@@ -58,6 +63,7 @@ from agent_harness.research import (
     simple_service_count_question,
     update_plan,
 )
+from agent_harness.retrieval_review import body_overlap
 from agent_harness.store import timestamp
 
 if TYPE_CHECKING:
@@ -75,6 +81,7 @@ class GraphState(TypedDict, total=False):
     calls: list[Any]
     exchange: list[dict[str, Any]]
     attempted_lookups: list[str]
+    finish_after_sandbox_check: bool
     recovery_lookup: bool
     quality_rounds: int
     branch_reason: str
@@ -146,6 +153,11 @@ class HarnessGraph:
         if resume:
             context.run.pop("_question_bound_mcp_call", None)
             context.run.pop("_goal_review_requested", None)
+            # A resumed graph searches the current corpus. A quote, negative judgment or
+            # remembered page from its interrupted pass must be checked against that corpus.
+            for field in ("_retrieval_support", "_retrieval_gap", "_source_assessments",
+                          "_routing_reads", "_search_hit_ids"):
+                context.run.pop(field, None)
             snapshot = await self.graph.aget_state(config)
             if not snapshot.values:
                 raise ValueError("Контрольная точка не найдена. Создайте новый запрос.")
@@ -188,6 +200,7 @@ class HarnessGraph:
                     "exchange": [],
                     "recovery_lookup": False,
                     "agent_batch": False,
+                    "finish_after_sandbox_check": False,
                     "branch_waiting": False,
                     "force_lookup": False,
                     "next_step": "collect",
@@ -260,7 +273,20 @@ class HarnessGraph:
             return self._result(context, "done")
         selected = requested or sorted(item["id"] for item in catalog
                                        if run["mode"] != "quick" or item["quick_search"])
+        # The environment picker binds service checks to one profile even when the
+        # caller selected all sources. Keep the selected environment inside the budget.
+        api = sandbox_api_index(run.get("sandbox_profile_id", ""))
+        selected = [item for item in selected if not item.startswith("sandbox-api:")]
+        if run["mode"] != "quick" and api in available:
+            selected.insert(0, api)
         if len(selected) > self.engine._runtime_limits(run).max_indexes:
+            # Rank the entire permitted RAG selection before applying an operator cap.
+            # A useful source at the end of the catalog still gets considered.
+            direct = {item["id"]: item for item in catalog if item["direct_search"]}
+            ranked = iter(await self.engine._rank_search_sources(
+                principal, run, [direct[i] for i in selected if i in direct], allowed=available,
+            ))
+            selected = [next(ranked) if index in direct else index for index in selected]
             self.engine._warn(run, "Область поиска ограничена бюджетом числа индексов.")
         run["index_ids"] = selected[: self.engine._runtime_limits(run).max_indexes]
         if (len(run["index_ids"]) == 1 and question_record_id(run["question"])
@@ -330,23 +356,13 @@ class HarnessGraph:
             if run["mode"] == "autonomous" and engine._answer_snapshot_count(run):
                 run["current_action"] = None
                 return self._result(context, "done")
-        await asyncio.gather(
-            *(
-                engine._search(
-                    principal,
-                    run,
-                    event,
-                    index,
-                    query,
-                    deadline=sweep_deadline,
-                    initial=True,
-                )
-                for index in bootstrap
-            )
-        )
+        direct = {item["id"]: item for item in catalog if item["direct_search"]}
+        verified = await self._retrieve(context, [direct[i] for i in bootstrap], query,
+                                        sweep_deadline, available, rag_only=not external)
         run["current_action"] = None
+        searched = sum(row["status"] in {"searched", "empty"} for row in run["coverage"].values())
         engine._trace(run, "search_knowledge", {},
-                      f"Начальный поиск завершён: источников {len(bootstrap)}.")
+                      f"Поиск завершён. Проверено источников: {searched} из {len(knowledge)}.")
         engine._checkpoint(principal, run, event)
         if event.is_set():
             return self._result(context, "done")
@@ -367,14 +383,170 @@ class HarnessGraph:
         if not run["evidence"] and not external and (quick or not knowledge):
             engine._warn(run, "Доступные источники не подтвердили сведения по вопросу.")
             return self._result(context, "synthesize", calls=[], exchange=[])
+        if (verified and any(tool["function"]["name"] == "check_sandbox_api" for tool in external)
+                and engine._followup_calls(run) < budget.source_calls
+                and run["metrics"]["tool_calls"] < budget.tool_calls):
+            return self._result(context, "tools", knowledge_ids=knowledge, external=external,
+                                calls=[{"name": "check_sandbox_api", "args": {}}], exchange=[],
+                                finish_after_sandbox_check=True)
         return self._result(
             context,
-            "synthesize" if quick and not external else "inspect",
+            "synthesize" if verified or (quick and not external) else "inspect",
             external=external,
             knowledge_ids=knowledge,
             exchange=[],
             calls=[],
         )
+
+    async def _retrieve(
+        self, context: ExecutionContext, catalog: list[dict[str, Any]], query: str,
+        deadline: float, available: set[str], *, rag_only: bool,
+    ) -> bool:
+        """Search a shortlist, widen on missing support and keep the original scope available."""
+        if not catalog:
+            return False
+        run, engine, principal = context.run, self.engine, context.principal
+        budget = engine._budget(run)
+        remaining = await engine._rank_search_sources(principal, run, catalog, allowed=available)
+        allowed = set(remaining)
+        names = {entry["id"]: entry.get("name") or entry["id"] for entry in catalog}
+        adaptive = (getattr(engine.model, "supports_search_assessment", False)
+                    and getattr(engine.source, "supports_passage_retrieval", False)
+                    and (await engine._model_status())["available"])
+        remembered = None
+        if adaptive and budget.document_reads and engine._followup_calls(run) < budget.source_calls:
+            routes = await engine._initial_routes(principal, run, allowed, mcp=False)
+            remembered = routes.get("read_document")
+        # A plain ModelPort can answer questions without providing a retrieval assessment.
+        # Without that decision boundary there is no benefit to serializing its initial search.
+        width = min(budget.parallelism, 2) if adaptive else budget.parallelism
+        if remembered and remaining[0] == remembered[0]["index_id"]:
+            width = 1
+        attempted = set()
+        retry: tuple[str, str] | None = None
+        while ((remaining or retry) and not context.cancel.is_set()
+               and engine._now(run) < deadline):
+            wave: list[tuple[str, str, bool]] = []
+            if retry:
+                index, alternate = retry
+                retry = None
+                if index in remaining:
+                    remaining.remove(index)
+                    wave.append((index, alternate, True))
+                elif (engine._followup_calls(run) < budget.source_calls
+                      and run["metrics"]["tool_calls"] < budget.tool_calls):
+                    run["metrics"]["tool_calls"] += 1
+                    wave.append((index, alternate, False))
+            # Check a specific new lead on its own before inviting a wider set of sources.
+            take = 0 if wave else width
+            wave.extend((index, query, True) for index in remaining[:take])
+            del remaining[:take]
+            if not wave:
+                break
+            for index, phrase, _ in wave:
+                attempted.add(lookup_key("search_knowledge", {"index_id": index, "query": phrase}))
+            if adaptive:
+                engine._trace(run, "source_routing", {},
+                              "Проверяем источники: " + ", ".join(names[i] for i, _, _ in wave))
+                engine._checkpoint(principal, run, context.cancel)
+            await asyncio.gather(*(engine._search(principal, run, context.cancel, index, phrase,
+                                                  deadline=deadline, initial=initial)
+                                   for index, phrase, initial in wave))
+            if not adaptive or context.cancel.is_set() or engine._now(run) >= deadline:
+                continue
+            indexes = [index for index, _, _ in wave]
+            advice = await self._review_wave(context, indexes, remaining, deadline, remembered,
+                                             single_pass=rag_only and len(catalog) <= 2,
+                                             refined=any(phrase != query for _, phrase, _ in wave))
+            if advice is None:
+                break
+            if advice["supported"]:
+                for index in remaining:
+                    if run["coverage"][index]["status"] == "pending":
+                        run["coverage"][index] = {"status": "deferred", "count": 0}
+                engine._trace(run, "source_supported", {"index_id": advice["index_id"]},
+                              "Найдено подтверждение в источнике «" + names[advice["index_id"]]
+                              + "». Переходим к ответу.")
+                return True
+            suggested = [i for i in dict.fromkeys(advice["indexes"]) if i in allowed]
+            remaining = [i for i in suggested if i in remaining] + [
+                i for i in remaining if i not in suggested
+            ]
+            alternate = advice["query"]
+            if alternate:
+                for index in suggested or indexes:
+                    key = lookup_key("search_knowledge", {"index_id": index, "query": alternate})
+                    if key not in attempted:
+                        retry = (index, alternate)
+                        engine._trace(run, "search_refinement", {"index_id": index},
+                                      "Уточняем поисковый запрос по результатам проверки.")
+                        break
+            width = min(budget.parallelism, width * 2)
+        if remaining and not context.cancel.is_set() and engine._now(run) >= deadline:
+            engine._warn(run, "Время поиска исчерпано; зарезервирован итоговый ответ.")
+        return False
+
+    async def _review_wave(
+        self, context: ExecutionContext, indexes: list[str], remaining: list[str], deadline: float,
+        remembered: tuple[dict[str, str], str] | None, *, single_pass: bool, refined: bool,
+    ) -> dict[str, Any] | None:
+        run, engine = context.run, self.engine
+        budget = engine._budget(run)
+        hits = run.get("_search_hit_ids", {})
+        refs = {(index, item_id) for index in indexes for item_id in hits.get(index, [])}
+        items = [item for item in engine._ranked_evidence(run)
+                 if (item["index_id"], item["id"]) in refs and is_answer_source(item)]
+        documents = {(e["index_id"], e.get("document_id") or e["id"]) for e in items}
+        if (single_pass and run["mode"] == "quick" and not remaining and len(documents) == 1
+                and len(run["question"].split()) <= 3 and "?" not in run["question"]
+                and len(set(items[0]["text"].casefold().split())
+                        - set(run["question"].casefold().split())) >= 2
+                and body_overlap(run["question"], items[0]["text"]) >= 0.85):
+            # A short keyword lookup resolving to just one page needs only the writer.
+            # Natural-language questions and competing documents still get reviewed.
+            return None
+        location = None
+        memory_id = ""
+        if remembered and remembered[0]["index_id"] in indexes:
+            location, memory_id = remembered
+        elif items and not items[0].get("read_document"):
+            best = items[0]
+            location = {"index_id": best["index_id"], "document_id": best.get("document_id")
+                        or best["id"]}
+        attempted = run.setdefault("_routing_reads", [])
+        # Keep a read for the next targeted lookup when there is one read left and the
+        # current generic hit barely overlaps the question. A saved route is already a lead.
+        save_read = (bool(remaining) and len(attempted) + 1 >= budget.document_reads and not refined
+                     and not memory_id and bool(items)
+                     and body_overlap(run["question"], items[0]["text"]) < 0.5)
+        if (location and not save_read and len(attempted) < budget.document_reads
+                and run["metrics"].get("document_reads", 0) < budget.document_reads
+                and engine._followup_calls(run) < budget.source_calls
+                and (key := lookup_key("read_document", location)) not in attempted):
+            attempted.append(key)
+            if memory_id:
+                engine._trace(run, "memory_route", location,
+                              "По опыту похожего вопроса проверяем текущий текст документа.")
+                try:
+                    engine.memory.record_usage(context.principal.owner_id, [memory_id], run["id"])
+                except Exception as exc:
+                    engine._memory_problem(run, "Не удалось записать выбор источника.", exc)
+            result = await engine._read(context.principal, run, context.cancel, location,
+                                        deadline=deadline)
+            engine._trace(run, "read_document", location, result)
+            # A chunk and its freshly opened parent may have different evidence IDs.
+            refs.add((location["index_id"], location["document_id"]))
+            items = [
+                item for item in engine._ranked_evidence(run) if is_answer_source(item) and (
+                    (item["index_id"], item["id"]) in refs or
+                    (item.get("read_document") and (item["index_id"], item.get("document_id"))
+                     == (location["index_id"], location["document_id"]))
+                )
+            ]
+        if context.cancel.is_set() or engine._now(run) >= deadline:
+            return None
+        return await engine._assess_search(context.principal, run, context.cancel, items,
+                                           [*indexes, *remaining], deadline)
 
     async def inspect(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
         """Open promising documents before accepting a snippet-only conclusion."""
@@ -386,7 +558,7 @@ class HarnessGraph:
         candidates = engine._ranked_evidence(run)
         if run["mode"] == "autonomous" and service_inventory_question(run["question"]):
             candidates.sort(key=inventory_source_score, reverse=True)
-        attempted = set(state.get("attempted_lookups", []))
+        attempted = set(state.get("attempted_lookups", [])) | set(run.get("_routing_reads", []))
         available_tools = {t["function"]["name"] for t in state.get("external", [])}
         routes = await engine._initial_routes(
             context.principal, run,
@@ -397,7 +569,7 @@ class HarnessGraph:
         if recalled:
             route, _ = recalled
             candidates = [{"id": route["document_id"], "index_id": route["index_id"]}, *candidates]
-        count = 0
+        count = run["metrics"].get("document_reads", 0)
         for item in candidates:
             if (count >= budget.document_reads or context.cancel.is_set()
                     or engine._now(run) >= self._reserve_deadline(context)
@@ -427,6 +599,14 @@ class HarnessGraph:
             attempted.add(key)
             engine._trace(run, "read_document", args, result)
             count += 1
+        checks = []
+        if ("check_sandbox_api" in available_tools
+                and lookup_key("check_sandbox_api", {}) not in attempted
+                and not context.cancel.is_set()
+                and engine._now(run) < self._reserve_deadline(context)
+                and engine._followup_calls(run) < budget.source_calls
+                and run["metrics"]["tool_calls"] < budget.tool_calls):
+            checks.append({"name": "check_sandbox_api", "args": {}})
         tool = "mcp_tool_schema" if "mcp_tool_schema" in routes else "mcp_list_tools"
         if (tool in routes and tool in available_tools and engine._decision_calls(run) == 0
                 and not context.cancel.is_set()):
@@ -434,7 +614,7 @@ class HarnessGraph:
             key = lookup_key(tool, args)
             # Discovery still needs a schema read and a substantive call. A
             # remembered contract only needs the latter.
-            reserve_calls = 2 if tool == "mcp_list_tools" else 1
+            reserve_calls = (2 if tool == "mcp_list_tools" else 1) + len(checks)
             if (key not in attempted and engine._now(run) < self._reserve_deadline(context)
                     and run["metrics"]["tool_calls"] + reserve_calls < budget.tool_calls
                     and engine._followup_calls(run) + reserve_calls < budget.source_calls
@@ -442,7 +622,9 @@ class HarnessGraph:
                 run["_initial_mcp_route"] = {"key": key, "memory_id": memory_id}
                 run["_round_evidence"] = evidence_signature(run)
                 return self._result(context, "tools", attempted_lookups=sorted(attempted),
-                                    calls=[{"name": tool, "args": args}])
+                                    calls=[*checks, {"name": tool, "args": args}])
+        if checks:
+            return self._result(context, "tools", calls=checks, attempted_lookups=sorted(attempted))
         if (read_chat(run) and "mcp_list_tools" in available_tools
                 and engine._decision_calls(run) == 0 and budget.model_calls > 1
                 and not context.cancel.is_set()):
@@ -498,7 +680,8 @@ class HarnessGraph:
         attempted = set(state.get("attempted_lookups", []))
         attempted.update(lookup_key("search_knowledge", {
             "index_id": index, "query": initial_search_query(run),
-        }) for index in knowledge)
+        }) for index in knowledge if run["coverage"].get(index, {}).get("status") in
+                         {"searched", "empty", "failed"})
         ranked = engine._ranked_evidence(run)
         inventory = service_inventory_question(run["question"])
         if inventory:
@@ -1123,11 +1306,14 @@ class HarnessGraph:
                 branch["status"] = "no_result"
             plan["branches"][-1] = branch
         next_step = "tools" if calls else "reflect"
+        if name == "check_sandbox_api" and state.get("finish_after_sandbox_check"):
+            next_step = "synthesize"
         if answer_ready:
             next_step = "done" if answered else "synthesize"
         return self._result(
             context,
             next_step,
+            finish_after_sandbox_check=False,
             calls=calls,
             attempted_lookups=sorted(attempted),
             recovery_lookup=False,

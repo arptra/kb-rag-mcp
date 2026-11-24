@@ -28,7 +28,14 @@ from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
 from corporate_kb.embeddings.sentence_transformer import SentenceTransformerEmbeddingProvider
 from corporate_kb.history import HistoryStore, embedding_key, normalize_document, utc_datetime
 from corporate_kb.loaders.filesystem import FileSystemDocumentLoader
-from corporate_kb.models import Chunk, Document, IndexStats, SearchFilters, SearchResult
+from corporate_kb.models import (
+    Chunk,
+    Document,
+    IndexStats,
+    SearchFilters,
+    SearchResult,
+    is_legacy_graph_item,
+)
 from corporate_kb.stores.base import KnowledgeStore
 from corporate_kb.stores.memory import InMemoryKnowledgeStore
 
@@ -211,6 +218,7 @@ class KnowledgeService:
         top_k: int | None = None,
         min_score: float | None = None,
         filters: SearchFilters | None = None,
+        full_text: bool = False,
     ) -> list[SearchResult]:
         self.load_read_index()
         if not query.strip():
@@ -225,12 +233,13 @@ class KnowledgeService:
             }
         )
         effective_top_k = self.settings.default_top_k if top_k is None else top_k
-        results = self.store.search(
-            query_vector,
-            top_k=effective_top_k,
-            min_score=min_score,
-            filters=active_filters,
-        )
+        if full_text and isinstance(self.store, InMemoryKnowledgeStore):
+            results = self.store.search(query_vector, top_k=effective_top_k, min_score=min_score,
+                                        filters=active_filters, text=query,
+                                        exclude=is_legacy_graph_item)
+        else:
+            results = self.store.search(query_vector, top_k=effective_top_k, min_score=min_score,
+                                        filters=active_filters)
         logger.info(
             "Search returned %d results in %.3f seconds; filters=%s",
             len(results),

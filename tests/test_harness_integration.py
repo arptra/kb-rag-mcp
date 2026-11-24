@@ -491,3 +491,189 @@ def test_distinct_search_chunks_keep_document_id_for_reading() -> None:
     }, 'main')
     assert first.id != second.id
     assert first.document_id == second.document_id == 'doc'
+
+
+async def test_search_returns_source_chunks_before_excerpt_packing_and_reads_deep_anchor(
+    settings_factory: Any,
+) -> None:
+    from agent_harness.contracts import Principal
+    from agent_harness.search_results import source_passage
+    from corporate_kb.catalog import RagCatalog
+    from corporate_kb.harness_integration import CatalogSource
+    from corporate_kb.mcp.tools import KnowledgeTools
+    from corporate_kb.usage import UsageTracker
+
+    settings, service = _service(settings_factory, search_excerpt_tokens=40)
+    filler = "Проверен регламент. " * 45
+    body = "Заявка ORION-7735. Комиссия приняла установку. Итоговый показатель 671."
+    page = "# Протокол 17\n\n" + ((filler + "\n\n") * 30) + body + "\n\n" + filler
+    (settings.knowledge_dir / "sheet.md").write_text(page, encoding="utf-8")
+    service.build_index(force=True)
+    usage = UsageTracker()
+    catalog = RagCatalog(settings, service, KnowledgeTools(service, usage=usage), usage)
+
+    async def permitted(_principal: Principal) -> bool:
+        return True
+
+    source = CatalogSource(catalog, permitted)
+    scope = {"index_id": "default", "principal": Principal("user"), "cancel": Event()}
+    hits = await source.search(query="Заявка ORION-7735 комиссия приняла установку",
+                               limit=5, **scope)
+    hit = next(item for item in hits if body in item.text)
+    doc = await source.read(document_id=hit.document_id, **scope)
+    assert doc.title == "Протокол 17" and len(doc.text) > 10_000
+    excerpt = source_passage(doc.text, "Каковы итоги приемки?", 1000, anchors=[hit.text])
+    assert body in excerpt
+
+
+async def test_harness_finds_body_outside_vector_window_and_reuses_only_current_postings(
+    settings_factory: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+    from threading import get_ident
+
+    import numpy as np
+
+    from agent_harness.contracts import Principal
+    from corporate_kb.catalog import RagCatalog
+    from corporate_kb.harness_integration import CatalogSource
+    from corporate_kb.mcp.tools import KnowledgeTools
+    from corporate_kb.models import SearchFilters
+    from corporate_kb.stores.fulltext import ChunkTextIndex
+    from corporate_kb.usage import UsageTracker
+
+    settings, service = _service(settings_factory, search_candidate_k=20)
+    sample = service.search("payments", top_k=1)[0]
+    doc = service.get_document(sample.document_id)
+    chunk = service.get_chunk(sample.chunk_id)
+    docs, chunks = [], []
+    # More than twenty better vector hits and more than twenty forbidden, stronger
+    # lexical matches. Neither top-K cutoff should hide the allowed body match.
+    kinds = ["other"] * 24 + ["hidden", "old", "graph", "retired"] * 8 + ["target"]
+    for i, kind in enumerate(kinds):
+        key = f"record-{i}"
+        body = "ordinary details" if kind == "other" else "ORION-7735"
+        if kind == "target":
+            body += " passed with coefficient 671."
+        page = "private" if kind == "hidden" else key
+        meta = {"status": "archived" if kind == "retired" else "current"}
+        if kind == "graph":
+            meta["document_type"] = "system_graph"
+        common = dict(document_id=key, page_id=page, title="Minutes", is_latest=kind != "old",
+                      metadata=meta)
+        docs.append(doc.model_copy(update={**common, "content": body}))
+        chunks.append(chunk.model_copy(update={**common, "chunk_id": key, "text": body}))
+    matrix = np.zeros((len(chunks), service.provider.dimension), dtype=np.float32)
+    matrix[:, 0] = 1
+    matrix[-1, :2] = [0, 1]
+    service.store.replace_index(docs, chunks, matrix)
+    service.set_page_visibility("private", False)
+    vector = matrix[0]
+    calls: list[str] = []
+
+    def embed(query: str) -> Any:
+        calls.append(query)
+        return vector
+
+    monkeypatch.setattr(service.provider, "embed_query", embed)
+    builds: list[int] = []
+    connections: list[sqlite3.Connection] = []
+    original_connect = sqlite3.connect
+
+    def connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        db = original_connect(database, *args, **kwargs)
+        if database == ":memory:":
+            def trace(sql: str) -> None:
+                if sql.startswith("CREATE VIRTUAL TABLE body "):
+                    builds.append(get_ident())
+                    connections.append(db)
+            db.set_trace_callback(trace)
+        return db
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    tool = KnowledgeTools(service)
+    target = docs[-1].document_id
+    assert target not in {r.document_id for r in tool.search_candidates(
+        "ORION-7735", 20, filters=SearchFilters(status="current"))}
+    assert not builds
+
+    async def permit(_principal: Principal) -> bool:
+        return True
+
+    catalog = RagCatalog(settings, service, tool, UsageTracker())
+    source = CatalogSource(catalog, permit)
+    scope = {"index_id": "default", "principal": Principal("user"), "cancel": Event()}
+    hits, again = await asyncio.gather(
+        source.search(query="ORION-7735", limit=20, **scope),
+        source.search(query="ORION-7735", limit=1, **scope),
+    )
+    allowed = {d.document_id for d in [*docs[:24], docs[-1]]}
+    assert again[0].document_id == hits[0].document_id == target
+    assert all(hit.document_id in allowed for hit in hits)
+    assert len(builds) == 1 and builds[0] != get_ident()
+    assert calls == ["ORION-7735"] * 3
+    service.set_page_visibility(target, False)
+    assert target not in {hit.document_id for hit in await source.search(
+        query="ORION-7735", limit=20, **scope)}
+    service.set_page_visibility(target, True)
+    assert len(builds) == 1
+
+    replacement = "Separate body containing TRITON-4821."
+    docs[-1] = docs[-1].model_copy(update={"content": replacement})
+    chunks[-1] = chunks[-1].model_copy(update={"text": replacement})
+    reading_old, release_old = Event(), Event()
+    original_search = ChunkTextIndex.search
+
+    def pause_old(index: ChunkTextIndex, text: str, *args: Any) -> list[int]:
+        if text == "ORION-7735":
+            reading_old.set()
+            assert release_old.wait(10)
+        return original_search(index, text, *args)
+
+    monkeypatch.setattr(ChunkTextIndex, "search", pause_old)
+    in_flight = asyncio.create_task(source.search(query="ORION-7735", limit=1, **scope))
+    try:
+        assert await asyncio.to_thread(reading_old.wait, 5)
+        service.store.replace_index(docs, chunks, matrix)
+        new = await source.search(query="TRITON-4821", limit=1, **scope)
+        assert new[0].document_id == target and new[0].text == replacement
+        assert connections[0].execute("SELECT 1").fetchone() == (1,)
+    finally:
+        release_old.set()
+    previous = await in_flight
+    assert previous[0].document_id == target and "671" in previous[0].text
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connections[0].execute("SELECT 1")
+    old = await source.search(query="ORION-7735", limit=20, **scope)
+    assert all(hit.document_id != target for hit in old)
+    assert len(builds) == 2 and all(thread != get_ident() for thread in builds)
+    assert len(calls) == 7
+
+
+async def test_harness_catalog_does_not_read_admin_job_history(
+    settings_factory: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_harness.contracts import Principal
+    from corporate_kb.catalog import RagCatalog
+    from corporate_kb.harness_integration import CatalogSource
+    from corporate_kb.mcp.tools import KnowledgeTools
+    from corporate_kb.usage import UsageTracker
+
+    settings, service = _service(settings_factory)
+    usage = UsageTracker()
+    catalog = RagCatalog(settings, service, KnowledgeTools(service, usage=usage), usage)
+    managed = catalog.create_index(name="Сводки", description="Итоги испытаний по подразделениям")
+
+    def no_admin_payload() -> Any:
+        pytest.fail("search loaded admin catalog/analysis history")
+
+    monkeypatch.setattr(catalog, "payload", no_admin_payload)
+
+    async def permitted(_principal: Principal) -> bool:
+        return True
+
+    sources = await CatalogSource(catalog, permitted).indexes(Principal("user"))
+    assert next(item for item in sources if item["id"] == managed.id) == {
+        "id": managed.id, "name": managed.name,
+        "description": managed.description, "revision": managed.updated_at.isoformat(),
+    }

@@ -65,6 +65,14 @@ class SearchResult(VersionMetadata):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+def is_legacy_graph_item(item: Chunk | Document | SearchResult) -> bool:
+    return (
+        item.metadata.get("document_type") == "system_graph"
+        or item.metadata.get("authority") == "source-derived-graph"
+        or item.source_path.replace("\\", "/").startswith("system-graph/")
+    )
+
+
 class IndexStats(DomainModel):
     document_count: int
     chunk_count: int

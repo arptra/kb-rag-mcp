@@ -127,8 +127,9 @@
                 <details id="composer-options" class="composer-options"><summary>Параметры</summary>
                 <div class="composer-settings">
                   <label class="effort-select" for="effort">Усилие <select id="effort" name="effort"><option value="low">Низкое</option><option value="medium" selected>Обычное</option><option value="high">Высокое</option></select></label>
+                  <button id="personal-open" class="text-button" type="button" aria-haspopup="dialog">Мои доступы к Git и Gradle</button>
                 </div>
-                <div id="composer-environment" class="composer-environment" hidden><label class="environment-select" for="sandbox-profile">Среда выполнения<select id="sandbox-profile" name="sandbox_profile_id" disabled><option value="">По умолчанию</option></select></label><p id="environment-description"></p></div>
+                <div id="composer-environment" class="composer-environment" hidden><label class="environment-select" for="sandbox-profile">Среда выполнения<select id="sandbox-profile" name="sandbox_profile_id" disabled><option value="">По умолчанию</option></select></label><p id="environment-description"></p><div class="sandbox-check"><button id="sandbox-check" type="button" class="secondary-button">Проверить среду</button><span id="sandbox-check-result" role="status" aria-live="polite"></span></div></div>
                 <p id="effort-description" class="effort-description">Проверяем все выбранные базы знаний. Усилие определяет глубину разбора.</p>
                 </details>
                 <div class="composer-footer">
@@ -228,7 +229,7 @@
               <p id="settings-connections-empty" class="settings-empty">Подключения пока не добавлены.</p>
             </section>
             <section id="settings-panel-sandbox" role="tabpanel" aria-labelledby="settings-tab-sandbox" tabindex="0" hidden>
-              <div class="settings-section-heading"><div><h3>Изолированное выполнение</h3><p>Для работы с кодом нужен готовый образ и доступный сервис песочниц на сервере. Здесь можно проверить готовность и задать ограничения.</p></div></div>
+              <div class="settings-section-heading"><div><h3>Основная песочница</h3><p>Выберите Docker, образ и при необходимости порт HTTP-сервиса внутри контейнера.</p></div></div>
               <div id="settings-sandbox"></div>
               <div class="settings-section-heading sandbox-profiles-heading"><div><h3>Дополнительные среды</h3><p>Подготовленные среды для разных проектов. Пользователь выбирает среду при запуске исследования; ограничения выше применяются ко всем средам.</p></div><button id="settings-add-sandbox-profile" class="secondary-button" type="button">Добавить среду</button></div>
               <div id="settings-sandbox-profiles" class="settings-items"></div>
@@ -279,7 +280,7 @@
                 </div>
                 <p id="model-connection-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
               </div>
-              <div class="settings-section-heading tls-section-heading"><div><h3>Сертификаты TLS</h3><p>Корпоративный центр сертификации и клиентская пара для mTLS, если сервер модели их требует.</p></div><button id="tls-new" class="secondary-button" type="button">Добавить сертификаты</button></div>
+              <div class="settings-section-heading tls-section-heading"><div><h3>Сертификаты TLS</h3><p>Наборы для модели и Docker API. Для Docker добавьте сертификат центра сертификации, клиентский сертификат и его ключ.</p></div><button id="tls-new" class="secondary-button" type="button">Добавить сертификаты</button></div>
               <div id="tls-list" class="settings-items"></div>
               <p id="tls-empty" class="settings-empty">Используется системное хранилище доверенных сертификатов.</p>
               <div id="tls-editor" class="settings-resource" hidden>
@@ -323,6 +324,30 @@
       <div id="memory-list" class="settings-items"></div>
       <button id="memory-load-more" class="secondary-button" type="button" hidden>Показать ещё</button>
       <p id="memory-empty" class="settings-empty">В вашей области доступа пока нет записей. Общий опыт появится автоматически после завершения запросов с включённой памятью. Можно добавить проверенную заметку.</p>
+    </dialog>
+
+    <dialog id="personal-dialog" class="memory-dialog personal-dialog" aria-labelledby="personal-title">
+      <div class="dialog-heading"><h2 id="personal-title">Мои доступы к Git и Gradle</h2><button id="personal-close" class="icon-button" type="button" aria-label="Закрыть">×</button></div>
+      <p class="settings-field-help">Секрет вводится здесь. В ваших следующих запусках Harness использует его для выбранного репозитория. В переписке и общей памяти он не появится.</p>
+      <form id="personal-form" autocomplete="off">
+        <fieldset id="personal-fields" class="settings-fields settings-grid">
+          <label class="settings-field"><span class="settings-field-label">Тип доступа</span><select id="personal-kind"><option value="ssh">Git по SSH</option><option value="gradle">Gradle · Maven-репозиторий</option></select></label>
+          <label class="settings-field"><span class="settings-field-label">Репозиторий проекта</span><select id="personal-repository" required></select></label>
+          <label class="settings-field wide"><span class="settings-field-label">Название доступа</span><input id="personal-name" maxlength="160" required placeholder="Например, сборка платежей"></label>
+          <div id="personal-ssh-fields" class="settings-grid wide">
+            <label class="settings-field wide"><span class="settings-field-label">Закрытый SSH-ключ</span><textarea id="personal-key" class="secret-field" spellcheck="false" autocapitalize="off" autocomplete="off" required></textarea></label>
+            <label class="settings-field wide"><span class="settings-field-label">Ключ сервера Git из known_hosts</span><textarea id="personal-known-hosts" spellcheck="false" autocapitalize="off" autocomplete="off" required></textarea></label>
+          </div>
+          <div id="personal-gradle-fields" class="settings-grid wide" hidden>
+            <label class="settings-field wide"><span class="settings-field-label">Адрес Maven-репозитория</span><input id="personal-registry" type="url" placeholder="https://packages.example.ru/maven/releases" spellcheck="false" required disabled></label>
+            <label class="settings-field"><span class="settings-field-label">Имя пользователя</span><input id="personal-username" spellcheck="false" autocapitalize="off" required disabled></label>
+            <label class="settings-field"><span class="settings-field-label">Пароль или токен</span><input id="personal-password" type="password" autocomplete="off" required disabled></label>
+          </div>
+        </fieldset>
+        <div class="resource-actions"><button id="personal-save" class="secondary-button" type="submit">Сохранить для моих запусков</button></div>
+      </form>
+      <p id="personal-feedback" class="settings-field-help" role="status" aria-live="polite"></p>
+      <div id="personal-list" class="settings-items"></div>
     </dialog>
 
     <dialog id="delete-dialog" class="auth-dialog" aria-labelledby="delete-title">

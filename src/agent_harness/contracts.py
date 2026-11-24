@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from threading import Event
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic_core import PydanticCustomError
 
 ANALYSIS_FILENAME = r"^[A-Za-z][A-Za-z0-9_]{0,63}\.(py|java)$"
 MAX_ANALYSIS_SOURCE_BYTES = 24_576
+
+
+def sandbox_api_index(profile_id: str) -> str:
+    return "sandbox-api:" + (profile_id or "~")
+
+
+def _contains_chat_credential(text: str) -> bool:
+    return bool(re.search(
+        r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----|"
+        r"(?im:^[ \t]*(?:systemProp\.|ORG_GRADLE_PROJECT_)?[\w.-]*(?:password|passwd|"
+        r"access[_-]?token|(?:maven|gradle|nexus|artifactory|repo|repository)[._-]?token)"
+        r"[ \t]*[=:][ \t]*(?!\$)\S+)", text,
+    ))
 
 
 class ModelDecisionError(ValueError):
@@ -62,6 +77,10 @@ class RunRequest(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("Question must not be blank")
+        if _contains_chat_credential(value):
+            raise PydanticCustomError(
+                "chat_credential", "Введите ключ или пароль через личную форму доступов в чате."
+            )
         return value
 
 
@@ -104,7 +123,12 @@ class Evidence(BaseModel):
 
 
 class SourcePort(Protocol):
-    """Providers enforce source permissions on each call, including background calls."""
+    """Providers enforce source permissions on each call, including background calls.
+
+    A corpus adapter may set supports_passage_retrieval = True when its search hits
+    carry readable text and read() can open a hit's document in the same index.
+    Harness uses those capabilities for passage assessment and search refinement.
+    """
 
     async def indexes(self, principal: Principal) -> list[dict[str, str]]: ...
 

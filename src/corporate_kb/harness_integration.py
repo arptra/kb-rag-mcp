@@ -26,10 +26,13 @@ from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
 from corporate_kb.gigacode_runner import GigaCodePolicyStop, GigaCodeTimedOut
 from corporate_kb.harness_graph import GRAPH_INDEX, read_graph, search_graph
+from corporate_kb.models import SearchFilters
 
 
 class CatalogSource:
     """Read-only projection of current RAG indexes, with host authorization per read."""
+
+    supports_passage_retrieval = True
 
     def __init__(
         self,
@@ -49,8 +52,8 @@ class CatalogSource:
 
     async def indexes(self, principal: Principal) -> list[dict[str, str]]:
         await self._check(principal)
-        payload = await asyncio.to_thread(self.catalog.payload)
-        indexes = [{"id": item["id"], "name": item["name"]} for item in payload["indexes"]]
+        indexes = await asyncio.to_thread(self.catalog.index_directory)
+        await self._check(principal)
         if self.authorize_graph is not None and await self.authorize_graph(principal):
             indexes.append({"id": GRAPH_INDEX, "name": "Граф сервисов"})
         return indexes
@@ -93,9 +96,25 @@ class CatalogSource:
             return items
         await self._check(principal, cancel)
         tool = self.catalog.tools_for(index_id)
-        result = await asyncio.to_thread(tool.search, query=query, top_k=min(20, max(1, limit)))
+        limit = min(20, max(1, limit))
+        chunks = await asyncio.to_thread(
+            tool.search_candidates, query, limit, filters=SearchFilters(status="current"),
+            full_text=True,
+        )
         await self._check(principal, cancel)
-        return [self._evidence(item, index_id) for item in result["results"]]
+        # Prefer one hit per page. When a small number of pages dominates the
+        # retrieval, retain further matching sections rather than wasting the budget.
+        pages, other_sections = {}, []
+        for chunk in chunks:
+            if chunk.document_id in pages:
+                other_sections.append(chunk)
+            else:
+                pages[chunk.document_id] = chunk
+        selected = [*pages.values(), *other_sections][:limit]
+        return [
+            self._evidence({**chunk.model_dump(), "rank": rank}, index_id)
+            for rank, chunk in enumerate(selected, 1)
+        ]
 
     async def read(
         self,
@@ -114,8 +133,8 @@ class CatalogSource:
         # The portal's MCP get_document deliberately compresses to 800 tokens.
         # Harness owns its own read/context budget and needs the original content
         # for an investigation, rather than another search-sized excerpt.
-        service = self.catalog.service_for(index_id)
-        document = await asyncio.to_thread(service.get_document, document_id)
+        tools = self.catalog.tools_for(index_id)
+        document = await asyncio.to_thread(tools.read_current_document, document_id=document_id)
         result = document.model_dump(mode="json")
         await self._check(principal, cancel)
         return self._evidence(result, index_id)
@@ -123,6 +142,8 @@ class CatalogSource:
 
 class GigaCodeDecisionModel:
     """Public model port over the existing launcher; keep login details administrative."""
+
+    supports_search_assessment = True
 
     def __init__(self, controller: GigaCodeAgentController, *, owns_controller: bool) -> None:
         self.model_control = controller

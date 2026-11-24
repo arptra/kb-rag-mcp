@@ -16,10 +16,16 @@ from agent_harness.contracts import (
     Evidence,
     Principal,
     ToolExecutionFailure,
+    sandbox_api_index,
     tool_failure_reason,
 )
 from agent_harness.credentials import CredentialStore
 from agent_harness.integrations_config import IntegrationSettings, IntegrationStore, SandboxConfig
+from agent_harness.tls_credentials import TLSCredentialStore
+
+
+class SandboxCheckArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 class RepositoryArgs(BaseModel):
@@ -78,6 +84,7 @@ class A2AArgs(BaseModel):
 
 
 ARGUMENTS: dict[str, type[BaseModel]] = {
+    "check_sandbox_api": SandboxCheckArgs,
     "clone_repository": RepositoryArgs,
     "search_repository": SearchRepositoryArgs,
     "read_repository": ReadRepositoryArgs,
@@ -89,7 +96,10 @@ ARGUMENTS: dict[str, type[BaseModel]] = {
     "a2a_ask": A2AArgs,
 }
 DESCRIPTIONS = {
-    "clone_repository": "Clone a configured repository into this run's sandbox.",
+    "check_sandbox_api": "Start the selected sandbox image and check its configured HTTP "
+    "endpoint. Returns a fresh status from the temporary container. Use to verify readiness.",
+    "clone_repository": "Clone a configured repository into this run's sandbox. Harness "
+    "automatically applies the user's saved SSH access for the selected repository.",
     "search_repository": "Search literal text in a repository; prepares its sandbox if needed.",
     "read_repository": "Read lines from a repository file inside this run's sandbox.",
     "write_analysis_script": "Prepare a small Python or Java analysis program to answer a "
@@ -98,7 +108,9 @@ DESCRIPTIONS = {
     "Use run_in_sandbox with the command in the receipt to obtain the actual output. "
     "Write the same filename again to correct a failed check.",
     "run_in_sandbox": "Run a command in an isolated repository container without network access. "
-    "Only for analysis, build and tests requested by the user. No host filesystem access.",
+    "Only for analysis, build and tests requested by the user. No host filesystem access. "
+    "For Gradle use gradle or ./gradlew directly. The user's saved Maven registry is attached "
+    "automatically for this repository; never request raw credentials.",
     "mcp_list_tools": "Discover the current allowed tools and their descriptions on a selected "
     "MCP connection. Use this to choose a relevant tool, then read mcp_tool_schema and call it. "
     "Use query to filter a large catalog. Set refresh=true if an earlier list does not show "
@@ -134,7 +146,10 @@ class IntegrationHub:
         if self._sandbox is None:
             from agent_harness.sandbox import SandboxBackend
 
-            self._sandbox = SandboxBackend(credentials=self.credentials)
+            self._sandbox = SandboxBackend(
+                credentials=self.credentials,
+                tls_credentials=TLSCredentialStore(self.store.path.parent),
+            )
         return self._sandbox
 
     @property
@@ -177,12 +192,20 @@ class IntegrationHub:
         if profile is None or not profile.allows(principal.owner_id):
             raise PermissionError("Sandbox profile is outside the permitted scope")
         # All resource/security limits remain administrator-owned global settings.
-        return settings.sandbox.model_copy(update={"image": profile.image})
+        return profile.apply_to(settings.sandbox)
 
     async def indexes(self, principal: Principal) -> list[dict[str, str]]:
         await self._check(principal)
         settings = self.store.load()
         return [
+            *([{"id": sandbox_api_index(""), "name": "API · Базовая среда", "kind": "sandbox"}]
+              if settings.sandbox.enabled and settings.sandbox.service_port else []),
+            *[
+                {"id": sandbox_api_index(item.id), "name": "API · " + item.name, "kind": "sandbox"}
+                for item in settings.sandbox_profiles
+                if settings.sandbox.enabled and item.service_port
+                and item.allows(principal.owner_id)
+            ],
             *[
                 {"id": "repo:" + item.id, "name": "Код · " + item.name}
                 for item in settings.repositories
@@ -218,6 +241,8 @@ class IntegrationHub:
         available = {item["id"] for item in await self.indexes(principal)} & set(index_ids)
         settings = self.store.load()
         names: list[str] = []
+        if not read_only_mcp and any(item.startswith("sandbox-api:") for item in available):
+            names.append("check_sandbox_api")
         repository_ids = [
             item.id for item in settings.repositories if "repo:" + item.id in available
         ]
@@ -245,7 +270,7 @@ class IntegrationHub:
             schema = ARGUMENTS[name].model_json_schema()
             if "repository_id" in schema["properties"]:
                 schema["properties"]["repository_id"]["enum"] = repository_ids
-            else:
+            elif "connection_id" in schema["properties"]:
                 schema["properties"]["connection_id"]["enum"] = (
                     a2a_ids if name == "a2a_ask" else mcp_ids
                 )
@@ -295,7 +320,16 @@ class IntegrationHub:
             validated.pop("schema_revision", None)
         settings = self.store.load()
         mcp_failure = None
-        if "repository_id" in validated:
+        if name == "check_sandbox_api":
+            resource_id = sandbox_api_index(sandbox_profile_id)
+            if resource_id not in index_ids:
+                raise PermissionError("Sandbox API is outside this run's scope")
+            check = await self.check_profile(principal, sandbox_profile_id, cancel, http_only=True)
+            result = [Evidence(id="sandbox-http-" + run_id, title="Проверка HTTP API в песочнице",
+                               index_id=resource_id, text=check["message"],
+                               tool_outcome=None if check.get("http_status") else "failed")]
+            credential_env = ""
+        elif "repository_id" in validated:
             resource_id = "repo:" + validated["repository_id"]
             repository = next(
                 (item for item in settings.repositories if item.id == validated["repository_id"]),
@@ -361,7 +395,7 @@ class IntegrationHub:
             raise PermissionError("Resource access was revoked")
         if "repository_id" in validated:
             current_sandbox = self._sandbox_config(self.store.load(), principal, sandbox_profile_id)
-            if current_sandbox.image != sandbox_config.image:
+            if current_sandbox != sandbox_config:
                 raise PermissionError("Sandbox profile changed during the call")
         if name in {"mcp_list_tools", "mcp_call", "mcp_tool_schema", "a2a_ask"}:
             assert connection is not None
@@ -420,23 +454,39 @@ class IntegrationHub:
         if self._sandbox is not None:
             await self._sandbox.close_run(run_id)
 
+    async def _probe_config(self, config: SandboxConfig, cancel: Event) -> dict[str, Any]:
+        if config.service_port is not None:
+            from agent_harness.sandbox_service import probe_service
+
+            return await probe_service(self.sandbox, config, cancel)
+        result = dict(await self.sandbox.probe(config))
+        result["message"] = result.get("message") or result.get("reason", "")
+        return result
+
+    async def check_profile(self, principal: Principal, profile_id: str, cancel: Event,
+                            *, http_only: bool = False) -> dict[str, Any]:
+        await self._check(principal, cancel)
+        config = self._sandbox_config(self.store.load(), principal, profile_id)
+        if http_only and config.service_port is None:
+            raise ValueError("Порт приложения для песочницы не настроен.")
+        result = await self._probe_config(config, cancel)
+        await self._check(principal, cancel)
+        if config != self._sandbox_config(self.store.load(), principal, profile_id):
+            raise PermissionError("Sandbox profile changed during the check")
+        return result
+
     async def probe(self, kind: str, resource_id: str = "") -> dict[str, Any]:
         settings = self.store.load()
         try:
             if kind == "sandbox":
-                result = dict(await self.sandbox.probe(settings.sandbox))
-                result["message"] = result.get("message") or result.get("reason", "")
-                return result
+                return await self._probe_config(settings.sandbox, Event())
             if kind == "sandbox_profile":
                 profile = next(
                     (item for item in settings.sandbox_profiles if item.id == resource_id), None
                 )
                 if profile is None:
                     raise ValueError("Sandbox profile not found")
-                config = settings.sandbox.model_copy(update={"image": profile.image})
-                result = dict(await self.sandbox.probe(config))
-                result["message"] = result.get("message") or result.get("reason", "")
-                return result
+                return await self._probe_config(profile.apply_to(settings.sandbox), Event())
             if kind == "repository":
                 repository = next((r for r in settings.repositories if r.id == resource_id), None)
                 if repository is None:

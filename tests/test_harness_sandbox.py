@@ -54,6 +54,9 @@ class FakeDocker:
         if args[0] == "run":
             if not self.image_available:
                 exit_code = 1
+            elif sandbox.PROBE_TOOLS_SCRIPT in args:
+                value = {"python": "3.12", "git": True, "ssh": True, "sleep": True,
+                         "java": False, "mvn": False, "gradle": False}
             elif sandbox.CLONE_SCRIPT in args:
                 value = {"commit": COMMIT}
                 exit_code = 1 if self.clone_fails else 0
@@ -135,7 +138,7 @@ async def test_clone_reused_bounded_networkless_tools_and_explicit_cleanup(
         network = command[command.index("--network") + 1]
         assert network == ("bridge" if sandbox.CLONE_SCRIPT in command else "none")
     await backend.close_run("run-1")
-    assert docker.calls[-2]["args"] == ["rm", "-f", keeper[keeper.index("--name") + 1]]
+    assert docker.calls[-2]["args"] == ["rm", "-f", "-v", keeper[keeper.index("--name") + 1]]
     assert docker.calls[-1]["args"] == ["volume", "rm", "-f", volumes[0][-1]]
     count = len(docker.calls)
     await backend.close_run("run-1")
@@ -242,10 +245,14 @@ async def test_probe_can_check_readiness_before_enabling_execution(docker: FakeD
     status = await backend.probe(config)
     assert status["available"] is True and status["enabled"] is False
     assert "выполнение выключено" in status["reason"]
-    assert [c["args"][0] for c in docker.calls] == ["version", "image"]
+    assert [c["args"][0] for c in docker.calls] == ["version", "image", "run"]
+    probe = docker.calls[-1]["args"]
+    assert probe[probe.index("--network") + 1] == "none"
+    assert probe[probe.index("--pull") + 1] == "never"
+    assert probe[probe.index("--entrypoint") + 1] == "python"
     with pytest.raises(SandboxError, match="disabled"):
         await invoke(backend, config=config)
-    assert len(docker.calls) == 2
+    assert len(docker.calls) == 3
 
 
 async def test_cancellation_force_removes_container_and_volume_and_releases_capacity(

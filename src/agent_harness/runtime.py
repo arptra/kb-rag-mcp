@@ -7,7 +7,9 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from contextlib import AsyncExitStack
+from itertools import islice
 from threading import Event
 from typing import Any
 from uuid import uuid4
@@ -23,6 +25,7 @@ from agent_harness.answer_quality import (
     WrittenFindings,
     answer_from_selected_quotes,
     answer_quality_issue,
+    cited_evidence_refs,
     decode_writer_answer,
     explanation_gap,
     format_source_reference,
@@ -53,6 +56,7 @@ from agent_harness.contracts import (
     SourcePort,
     ToolExecutionFailure,
     ToolPort,
+    sandbox_api_index,
     tool_failure_reason,
 )
 from agent_harness.control.settings import (
@@ -101,6 +105,7 @@ from agent_harness.research import (
     needs_source_check,
     simple_service_count_question,
 )
+from agent_harness.retrieval_review import REVIEW_PROMPT, REVIEW_TOOL, body_overlap, parse_review
 from agent_harness.search_results import source_passage
 from agent_harness.store import ACTIVE, RunStore, timestamp
 
@@ -512,6 +517,8 @@ class HarnessRuntime:
             for key in (
                 "_seen_tool_calls", "_round_evidence", "_stalled_rounds", "_gap_review_requested",
                 "_pending_source_checks",
+                "_source_revisions", "_source_assessments", "_search_hit_ids",
+                "_retrieval_support", "_retrieval_gap", "_retrieval_reviews", "_routing_reads",
                 "_mcp_metadata_refs", "_mcp_catalog_revisions", "_mcp_schema_revisions",
                 "_mcp_contract_repairs", "_initial_mcp_route", "_question_bound_mcp_refs",
                 "_question_bound_mcp_call", "_mcp_record_lookup",
@@ -901,6 +908,10 @@ class HarnessRuntime:
         return list(
             {
                 str(item["id"]): {"id": str(item["id"]), "name": str(item.get("name", item["id"])),
+                                  **({"description": str(item["description"])[:640]}
+                                     if item.get("description") else {}),
+                                  **({"revision": str(item["revision"])[:200]}
+                                     if item.get("revision") else {}),
                                   "direct_search": provider is self.source,
                                   "quick_search": provider is self.source or (
                                       item.get("kind") == "mcp"
@@ -1373,7 +1384,9 @@ class HarnessRuntime:
                          if name in {"mcp_call", "mcp_list_tools", "mcp_tool_schema", "a2a_ask"}
                          else ("repository_id", "repo:"))
         resource = args.get(field) if isinstance(args, dict) else None
-        if isinstance(resource, str) and prefix + resource in scope:
+        if name == "check_sandbox_api":
+            scope = [sandbox_api_index(run.get("sandbox_profile_id", ""))]
+        elif isinstance(resource, str) and prefix + resource in scope:
             scope = [prefix + resource]
         try:
             timeout = min(self._runtime_limits(run).external_tool_timeout_seconds,
@@ -1422,6 +1435,8 @@ class HarnessRuntime:
                     origin_tool=None if setup_only else name,
                 )
                 accepted += int(stored and item.tool_outcome is None and bool(item.text.strip()))
+            if name == "check_sandbox_api" and items:
+                return items[0].text
             if failed:
                 return "Команда завершилась ошибкой. Код завершения и вывод доступны для разбора."
             return f"Получено подтверждений: {accepted}."
@@ -1448,6 +1463,132 @@ class HarnessRuntime:
         finally:
             self._checkpoint(principal, run, event)
 
+    async def _rank_search_sources(
+        self, principal: Principal, run: dict[str, Any], catalog: list[dict[str, Any]], *,
+        allowed: set[str],
+    ) -> list[str]:
+        # collect() has just checked the complete run scope against the live ACL.
+        eligible = [source for source in catalog if source["id"] in allowed]
+        selected = {s["id"] for s in eligible}
+        revisions = {s["id"]: s["revision"] for s in eligible if s.get("revision")}
+        run["_source_revisions"] = revisions
+        try:
+            scores = await asyncio.to_thread(
+                self.memory.source_scores, principal.owner_id, run["question"],
+                allowed, selected, exclude_run_id=run["id"], revisions=revisions,
+            )
+        except Exception as exc:
+            scores = {}
+            self._memory_problem(run, "Опыт маршрутизации временно недоступен.", exc)
+
+        def priority(source: dict[str, Any]) -> float:
+            label = " ".join([source["id"], source.get("name", ""), source.get("description", "")])
+            return body_overlap(run["question"], label) + scores.get(source["id"], 0)
+
+        return [s["id"] for s in sorted(eligible, key=priority, reverse=True)]
+
+    async def _assess_search(
+        self, principal: Principal, run: dict[str, Any], event: Event,
+        items: list[dict[str, Any]], remaining: list[str], deadline: float,
+    ) -> dict[str, Any]:
+        fallback: dict[str, Any] = {"supported": False, "indexes": [], "query": ""}
+        budget = self._budget(run)
+        reserve = 1 if run["mode"] == "quick" else 2
+        if (not getattr(self.model, "supports_search_assessment", False) or event.is_set()
+                or self._decision_calls(run) + reserve >= budget.model_calls
+                or run.get("_retrieval_reviews", 0) >= min(3, max(2, budget.model_calls // 3))
+                or self._now(run) >= deadline):
+            return fallback
+        # Source IDs from the model are only suggestions within this run. Pass numbered,
+        # bounded, untrusted passages and validate the literal support against those passages.
+        catalog = {s["id"]: s for s in await self._indexes(principal)}
+        if not self._run_scope(run) <= catalog.keys():
+            raise ValueError("Source access changed during the investigation")
+        candidates = [idx for idx in dict.fromkeys(remaining)
+                      if idx in run["index_ids"] and catalog[idx]["direct_search"]][:100]
+        visible = [e for e in items
+                   if e["index_id"] in run["index_ids"] and is_answer_source(e)][:8]
+        current_refs = {(e["index_id"], e["id"]) for e in visible}
+        if run.get("_retrieval_reviews"):
+            # A comparison can span separate waves. Reserve a few slots for previous
+            # findings without treating an old observation as a hit on the new query.
+            previous = (e for e in self._ranked_evidence(run)
+                        if (e["index_id"], e["id"]) not in current_refs and e["index_id"] in catalog
+                        and e["index_id"] in run["index_ids"]
+                        and catalog[e["index_id"]]["direct_search"] and is_answer_source(e))
+            visible.extend(islice(previous, 3))
+        question = initial_search_query(run)
+        passages = [{"number": i, "index": e["index_id"], "title": e["title"],
+                     "text": source_passage(e["text"], question, 1400)}
+                    for i, e in enumerate(visible, 1)]
+        payload = {
+            "question": question,
+            "sources": [{"id": idx, "name": catalog[idx]["name"],
+                         "coverage": run.get("coverage", {}).get(idx, {}).get("status", "pending"),
+                         "description": catalog[idx].get("description", "")[:160]}
+                        for idx in candidates],
+            "passages": passages,
+        }
+        messages = [{"role": "system", "content": REVIEW_PROMPT},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
+        run["_retrieval_reviews"] = run.get("_retrieval_reviews", 0) + 1
+        phase, run["phase"] = run["phase"], "assessing_search"
+        try:
+            decision = await self._invoke_model(
+                principal, run, event, messages, [REVIEW_TOOL],
+                deadline=min(deadline, self._now(run) + self._source_timeout(run)),
+            )
+        except _AuthenticationTimeout:
+            raise
+        except (ModelDecisionError, ModelTransientError, TimeoutError):
+            self._trace(run, "search_assessment", {}, "Продолжаем поиск в доступных источниках.")
+            return fallback
+        finally:
+            run["phase"] = phase
+        if decision.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
+            return fallback
+        try:
+            review = parse_review(decision)
+        except (ValueError, TypeError, AttributeError):
+            self._trace(run, "search_assessment", {}, "Расширяем поиск после неполной оценки.")
+            return fallback
+        run["_retrieval_gap"] = review.gap or "Достаточность найденных материалов не подтверждена."
+        rejected = set(review.irrelevant_passages)
+        for i, item in enumerate(visible, 1):
+            if i in rejected and passages[i - 1]["text"] == item["text"]:
+                item["retrieval_relevance"] = "irrelevant"
+        for idx in {e["index_id"] for e in items}:
+            hit_ids = set(run.get("_search_hit_ids", {}).get(idx, []))
+            rejected_hits = {e["id"] for e in visible if e["index_id"] == idx
+                             and e.get("retrieval_relevance") == "irrelevant"}
+            if (hit_ids and hit_ids <= rejected_hits
+                    and all(e.get("retrieval_relevance") == "irrelevant"
+                            for e in visible if e["index_id"] == idx)):
+                run.setdefault("_source_assessments", {})[idx] = "irrelevant"
+        quote = review.quote.strip()
+        if (0 < review.passage <= len(visible) and review.passage not in rejected
+                and len(quote) >= 8 and quote in passages[review.passage - 1]["text"]
+                and quote in visible[review.passage - 1]["text"]):
+            item = visible[review.passage - 1]
+            if run["mode"] == "autonomous" and not item.get("checked_with"):
+                doc = item.get("document_id") or item["id"]
+                opened = next((e for e in visible if e.get("read_document")
+                               and e["index_id"] == item["index_id"]
+                               and (e.get("document_id") or e["id"]) == doc
+                               and (e is item or e.get("revision") == item.get("revision"))
+                               and quote in e["text"]), None)
+                if opened is None:
+                    return fallback
+                opened["checked_with"] = "read_document"
+                item = opened
+            support = {"id": item["id"], "index_id": item["index_id"], "quote": quote}
+            run["_retrieval_support"] = support
+            run.pop("_retrieval_gap", None)
+            run.get("_source_assessments", {}).pop(item["index_id"], None)
+            return {**fallback, **support, "supported": True}
+        return {**fallback, "query": " ".join(review.query.split()),
+                "indexes": [idx for idx in dict.fromkeys(review.indexes) if idx in candidates]}
+
     async def _search(
         self,
         principal: Principal,
@@ -1462,6 +1603,8 @@ class HarnessRuntime:
     ) -> str:
         if event.is_set() or self.source is None:
             return "Вызов отменён либо источник отключён."
+        hit_ids: list[str] = []
+        run.setdefault("_search_hit_ids", {})[index_id] = hit_ids
         profile = self._budget(run)
         count = min(
             limit or self._runtime_limits(run).results_per_index,
@@ -1492,6 +1635,8 @@ class HarnessRuntime:
                     timeout,
                 )
             check = None
+            # A new result set supersedes the previous query's verdict for this source.
+            run.get("_source_assessments", {}).pop(index_id, None)
             if not initial and run["mode"] == "autonomous":
                 previous_status = run.get("coverage", {}).get(index_id, {}).get("status")
                 initial_terms = initial_search_query(run).casefold().split()
@@ -1502,15 +1647,20 @@ class HarnessRuntime:
             recovered = False
             target = {"index_id": index_id}
             for item in items[:count]:
+                if item.index_id == index_id:
+                    # Keep even a dropped hit's ID: unseen passages cannot teach a miss.
+                    hit_ids.append(item.id)
                 if self._add_evidence(run, item, index_id, fresh=not initial,
                                       checked_with=check, recovery=recovery,
-                                      origin_tool="search_knowledge"):
+                                      origin_tool="search_knowledge", query=query):
                     accepted += 1
                     if (not recovered and run.get("_pending_source_checks")
                             and is_answer_source(item.model_dump())):
                         recovered = self._source_recovered(run, "search_knowledge", target)
             previous_coverage = run.get("coverage", {}).get(index_id, {}).get("status")
-            if initial or (recovered and previous_coverage == "failed"):
+            if initial or (accepted and previous_coverage in {"empty", "pending", "deferred"}) or (
+                recovered and previous_coverage == "failed"
+            ):
                 run.setdefault("coverage", {})[index_id] = {
                     "status": "searched" if items else "empty", "count": len(items[:count]),
                 }
@@ -1609,10 +1759,23 @@ class HarnessRuntime:
                 timeout,
             )
             run["metrics"]["document_reads"] = run["metrics"].get("document_reads", 0) + 1
+            excerpt = None
+            limit = self._budget(run).document_chars
+            if (item.index_id == args["index_id"] and item.kind == "source"
+                    and len(item.text) > limit):
+                document_id = item.document_id or item.id
+                anchors = [e["text"] for e in run["evidence"]
+                           if item.revision and e.get("revision") == item.revision
+                           and e["index_id"] == item.index_id and not e.get("read_document")
+                           and (e.get("document_id") or e["id"]) == document_id][:3]
+                # Passage selection on a multi-MB original must not block other chats.
+                excerpt = await asyncio.to_thread(
+                    source_passage, item.text, run["question"], limit, anchors=anchors,
+                )
             if not self._add_evidence(run, item, args["index_id"], document=True,
                                       checked_with="read_document"
                                       if model_requested or recovery else None, recovery=recovery,
-                                      origin_tool="read_document"):
+                                      origin_tool="read_document", excerpt=excerpt):
                 return "Документ не включён: ограничение области доступа или бюджета."
             if (run.get("_pending_source_checks")
                     and args["document_id"] in {item.id, item.document_id}
@@ -1668,7 +1831,7 @@ class HarnessRuntime:
     def _add_evidence(
         self, run: dict[str, Any], item: Evidence, index_id: str, *, document: bool = False,
         fresh: bool = False, checked_with: str | None = None, recovery: bool = False,
-        origin_tool: str | None = None,
+        origin_tool: str | None = None, query: str = "", excerpt: str | None = None,
     ) -> bool:
         item = Evidence.model_validate(item)
         if item.index_id != index_id:
@@ -1697,8 +1860,12 @@ class HarnessRuntime:
             else profile.document_chars if document
             else min(self._runtime_limits(run).evidence_chars, profile.evidence_chars)
         )
-        if (not document and item.kind == "source"
-                and run.get("mode") in {"quick", "investigate", "search"}):
+        if excerpt is not None:
+            payload["text"] = excerpt
+        elif item.kind == "source" and origin_tool in {"search_knowledge", "read_document"}:
+            payload["text"] = source_passage(item.text, query or run["question"], text_limit)
+        elif (not document and item.kind == "source"
+              and run.get("mode") in {"quick", "investigate", "search"}):
             payload["text"] = source_passage(item.text, run["question"], text_limit)
         else:
             payload["text"] = payload["text"][:text_limit]
@@ -1730,7 +1897,9 @@ class HarnessRuntime:
             payload["text_truncated"] = len(item.text) > text_limit
         for i, existing in enumerate(run["evidence"]):
             if (existing["id"], existing["index_id"]) == (payload["id"], index_id):
-                if existing.get("read_document") and not document:
+                changed_revision = (payload["revision"] and existing.get("revision")
+                                    and payload["revision"] != existing["revision"])
+                if existing.get("read_document") and not document and not changed_revision:
                     if (not recovery and payload.get("checked_with")
                             and existing.get("kind") == "source"
                             and existing.get("revision") == payload["revision"]
@@ -1739,7 +1908,7 @@ class HarnessRuntime:
                     return True
                 if (substantive and existing["text"] == payload["text"]
                         and existing.get("revision") == payload["revision"]):
-                    for field in ("checked_with", "tool_origin"):
+                    for field in ("checked_with", "tool_origin", "retrieval_relevance"):
                         if existing.get(field):
                             payload.setdefault(field, existing[field])
                 run["evidence"][i] = payload
@@ -1765,16 +1934,19 @@ class HarnessRuntime:
 
     @staticmethod
     def _ranked_evidence(run: dict[str, Any]) -> list[dict[str, Any]]:
-        words = set(re.findall(r"[\w-]{3,}", run["question"].casefold()))
+        question = run["question"]
+        support = run.get("_retrieval_support", {})
 
-        def relevance(item: dict[str, Any]) -> int:
-            title = set(re.findall(r"[\w-]{3,}", item["title"].casefold()))
-            body = set(re.findall(r"[\w-]{3,}", item["text"].casefold()))
-            return len(words & title) * 4 + len(words & body)
+        def relevance(item: dict[str, Any]) -> float:
+            return (2 * body_overlap(question, item["text"]) + body_overlap(question, item["title"])
+                    + 1 / (1 + (item.get("rank") or 100)))
 
         ranked = sorted(run["evidence"],
                         key=lambda item: (item.get("kind") == "tool_metadata",
-                                          bool(item.get("read_document")), relevance(item)),
+                                          (bool(support) and support["id"] == item["id"]
+                                           and support["index_id"] == item["index_id"]
+                                           and support["quote"] in item["text"]),
+                                          relevance(item), bool(item.get("read_document"))),
                         reverse=True)
         first, remaining, indexes = [], [], set()
         for item in ranked:
@@ -1855,7 +2027,7 @@ class HarnessRuntime:
             "selected_index_count": len(run["index_ids"]),
             "index_catalog_truncated": False,
             "coverage": {status: sum(item["status"] == status for item in coverage.values())
-                         for status in ("searched", "empty", "failed", "pending")},
+                         for status in ("searched", "empty", "failed", "pending", "deferred")},
             "source_gaps": [],
             "source_gaps_truncated": False,
             "evidence": [],
@@ -2027,12 +2199,25 @@ class HarnessRuntime:
         ranked = planning_evidence(run, exchange or []) if planning else self._ranked_evidence(run)
         if reporting:
             ordinals = {(e["index_id"], e["id"]): n for n, e in enumerate(run["evidence"], 1)}
-            ranked = [{**item, "citation_number": ordinals[(item["index_id"], item["id"])],
-                       "citation": "[" + item["id"] + "]"} for item in ranked
-                      if is_answer_source(item) and (
-                          not source_quotes or passage_repair
-                          or item.get("read_document") or item.get("checked_with")
-                      )]
+            counts = Counter(e["id"] for e in run["evidence"])
+            report_items = []
+            support = run.get("_retrieval_support", {})
+            for item in ranked:
+                if not is_answer_source(item) or (
+                    source_quotes and not passage_repair
+                    and not (item.get("read_document") or item.get("checked_with"))
+                ):
+                    continue
+                number = ordinals[(item["index_id"], item["id"])]
+                ref = item["id"] if counts[item["id"]] == 1 else str(number)
+                item = {**item, "citation_number": number, "citation": f"[{ref}]"}
+                if (item["id"] == support.get("id") and item["index_id"] == support.get("index_id")
+                        and support["quote"] in item["text"] and len(item["text"]) > 1500):
+                    item["text"] = source_passage(item["text"], run["question"], 1500,
+                                                  anchors=[support["quote"]])
+                    item["context_truncated"] = True
+                report_items.append(item)
+            ranked = report_items
             if correcting and not source_quotes:
                 for item in ranked:
                     if len(item["text"]) > 1200:
@@ -2174,8 +2359,10 @@ class HarnessRuntime:
                     writer_refs[number] = ref
             if requested_json(run["question"]):
                 writer_refs.clear()  # Respect the user's requested data format.
-            names = named_values(run["question"], context["evidence"]) if writer_refs else {}
-            numbers = {item["id"]: item["citation_number"] for item in context["evidence"]}
+            visible_ids = {item["id"] for item in context["evidence"]}
+            names = named_values(run["question"], [
+                {**item, "id": str(item["citation_number"])} for item in context["evidence"]
+            ]) if writer_refs else {}
             if writer_refs:
                 # Relax the wire format for a model which has just missed it.
                 # Markdown citations are validated against this same source set.
@@ -2204,7 +2391,7 @@ class HarnessRuntime:
                 ) if context.get(k)},
             }
             if 0 < len(names) <= 24:
-                options = {name: [numbers[ref] for ref in refs] for name, refs in names.items()}
+                options = {name: [int(ref) for ref in refs] for name, refs in names.items()}
                 candidate = {**context, "names_in_sources": options}
                 if fits(candidate):
                     context = candidate
@@ -2239,6 +2426,21 @@ class HarnessRuntime:
                 "last_action": next((s["result"] for s in reversed(run["research_trace"])
                                      if s["name"] == "mcp_call"), ""),
             }
+        if reporting and (gap := run.get("_retrieval_gap")):
+            # Apply this after selecting the writer format, including the compact API
+            # and citation-repair variants. Later tool findings can resolve an earlier gap.
+            candidate = {**context, "last_passage_review_gap": gap}
+            original_prompt = messages[0]["content"]
+            if any(is_answer_source(item) for item in run["evidence"]):
+                messages[0]["content"] += (
+                    " Проверь по свежим материалам, закрыт ли указанный пробел. "
+                    "Если он остался, объясни, что удалось установить и чего ещё не хватает. "
+                    "Ограничь вывод проверенным охватом источников."
+                )
+            if fits(candidate):
+                context = candidate
+            else:
+                messages[0]["content"] = original_prompt
         messages.append({"role": "user", "content": json.dumps(context, ensure_ascii=False)})
         used = {item["id"]: item for item in run.get("memory_used", [])}
         for item in included_memories:
@@ -2259,7 +2461,7 @@ class HarnessRuntime:
                 and isinstance(decision.get("content"), str)):
             try:
                 answer = decode_writer_answer(
-                    decision["content"], writer_refs, visible_ids=set(numbers),
+                    decision["content"], writer_refs, visible_ids=visible_ids,
                 )
             except InvalidWriterAnswer as exc:
                 if decision.get("finish_reason") in RETRYABLE_FINISH_REASONS:
@@ -2386,11 +2588,14 @@ class HarnessRuntime:
         output_tokens = (run.get("_summary_output_tokens",
                                  run["_control"]["context"]["summary_output_tokens"])
                          if summary else run["_control"]["context"]["response_reserve_tokens"])
+        if run.get("phase") == "assessing_search":
+            output_tokens = min(output_tokens, 768)
         options = (
             {"max_output_tokens": output_tokens} if isinstance(self.model, ModelRouter) else {}
         )
         action_name = "context_compaction" if summary else {
             "investigating": "model_planning", "budget_review": "model_budget_review",
+            "assessing_search": "search_assessment",
         }.get(run.get("phase", ""), "model_response")
         run["current_action"] = {"name": action_name, "started_at": timestamp()}
         self._checkpoint(principal, run, event)
@@ -2545,8 +2750,16 @@ class HarnessRuntime:
         limit = self._runtime_limits(run).answer_chars
         if len(content) > limit:
             content = content[:limit - len(_ANSWER_TRUNCATED)]
-        return (answer_quality_issue(run, content) or inventory_citation_issue(run, content)
-                or explanation_gap(run, content))
+        issue = (answer_quality_issue(run, content) or inventory_citation_issue(run, content)
+                 or explanation_gap(run, content))
+        support = run.get("_retrieval_support")
+        if issue or not support:
+            return issue
+        cited = cited_evidence_refs(content, run["evidence"], question=run["question"])
+        if not any((e["index_id"], e["id"]) in cited and e["index_id"] == support["index_id"]
+                   and support["quote"] in e["text"] for e in run["evidence"]):
+            return "Добавьте ссылку на проверенный фрагмент, который подтвердил ответ."
+        return None
 
     def _answer(
         self, run: dict[str, Any], decision: dict[str, Any], *, last_attempt: bool = False,

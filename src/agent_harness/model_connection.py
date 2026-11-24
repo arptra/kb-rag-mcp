@@ -287,6 +287,12 @@ class ModelRouter:
         self.state_dir = state_dir
         self.transport: httpx.AsyncBaseTransport | None = None
 
+    @property
+    def supports_search_assessment(self) -> bool:
+        return self.store.load().provider != "gigacode" or bool(
+            getattr(self.fallback, "supports_search_assessment", False)
+        )
+
     def _ssl(self, settings: ModelConnection) -> ssl.SSLContext:
         if not settings.tls_bundle_id:
             return ssl.create_default_context()

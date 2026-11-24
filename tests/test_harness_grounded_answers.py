@@ -38,6 +38,24 @@ def test_duration_and_card_number_are_checked_against_real_evidence() -> None:
     )
 
 
+def test_same_document_ids_in_different_sources_validate_only_the_cited_card() -> None:
+    evidence = [
+        {"id": "page", "index_id": "wiki", "title": "Реестр сервисов",
+         "text": "Read timeout: 99 s. archive-service."},
+        {"id": "page", "index_id": "code", "title": "Client",
+         "text": "Read timeout: 60 s. queue-service."},
+    ]
+    run = {"mode": "quick", "evidence": evidence, "question": "Сколько секунд клиент ждёт ответ?"}
+    assert not answer_quality_issue(run, "Клиент ждёт 60 секунд [2].")
+    assert answer_quality_issue(run, "Клиент ждёт 99 секунд [2].")
+    assert answer_quality_issue(run, "Клиент ждёт 60 секунд [page].")
+    run["question"] = "Какой сервис выполняет запрос?"
+    assert answer_quality_issue(run, "Запрос выполняет archive-service [2].")
+    assert not answer_quality_issue(run, "Запрос выполняет queue-service [2].")
+    run["question"] = "Сколько сервисов в АС?"
+    assert inventory_citation_issue(run, "В реестре 12 сервисов [2].")
+
+
 def test_mixed_script_word_in_generated_russian_prose_requests_repair() -> None:
     damaged = "Рaclёт дневного лимита платежа выполняет сервис лимитов [doc]."
     run = {"question": "Кто проверяет лимит?", "mode": "quick", "evidence": [

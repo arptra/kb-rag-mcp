@@ -89,7 +89,8 @@ function fixture(t, handler = () => ({}), { session = () => ({ ok: false, status
     /  updateSubmit\(\);\s+renderHistory\(\);\s+loadWorkspace\(\);\s+\}\)\(\);\s*$/,
     "globalThis.ui = { state, conversationState, api, loadConversation, loadConversations, " +
     "selectRun, refreshRun, submitRun, resetWorkspace, loadMemory, renderResearchActivity, renderStatus, renderBudget, modelConnectionValue, applyModelConnection, " +
-    "settingsState, modelConnectionState, tlsState, changeModelConnection, saveTlsBundle, layoutState, setPanelCollapsed, initLayout, renderTranscript, renderAnswer, renderRun, applyProfileDefaults };\n})();",
+    "settingsState, modelConnectionState, tlsState, changeModelConnection, saveTlsBundle, layoutState, setPanelCollapsed, initLayout, renderTranscript, renderAnswer, renderRun, applyProfileDefaults, " +
+    "normalizedSettings, renderSettings, checkSelectedSandbox, openPersonalCredentials, changePersonalCredential, resetPersonalData };\n})();",
   );
   vm.runInContext(fs.readFileSync(path.join(staticPath, "vendor/markdown-it.min.js"), "utf8"), context);
   context.window.markdownit = context.markdownit;
@@ -107,6 +108,86 @@ function run(id, extra = {}) {
     index_ids: ["a"], mode: "quick", effort: "medium", status: "completed", phase: "finished",
     created_at: "2026-11-24T10:00:00Z", evidence: [], warnings: [], metrics: {}, ...extra };
 }
+
+test("sandbox settings discover images once per effective Docker and preserve separate service ports", async (t) => {
+  const { ui, nodes, requests } = fixture(t, (call) => call.path === "settings/sandbox/images" ? {
+    images: [{ reference: (JSON.parse(call.body).engine.context || "local") + ":21", size: "250MB" }],
+  } : { credentials: [] });
+  const config = ui.normalizedSettings({
+    sandbox: { enabled: true },
+    sandbox_profiles: [{ id: "java", name: "Java", image: "local:21" }, {
+      id: "service", name: "Service", image: "other:21", engine: { mode: "context", context: "other" },
+      service_port: 8080, service_health_path: "/health",
+    }],
+  });
+  Object.assign(ui.settingsState, { canManage: true, config, activeTab: "sandbox" });
+  nodes.get("settings-dialog").open = true;
+  ui.renderSettings();
+  await new Promise(setImmediate);
+  assert.deepEqual(requests.filter((call) => call.path === "settings/sandbox/images")
+    .map((call) => JSON.parse(call.body).engine.mode).sort(), ["context", "default"]);
+  const [java, service] = nodes.get("settings-sandbox-profiles").children;
+  assert.match(java.textContent, /local:21 · 250MB/);
+  assert.doesNotMatch(java.textContent, /other:21/);
+  assert.match(service.textContent, /other:21 · 250MB/);
+  assert.equal(config.sandbox_profiles[0].engine, null);
+  assert.equal(config.sandbox_profiles[1].service_port, 8080);
+  assert.equal(config.sandbox_profiles[1].engine.port, 2376);
+  assert.equal(config.sandbox_profiles[1].service_health_path, "/health");
+});
+
+test("research can use the selected sandbox HTTP API without any RAG index or another profile", async (t) => {
+  const { ui, nodes, requests } = fixture(t, (call) =>
+    call.path === "sandbox/check" ? { available: true, message: "GET /ready вернул HTTP 204." } : run("answer"));
+  nodes.get("response-mode").value = "investigate";
+  Object.assign(ui.state, { sandboxProfiles: [{ id: "java", name: "Java" }], selectedSandboxProfile: "java" });
+  ui.state.status.indexes = [{ id: "sandbox-api:~" }, { id: "sandbox-api:java" }];
+  ui.state.selected.clear();
+  await ui.checkSelectedSandbox();
+  assert.equal(JSON.parse(requests.find((r) => r.path === "sandbox/check").body).profile_id, "java");
+  assert.match(nodes.get("sandbox-check-result").textContent, /HTTP 204/);
+  nodes.get("question").value = "Проверь сервис";
+  await ui.submitRun();
+  assert.deepEqual(JSON.parse(requests.find((r) => r.path === "runs").body).index_ids, ["sandbox-api:java"]);
+});
+
+test("credentials requested in a chat use a private editor and bypass admin, runs and browser storage", async (t) => {
+  const repository = { id: "proj", name: "Проект", ssh: true };
+  const { ui, nodes, requests, storage } = fixture(t, (call) => call.method === "GET"
+    ? { credentials: [], repositories: [repository] } : { credential: { kind: "gradle", id: "personal-1", repository_id: "proj", name: "Сборка" } });
+  nodes.get("question").value = "Запомни креды Gradle";
+  await ui.submitRun(); await new Promise(setImmediate);
+  assert.equal(nodes.get("question").value, "");
+  assert.equal(nodes.get("personal-kind").value, "gradle");
+  assert.equal(nodes.get("personal-repository").value, "proj");
+  assert.equal(nodes.get("personal-save").disabled, false);
+  nodes.get("personal-name").value = "Сборка"; nodes.get("personal-registry").value = "https://packages.example/maven";
+  nodes.get("personal-username").value = "user"; nodes.get("personal-password").value = "test-private-value";
+  await ui.changePersonalCredential();
+  assert.equal(nodes.get("personal-password").value, "");
+  assert.doesNotMatch(nodes.get("personal-list").textContent, /test-private-value/);
+  assert.deepEqual(requests.map((r) => [r.method, r.path]), [["GET", "credentials/personal"], ["POST", "credentials/personal"]]);
+  assert.equal(JSON.parse(requests[1].body).kind, "gradle");
+  assert.doesNotMatch(JSON.stringify([...storage]), /test-private-value/);
+  await ui.changePersonalCredential("personal-1");
+  assert.equal(requests.at(-1).path, "credentials/personal/personal-1");
+  assert.equal(nodes.get("personal-list").children.length, 0);
+});
+
+test("pasting a private key into chat diverts it to the SSH form and clears it on close", async (t) => {
+  const { nodes, requests } = fixture(t, () => ({ repositories: [{ id: "project", ssh: true }] }));
+  let prevented = false;
+  const key = "-----BEGIN OPENSSH PRIVATE KEY-----\nexample\n-----END OPENSSH PRIVATE KEY-----";
+  nodes.get("question").value = "До вставки";
+  nodes.get("question").listeners.paste({ clipboardData: { getData: () => key }, preventDefault() { prevented = true; } });
+  await new Promise(setImmediate);
+  assert.equal(prevented, true);
+  assert.equal(nodes.get("question").value, "До вставки");
+  assert.equal(nodes.get("personal-key").value, key);
+  nodes.get("personal-dialog").listeners.close();
+  assert.equal(nodes.get("personal-key").value, "");
+  assert.doesNotMatch(JSON.stringify(requests), /BEGIN OPENSSH/);
+});
 
 test("panels collapse independently without losing the message draft or leaving hidden keyboard focus", (t) => {
   const { ui, nodes, document } = fixture(t);
@@ -594,6 +675,20 @@ test("missing administrator rights give an actionable error and keep unsaved mod
 function descendants(node) {
   return [node, ...node.children.flatMap(descendants)];
 }
+
+test("source history groups only the observed outcomes of that search", async (t) => {
+  const { ui, nodes } = fixture(t, () => ({ memories: [{ id: "sample", text: "", index_ids: ["a", "b", "c", "d"],
+    strategy: { source_outcomes: { a: "useful", b: "empty", c: "irrelevant", d: "empty", other: "irrelevant" } } }] }));
+  ui.state.status.indexes.push({ id: "b", name: "Архив" }, { id: "c", name: "Тикеты" }, { id: "d", name: "Код" });
+  await ui.loadMemory();
+  const section = descendants(nodes.get("memory-list")).find((node) => node.tagName === "details");
+  assert.equal(section.firstElementChild.textContent, "Что показал прошлый поиск по источникам");
+  assert.deepEqual(section.lastElementChild.children.map((row) => [row.text, row.lastElementChild.textContent]), [
+    ["Материалы использованы в ответе", "Documents"],
+    ["Поиск не вернул материалов", "Архив, Код"],
+    ["Просмотренные фрагменты не ответили на вопрос", "Тикеты"],
+  ]);
+});
 
 test("shared memory distinguishes cited tool results, incomplete checks and failed calls", async (t) => {
   const base = { kind: "case", status: "experience", visibility: "shared", index_ids: ["a"], text: "Материалы проверки" };

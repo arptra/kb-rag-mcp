@@ -1,4 +1,4 @@
-"""Administrator-owned SSH secrets, never included in integration settings or tool data."""
+"""Credential storage outside chat history, integration settings and shared memory."""
 
 from __future__ import annotations
 
@@ -7,16 +7,21 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import serialization
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, TypeAdapter, field_validator
 
 
 class SSHKeyUpload(BaseModel):
@@ -105,6 +110,7 @@ class CredentialStore:
 
     def __init__(self, state_dir: Path) -> None:
         self.directory = state_dir / "ssh-credentials"
+        self.personal = PersonalCredentials(state_dir)
         self._lock = RLock()
 
     def _path(self, key_id: str) -> Path:
@@ -176,3 +182,183 @@ class CredentialStore:
                 self._path(key_id).unlink()
             except FileNotFoundError:
                 raise KeyError("SSH key not found") from None
+
+
+class _PersonalUpload(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    repository_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+    name: str = Field(min_length=1, max_length=160)
+
+
+class PersonalSSHUpload(_PersonalUpload):
+    kind: Literal["ssh"]
+    private_key: SecretStr = Field(min_length=1, max_length=24000)
+    known_hosts: SecretStr = Field(min_length=1, max_length=24000)
+
+
+class GradleUpload(_PersonalUpload):
+    kind: Literal["gradle"]
+    registry_url: str = Field(min_length=1, max_length=2000)
+    username: SecretStr = Field(min_length=1, max_length=256)
+    password: SecretStr = Field(min_length=1, max_length=4096)
+
+    @field_validator("registry_url")
+    @classmethod
+    def validate_registry(cls, value: str) -> str:
+        parts = urlsplit(value)
+        if (parts.scheme != "https" or not parts.hostname or parts.username is not None
+                or parts.password is not None or parts.query or parts.fragment
+                or any(c.isspace() or ord(c) < 32 for c in value)
+                or not re.fullmatch(r"[a-zA-Z0-9/_.~+-]*", parts.path)
+                or any(p in {".", ".."} for p in parts.path.split("/"))
+                or not re.fullmatch(r"[a-zA-Z0-9.\[\]:-]+", parts.netloc)):
+            raise ValueError("Укажите HTTPS-адрес Maven-репозитория.")
+        _ = parts.port
+        return value.rstrip("/")
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, username: SecretStr) -> SecretStr:
+        if ":" in username.get_secret_value():
+            raise ValueError("Имя пользователя не может содержать двоеточие.")
+        return username
+
+
+PersonalUpload: TypeAdapter[PersonalSSHUpload | GradleUpload] = TypeAdapter(
+    Annotated[PersonalSSHUpload | GradleUpload, Field(discriminator="kind")]
+)
+
+
+class PersonalCredentials:
+    """A private file shared by the installation; every query binds the authenticated owner."""
+
+    def __init__(self, state_dir: Path) -> None:
+        self.path = state_dir / "personal-credentials" / "credentials.sqlite3"
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        folder = self.path.parent
+        folder.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if folder.is_symlink():
+            raise ValueError("Некорректный каталог личных доступов.")
+        folder.chmod(0o700)
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+        db = sqlite3.connect(self.path, timeout=5)
+        try:
+            with db:
+                db.execute("PRAGMA secure_delete=ON")
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS credentials(
+                        owner TEXT NOT NULL, id TEXT NOT NULL, repository_id TEXT NOT NULL,
+                        repository_url TEXT NOT NULL, kind TEXT NOT NULL, metadata TEXT NOT NULL,
+                        secret BLOB NOT NULL, PRIMARY KEY(owner, id),
+                        UNIQUE(owner, repository_id, repository_url, kind)
+                    )
+                """)
+                yield db
+        finally:
+            db.close()
+
+    def _cipher(self, *, initialize: bool = False) -> Fernet:
+        key_path = self.path.with_name("encryption.key")
+        if initialize and not key_path.exists():
+            # Publish a fully written key without overwriting a concurrent first writer.
+            staging = self.path.with_name("." + uuid4().hex + ".key")
+            try:
+                fd = os.open(staging, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(fd, "wb") as keyfile:
+                    keyfile.write(Fernet.generate_key())
+                    keyfile.flush()
+                    os.fsync(keyfile.fileno())
+                with suppress(FileExistsError):
+                    os.link(staging, key_path)
+            finally:
+                staging.unlink(missing_ok=True)
+        try:
+            fd = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as keyfile:
+                os.fchmod(keyfile.fileno(), 0o600)
+                return Fernet(keyfile.read(45))
+        except (OSError, ValueError):
+            raise ValueError("Восстановите файл шифрования личных доступов.") from None
+
+    def save(
+        self, owner: str, url: str, upload: PersonalSSHUpload | GradleUpload,
+    ) -> dict[str, str]:
+        metadata = {"name": upload.name, "repository_id": upload.repository_id,
+                    "repository_url": url, "kind": upload.kind}
+        if isinstance(upload, PersonalSSHUpload):
+            if url.startswith("https://"):
+                raise ValueError("Выберите SSH-репозиторий.")
+            key = _validate(SSHKeyUpload(id="key", name=upload.name,
+                                         private_key=upload.private_key.get_secret_value(),
+                                         known_hosts=upload.known_hosts.get_secret_value()))
+            metadata["fingerprint"] = key.metadata["fingerprint"]
+            secret = key.clone_input().decode()
+        else:
+            metadata["registry_url"] = upload.registry_url
+            secret = json.dumps({"url": upload.registry_url,
+                                 "username": upload.username.get_secret_value(),
+                                 "password": upload.password.get_secret_value()})
+        with self._connect() as db:
+            empty = db.execute("SELECT 1 FROM credentials LIMIT 1").fetchone() is None
+            cipher = self._cipher(initialize=empty)
+            binding = [owner, upload.repository_id, url, upload.kind]
+            encrypted = cipher.encrypt(json.dumps([binding, secret]).encode())
+            row = db.execute("""
+                INSERT INTO credentials(owner,id,repository_id,repository_url,kind,metadata,secret)
+                VALUES(?,?,?,?,?,?,?) ON CONFLICT(owner,repository_id,repository_url,kind)
+                DO UPDATE SET metadata=excluded.metadata,secret=excluded.secret RETURNING id
+            """, (owner, uuid4().hex, upload.repository_id, url, upload.kind,
+                  json.dumps(metadata), encrypted)).fetchone()
+        return {**metadata, "id": row[0]}
+
+    def list(self, owner: str) -> list[dict[str, str]]:
+        with self._connect() as db:
+            return [{**json.loads(raw), "id": key_id} for key_id, raw in db.execute(
+                "SELECT id,metadata FROM credentials WHERE owner=? ORDER BY repository_id,kind",
+                (owner,),
+            )]
+
+    def delete(self, owner: str, key_id: str) -> bool:
+        with self._connect() as db:
+            return bool(db.execute("DELETE FROM credentials WHERE owner=? AND id=?",
+                                   (owner, key_id)).rowcount)
+
+    def _lookup(
+        self, owner: str, repository_id: str, url: str, kind: str,
+    ) -> str | None:
+        if not self.path.exists():
+            return None
+        with self._connect() as db:
+            row = db.execute("""
+                SELECT secret FROM credentials WHERE owner=? AND repository_id=?
+                AND repository_url=? AND kind=?
+            """, (owner, repository_id, url, kind)).fetchone()
+        if not row:
+            return None
+        try:
+            binding, secret = json.loads(self._cipher().decrypt(row[0]))
+            if binding != [owner, repository_id, url, kind] or not isinstance(secret, str):
+                raise InvalidToken
+            return secret
+        except (InvalidToken, TypeError, ValueError):
+            raise ValueError("Проверьте файл шифрования личных доступов.") from None
+
+    def clone_input(self, owner: str, repository_id: str, url: str) -> bytes | None:
+        secret = self._lookup(owner, repository_id, url, "ssh")
+        return secret.encode() if secret else None
+
+    def gradle_access(
+        self, owner: str, repository_id: str, url: str,
+    ) -> tuple[str, SecretStr, SecretStr] | None:
+        raw = self._lookup(owner, repository_id, url, "gradle")
+        if not raw:
+            return None
+        secret = json.loads(raw)
+        return (secret["url"], SecretStr(secret["username"]),
+                SecretStr(secret["password"]))

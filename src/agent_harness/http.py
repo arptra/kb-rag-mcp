@@ -7,6 +7,7 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import Event
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
@@ -19,7 +20,10 @@ from starlette.routing import Route
 
 from agent_harness.contracts import Principal, RunRequest
 from agent_harness.control.http import create_control_routes
-from agent_harness.credentials_http import create_credential_routes
+from agent_harness.credentials_http import (
+    create_credential_routes,
+    create_personal_credential_routes,
+)
 from agent_harness.discovery import DiscoveryStore
 from agent_harness.discovery_http import create_discovery_routes
 from agent_harness.integrations import IntegrationHub
@@ -28,6 +32,7 @@ from agent_harness.memory_http import create_memory_routes
 from agent_harness.model_connection import ModelRouter
 from agent_harness.model_http import create_model_routes
 from agent_harness.runtime import HarnessRuntime, HarnessUnavailableError, QueueFullError
+from agent_harness.sandbox_http import create_sandbox_image_route
 from agent_harness.tls_credentials import TLSCredentialStore
 from agent_harness.tls_http import create_tls_routes
 
@@ -115,7 +120,10 @@ async def _run_request(request: Request) -> RunRequest:
         return RunRequest.model_validate(payload)
     except ValidationError as exc:
         # Do not echo questions, tool inputs or other potentially sensitive values.
-        fields = sorted({str(error["loc"][0]) for error in exc.errors() if error["loc"]})
+        errors = exc.errors(include_input=False, include_context=False)
+        if any(error["type"] == "chat_credential" for error in errors):
+            raise HTTPException(400, "Добавьте доступ через личную форму в чате.") from None
+        fields = sorted({str(error["loc"][0]) for error in errors if error["loc"]})
         detail = "Invalid request" + (": " + ", ".join(fields) if fields else "")
         raise HTTPException(400, detail) from exc
 
@@ -173,6 +181,24 @@ def create_app(
         identity = await principal(request)
         profiles = await integrations.profiles(identity) if integrations else []
         return _json({"profiles": profiles, "default_id": ""})
+
+    async def check_sandbox(request: Request) -> Response:
+        identity = await principal(request, mutate=True)
+        if integrations is None:
+            raise HTTPException(403, "Песочницы недоступны.")
+        try:
+            payload = json.loads(await _body(request))
+            if (not isinstance(payload, dict) or set(payload) != {"profile_id"}
+                    or not isinstance(payload["profile_id"], str)
+                    or len(payload["profile_id"]) > 64):
+                raise ValueError
+        except (ValueError, UnicodeError, RecursionError):
+            raise HTTPException(400, "Выберите среду выполнения.") from None
+        try:
+            result = await integrations.check_profile(identity, payload["profile_id"], Event())
+        except PermissionError:
+            raise HTTPException(403, "Выбранная среда выполнения недоступна.") from None
+        return _json(result)
 
     async def runs(request: Request) -> Response:
         identity = await principal(request, mutate=request.method == "POST")
@@ -348,6 +374,14 @@ def create_app(
                 for repository in parsed.repositories
             ):
                 raise HTTPException(400, "Выбранный SSH-ключ не найден.")
+            engines = [parsed.sandbox.engine, *(p.engine for p in parsed.sandbox_profiles)]
+            tls_ids = {item["id"] for item in tls_credentials.list()
+                       if item["has_ca_certificate"] and item["has_client_certificate"]}
+            if any(engine and engine.mode == "tls" and engine.tls_id not in tls_ids
+                   for engine in engines):
+                raise HTTPException(
+                    400, "Для Docker Engine нужны CA, клиентский сертификат и ключ."
+                )
             await asyncio.to_thread(integrations.store.save, parsed)
         settings = await asyncio.to_thread(integrations.store.load)
         return _json({"can_manage": True, "settings": settings.model_dump()})
@@ -369,9 +403,14 @@ def create_app(
         ):
             raise HTTPException(400, "Invalid probe request")
         try:
+            timeout = 65
+            if payload["kind"] in {"sandbox", "sandbox_profile"}:
+                # The selected service can need the full configured startup time,
+                # followed by removal of both temporary containers.
+                timeout = integrations.store.load().sandbox.timeout_seconds + 30
             result = await asyncio.wait_for(
                 integrations.probe(payload["kind"], payload.get("id", "")),
-                65,
+                timeout,
             )
         except TimeoutError:
             result = {"available": False, "message": "Подключение не ответило вовремя."}
@@ -422,6 +461,8 @@ def create_app(
             Route("/assets/vendor/markdown-it.min.js", markdown_library),
             Route("/api/status", status),
             Route("/api/sandbox/profiles", sandbox_profiles),
+            Route("/api/sandbox/check", check_sandbox, methods=["POST"]),
+            create_sandbox_image_route(integrations, authorize=settings_access, read_body=_body),
             Route("/api/model", model_status),
             Route("/api/model/enable", model_action, methods=["POST"]),
             Route("/api/model/disable", model_action, methods=["POST"]),
@@ -450,13 +491,20 @@ def create_app(
                 read_body=_body,
                 busy=lambda: bool(runtime._signals),
             ),
+            *(
+                create_personal_credential_routes(
+                    integrations.credentials.personal, integrations.store,
+                    identify=lambda request: principal(request, mutate=request.method != "GET"),
+                    read_body=_body,
+                ) if integrations else []
+            ),
             *create_tls_routes(
                 tls_credentials,
                 authorize=manager_access,
                 read_body=_body,
                 in_use=lambda key_id: (
                     ["model"] if model_router.store.load().tls_bundle_id == key_id else []
-                ),
+                ) + (integrations.store.load().docker_tls_users(key_id) if integrations else []),
             ),
             *(
                 create_credential_routes(

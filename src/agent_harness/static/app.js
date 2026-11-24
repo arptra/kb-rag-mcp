@@ -21,6 +21,7 @@
     reading_code: "Изучаем код подключённых сервисов.",
     running_code: "Проверяем код в песочнице.",
     checking: "Проверяем гипотезы по найденным материалам.",
+    assessing_search: "Проверяем, достаточно ли найденного для ответа.",
     compacting: "Сохраняем суть беседы и готовим контекст.",
     budget_review: "Проверяем, сколько дополнительных ресурсов нужно исследованию.",
     authentication_required: "Ожидаем подключения модели.",
@@ -81,6 +82,9 @@
     canManage: false, checked: false, config: null, saved: "", dirty: false, busy: null,
     controller: null, generation: 0, activeTab: "repositories", message: "", probes: new Map(),
   };
+  const imageInventory = new Map();
+  let sandboxEditors = [], inventoryTimer = null, sandboxTabOpen = false, sandboxCheck = null;
+  const personalState = { repositories: [], credentials: [], controller: null, ready: false };
   const sshState = { credentials: [], controller: null, busy: false, editingId: null, generation: 0 };
   const memoryState = { available: false, enabled: true, memories: [], nextOffset: null, total: null, loading: false, editing: null, controller: null, busy: false };
   const discoveryState = { current: [], all: [], signature: null, controller: null, adminController: null, busy: new Set() };
@@ -213,7 +217,7 @@
     const wait = timeoutMs || (modelProbe ? Math.min(3600, Number(body?.timeout_seconds || modelConnectionState.settings?.timeout_seconds) || 60) * 1000 + 5000 : method === "GET" ? 20000 : 45000);
     const timer = window.setTimeout(() => { timedOut = true; abort(); }, wait);
     try {
-      if (method !== "GET" && /^(settings|model|credentials)(\/|$)/.test(path)) {
+      if (method !== "GET" && /^(settings|model|credentials)(\/|$)/.test(path) && !/^credentials\/personal(?:\/|$)/.test(path)) {
         // Portal cookie admins need CSRF proof even when a reader Bearer token
         // supplies their personal identity. Header-only hosts have no session API.
         const session = await fetch(new URL("../access/api/session", document.baseURI), {
@@ -270,6 +274,14 @@
     $("settings-error").textContent = message;
     $("settings-error").hidden = !message;
   }
+  function dockerEngine(value = {}) {
+    return { mode: value.mode || "default", host: value.host || "", port: value.port ?? 2376,
+      context: value.context || "", tls_id: value.tls_id || "" };
+  }
+  function sandboxConnection(value, inherit = false) {
+    return { engine: inherit && !value.engine ? null : dockerEngine(value.engine || {}),
+      service_port: value.service_port ?? null, service_health_path: value.service_health_path || "/" };
+  }
   function normalizedSettings(value = {}) {
     const strings = (items) => Array.isArray(items) ? items.filter((item) => typeof item === "string") : [];
     const resource = (item) => ({
@@ -288,10 +300,11 @@
       })),
       sandbox_profiles: (Array.isArray(value.sandbox_profiles) ? value.sandbox_profiles : []).map((item) => ({
         id: String(item.id || ""), name: String(item.name || "").trim(), image: String(item.image || "").trim(),
-        enabled: item.enabled !== false, allowed_owners: strings(item.allowed_owners),
+        enabled: item.enabled !== false, allowed_owners: strings(item.allowed_owners), ...sandboxConnection(item, true),
       })),
       sandbox: {
         enabled: sandbox.enabled === true, image: String(sandbox.image || "harness-sandbox:local").trim(),
+        ...sandboxConnection(sandbox),
         cpus: sandbox.cpus ?? 1, memory_mb: sandbox.memory_mb ?? 1024, workspace_mb: sandbox.workspace_mb ?? 512,
         pids_limit: sandbox.pids_limit ?? 128,
         timeout_seconds: sandbox.timeout_seconds ?? 90, max_output_chars: sandbox.max_output_chars ?? 12000,
@@ -300,6 +313,7 @@
     };
   }
   function resetSettingsAccess() {
+    clearImageInventory();
     settingsState.generation += 1;
     if (settingsState.controller) settingsState.controller.abort();
     Object.assign(settingsState, { canManage: false, checked: false, config: null, saved: "", dirty: false,
@@ -368,6 +382,10 @@
     if (name === "ssh" && $("settings-dialog").open) loadSshKeys();
     if (name === "discoveries" && $("settings-dialog").open) loadAdminDiscoveries();
     if (name === "model" && $("settings-dialog").open) loadModelConnection();
+    const sandboxActive = name === "sandbox" && $("settings-dialog").open && settingsState.canManage;
+    if (sandboxActive && !sandboxTabOpen) loadTlsBundles();
+    sandboxTabOpen = sandboxActive;
+    if (sandboxActive) refreshSandboxEditors();
     updateSettingsChrome();
   }
   function settingField(label, value, onInput, options = {}) {
@@ -414,7 +432,7 @@
     button.addEventListener("click", () => probeSettings(kind, entry?.id));
     actions.append(button);
     if (kind === "repository") actions.append(element("p", "settings-probe-note", "Проверим адрес и готовность песочницы. Репозиторий будет загружен при исследовании."));
-    if (kind === "sandbox_profile") actions.append(element("p", "settings-probe-note", "Проверим готовность выбранного образа на сервере."));
+    if (kind === "sandbox_profile" || kind === "sandbox") actions.append(element("p", "settings-probe-note", "Проверим Docker и образ. Если задан порт, запустим контейнер и запросим указанный путь."));
     wrapper.append(actions);
     const result = settingsState.probes.get(key);
     if (result) {
@@ -542,6 +560,121 @@
     card.append(heading, fields, settingProbeArea(kind, entry, toolsInput));
     return card;
   }
+  function clearImageInventory({ resetEditors = true } = {}) {
+    window.clearTimeout(inventoryTimer);
+    for (const result of imageInventory.values()) result.controller?.abort();
+    imageInventory.clear(); if (resetEditors) sandboxEditors = []; sandboxTabOpen = false;
+  }
+  function inventoryReady(engine) {
+    if (engine.mode === "context") return Boolean(engine.context.trim());
+    if (engine.mode === "tls") return Boolean(engine.host.trim() && engine.tls_id && engine.port >= 1 && engine.port <= 65535);
+    return engine.mode === "default";
+  }
+  async function discoverImages(engine, reload = false) {
+    if (!sandboxTabOpen || !settingsState.canManage || !inventoryReady(engine)) return;
+    const key = JSON.stringify(engine), previous = imageInventory.get(key);
+    if (previous?.controller || (previous && !reload)) return;
+    const record = { controller: new AbortController(), images: [], message: "Ищем образы в Docker…" };
+    imageInventory.set(key, record);
+    const updateResults = () => sandboxEditors.filter((editor) => JSON.stringify(editor.engine()) === key).forEach((editor) => editor.render());
+    updateResults();
+    try {
+      const result = await api("settings/sandbox/images", { method: "POST", body: { engine }, signal: record.controller.signal });
+      record.images = Array.isArray(result.images) ? result.images.filter((item) => typeof item?.reference === "string") : [];
+      record.message = record.images.length ? "Доступно образов: " + record.images.length + (result.truncated ? " · список ограничен" : "") : "В этом Docker нет образов.";
+    } catch (error) {
+      if (error.name !== "AbortError") record.message = errorMessage(error);
+    } finally {
+      record.controller = null;
+      if (imageInventory.get(key) === record) updateResults();
+    }
+  }
+  function refreshSandboxEditors(debounce = false) {
+    window.clearTimeout(inventoryTimer);
+    sandboxEditors.forEach((editor) => editor.render());
+    if (!sandboxTabOpen) return;
+    const scan = () => sandboxEditors.forEach((editor) => discoverImages(editor.engine()));
+    if (debounce) inventoryTimer = window.setTimeout(scan, 550); else scan();
+  }
+  function sandboxFields(fields, entry, isProfile = false) {
+    const selectField = (label) => {
+      const wrapper = element("label", "settings-field"), select = element("select");
+      wrapper.append(element("span", "settings-field-label", label), select); return { wrapper, select };
+    };
+    const option = (value, label) => { const item = element("option", "", label); item.value = value; return item; };
+    const mode = selectField("Подключение к Docker");
+    if (isProfile) mode.select.append(option("inherit", "Как в основной песочнице"));
+    mode.select.append(option("default", "Docker сервера Harness"), option("context", "Именованный Docker context"), option("tls", "Удалённый Docker API · mTLS"));
+    mode.select.value = entry.engine?.mode || "inherit";
+    const engine = () => entry.engine || settingsState.config.sandbox.engine;
+    const engineField = (label, key, options) => settingField(label, entry.engine?.[key] ?? "", (value) => {
+      entry.engine[key] = key === "port" ? Number(value) : value.trim(); refreshSandboxEditors(true);
+    }, options);
+    const context = engineField("Имя Docker context", "context", { required: true, placeholder: "build-team" });
+    const host = engineField("Хост Docker API", "host", { required: true, placeholder: "docker.example.ru" });
+    const port = engineField("Порт Docker API", "port", { required: true, type: "number", min: 1, max: 65535 });
+    const tls = selectField("Клиентский сертификат Docker");
+    const newTls = element("button", "text-button", "Добавить сертификаты Docker");
+    newTls.type = "button";
+    newTls.addEventListener("click", () => { selectSettingsTab("model"); openTlsEditor(null, entry); });
+    const tlsBlock = element("div", "settings-field"); tlsBlock.append(tls.wrapper, newTls);
+    tls.select.required = true;
+    tls.select.addEventListener("change", () => { entry.engine.tls_id = tls.select.value; refreshSandboxEditors(); markSettingsChanged(); });
+    const imageField = selectField("Образ контейнера");
+    const custom = settingField("Тег образа", entry.image, (value) => { entry.image = value.trim(); }, { required: true, maxLength: 251, placeholder: "java-build:21" });
+    const refresh = element("button", "text-button", "Обновить образы"), message = element("small", "settings-field-help");
+    refresh.type = "button"; message.setAttribute("role", "status");
+    refresh.addEventListener("click", () => discoverImages(engine(), true));
+    const imageBar = element("div", "sandbox-image-actions"); imageBar.append(message, refresh);
+    const imageBlock = element("div", "settings-field wide"); imageBlock.append(imageField.wrapper, custom.wrapper, imageBar);
+    let manual = false, displayedTls = "";
+    function render() {
+      const selectedMode = entry.engine?.mode, effective = engine();
+      for (const [field, active] of [[context, selectedMode === "context"], [host, selectedMode === "tls"], [port, selectedMode === "tls"], [tls, selectedMode === "tls"]]) {
+        field.wrapper.hidden = !active; (field.input || field.select).disabled = !active;
+      }
+      tlsBlock.hidden = selectedMode !== "tls";
+      const tlsId = entry.engine?.tls_id || "";
+      const bundles = tlsState.credentials.filter((item) => item.has_ca_certificate && item.has_client_certificate);
+      const tlsSignature = JSON.stringify([tlsId, bundles.map((item) => [item.id, item.name])]);
+      if (tlsSignature !== displayedTls) {
+        displayedTls = tlsSignature;
+        tls.select.replaceChildren(option("", "Выберите набор сертификатов"), ...bundles.map((item) => option(item.id, item.name || item.id)));
+        if (tlsId && !bundles.some((item) => item.id === tlsId)) {
+          const unavailable = option(tlsId, "Недоступный набор · " + tlsId); unavailable.disabled = true; tls.select.append(unavailable);
+        }
+        tls.select.value = tlsId;
+      }
+      const result = imageInventory.get(JSON.stringify(effective));
+      const images = result?.images || [];
+      const options = images.map((item) => option(item.reference, item.reference + (item.size ? " · " + item.size : "")));
+      if (entry.image && !images.some((item) => item.reference === entry.image)) options.unshift(option(entry.image, entry.image + " · задано вручную"));
+      imageField.select.replaceChildren(option("", "Выберите образ"), ...options, option("@manual", "Ввести тег вручную…"));
+      imageField.select.value = manual ? "@manual" : entry.image;
+      imageField.select.required = !manual; custom.wrapper.hidden = !manual; custom.input.disabled = !manual;
+      message.textContent = result?.message || (inventoryReady(effective) ? "" : "Для поиска образов заполните подключение к Docker.");
+      refresh.disabled = Boolean(result?.controller) || !inventoryReady(effective);
+    }
+    imageField.select.addEventListener("change", () => {
+      manual = imageField.select.value === "@manual";
+      if (!manual) { entry.image = imageField.select.value; custom.input.value = entry.image; markSettingsChanged(); }
+      render(); if (manual) custom.input.focus();
+    });
+    mode.select.addEventListener("change", () => {
+      const value = mode.select.value;
+      entry.engine = value === "inherit" ? null : dockerEngine({ mode: value });
+      host.input.value = ""; port.input.value = entry.engine?.port ?? ""; context.input.value = "";
+      refreshSandboxEditors(); markSettingsChanged();
+    });
+    fields.append(mode.wrapper, context.wrapper, host.wrapper, port.wrapper, tlsBlock, imageBlock,
+      settingField("Порт HTTP-сервиса в контейнере", entry.service_port ?? "", (value) => { entry.service_port = value ? Number(value) : null; }, {
+        type: "number", min: 1, max: 65535, placeholder: "Например, 8080", help: "Оставьте пустым для среды без HTTP-сервиса.",
+      }).wrapper,
+      settingField("Путь проверки HTTP", entry.service_health_path, (value) => { entry.service_health_path = value; }, {
+        placeholder: "/health", pattern: "/.*", required: true,
+      }).wrapper);
+    sandboxEditors.push({ engine, render }); render();
+  }
   function renderSettings() {
     if (!settingsState.config || !settingsState.canManage) return;
     const { repositories, connections, sandbox } = settingsState.config;
@@ -552,9 +685,7 @@
     const card = element("div", "settings-resource");
     card.append(settingSwitch(sandbox.enabled, (value) => { sandbox.enabled = value; }, "Использовать песочницы"));
     const fields = element("div", "settings-grid");
-    fields.append(settingField("Образ песочницы", sandbox.image, (value) => { sandbox.image = value; }, {
-      required: true, wide: true, help: "Образ должен быть подготовлен на сервере. Проверка сообщит, если он отсутствует.",
-    }).wrapper);
+    sandboxEditors = []; sandboxFields(fields, sandbox);
     for (const [key, label, min, max, step] of [
       ["cpus", "Процессорные ядра", 0.25, 8, "any"], ["memory_mb", "Память, МБ", 128, 16384, 1],
       ["workspace_mb", "Место для файлов, МБ", 64, 8192, 1],
@@ -585,10 +716,7 @@
     fields.append(settingField("Название среды", profile.name, (value) => {
       profile.name = value; title.textContent = value || "Среда " + (index + 1);
     }, { required: true, wide: true, maxLength: 160, placeholder: "Например, Java 21" }).wrapper);
-    fields.append(settingField("Образ среды на сервере", profile.image, (value) => { profile.image = value; }, {
-      required: true, wide: true, maxLength: 251, placeholder: "harness-sandbox-java21:local",
-      help: "Образ должен быть подготовлен на сервере. Агент использует выбранную среду и не меняет её образ самостоятельно.",
-    }).wrapper);
+    sandboxFields(fields, profile, true);
     fields.append(settingField("Кому доступно (ID пользователей; пусто — всем вошедшим)", profile.allowed_owners.join(", "),
       (value) => { profile.allowed_owners = commaValues(value); }, { wide: true, help: "Несколько ID укажите через запятую." }).wrapper);
     card.append(heading, fields, settingProbeArea("sandbox_profile", profile));
@@ -596,7 +724,7 @@
   }
   function addSandboxProfile() {
     if (!settingsState.canManage || !settingsState.config || settingsState.busy || settingsState.config.sandbox_profiles.length >= 20) return;
-    settingsState.config.sandbox_profiles.push({ id: newResourceId("profile"), name: "", image: "", enabled: false, allowed_owners: [] });
+    settingsState.config.sandbox_profiles.push({ id: newResourceId("profile"), name: "", image: "", enabled: false, allowed_owners: [], ...sandboxConnection({}, true) });
     markSettingsChanged(); renderSettings();
     $("settings-sandbox-profiles").lastElementChild?.querySelector("input[type='text']")?.focus();
   }
@@ -694,7 +822,8 @@
     settingsError();
     updateSettingsChrome();
     try {
-      const result = await api("settings/probe", { method: "POST", body: { kind, ...(id ? { id } : {}) }, signal: controller.signal });
+      const result = await api("settings/probe", { method: "POST", body: { kind, ...(id ? { id } : {}) }, signal: controller.signal,
+        timeoutMs: ["sandbox", "sandbox_profile"].includes(kind) ? (settingsState.config.sandbox.timeout_seconds * 1000 + 35000) : undefined });
       if (controller.signal.aborted || generation !== settingsState.generation || identityEpoch !== state.identityEpoch) return;
       settingsState.probes.set(kind + ":" + (id || ""), result);
       settingsState.message = result.available === true ? "Проверка завершена." : "Подключение пока недоступно. Подробности — в его настройках.";
@@ -828,15 +957,16 @@
     finally { if (modelConnectionState.controller === controller) { modelConnectionState.controller = null; modelConnectionState.busy = false; updateModelConnection(); } }
   }
   function clearTlsEditor() {
-    tlsState.generation += 1; tlsState.editingId = null;
+    tlsState.generation += 1; tlsState.editingId = null; tlsState.dockerTarget = null;
     for (const id of ["tls-name", "tls-ca", "tls-cert", "tls-key", "tls-ca-file", "tls-cert-file", "tls-key-file"]) $(id).value = "";
     $("tls-editor").hidden = true;
   }
-  function openTlsEditor(bundle = null) {
+  function openTlsEditor(bundle = null, dockerTarget = null) {
     if (tlsState.busy) return;
     clearTlsEditor(); tlsState.editingId = bundle?.id || null;
+    tlsState.dockerTarget = dockerTarget;
     $("tls-name").value = bundle?.name || "";
-    $("tls-editor-title").textContent = bundle ? "Заменить сертификаты" : "Набор сертификатов";
+    $("tls-editor-title").textContent = dockerTarget ? "Сертификаты для Docker" : bundle ? "Заменить сертификаты" : "Набор сертификатов";
     $("tls-editor").hidden = false; $("tls-name").focus();
   }
   function renderTlsBundles() {
@@ -846,8 +976,9 @@
       const actions = element("div", "resource-actions");
       const replace = element("button", "text-button", "Заменить"); replace.type = "button"; replace.addEventListener("click", () => openTlsEditor(bundle));
       const remove = element("button", "text-button", "Удалить"); remove.type = "button"; remove.addEventListener("click", () => openDeletion("tls", bundle));
-      remove.disabled = modelConnectionState.settings?.tls_bundle_id === bundle.id || $("direct-model-tls").value === bundle.id;
-      if (remove.disabled) remove.title = "Сначала выберите другие сертификаты в подключении модели и сохраните его";
+      const sandboxUsesBundle = [settingsState.config?.sandbox, ...(settingsState.config?.sandbox_profiles || [])].some((entry) => entry?.engine?.tls_id === bundle.id);
+      remove.disabled = sandboxUsesBundle || modelConnectionState.settings?.tls_bundle_id === bundle.id || $("direct-model-tls").value === bundle.id;
+      if (remove.disabled) remove.title = "Сначала выберите другие сертификаты в настройках подключения и сохраните их";
       actions.append(replace, remove); heading.append(actions);
       card.append(heading, element("p", "settings-field-help", bundle.has_client_certificate ? "С клиентским сертификатом · mTLS" : "Сертификаты доверенного центра"));
       if (bundle.expires_at) card.append(element("p", "settings-field-help", "Действует до: " + dateLabel(bundle.expires_at)));
@@ -864,7 +995,7 @@
       if (controller.signal.aborted || epoch !== state.identityEpoch || !settingsState.canManage) return;
       const selected = $("direct-model-tls").value;
       tlsState.credentials = Array.isArray(response.credentials) ? response.credentials : [];
-      fillTlsSelect(selected); renderTlsBundles();
+      fillTlsSelect(selected); renderTlsBundles(); sandboxEditors.forEach((editor) => editor.render());
     } catch (error) { if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) $("tls-feedback").textContent = errorMessage(error); }
     finally { if (tlsState.controller === controller) tlsState.controller = null; }
   }
@@ -872,6 +1003,10 @@
     if (tlsState.busy || !settingsState.canManage || state.needsAuth) return;
     const body = { id: tlsState.editingId || newResourceId("tls"), name: $("tls-name").value.trim(), ca_certificate: $("tls-ca").value.trim(),
       client_certificate: $("tls-cert").value.trim(), client_key: $("tls-key").value.trim() };
+    const dockerTarget = tlsState.dockerTarget;
+    if (dockerTarget && !(body.ca_certificate && body.client_certificate && body.client_key)) {
+      $("tls-feedback").textContent = "Для Docker нужны CA-сертификат, клиентский сертификат и его приватный ключ."; return;
+    }
     if (!body.name || (!body.ca_certificate && !body.client_certificate) || Boolean(body.client_certificate) !== Boolean(body.client_key)) {
       $("tls-feedback").textContent = "Укажите название и CA-сертификат или клиентский сертификат вместе с его приватным ключом."; return;
     }
@@ -882,7 +1017,10 @@
     try {
       await request;
       if (controller.signal.aborted || epoch !== state.identityEpoch) return;
-      $("tls-feedback").textContent = "Сертификаты сохранены. Выберите их в подключении модели.";
+      if (dockerTarget?.engine?.mode === "tls" && [settingsState.config?.sandbox, ...(settingsState.config?.sandbox_profiles || [])].includes(dockerTarget)) {
+        dockerTarget.engine.tls_id = body.id; markSettingsChanged(); selectSettingsTab("sandbox");
+      }
+      $("tls-feedback").textContent = "Сертификаты сохранены.";
     } catch (error) { if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) $("tls-feedback").textContent = errorMessage(error) + " Поля сертификатов очищены."; }
     finally { if (tlsState.controller === controller) { tlsState.controller = null; tlsState.busy = false; $("tls-save").disabled = false; $("tls-new").disabled = false; if (epoch === state.identityEpoch && !controller.signal.aborted) loadTlsBundles(); } }
   }
@@ -1151,6 +1289,27 @@
       const visibility = record.visibility === "shared" ? "Общая память АС" : "Ваш личный черновик";
       const status = record.status === "active" ? "Подтверждено автором" : record.status === "experience" ? "Автоматически · требует повторной проверки" : "Не используется в ответах";
       card.append(heading, element("p", "discovery-meta", visibility + " · " + kind + " · " + status));
+      const outcomes = record.strategy?.source_outcomes;
+      if (outcomes) {
+        const list = element("ul", "");
+        for (const [signal, label] of [
+          ["useful", "Материалы использованы в ответе"],
+          ["empty", "Поиск не вернул материалов"],
+          ["irrelevant", "Просмотренные фрагменты не ответили на вопрос"],
+        ]) {
+          const names = (record.index_ids || []).filter((id) => outcomes[id] === signal).map(sourceName);
+          if (names.length) {
+            const row = element("li", "", label);
+            row.append(element("small", "", names.join(", ")));
+            list.append(row);
+          }
+        }
+        if (list.firstElementChild) {
+          const section = element("details", "memory-tool-section");
+          section.append(element("summary", "", "Что показал прошлый поиск по источникам"), list);
+          card.append(section);
+        }
+      }
       for (const [title, entries] of [
         ["Что помогло", record.strategy?.successful_tools],
         ["Материалы незавершённой проверки", record.strategy?.observed_tools],
@@ -1328,7 +1487,110 @@
       if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) { $("delete-error").textContent = errorMessage(error); $("delete-error").hidden = false; }
     } finally { if (deletionState.controller === controller) { deletionState.controller = null; $("delete-confirm").disabled = false; } }
   }
+  function clearPersonalInputs() {
+    for (const field of ["personal-key", "personal-known-hosts", "personal-password", "personal-username", "personal-registry", "personal-name"]) $(field).value = "";
+  }
+  function resetPersonalCredentials() {
+    personalState.controller?.abort();
+    Object.assign(personalState, { controller: null, repositories: [], credentials: [], ready: false });
+    clearPersonalInputs(); $("personal-list").replaceChildren(); $("personal-repository").replaceChildren();
+    $("personal-feedback").textContent = "";
+  }
+  function renderPersonalForm() {
+    const ssh = $("personal-kind").value !== "gradle", repo = $("personal-repository");
+    const current = repo.value, choices = personalState.repositories.filter((item) => !ssh || item.ssh);
+    repo.replaceChildren(...choices.map((item) => {
+      const option = element("option", "", item.name || item.id); option.value = item.id; return option;
+    }));
+    repo.value = choices.some((item) => item.id === current) ? current : choices[0]?.id || "";
+    if (!choices.length) repo.append(element("option", "", ssh ? "Нет доступных Git-репозиториев по SSH" : "Нет доступных репозиториев"));
+    $("personal-ssh-fields").hidden = !ssh; $("personal-gradle-fields").hidden = ssh;
+    for (const key of ["personal-key", "personal-known-hosts"]) $(key).disabled = !ssh;
+    for (const key of ["personal-registry", "personal-username", "personal-password"]) $(key).disabled = ssh;
+    $("personal-fields").disabled = !personalState.ready || Boolean(personalState.controller);
+    $("personal-save").disabled = $("personal-fields").disabled || !choices.length;
+  }
+  function renderPersonalList() {
+    $("personal-list").replaceChildren(...personalState.credentials.map((item) => {
+      const row = element("div", "personal-row"), description = element("div");
+      const project = personalState.repositories.find((repo) => repo.id === item.repository_id);
+      description.append(element("strong", "", item.name), element("small", "", [item.kind === "ssh" ? "SSH" : "Gradle", project?.name || item.repository_id].join(" · ")));
+      const remove = element("button", "text-button", "Удалить"); remove.type = "button";
+      remove.addEventListener("click", () => {
+        const confirm = element("button", "secondary-button", "Удалить доступ"), cancel = element("button", "text-button", "Отмена");
+        confirm.type = cancel.type = "button";
+        confirm.addEventListener("click", () => changePersonalCredential(item.id)); cancel.addEventListener("click", renderPersonalList);
+        row.replaceChildren(description, confirm, cancel); cancel.focus();
+      });
+      row.append(description, remove); return row;
+    }));
+  }
+  async function openPersonalCredentials(kind = "ssh") {
+    if (state.needsAuth) { openAuth(); return; }
+    resetPersonalCredentials();
+    $("personal-kind").value = kind;
+    if (!$("personal-dialog").open) $("personal-dialog").showModal();
+    const controller = new AbortController(); personalState.controller = controller;
+    renderPersonalForm(); $("personal-feedback").textContent = "Загружаем ваши репозитории и доступы…";
+    try {
+      const result = await api("credentials/personal", { signal: controller.signal });
+      if (controller.signal.aborted) return;
+      personalState.credentials = Array.isArray(result.credentials) ? result.credentials : [];
+      personalState.repositories = Array.isArray(result.repositories) ? result.repositories : [];
+      personalState.ready = true; renderPersonalList(); $("personal-feedback").textContent = "";
+    } catch (error) {
+      if (!controller.signal.aborted) $("personal-feedback").textContent = error.status === 403 ?
+        "Для личных доступов войдите под своей учётной записью." : errorMessage(error);
+    } finally {
+      if (personalState.controller === controller) { personalState.controller = null; renderPersonalForm(); }
+    }
+  }
+  async function changePersonalCredential(removeId = "") {
+    if (personalState.controller || !personalState.ready) return;
+    const kind = $("personal-kind").value, repositoryId = $("personal-repository").value;
+    if (!removeId && !personalState.repositories.some((repo) => repo.id === repositoryId && (kind !== "ssh" || repo.ssh))) return;
+    const controller = new AbortController(); personalState.controller = controller;
+    renderPersonalForm(); $("personal-feedback").textContent = removeId ? "Удаляем доступ…" : "Сохраняем доступ…";
+    try {
+      const request = removeId ?
+        api("credentials/personal/" + encodeURIComponent(removeId), { method: "DELETE", signal: controller.signal }) :
+        api("credentials/personal", { method: "POST", signal: controller.signal, body: {
+          kind, repository_id: repositoryId, name: $("personal-name").value.trim(),
+          ...(kind === "gradle" ? { registry_url: $("personal-registry").value.trim(), username: $("personal-username").value, password: $("personal-password").value } :
+            { private_key: $("personal-key").value, known_hosts: $("personal-known-hosts").value }),
+        } });
+      if (!removeId) { $("personal-key").value = ""; $("personal-password").value = ""; }
+      const result = await request;
+      if (controller.signal.aborted) return;
+      if (removeId) personalState.credentials = personalState.credentials.filter((item) => item.id !== removeId);
+      else {
+        clearPersonalInputs();
+        personalState.credentials = personalState.credentials.filter((item) => item.repository_id !== repositoryId || item.kind !== kind);
+        if (result.credential) personalState.credentials.push(result.credential);
+      }
+      renderPersonalList(); $("personal-feedback").textContent = removeId ? "Доступ удалён." : "Доступ сохранён для ваших запусков.";
+    } catch (error) {
+      if (!controller.signal.aborted) $("personal-feedback").textContent = errorMessage(error);
+    } finally {
+      if (personalState.controller === controller) { personalState.controller = null; renderPersonalForm(); }
+    }
+  }
+  function interceptCredentialRequest(text, paste = false) {
+    const key = text.match(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/i);
+    const gradleSecret = text.match(/^\s*[\w.-]*(?:password|passwd|access[_-]?token|(?:gradle|maven|nexus|artifactory|repo|repository)[._-]?token)[ \t]*[:=][ \t]*(?!\$)(\S[^\r\n]*)/im);
+    const command = !paste && /^(?:(?:пожалуйста|можешь|можете|давай)[, ]+)*(?:добавь(?:те)?|добавить|сохрани(?:те|ть)?|запомни(?:те|ть)?|настрой(?:те)?|подключи(?:те|ть)?|add|save|remember)\s/i.test(text.trim());
+    const kind = key ? "ssh" : gradleSecret ? "gradle" : command && /ssh/i.test(text) && /ключ|key/i.test(text) ? "ssh" :
+      command && /gradle|гредл|грейдл|градл/i.test(text) && /кред|доступ|логин|парол|токен|уч[её]т|cred|password/i.test(text) ? "gradle" : "";
+    if (!kind) return false;
+    if (!paste) { $("question").value = ""; updateCharacterCount(); }
+    openPersonalCredentials(kind);
+    if (key && !state.needsAuth) $("personal-key").value = key[0];
+    else if (gradleSecret && !state.needsAuth) $("personal-password").value = gradleSecret[1].trimEnd();
+    return true;
+  }
   function resetPersonalData() {
+    if ($("personal-dialog").open) $("personal-dialog").close();
+    resetPersonalCredentials(); clearSandboxCheck();
     resetRunFeedback();
     state.memoryRunSignature = null;
     for (const controller of [memoryState.controller, discoveryState.controller, discoveryState.adminController, deletionState.controller]) controller?.abort();
@@ -1345,6 +1607,30 @@
   function sandboxProfileName(id) {
     return state.sandboxProfiles.find((profile) => profile.id === id)?.name || (id ? id : "По умолчанию");
   }
+  function sandboxApiIndex(id = state.selectedSandboxProfile) {
+    return indexes().find((item) => item.id === "sandbox-api:" + (id || "~"))?.id;
+  }
+  function clearSandboxCheck() {
+    sandboxCheck?.controller?.abort(); sandboxCheck = null;
+    $("sandbox-check-result").textContent = "";
+  }
+  async function checkSelectedSandbox() {
+    if (state.needsAuth || !usesSandbox(composerMode()) || $("sandbox-check").disabled) return;
+    clearSandboxCheck();
+    const check = { id: state.selectedSandboxProfile, controller: new AbortController() }, epoch = state.identityEpoch;
+    sandboxCheck = check; renderExecutionEnvironment();
+    $("sandbox-check-result").textContent = "Запускаем проверку среды…";
+    try {
+      const result = await api("sandbox/check", { method: "POST", body: { profile_id: check.id }, signal: check.controller.signal, timeoutMs: 635000 });
+      if (sandboxCheck !== check || epoch !== state.identityEpoch) return;
+      $("sandbox-check-result").textContent = [result.available ? "Среда готова." : "Среда недоступна.", result.message ||
+        (result.http_status ? "HTTP " + result.http_status : "")].filter(Boolean).join(" ");
+    } catch (error) {
+      if (sandboxCheck === check && error.name !== "AbortError") $("sandbox-check-result").textContent = errorMessage(error);
+    } finally {
+      if (sandboxCheck === check) { check.controller = null; renderExecutionEnvironment(); }
+    }
+  }
   function renderExecutionEnvironment() {
     const select = $("sandbox-profile"), selected = state.selectedSandboxProfile;
     const option = element("option", "", "По умолчанию"); option.value = ""; select.replaceChildren(option);
@@ -1356,10 +1642,13 @@
     if (unavailable) { const item = element("option", "", "Недоступная среда · " + selected); item.value = selected; item.disabled = true; select.append(item); }
     select.value = selected;
     const withSandbox = usesSandbox(composerMode());
+    if (sandboxCheck && (sandboxCheck.id !== selected || !withSandbox)) clearSandboxCheck();
     $("composer-environment").hidden = !withSandbox;
     select.disabled = !withSandbox || state.needsAuth || Boolean(state.current && !Array.isArray(state.current.index_ids));
+    $("sandbox-check").disabled = Boolean(select.disabled || !state.sandboxProfiles.length || unavailable || sandboxCheck?.controller);
     $("environment-description").textContent = unavailable ?
-      "Выбранная среда сейчас недоступна. Выберите другую среду." : state.sandboxProfiles.length ?
+      "Выбранная среда сейчас недоступна. Выберите другую среду." : sandboxApiIndex() ?
+      "HTTP API этой среды включён в исследование." : state.sandboxProfiles.length ?
       "Подготовленная среда для запуска кода." : "Среды включаются в настройках песочниц.";
   }
   async function loadSandboxProfiles() {
@@ -1385,8 +1674,9 @@
   }
   function indexes() { return Array.isArray(state.status?.indexes) ? state.status.indexes : []; }
   function modeIndexes(mode) {
-    return mode === "quick" ? indexes().filter((item) =>
-      item.quick_search ?? item.direct_search ?? !/^(repo|connection):/.test(item.id)) : indexes();
+    const sources = indexes().filter((item) => !item.id.startsWith("sandbox-api:"));
+    return mode === "quick" ? sources.filter((item) =>
+      item.quick_search ?? item.direct_search ?? !/^(repo|connection):/.test(item.id)) : sources;
   }
   function renderEffortDescription() {
     $("mode-autonomous").disabled = state.status?.limits?.autonomous_enabled === false;
@@ -2026,6 +2316,9 @@
     update_research_plan: "Обновление плана", request_budget: "Запрос дополнительных ресурсов",
     budget_review: "Проверка необходимого бюджета", research_round: "Проверка результатов поиска",
     goal_check: "Проверка оставшихся вопросов", answer_recovery: "Повторная подготовка ответа",
+    search_assessment: "Проверяем содержание найденных фрагментов",
+    source_routing: "Выбираем источники для поиска", search_refinement: "Уточняем поисковый запрос",
+    source_supported: "Найдено подтверждение в тексте",
     answer_quality_check: "Проверка ответа по источникам", answer_quality_rejected: "Черновик не прошёл проверку",
     research_recovery: "Поиск дополнительных подтверждений",
     research_branch: "Другая ветка исследования", memory_route: "Проверяем источник из общей памяти",
@@ -2045,6 +2338,7 @@
     conversation_compaction: "Сохранение сводки беседы", mcp_list_tools: "Изучаем доступные инструменты",
     mcp_tool_schema: "Проверяем параметры инструмента",
     search_repository: "Поиск в репозитории", read_repository: "Чтение файла в репозитории",
+    check_sandbox_api: "Проверяем HTTP-ответ сервиса в песочнице",
   };
   const TOOL_FAILURE_LABELS = {
     timeout: "Истекло время ожидания", permission: "Доступ к источнику отклонён",
@@ -2211,9 +2505,11 @@
     const searched = coverage.filter((item) => item && ["searched", "empty"].includes(item.status)).length;
     const failed = coverage.filter((item) => item?.status === "failed").length;
     const pending = coverage.filter((item) => item?.status === "pending").length;
+    const deferred = coverage.filter((item) => item?.status === "deferred").length;
     $("run-coverage").hidden = !coverage.length;
     $("run-coverage").textContent = "Поиск по базам знаний: " + searched + " / " + coverage.length +
-      (failed ? " · Недоступно: " + failed : "") + (pending ? " · Ещё не проверено: " + pending : "");
+      (failed ? " · Недоступно: " + failed : "") + (pending ? " · Ещё не проверено: " + pending : "") +
+      (deferred ? " · Пропущено после подтверждения: " + deferred : "");
     renderResearchActivity(run);
     renderBudget(run);
     const announcement = [currentAction || status, phase, "Найдено подтверждений: " + evidenceCount].filter(Boolean).join(". ");
@@ -2379,6 +2675,7 @@
   function updateCharacterCount() { $("character-count").textContent = $("question").value.length.toLocaleString("ru-RU") + " / 8 000"; }
   async function submitRun(parent = null) {
     if (state.submitting) return;
+    if (!parent && interceptCredentialRequest($("question").value)) return;
     if (state.needsAuth) { openAuth(); return; }
     if (conversationState.loading || activeConversationRun()) { showError("Дождитесь ответа или остановите текущее исследование."); return; }
     const followup = parent || conversationState.runs.at(-1) || null;
@@ -2387,7 +2684,10 @@
     const mode = parent ? (parent.mode === "autonomous" ? "autonomous" : "investigate") : composerMode();
     const selected = parent ? (Array.isArray(parent.index_ids) ? parent.index_ids : [])
       : modeIndexes(mode).filter((item) => state.selected.has(item.id)).map((item) => item.id);
-    if (!parent && indexes().length && !selected.length) {
+    const sandboxSource = usesSandbox(mode) && sandboxApiIndex();
+    const researchSources = selected.filter((id) => !id.startsWith("sandbox-api:"));
+    if (sandboxSource) researchSources.push(sandboxSource);
+    if (!parent && indexes().length && !researchSources.length) {
       showError(mode === "quick" ? "Выберите базу знаний, граф или MCP для быстрого ответа." : "Выберите хотя бы один источник в области поиска.");
       setPanelCollapsed("context", false);
       const summary = $("sources-disclosure").querySelector("summary");
@@ -2399,7 +2699,7 @@
       question,
       mode,
       effort: parent ? "high" : $("effort").value,
-      index_ids: selected,
+      index_ids: researchSources,
       ...(followup ? { parent_run_id: idOf(followup) } : {}),
     };
     if (payload.mode === "autonomous" && state.status?.limits?.autonomous_enabled === false) { showError("Автопилот отключён администратором. Выберите другой режим."); return; }
@@ -2452,6 +2752,8 @@
     if (!state.current?.resumable || state.current.mode === "search" || state.submitting || state.needsAuth) return;
     const visible = new Set(modeIndexes(composerMode()).map((item) => item.id));
     const selected = modeIndexes(state.current.mode).filter((item) => visible.has(item.id) && state.selected.has(item.id)).map((item) => item.id);
+    const sandboxSource = usesSandbox(state.current.mode) && sandboxApiIndex(state.current.sandbox_profile_id || "");
+    if (sandboxSource) selected.push(sandboxSource);
     if (!selected.length) { showError("Выберите источники для продолжения."); setPanelCollapsed("context", false); return; }
     const epoch = state.identityEpoch, generation = state.generation, id = idOf(state.current);
     state.submitting = true; showError(""); updateSubmit();
@@ -2500,8 +2802,17 @@
     if (conversationState.id) openDeletion("conversation", { id: conversationState.id, title: conversationState.title, status: latest?.status, last_run_id: idOf(latest) });
   });
   $("settings-open").addEventListener("click", openSettings);
+  $("personal-open").addEventListener("click", () => openPersonalCredentials());
+  $("personal-close").addEventListener("click", () => $("personal-dialog").close());
+  $("personal-dialog").addEventListener("close", resetPersonalCredentials);
+  $("personal-kind").addEventListener("change", () => { clearPersonalInputs(); renderPersonalForm(); });
+  $("personal-repository").addEventListener("change", clearPersonalInputs);
+  $("personal-form").addEventListener("submit", (event) => { event.preventDefault(); changePersonalCredential(); });
+  $("question").addEventListener("paste", (event) => {
+    if (interceptCredentialRequest(event.clipboardData?.getData("text/plain") || "", true)) event.preventDefault();
+  });
   $("settings-close").addEventListener("click", () => $("settings-dialog").close());
-  $("settings-dialog").addEventListener("close", () => { clearSshEditor(); clearTlsEditor(); });
+  $("settings-dialog").addEventListener("close", () => { clearSshEditor(); clearTlsEditor(); clearImageInventory({ resetEditors: false }); });
   $("settings-form").addEventListener("submit", (event) => { event.preventDefault(); saveSettings(); });
   $("settings-add-repository").addEventListener("click", () => addSettingResource("repository"));
   $("settings-add-connection").addEventListener("click", () => addSettingResource("connection"));
@@ -2602,6 +2913,7 @@
   });
   $("effort").addEventListener("change", renderEffortDescription);
   $("sandbox-profile").addEventListener("change", () => { state.selectedSandboxProfile = $("sandbox-profile").value; renderExecutionEnvironment(); });
+  $("sandbox-check").addEventListener("click", checkSelectedSandbox);
   document.querySelectorAll("[data-question]").forEach((button) => button.addEventListener("click", () => {
     $("question").value = button.dataset.question;
     updateCharacterCount();
@@ -2651,6 +2963,8 @@
     }
   });
   window.addEventListener("pagehide", () => {
+    if ($("personal-dialog").open) $("personal-dialog").close();
+    resetPersonalCredentials(); clearSandboxCheck(); clearImageInventory({ resetEditors: false });
     stopPolling();
     stopModelPolling();
     if (state.modelActionController) state.modelActionController.abort();

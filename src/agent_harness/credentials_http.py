@@ -1,4 +1,4 @@
-"""Manager-only SSH key upload and metadata routes for the portable app."""
+"""Admin and personal credential routes. Responses only expose credential metadata."""
 
 from __future__ import annotations
 
@@ -12,7 +12,14 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from agent_harness.credentials import CredentialStore, SSHKeyUpload
+from agent_harness.contracts import Principal
+from agent_harness.credentials import (
+    CredentialStore,
+    PersonalCredentials,
+    PersonalUpload,
+    SSHKeyUpload,
+)
+from agent_harness.integrations_config import IntegrationStore
 
 
 def create_credential_routes(
@@ -74,4 +81,49 @@ def create_credential_routes(
     return [
         Route("/api/credentials/ssh", keys, methods=["GET", "POST"]),
         Route("/api/credentials/ssh/{credential_id}", delete, methods=["DELETE"]),
+    ]
+
+
+def create_personal_credential_routes(
+    store: PersonalCredentials, integrations: IntegrationStore, *,
+    identify: Callable[[Request], Awaitable[Principal]],
+    read_body: Callable[[Request], Awaitable[bytes]],
+) -> list[Route]:
+    async def personal(request: Request) -> Response:
+        identity = await identify(request)
+        if identity.shared:
+            raise HTTPException(403, "Для личного доступа войдите под своей учётной записью.")
+        owner = identity.owner_id
+        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+        if request.method == "DELETE":
+            removed = await asyncio.to_thread(store.delete, owner, request.path_params["id"])
+            if not removed:
+                raise HTTPException(404, "Личный доступ не найден.")
+            return JSONResponse({"ok": True}, headers=headers)
+        settings = await asyncio.to_thread(integrations.load)
+        repos = {r.id: r for r in settings.repositories if r.allows(owner)}
+        if request.method == "GET":
+            return JSONResponse({
+                "credentials": await asyncio.to_thread(store.list, owner),
+                "repositories": [{"id": r.id, "name": r.name, "url": r.url,
+                                  "ssh": not r.url.startswith("https://")} for r in repos.values()],
+            }, headers=headers)
+        if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
+            raise HTTPException(415, "Content-Type must be application/json")
+        try:
+            upload = PersonalUpload.validate_json(await read_body(request))
+        except (ValidationError, ValueError):
+            raise HTTPException(400, "Проверьте поля доступа и адрес репозитория.") from None
+        repo = repos.get(upload.repository_id)
+        if not repo:
+            raise HTTPException(403, "Репозиторий недоступен.")
+        try:
+            saved = await asyncio.to_thread(store.save, owner, repo.url, upload)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return JSONResponse({"credential": saved}, status_code=201, headers=headers)
+
+    return [
+        Route("/api/credentials/personal", personal, methods=["GET", "POST"]),
+        Route("/api/credentials/personal/{id}", personal, methods=["DELETE"]),
     ]

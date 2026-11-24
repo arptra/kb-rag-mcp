@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import ssl
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -99,6 +100,11 @@ def test_tls_store_private_files_public_metadata_and_verified_context(
     context = store.ssl_context("gateway")
     assert context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED
     assert len(list(store.directory.iterdir())) == 1  # Temporary PEM files removed.
+    with store.docker_client_directory("gateway") as directory:
+        assert {path.name for path in directory.iterdir()} == {"ca.pem", "cert.pem", "key.pem"}
+        assert all(path.stat().st_mode & 0o777 == 0o600 for path in directory.iterdir())
+        assert (directory / "key.pem").read_text() == materials["client_key"]
+    assert not directory.exists()
     with pytest.raises(ValueError):
         store.get("../arbitrary-path")
     store.delete("gateway")
@@ -308,3 +314,63 @@ async def test_keyless_model_probe_and_completion_perform_real_mutual_tls_reques
         result = await router.probe(settings.model_copy(update={"tls_bundle_id": "ca-only"}))
         assert result["available"] is False
         assert len(requests) == 2
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Requires the Docker CLI")
+async def test_docker_cli_inventory_over_mutual_tls(
+    tmp_path: Path, materials: dict[str, str]
+) -> None:
+    from agent_harness.integrations_config import DockerEngineConfig
+    from agent_harness.sandbox import SandboxBackend
+
+    store = TLSCredentialStore(tmp_path)
+    store.save(upload(materials))
+    cert, key = tmp_path / "server.pem", tmp_path / "server-key.pem"
+    cert.write_text(materials["server_certificate"])
+    key.write_text(materials["server_key"])
+    key.chmod(0o600)
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(cert, key)
+    server_context.load_verify_locations(cadata=materials["ca_certificate"])
+    server_context.verify_mode = ssl.CERT_REQUIRED
+    paths = []
+    image_id = "sha256:" + "a" * 64
+
+    async def engine(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            assert writer.get_extra_info("peercert")
+            headers = await reader.readuntil(b"\r\n\r\n")
+            method, path, _ = headers.split(b"\r\n", 1)[0].decode().split()
+            paths.append(path)
+            if path.endswith("/_ping"):
+                data = b"OK" if method != "HEAD" else b""
+            elif path.split("?")[0].endswith("/images/json"):
+                data = json.dumps(
+                    [{"Id": image_id, "RepoTags": ["qa/build:1"], "Size": 1024}]
+                ).encode()
+            elif path.endswith("/version"):
+                data = b'{"Version":"24.0.7","ApiVersion":"1.43","MinAPIVersion":"1.24"}'
+            else:
+                raise AssertionError(path)
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nAPI-Version: 1.43\r\nContent-Type: application/json\r\n"
+                b"Connection: close\r\nContent-Length: "
+                + str(len(data)).encode()
+                + b"\r\n\r\n"
+                + data
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(engine, "127.0.0.1", 0, ssl=server_context)
+    async with server:
+        port = server.sockets[0].getsockname()[1]
+        inventory = await SandboxBackend(tls_credentials=store).list_images(
+            DockerEngineConfig(mode="tls", host="localhost", port=port, tls_id="gateway")
+        )
+        assert inventory["images"][0]["reference"] == "qa/build:1"
+        assert inventory["images"][0]["id"] == image_id
+        assert any("/images/json" in path for path in paths)
+    assert len(list(store.directory.iterdir())) == 1

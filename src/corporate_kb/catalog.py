@@ -303,6 +303,15 @@ class RagCatalog:
         with self._lock:
             return any(item.id == index_id for item in self._state.indexes)
 
+    def index_directory(self) -> list[dict[str, str]]:
+        """Search routing needs index descriptions, without the admin analysis archive."""
+        with self._lock:
+            return [
+                {"id": item.id, "name": item.name, "description": item.description,
+                 "revision": item.updated_at.isoformat()}
+                for item in self._state.indexes
+            ]
+
     def tools_for(self, index_id: str) -> KnowledgeTools:
         with self._lock:
             tools = self._tools.get(index_id)

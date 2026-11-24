@@ -7,7 +7,6 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections import Counter
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
@@ -15,8 +14,9 @@ from langchain_core.messages import HumanMessage
 from langchain_core.messages.utils import count_tokens_approximately
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from agent_harness.answer_quality import answer_for_history, cited_evidence_ids, is_answer_source
+from agent_harness.answer_quality import answer_for_history, cited_evidence_refs, is_answer_source
 from agent_harness.control.settings import ControlStore
+from agent_harness.source_experience import SourceExperience, observed_sources
 from agent_harness.store import RunStore, timestamp
 
 LIST_LIMIT = 200
@@ -154,12 +154,23 @@ def _source_choices(run: dict[str, Any]) -> list[dict[str, Any]]:
     if not candidates:
         return []
     if run["status"] == "completed" or run.get("_accepted_with_warnings"):
-        cited = cited_evidence_ids(
+        cited = cited_evidence_refs(
             run.get("answer", ""), evidence, question=run.get("question", ""),
         )
-        counts = Counter(item.get("id") for item in evidence)
+        support = run.get("_retrieval_support") or {}
         candidates = [(item, origin) for item, origin in candidates
-                      if item["id"] in cited and counts[item["id"]] == 1]
+                      if (item["index_id"], item["id"]) in cited]
+        # When a reviewed passage established the answer, a writer can still cite
+        # additional retrieved snippets. Only learn the verified RAG route. Other
+        # tools have independent provenance and continue to be credited normally.
+        if support:
+            candidates = [
+                (item, origin) for item, origin in candidates
+                if origin.get("tool") not in {"read_document", "search_knowledge"} or (
+                    item["index_id"] == support.get("index_id") and item["id"] == support.get("id")
+                    and support.get("quote") and support["quote"] in item["text"]
+                )
+            ]
     for item, origin in candidates:
         tool, index = origin.get("tool"), origin.get("index_id")
         if tool not in _SOURCE_TOOLS or index != item["index_id"]:
@@ -242,6 +253,25 @@ class MemoryStore:
                 "('model_policy_stop','model_refusal_text')"
             )
         self._backfill_tool_choices()
+        with runs._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.source_experience = SourceExperience(db)
+            if self.source_experience.needs_backfill:
+                for (raw,) in db.execute(
+                    "SELECT data FROM memories WHERE status IN ('experience','active') "
+                    "AND json_valid(data) AND json_extract(data,'$.origin')='automatic'"
+                ):
+                    case = json.loads(raw)
+                    if ((case.get("feedback") or {}).get("rating") == "unhelpful"
+                            or not case.get("created_at")):
+                        continue
+                    # Older cards can prove a cited route. Their bootstrap-only coverage
+                    # cannot exclude a later query that succeeded in the same index.
+                    choices = case.get("strategy", {}).get("successful_tools", [])
+                    observations = {tool["index_id"]: "useful" for tool in choices}
+                    self.source_experience.update(
+                        db, case, _terms(case.get("_match_question", "")), observations, {},
+                    )
 
     def _backfill_tool_choices(self) -> None:
         """Recover provable choices for existing cases while their private producer still exists."""
@@ -292,6 +322,19 @@ class MemoryStore:
                 "SELECT enabled FROM memory_preferences WHERE owner=?", (owner,)
             ).fetchone()
         return bool(row[0]) if row else True
+
+    def source_scores(
+        self, owner: str, question: str, allowed: set[str], selected: set[str], *,
+        exclude_run_id: str | None = None, revisions: dict[str, str] | None = None,
+    ) -> dict[str, float]:
+        if not self.enabled(owner):
+            return {}
+        with self.runs._connect() as db:
+            return self.source_experience.scores(
+                db, _terms(question), allowed, selected, revisions=revisions or {},
+                exclude=self._automatic_id(owner, exclude_run_id) if exclude_run_id else "",
+                retention_days=self.runs.settings.retention_days,
+            )
 
     def maximum(self) -> int:
         policy = self.controls.load()
@@ -951,6 +994,16 @@ class MemoryStore:
                 owner, run, index_ids=index_ids, existing=existing, failures=failures,
                 choices=choices,
             )
+            if not failure:
+                observations = observed_sources(run, choices, failures)
+                item["strategy"]["source_outcomes"] = observations
+                revisions = {key: row["revision"] for key, row in run.get("coverage", {}).items()
+                             if row.get("revision")}
+                revisions.update(run.get("_source_revisions", {}))
+                self.source_experience.update(
+                    db, item, _terms(run.get("question", "")), observations, revisions,
+                    observed_at=run.get("completed_at"),
+                )
             if existing and existing["status"] == "active":
                 # The author has confirmed/edited this card. Updating the vote on the
                 # originating answer must not replace their text with a generated lesson.

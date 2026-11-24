@@ -9,7 +9,7 @@ show_help() {
 Без флагов:
   1. Устанавливает зависимости Harness и Deep Agents в .venv.
   2. Собирает harness-sandbox:local (Git/SSH/Python/поиск).
-  3. Собирает harness-sandbox-java21:local (дополнительно Java 21 и Maven).
+  3. Собирает harness-sandbox-java21:local (дополнительно Java 21, Maven и Gradle).
 
 --deps-only  Обновить только зависимости Python, без Docker.
 --installer auto  Использовать установленный uv, иначе pip (по умолчанию).
@@ -17,12 +17,15 @@ show_help() {
 --installer uv    Использовать установленный uv и точные версии из uv.lock.
 --help, -h   Показать справку.
 
+HARNESS_GRADLE_IMAGE задаёт образ Gradle для сборки Java-профиля, в том числе из
+внутреннего реестра. По умолчанию используется gradle:8.14.3-jdk21.
+
 Нужны uv или Python 3.12; для образов — работающий Docker Engine.
 uv автоматически не устанавливается. Для корпоративной сети выбирайте
 --installer pip: сохраняются настройки pip, прокси, каталога пакетов и сертификатов.
 При установленном uv Python 3.12 при необходимости загружается автоматически.
 Первой установке нужен доступ к реестрам пакетов/образов. Повторная сборка
-использует Docker cache; во время вопросов пакеты и образы не скачиваются.
+использует Docker cache. Сохранённый доступ Gradle позволяет сборке получать зависимости.
 Скрипт не обновляет Git, не меняет .env/подключения и не запускает сервер.
 EOF
 }
@@ -141,14 +144,17 @@ echo "Собираем базовую песочницу…"
 docker build --tag harness-sandbox:local \
   --file src/agent_harness/sandbox.Dockerfile src/agent_harness
 
-echo "Собираем песочницу Java 21 / Maven…"
-docker build --tag harness-sandbox-java21:local \
-  --file src/agent_harness/sandbox.java21.Dockerfile src/agent_harness
+echo "Собираем песочницу Java 21 / Maven / Gradle…"
+java_build_args=(--file src/agent_harness/sandbox.java21.Dockerfile)
+if [[ -n "${HARNESS_GRADLE_IMAGE:-}" ]]; then
+  java_build_args+=(--build-arg "GRADLE_IMAGE=${HARNESS_GRADLE_IMAGE}")
+fi
+docker build --tag harness-sandbox-java21:local "${java_build_args[@]}" src/agent_harness
 
 echo "Зависимости и оба образа готовы. Перезапустите backend после обновления кода."
 echo "В Harness → Настройки → Песочницы включите песочницы и проверьте базовую среду."
 echo "В разделе «Дополнительные среды» проверьте профиль Java 21:"
 echo "образ harness-sandbox-java21:local, профиль включён."
 echo "Для Java-запроса выберите «Исследовать» → «Среда выполнения» → «Java 21»."
-echo "Java/Maven уже установлены в образе. Зависимости конкретного Maven-проекта"
-echo "нужно заранее добавить в собственный образ: при анализе сеть отключена."
+echo "Java, Maven и Gradle установлены в образе. Доступ Gradle к реестру можно добавить из чата."
+echo "Для запуска Maven без сети заранее добавьте его зависимости в сборочный образ."
