@@ -6,11 +6,13 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent_harness.config import HarnessSettings
+from agent_harness.model_connection import ModelConnectionStore
+from agent_harness.model_profiles import DEEPSEEK_CONTEXT_WINDOW_TOKENS, DEEPSEEK_OUTPUT_TOKENS
 from agent_harness.policy import BUDGETS, QUICK_BUDGETS
 
 MODES = ("quick", "investigate", "autonomous")
@@ -111,6 +113,7 @@ class RuntimeLimits(StrictSettings):
 
 class ControlSettings(StrictSettings):
     revision: int = Field(default=0, ge=0)
+    model_profile: Literal["generic", "deepseek_v4_flash"] = "generic"
     profiles: dict[str, dict[str, RunLimits]]
     autonomy: AutonomySettings
     context: ContextSettings = Field(default_factory=ContextSettings)
@@ -133,7 +136,9 @@ class ControlSettings(StrictSettings):
         return self
 
 
-def default_settings(settings: HarnessSettings) -> ControlSettings:
+def default_settings(
+    settings: HarnessSettings, model_profile: str = "generic",
+) -> ControlSettings:
     profiles: dict[str, dict[str, RunLimits]] = {}
     for mode in MODES:
         source_mode = "quick" if mode == "quick" else "investigate"
@@ -184,13 +189,72 @@ def default_settings(settings: HarnessSettings) -> ControlSettings:
         }
     )
     runtime_fields = set(RuntimeLimits.model_fields) & set(type(settings).model_fields)
-    return ControlSettings(
+    result = ControlSettings(
         profiles=profiles,
         autonomy=AutonomySettings(caps=ceiling),
         runtime=RuntimeLimits.model_validate(
             {field: getattr(settings, field) for field in runtime_fields}
         ),
     )
+    if model_profile != "deepseek_v4_flash":
+        return result
+    result.model_profile = "deepseek_v4_flash"
+    result.context.window_tokens = DEEPSEEK_CONTEXT_WINDOW_TOKENS
+    result.context.response_reserve_tokens = DEEPSEEK_OUTPUT_TOKENS
+    result.context.summary_output_tokens = 4096
+    # Approximate counting needs headroom for provider framing and tokenizer
+    # differences. The 256K window includes both the prompt and the response.
+    input_tokens = DEEPSEEK_CONTEXT_WINDOW_TOKENS - DEEPSEEK_OUTPUT_TOKENS - 8192
+    for mode, mode_profiles in result.profiles.items():
+        legacy_mode = "quick" if mode == "quick" else "investigate"
+        for position, profile in enumerate(mode_profiles.values()):
+            if legacy_mode + "_context_chars" not in settings.model_fields_set:
+                profile.context_tokens = input_tokens
+            if legacy_mode + "_timeout_seconds" not in settings.model_fields_set:
+                profile.timeout_seconds = 3900.0 if mode == "quick" else (
+                    14_400.0, 21_600.0, 28_800.0
+                )[position]
+            if mode != "quick":
+                profile.model_calls = (12, 24, 48)[position]
+                profile.source_calls = (96, 192, 384)[position]
+                profile.tool_calls = (48, 96, 192)[position]
+                profile.document_reads = (4, 8, 12)[position]
+                profile.document_chars = 120_000
+                profile.evidence_chars = 12_000
+    if "final_reserve_seconds" not in settings.model_fields_set:
+        result.runtime.final_reserve_seconds = 3600.0
+    if "answer_chars" not in settings.model_fields_set:
+        result.runtime.answer_chars = 200_000
+    if "evidence_chars" not in settings.model_fields_set:
+        result.runtime.evidence_chars = 12_000
+    result.autonomy.caps.timeout_seconds = 86_400.0
+    result.autonomy.caps.context_tokens = input_tokens
+    result.autonomy.caps.document_chars = 120_000
+    return ControlSettings.model_validate(result.model_dump())
+
+
+def _migrate_profile(
+    current: ControlSettings, previous: ControlSettings, selected: ControlSettings,
+) -> ControlSettings:
+    """Replace only untouched defaults when the connected model profile changes."""
+    def merge(value: Any, old: Any, new: Any) -> Any:
+        if isinstance(value, dict) and isinstance(old, dict) and isinstance(new, dict):
+            return {key: merge(item, old.get(key), new.get(key))
+                    for key, item in value.items()}
+        return new if value == old else value
+
+    data = merge(current.model_dump(), previous.model_dump(), selected.model_dump())
+    data["revision"] = current.revision
+    data["model_profile"] = selected.model_profile
+    # Explicit operator ceilings take precedence over a larger provider preset.
+    for profile in data["profiles"]["autonomous"].values():
+        for field in RunLimits.model_fields:
+            profile[field] = min(profile[field], data["autonomy"]["caps"][field])
+    if data["context"]["response_reserve_tokens"] >= data["context"]["window_tokens"]:
+        data["context"]["response_reserve_tokens"] = max(
+            128, data["context"]["window_tokens"] // 4,
+        )
+    return ControlSettings.model_validate(data)
 
 
 class RevisionConflict(ValueError):
@@ -202,7 +266,24 @@ class ControlStore:
 
     def __init__(self, settings: HarnessSettings) -> None:
         self.path: Path = settings.state_dir / "control.sqlite3"
-        self.defaults = default_settings(settings)
+        self.settings = settings
+        self._model_store: ModelConnectionStore | None = None
+        self._defaults: dict[str, ControlSettings] = {"generic": default_settings(settings)}
+
+    @property
+    def defaults(self) -> ControlSettings:
+        # Resolve at each load so saving a model connection applies to new runs
+        # immediately, including stores created before the connection was edited.
+        profile = "generic"
+        if (self.settings.state_dir / "configuration.sqlite3").exists():
+            if self._model_store is None:
+                self._model_store = ModelConnectionStore(self.settings.state_dir)
+            connection = self._model_store.load()
+            if connection.provider == "openai":
+                profile = connection.resolved_profile
+        if profile not in self._defaults:
+            self._defaults[profile] = default_settings(self.settings, profile)
+        return self._defaults[profile].model_copy(deep=True)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -220,17 +301,17 @@ class ControlStore:
             db.close()
 
     def load(self) -> ControlSettings:
+        defaults = self.defaults
         if not self.path.exists():
-            return self.defaults.model_copy(deep=True)
+            return defaults
         with self._connect() as db:
             row = db.execute("SELECT data FROM control WHERE id=1").fetchone()
-        return (
-            ControlSettings.model_validate_json(row[0])
-            if row
-            else self.defaults.model_copy(
-                deep=True,
+        current = ControlSettings.model_validate_json(row[0]) if row else defaults
+        if current.model_profile != defaults.model_profile:
+            current = _migrate_profile(
+                current, default_settings(self.settings, current.model_profile), defaults,
             )
-        )
+        return current
 
     def save(self, candidate: ControlSettings, *, expected_revision: int) -> ControlSettings:
         # Validate even callers using model_copy/model_construct bypassed Pydantic initially.

@@ -86,8 +86,10 @@ function fixture(t, handler = () => ({}), { session = () => ({ ok: false, status
     /  updateSubmit\(\);\s+renderHistory\(\);\s+loadWorkspace\(\);\s+\}\)\(\);\s*$/,
     "globalThis.ui = { state, conversationState, api, loadConversation, loadConversations, " +
     "selectRun, refreshRun, submitRun, resetWorkspace, renderResearchActivity, renderStatus, renderBudget, modelConnectionValue, applyModelConnection, " +
-    "settingsState, modelConnectionState, tlsState, changeModelConnection, saveTlsBundle, layoutState, setPanelCollapsed, initLayout, renderTranscript };\n})();",
+    "settingsState, modelConnectionState, tlsState, changeModelConnection, saveTlsBundle, layoutState, setPanelCollapsed, initLayout, renderTranscript, renderAnswer, renderRun, applyProfileDefaults };\n})();",
   );
+  vm.runInContext(fs.readFileSync(path.join(staticPath, "vendor/markdown-it.min.js"), "utf8"), context);
+  context.window.markdownit = context.markdownit;
   vm.runInContext(source, context);
   assert(context.ui, "The test must expose the actual shipped script");
   const ui = context.ui;
@@ -412,4 +414,105 @@ test("missing administrator rights give an actionable error and keep unsaved mod
   assert.equal(nodes.get("direct-model-url").value, "https://new.test/v1");
   assert.equal(ui.modelConnectionState.dirty, true);
   assert.equal(requests.filter((request) => request.method === "PUT").length, 1);
+});
+
+function descendants(node) {
+  return [node, ...node.children.flatMap(descendants)];
+}
+
+test("Markdown preserves heading levels, nested lists, tables, quotations and fenced code", (t) => {
+  const { ui, nodes } = fixture(t);
+  ui.renderAnswer("## Вывод\n\n**Оплата** прошла, *уведомление* задержалось.\n\n1. Проверить очередь\n   - Найти событие\n   - Сверить ID\n2. Повторить доставку\n\n> Проверено по журналу\n\n| Сервис | Статус |\n| --- | ---: |\n| API | Готово |\n\n```java\nSystem.out.println(\"ok\");\n```\n");
+  const tree = descendants(nodes.get("answer"));
+  for (const tag of ["h2", "strong", "em", "ol", "ul", "blockquote", "table", "thead", "tbody", "th", "td", "pre", "code"]) {
+    assert(tree.some((node) => node.tagName === tag), "Expected Markdown element: " + tag);
+  }
+  const nested = tree.find((node) => node.tagName === "ul");
+  assert.equal(nested.parent.tagName, "li");
+  assert.equal(tree.find((node) => node.tagName === "pre").textContent, 'System.out.println("ok");');
+  assert.equal(tree.find((node) => node.tagName === "table").parent.attributes["role"], "region");
+});
+
+test("untrusted answers cannot execute HTML, create unsafe links or load remote images", (t) => {
+  const { ui, nodes } = fixture(t);
+  ui.renderAnswer('<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>\n\n[unsafe](javascript:alert(1))\n\n![external](https://example.test/tracking.png)\n\n[safe](https://example.test/doc)');
+  const tree = descendants(nodes.get("answer"));
+  assert(!tree.some((node) => ["script", "img", "iframe"].includes(node.tagName)));
+  const links = tree.filter((node) => node.tagName === "a");
+  assert.equal(links.length, 2);
+  assert(links.every((node) => node.href.startsWith("https://")));
+  assert(links.every((node) => node.rel.includes("noopener")));
+  assert.match(nodes.get("answer").textContent, /<script>alert/);
+});
+
+test("chat separates user's question and Harness answer without duplicating technical status", (t) => {
+  const { ui, nodes } = fixture(t);
+  const first = run("first");
+  ui.conversationState.id = "chat"; ui.conversationState.runs = [first];
+  ui.renderTranscript();
+  const turn = nodes.get("conversation-messages").children[0];
+  assert.equal(turn.children[0].children[0].textContent, "Вы");
+  assert.equal(turn.children[1].children[0].children[0].textContent, "Ответ Harness");
+  assert.equal(turn.children[1].children[1].textContent, "Answer first");
+});
+
+test("live activity shows model waiting and elapsed time, then collapses completed investigation", (t) => {
+  const { ui, nodes } = fixture(t);
+  ui.conversationState.id = "chat";
+  const active = run("active", { status: "running", phase: "synthesizing", answer: "", current_action: { name: "model_response", started_at: new Date(Date.now() - 125000).toISOString() }, research_trace: [{ name: "mcp_list_tools", result: "Найдено 6 инструментов" }] });
+  ui.state.current = active; ui.conversationState.runs = [active]; ui.renderRun();
+  assert.equal(nodes.get("run-progress").hidden, false);
+  assert.match(nodes.get("run-status").textContent, /Модель анализирует/);
+  assert.match(nodes.get("run-waiting").textContent, /2 мин 5 сек/);
+  assert.match(nodes.get("run-last-step").textContent, /Изучаем доступные инструменты/);
+  nodes.get("run-details").open = true;
+  ui.renderRun();
+  assert.equal(nodes.get("run-details").open, true, "Polling must not undo an explicit disclosure choice");
+  const finished = run("active"); ui.state.current = finished; ui.conversationState.runs = [finished]; ui.renderRun();
+  assert.equal(nodes.get("run-progress").hidden, true);
+  assert.equal(nodes.get("run-details").open, false);
+  assert.equal(nodes.get("answer").textContent, "Answer active");
+});
+
+test("DeepSeek profile recommendations only change custom values after the apply action", (t) => {
+  const { ui, nodes } = fixture(t);
+  ui.applyModelConnection({ provider: "openai", model: "deepseek-v4-flash", profile: "deepseek_v4_flash", timeout_seconds: 900, output_tokens: 12000 }, { profiles: [{ id: "deepseek_v4_flash", defaults: { timeout_seconds: 1800, output_tokens: 32768, model_window_tokens: 256000 } }] });
+  assert.equal(ui.modelConnectionValue().timeout_seconds, 900);
+  assert.equal(ui.modelConnectionValue().output_tokens, 12000);
+  assert.equal(ui.modelConnectionValue().profile, "deepseek_v4_flash");
+  ui.applyProfileDefaults();
+  assert.equal(ui.modelConnectionValue().timeout_seconds, 1800);
+  assert.equal(ui.modelConnectionValue().output_tokens, 32768);
+  assert.equal(ui.modelConnectionState.dirty, true);
+  assert.match(nodes.get("model-connection-feedback").textContent, /Сохраните подключение/);
+});
+
+
+test("switching from untouched generic defaults to DeepSeek adopts its recommended limits", (t) => {
+  const { ui, nodes } = fixture(t);
+  ui.applyModelConnection({ provider: "openai", profile: "auto", model: "", timeout_seconds: 60, output_tokens: 4096 }, { resolved_profile: "generic", profile_defaults: { timeout_seconds: 60, output_tokens: 4096, model_window_tokens: 65536 } });
+  nodes.get("direct-model-name").value = "deepseek-v4-flash";
+  nodes.get("model-profile").value = "deepseek_v4_flash";
+  nodes.get("model-profile").listeners.change();
+  assert.equal(ui.modelConnectionValue().timeout_seconds, 1800);
+  assert.equal(ui.modelConnectionValue().output_tokens, 32768);
+  assert.equal(ui.modelConnectionState.dirty, true);
+  nodes.get("model-profile").value = "generic";
+  nodes.get("model-profile").listeners.change();
+  assert.equal(ui.modelConnectionValue().timeout_seconds, 60);
+  assert.equal(ui.modelConnectionValue().output_tokens, 4096);
+});
+
+test("profile changes preserve custom limits and only update untouched default fields", (t) => {
+  const { ui, nodes } = fixture(t);
+  ui.applyModelConnection({ provider: "openai", profile: "generic", timeout_seconds: 120, output_tokens: 8192 });
+  nodes.get("model-profile").value = "deepseek_v4_flash";
+  nodes.get("model-profile").listeners.change();
+  assert.equal(ui.modelConnectionValue().timeout_seconds, 120);
+  assert.equal(ui.modelConnectionValue().output_tokens, 8192);
+  ui.applyModelConnection({ provider: "openai", profile: "generic", timeout_seconds: 120, output_tokens: 4096 });
+  nodes.get("model-profile").value = "deepseek_v4_flash";
+  nodes.get("model-profile").listeners.change();
+  assert.equal(ui.modelConnectionValue().timeout_seconds, 120);
+  assert.equal(ui.modelConnectionValue().output_tokens, 32768);
 });

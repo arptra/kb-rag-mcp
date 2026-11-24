@@ -34,6 +34,12 @@ class RunSandboxArgs(RepositoryArgs):
     command: list[str] = Field(min_length=1, max_length=64)
 
 
+class MCPListArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    connection_id: str = Field(min_length=1, max_length=64)
+    query: str = Field(default="", max_length=200)
+
+
 class MCPSchemaArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     connection_id: str = Field(min_length=1, max_length=64)
@@ -55,6 +61,7 @@ ARGUMENTS: dict[str, type[BaseModel]] = {
     "search_repository": SearchRepositoryArgs,
     "read_repository": ReadRepositoryArgs,
     "run_in_sandbox": RunSandboxArgs,
+    "mcp_list_tools": MCPListArgs,
     "mcp_call": MCPArgs,
     "mcp_tool_schema": MCPSchemaArgs,
     "a2a_ask": A2AArgs,
@@ -65,6 +72,10 @@ DESCRIPTIONS = {
     "read_repository": "Read lines from a repository file inside this run's sandbox.",
     "run_in_sandbox": "Run a command in an isolated repository container without network access. "
     "Only for analysis, build and tests requested by the user. No host filesystem access.",
+    "mcp_list_tools": "Discover the current allowed tools and their descriptions on a selected "
+    "MCP connection. Use this to choose a relevant tool, then read mcp_tool_schema and call it. "
+    "Use query to filter names/descriptions if the catalog is large or truncated. "
+    "The catalog is metadata, not evidence about the corporate system.",
     "mcp_tool_schema": "Read an allowed MCP tool's input schema before calling it. "
     "This is tool metadata, not evidence of the corporate system.",
     "mcp_call": "Call an administrator-allowed MCP tool. Read mcp_tool_schema first. "
@@ -169,7 +180,7 @@ class IntegrationHub:
             item for item in settings.connections if "connection:" + item.id in available
         ]
         if any(item.kind == "mcp" for item in connections):
-            names.extend(("mcp_tool_schema", "mcp_call"))
+            names.extend(("mcp_list_tools", "mcp_tool_schema", "mcp_call"))
         if any(item.kind == "a2a" for item in connections):
             names.append("a2a_ask")
         allowed = "; ".join(
@@ -177,6 +188,7 @@ class IntegrationHub:
             for item in connections
             if item.kind == "mcp"
         )[:2000]
+        connection_ids = ", ".join(item.id for item in connections if item.kind == "mcp")
         return [
             {
                 "type": "function",
@@ -184,8 +196,9 @@ class IntegrationHub:
                     "name": name,
                     "description": DESCRIPTIONS[name]
                     + (
-                        " Allowed connection IDs and tools: " + allowed
-                        if name in {"mcp_call", "mcp_tool_schema"}
+                        " Allowed connection IDs: " + connection_ids
+                        + ". Tool name hints: " + allowed
+                        if name in {"mcp_list_tools", "mcp_call", "mcp_tool_schema"}
                         else ""
                     ),
                     "parameters": ARGUMENTS[name].model_json_schema(),
@@ -244,8 +257,15 @@ class IntegrationHub:
                 resource_id not in index_ids
                 or connection is None
                 or not connection.allows(principal.owner_id)
-                or connection.kind != ("mcp" if name in {"mcp_call", "mcp_tool_schema"} else "a2a")
-                or (connection.kind == "mcp" and validated["tool"] not in connection.allowed_tools)
+                or connection.kind != (
+                    "mcp" if name in {"mcp_list_tools", "mcp_call", "mcp_tool_schema"} else "a2a"
+                )
+                or (connection.kind == "mcp" and (
+                    not connection.allowed_tools or (
+                        name != "mcp_list_tools"
+                        and validated["tool"] not in connection.allowed_tools
+                    )
+                ))
             ):
                 raise PermissionError("Connection is outside the permitted scope")
             credential_env = connection.credential_env
@@ -264,7 +284,7 @@ class IntegrationHub:
             current_sandbox = self._sandbox_config(self.store.load(), principal, sandbox_profile_id)
             if current_sandbox.image != sandbox_config.image:
                 raise PermissionError("Sandbox profile changed during the call")
-        if name in {"mcp_call", "mcp_tool_schema", "a2a_ask"}:
+        if name in {"mcp_list_tools", "mcp_call", "mcp_tool_schema", "a2a_ask"}:
             assert connection is not None
             current = next(
                 (
@@ -279,7 +299,12 @@ class IntegrationHub:
                 or not current.allows(principal.owner_id)
                 or current.kind != connection.kind
                 or current.url != connection.url
-                or (current.kind == "mcp" and validated["tool"] not in current.allowed_tools)
+                or (current.kind == "mcp" and (
+                    (name == "mcp_list_tools" and not set(connection.allowed_tools).issubset(
+                        current.allowed_tools
+                    ))
+                    or (name != "mcp_list_tools" and validated["tool"] not in current.allowed_tools)
+                ))
             ):
                 raise PermissionError("Connection permission changed during the call")
         secret = os.environ.get(credential_env, "") if credential_env else ""

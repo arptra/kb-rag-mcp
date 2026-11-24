@@ -163,7 +163,7 @@ async def test_hub_rechecks_acl_and_run_scope_and_redacts_secret(
     assert b"secret-value" not in integrations.store.path.read_bytes()
 
 
-@pytest.mark.parametrize("tool_name", ["mcp_call", "mcp_tool_schema"])
+@pytest.mark.parametrize("tool_name", ["mcp_call", "mcp_tool_schema", "mcp_list_tools"])
 async def test_tool_revoked_during_backend_call_rejects_result(
     tmp_path: Path, tool_name: str
 ) -> None:
@@ -183,6 +183,8 @@ async def test_tool_revoked_during_backend_call_rejects_result(
 
     integrations._remote = PendingBackend()
     args: dict[str, Any] = {"connection_id": "jira", "tool": "search"}
+    if tool_name == "mcp_list_tools":
+        args = {"connection_id": "jira"}
     if tool_name == "mcp_call":
         args["arguments"] = {}
     operation = asyncio.create_task(
@@ -327,7 +329,9 @@ async def test_tool_only_answer_without_external_calls_is_unverified(tmp_path: P
         assert any("не подтверждён источниками" in warning for warning in result["warnings"])
         assert result["metrics"]["tool_calls"] == 0
         assert not integrations._sandbox.calls and not integrations._remote.calls
-        assert len(model.requests) == 1
+        # One explicit goal check gives the model a chance to actually inspect
+        # the selected sources instead of accepting an unsupported assertion.
+        assert len(model.requests) == 2
         assert model.requests[0]["tools"]
     finally:
         await runtime.stop()

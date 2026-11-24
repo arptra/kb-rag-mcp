@@ -203,6 +203,18 @@ def test_model_http_manager_origin_and_busy_guard(tmp_path: Path) -> None:
         runtime._signals.clear()
         assert client.put(endpoint, headers=admin, json=payload).status_code == 200
         assert client.get("/api/status", headers=admin).json()["model"]["provider"] == "openai"
+        configured = client.put(endpoint, headers=admin, json={
+            "provider": "openai", "base_url": "https://models.test/v1",
+            "profile": "deepseek_v4_flash",
+        }).json()
+        assert configured["settings"]["model"] == ""
+        assert configured["settings"]["timeout_seconds"] == 1800
+        assert configured["settings"]["output_tokens"] == 32768
+        assert configured["resolved_profile"] == "deepseek_v4_flash"
+        assert configured["profile_defaults"]["model_window_tokens"] == 256000
+        assert {item["id"] for item in configured["profiles"]} == {
+            "auto", "generic", "deepseek_v4_flash",
+        }
 
 
 @pytest.mark.parametrize(

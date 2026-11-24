@@ -7,6 +7,7 @@
     <meta name="description" content="Harness — ответы и исследования по корпоративным знаниям.">
     <title>Harness · Чаты</title>
     <link rel="stylesheet" href="./assets/styles.css">
+    <script src="./assets/vendor/markdown-it.min.js" defer></script>
     <script src="./assets/app.js" defer></script>
   </head>
   <body>
@@ -72,34 +73,40 @@
               </section>
 
               <section id="run-panel" class="run-panel" aria-labelledby="run-question" hidden>
-                <div class="run-topline"><span id="run-mode" class="eyebrow">Исследование</span><span id="run-date" class="muted"></span></div>
                 <h2 id="run-question" class="sr-only"></h2>
                 <p id="parent-note" class="parent-note" hidden></p>
-                <div class="run-progress">
-                  <div class="progress-description"><span id="run-status-dot" class="run-status-dot" aria-hidden="true"></span><div><strong id="run-status">Запрос принят</strong><p id="run-phase"></p></div></div>
+                <div id="run-progress" class="run-progress">
+                  <div class="progress-description"><span id="run-status-dot" class="run-status-dot" aria-hidden="true"></span><div><strong id="run-status">Запрос принят</strong><p id="run-phase"></p><p id="run-waiting" class="run-waiting" hidden></p></div></div>
                   <button id="cancel-run" class="text-button" type="button" hidden>Остановить</button>
+                  <p id="run-last-step" class="run-last-step" hidden></p>
                 </div>
                 <div id="progress-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
-                <p id="run-coverage" class="run-coverage" hidden></p>
-                <section id="research-activity" class="research-activity" aria-label="Ход исследования" hidden>
-                  <p id="research-current" class="research-next" role="status" aria-live="polite" hidden></p>
-                  <p id="research-goal" class="research-goal" hidden></p>
-                  <p id="research-next" class="research-next" hidden></p>
-                  <details id="research-details"><summary>Что проверено и что ещё нужно выяснить</summary><div id="research-plan" class="research-plan"></div><ol id="research-timeline" class="research-timeline"></ol></details>
-                </section>
                 <div id="run-warnings" class="run-warnings" hidden></div>
-                <details id="run-budget" class="run-budget" hidden><summary>Ресурсы и управление контекстом</summary><p id="run-context-summary" class="muted"></p><div id="run-budget-values" class="budget-values"></div><ol id="run-budget-events" class="research-timeline"></ol></details>
                 <div id="answer" class="answer"></div>
-                <div id="answer-placeholder" class="answer-placeholder" hidden><p>Сведения появятся здесь.<br><span>Найденные материалы доступны в блоке подтверждений уже во время работы.</span></p></div>
-                <div id="run-memory-used" class="run-memory-used" hidden></div>
-                <p id="run-environment" class="run-environment" hidden></p>
+                <div id="answer-placeholder" class="answer-placeholder" hidden><p>Ответ появится здесь.<br><span>Ход работы обновляется автоматически. Найденные материалы доступны в «Источниках».</span></p></div>
                 <section id="run-feedback" class="run-feedback" aria-labelledby="run-feedback-title" hidden>
-                  <h3 id="run-feedback-title">Ответ помог?</h3>
-                  <label class="settings-field"><span class="settings-field-label">Комментарий · необязательно</span><textarea id="run-feedback-comment" rows="2" maxlength="1000" placeholder="Что получилось или что нужно исправить?"></textarea></label>
-                  <div class="resource-actions"><button id="feedback-helpful" class="secondary-button" type="button" aria-pressed="false">Помогло</button><button id="feedback-unhelpful" class="secondary-button" type="button" aria-pressed="false">Не помогло</button></div>
+                  <div class="feedback-heading"><h3 id="run-feedback-title">Ответ помог?</h3><div class="resource-actions"><button id="feedback-helpful" class="secondary-button" type="button" aria-pressed="false">Помогло</button><button id="feedback-unhelpful" class="secondary-button" type="button" aria-pressed="false">Не помогло</button></div></div>
+                  <details id="feedback-comment-details" class="feedback-comment"><summary>Добавить комментарий</summary><label class="settings-field"><span class="sr-only">Комментарий к оценке</span><textarea id="run-feedback-comment" rows="2" maxlength="1000" placeholder="Что получилось или что нужно исправить?"></textarea></label></details>
                   <p id="run-feedback-status" class="settings-field-help" role="status" aria-live="polite"></p>
                 </section>
-                <div class="run-footer"><span id="run-metrics" class="muted"></span><div class="run-actions"><button id="remember-run" class="text-button" type="button" hidden>Запомнить уточнение</button><button id="resume-run" class="secondary-button" type="button" hidden>Продолжить с выбранными источниками</button><button id="deepen-run" class="secondary-button" type="button" hidden>Исследовать глубже</button><button id="delete-run" class="text-button" type="button">Удалить этот запрос</button></div></div>
+                <details id="run-details" class="run-details">
+                  <summary><span id="run-details-label">Как получен ответ</span><span id="run-details-summary" class="run-details-summary"></span></summary>
+                  <div class="run-details-body">
+                    <div class="run-topline"><span id="run-mode" class="eyebrow">Исследование</span><span id="run-date" class="muted"></span></div>
+                    <p id="run-coverage" class="run-coverage" hidden></p>
+                    <section id="research-activity" class="research-activity" aria-label="Ход исследования" hidden>
+                      <p id="research-current" class="research-next" hidden></p>
+                      <p id="research-goal" class="research-goal" hidden></p>
+                      <p id="research-next" class="research-next" hidden></p>
+                      <details id="research-details"><summary>План и выполненные действия</summary><div id="research-plan" class="research-plan"></div><ol id="research-timeline" class="research-timeline"></ol></details>
+                    </section>
+                    <details id="run-budget" class="run-budget" hidden><summary>Ресурсы и управление контекстом</summary><p id="run-context-summary" class="muted"></p><div id="run-budget-values" class="budget-values"></div><ol id="run-budget-events" class="research-timeline"></ol></details>
+                    <div id="run-memory-used" class="run-memory-used" hidden></div>
+                    <p id="run-environment" class="run-environment" hidden></p>
+                    <p id="run-metrics" class="muted"></p>
+                  </div>
+                </details>
+                <div class="run-footer"><div class="run-actions"><button id="resume-run" class="secondary-button" type="button" hidden>Продолжить с выбранными источниками</button><button id="deepen-run" class="secondary-button" type="button" hidden>Исследовать глубже</button><button id="remember-run" class="text-button" type="button" hidden>Запомнить уточнение</button><button id="delete-run" class="text-button" type="button">Удалить запрос</button></div></div>
               </section>
             </div>
             <section id="composer-section" class="composer-section" aria-label="Сообщение в чат">
@@ -243,8 +250,10 @@
                     <label class="settings-field wide"><span class="settings-field-label">Название модели · необязательно</span><input id="direct-model-name" maxlength="200" autocomplete="off" placeholder="Если модель уже выбрана адресом, оставьте пустым"></label>
                     <label class="settings-field wide"><span class="settings-field-label">Переменная с API-ключом · необязательно</span><input id="direct-model-token" maxlength="128" pattern="[A-Z][A-Z0-9_]{0,127}" autocomplete="off" placeholder="Для доступа только по сертификатам оставьте пустым"><small class="settings-field-help">Нужно только для API с ключом. Укажите имя переменной на сервере, например MODEL_API_KEY.</small></label>
                     <label class="settings-field wide"><span class="settings-field-label">Сертификаты подключения</span><select id="direct-model-tls"><option value="">Системные доверенные сертификаты</option></select></label>
-                    <label class="settings-field"><span class="settings-field-label">Ожидание ответа, секунды</span><input id="direct-model-timeout" type="number" min="5" max="300" value="60"></label>
-                    <label class="settings-field"><span class="settings-field-label">Предел ответа API, токены</span><input id="model-output-tokens" type="number" min="128" max="32768" value="4096"><small class="settings-field-help">Для прямого API. Фактический предел также зависит от вашей модели.</small></label>
+                    <label class="settings-field wide"><span class="settings-field-label">Профиль модели</span><select id="model-profile"><option value="auto">Определить автоматически</option><option value="deepseek_v4_flash">DeepSeek V4 Flash · контекст 256K</option><option value="generic">Универсальный</option></select><small id="model-profile-description" class="settings-field-help"></small></label>
+                    <div class="wide"><button id="model-profile-apply" class="secondary-button" type="button">Применить рекомендуемые настройки</button><p class="settings-field-help">При смене профиля стандартные значения обновляются автоматически, а ваши собственные сохраняются. Эта кнопка заменит их рекомендациями выбранного профиля.</p></div>
+                    <label class="settings-field"><span class="settings-field-label">Ожидание ответа, секунды</span><input id="direct-model-timeout" type="number" min="5" max="3600" value="1800"></label>
+                    <label class="settings-field"><span class="settings-field-label">Предел ответа API, токены</span><input id="model-output-tokens" type="number" min="128" max="131072" value="32768"><small class="settings-field-help">Для прямого API. Фактический предел также зависит от вашей модели.</small></label>
                   </div>
                 </div>
                 <div class="resource-actions"><button id="model-connection-probe" class="secondary-button" type="button">Проверить запросом</button><button id="model-connection-save" class="text-button" type="button">Сохранить подключение</button></div>

@@ -598,7 +598,10 @@ async def test_failed_tool_outcome_is_reported_truthfully_to_model(tmp_path: Pat
         submitted = await runtime.submit(OWNER, RunRequest(question="Read", mode="investigate"))
         await finished(runtime, submitted["id"])
         context = json.loads(model.requests[1]["messages"][-1]["content"])
-        outcome = context["prior_tool_attempts"][0]["result"]
+        outcome = next(
+            item["result"] for item in context["prior_tool_attempts"]
+            if item["name"] == "read_document" and item["args"].get("document_id") == "x"
+        )
         assert "недоступно" in outcome and "добавлены" not in outcome
     finally:
         await runtime.stop()
@@ -647,6 +650,7 @@ async def test_invalid_model_decision_is_corrected_without_losing_research(tmp_p
         assert result['status'] == 'completed'
         assert result['answer'] == 'Corrected investigation [a].'
         assert result['metrics']['decision_errors'] == 1
-        assert result['metrics']['model_calls'] == 2
+        assert result['metrics']['model_calls'] == 3
+        assert any(item["name"] == "goal_check" for item in result["research_trace"])
     finally:
         await runtime.stop()

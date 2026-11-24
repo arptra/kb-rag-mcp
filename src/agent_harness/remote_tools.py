@@ -241,7 +241,19 @@ class RemoteTools:
                 raise ValueError("Invalid connection arguments")
             if len(_json(args).encode()) > _MAX_ARGUMENT_BYTES:
                 raise ValueError("Arguments exceed the byte limit")
-            if name in {"mcp_call", "mcp_tool_schema"} and connection.kind == "mcp":
+            if name == "mcp_list_tools" and connection.kind == "mcp":
+                query = args.get("query", "")
+                if (set(args) - {"connection_id", "query"}
+                        or not isinstance(query, str) or len(query) > 200):
+                    raise ValueError("Invalid MCP discovery arguments")
+                if not connection.allowed_tools:
+                    raise PermissionError("No tools are allowed on this connection")
+                secret = self._credential(connection)
+                text = await self._bounded(
+                    lambda: self._call_mcp(connection, None, None, secret, query=query), cancel,
+                )
+                title = f"{connection.name}: доступные инструменты"
+            elif name in {"mcp_call", "mcp_tool_schema"} and connection.kind == "mcp":
                 tool = args.get("tool")
                 arguments = args.get("arguments", {}) if name == "mcp_call" else None
                 fields = {"connection_id", "tool"}
@@ -286,7 +298,8 @@ class RemoteTools:
                     title=_redact(title, secret)[:300],
                     text=_redact(text, secret)[:_MAX_CHARS],
                     url=connection.url,
-                    kind="tool_metadata" if name == "mcp_tool_schema" else "source",
+                    kind="tool_metadata"
+                    if name in {"mcp_list_tools", "mcp_tool_schema"} else "source",
                 )
             ]
         except asyncio.CancelledError:
@@ -294,13 +307,17 @@ class RemoteTools:
         except Exception as exc:
             raise RemoteToolError(f"Remote operation failed ({_error_kind(exc)})") from None
 
-    async def _tools(self, session: ClientSession) -> list[dict[str, Any]]:
+    async def _tools(
+        self, session: ClientSession, allowed_names: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
         cursor = None
         seen = set()
         for _ in range(8):
             page = await session.list_tools(cursor=cursor)
             for tool in page.tools:
+                if allowed_names is not None and tool.name not in allowed_names:
+                    continue
                 tools.append(
                     {
                         "name": tool.name,
@@ -348,9 +365,11 @@ class RemoteTools:
     async def _call_mcp(
         self,
         connection: ConnectionConfig,
-        tool: str,
+        tool: str | None,
         arguments: dict[str, Any] | None,
         secret: str,
+        *,
+        query: str = "",
     ) -> str:
         async with (
             self._client(secret) as client,
@@ -362,7 +381,28 @@ class RemoteTools:
             ) as session,
         ):
             await session.initialize()
-            definitions = await self._tools(session)
+            definitions = await self._tools(session, set(connection.allowed_tools))
+            if tool is None:
+                terms = query.casefold().split()
+                matches = [item for item in definitions if all(
+                    term in (item["name"] + " " + item["description"]).casefold()
+                    for term in terms
+                )]
+                catalog: dict[str, Any] = {
+                    "kind": "tool_catalog_not_system_evidence", "tools": [],
+                    "matched_count": len(matches), "truncated": False,
+                    "next_action": "Read mcp_tool_schema for a selected tool before calling it. "
+                    "If truncated, repeat mcp_list_tools with a more specific query.",
+                }
+                for item in matches:
+                    catalog["tools"].append(_redact_tree({
+                        "name": item["name"], "description": item["description"][:500],
+                    }, secret))
+                    if len(_json(catalog)) > _MAX_CHARS:
+                        catalog["tools"].pop()
+                        catalog["truncated"] = True
+                        break
+                return _json(catalog)
             matches = [item for item in definitions if item["name"] == tool]
             if len(matches) != 1:
                 raise ValueError("Remote tool is missing or ambiguous")

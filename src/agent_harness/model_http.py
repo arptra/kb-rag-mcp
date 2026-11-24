@@ -12,6 +12,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from agent_harness.model_connection import ModelConnection, ModelRouter
+from agent_harness.model_profiles import model_profile_defaults, model_profile_options
 from agent_harness.tls_credentials import TLSCredentialStore
 
 
@@ -57,7 +58,14 @@ def create_model_routes(
             asyncio.to_thread(router.store.load), asyncio.to_thread(certificates.list)
         )
         return JSONResponse(
-            {"can_manage": True, "settings": saved.model_dump(), "tls_bundles": bundles},
+            {
+                "can_manage": True,
+                "settings": saved.model_dump(),
+                "tls_bundles": bundles,
+                "resolved_profile": saved.resolved_profile,
+                "profile_defaults": model_profile_defaults(saved.resolved_profile),
+                "profiles": model_profile_options(),
+            },
             headers={"Cache-Control": "no-store"},
         )
 

@@ -107,7 +107,8 @@ async def test_recursive_findings_drive_next_search_and_persist_progress(tmp_pat
         await asyncio.wait_for(source.entered.wait(), 2)
         live = await runtime.get(OWNER, submitted["id"])
         assert live["phase"] == "refining"
-        assert live["current_action"] == {"name": "search_knowledge"}
+        assert live["current_action"]["name"] == "search_knowledge"
+        assert live["current_action"]["started_at"]
         assert live["research_plan"]["gaps"]
         source.release.set()
         result = await finished(runtime, submitted["id"])

@@ -37,7 +37,14 @@ from agent_harness.contracts import (
 from agent_harness.control.settings import ControlSettings, ControlStore, RunLimits, RuntimeLimits
 from agent_harness.graph import ExecutionContext, HarnessGraph
 from agent_harness.memory import LIST_LIMIT, MemoryFeedback, MemoryInput, MemoryStore
-from agent_harness.model_connection import ModelConnectionError, ModelRouter
+from agent_harness.model_connection import (
+    INCOMPLETE_FINISH_REASONS,
+    RETRYABLE_FINISH_REASONS,
+    ModelConnectionError,
+    ModelRouter,
+    ModelTransientError,
+)
+from agent_harness.model_profiles import DEEPSEEK_CONTEXT_WINDOW_TOKENS
 from agent_harness.policy import SYSTEM_PROMPT
 from agent_harness.store import ACTIVE, RunStore, timestamp
 
@@ -239,13 +246,23 @@ class HarnessRuntime:
         return {key: value for key, value in run.items() if not key.startswith("_")}
 
     def _initialize_budget(self, run: dict[str, Any], controls: ControlSettings) -> None:
+        if controls.model_profile == "deepseek_v4_flash":
+            controls = controls.model_copy(deep=True)
+            controls.context.window_tokens = min(
+                controls.context.window_tokens, DEEPSEEK_CONTEXT_WINDOW_TOKENS,
+            )
+        context_capacity = controls.context.window_tokens - controls.context.response_reserve_tokens
+        if controls.model_profile == "deepseek_v4_flash":
+            context_capacity = max(256, context_capacity - min(
+                8192, controls.context.window_tokens // 32,
+            ))
         initial = controls.profiles[run["mode"]][run["effort"]].model_dump()
         ceiling = (controls.autonomy.caps.model_dump()
                    if run["mode"] == "autonomous" else dict(initial))
         for limits in (initial, ceiling):
             limits["context_tokens"] = min(
                 limits["context_tokens"],
-                controls.context.window_tokens - controls.context.response_reserve_tokens,
+                context_capacity,
             )
         run["budget"] = {
             "initial": dict(initial), "current": dict(initial), "ceiling": ceiling,
@@ -284,6 +301,8 @@ class HarnessRuntime:
         self, principal: Principal, run: dict[str, Any], event: Event,
         *, started: float, deadline: float, reason: str,
     ) -> bool:
+        if self._now(run) >= deadline:
+            return False
         if run["mode"] != "autonomous" or not run["_control"]["autonomy"]["enabled"]:
             return False
         if run["budget"]["extensions"] >= run["_control"]["autonomy"]["max_extensions"]:
@@ -323,7 +342,7 @@ class HarnessRuntime:
                     continue
                 result = self._change_budget(run, call.get("args"), started=started)
                 self._trace(run, "request_budget", {}, result)
-        except (ModelDecisionError, TimeoutError, ValueError):
+        except (ModelDecisionError, ModelTransientError, TimeoutError, ValueError):
             self._trace(run, "budget_review", {}, "Расширение не подтверждено; готовим итог.")
         self._checkpoint(principal, run, event)
         return bool(before != run["budget"]["current"])
@@ -794,7 +813,7 @@ class HarnessRuntime:
                     self._warn(run, "Обработка запроса завершилась ошибкой. Повторите запрос.")
                     if not run.get("answer"):
                         self._evidence_answer(run)
-                    run.update(phase="finished", completed_at=timestamp())
+                    run.update(phase="finished", completed_at=timestamp(), current_action=None)
                     try:
                         self.store.save(principal.owner_id, run)
                     except Exception as save_error:
@@ -885,7 +904,7 @@ class HarnessRuntime:
             if not run["answer"]:
                 self._evidence_answer(run)
             run.setdefault("stop_reason", run["status"])
-            run.update(phase="finished", completed_at=timestamp())
+            run.update(phase="finished", completed_at=timestamp(), current_action=None)
             run["metrics"]["duration_ms"] = previous_duration + round(
                 (time.monotonic() - started) * 1000
             )
@@ -1126,6 +1145,8 @@ class HarnessRuntime:
         if event.is_set() or self.source is None:
             return "Вызов отменён либо источник отключён."
         run["metrics"]["source_calls"] += 1
+        run["current_action"] = {"name": "read_document", "started_at": timestamp()}
+        self._checkpoint(principal, run, event)
         try:
             timeout = self._source_timeout(run)
             if deadline is not None:
@@ -1148,6 +1169,7 @@ class HarnessRuntime:
             )
             return outcome
         finally:
+            run["current_action"] = None
             self._checkpoint(principal, run, event)
 
     def _checkpoint(
@@ -1497,6 +1519,9 @@ class HarnessRuntime:
         options = (
             {"max_output_tokens": output_tokens} if isinstance(self.model, ModelRouter) else {}
         )
+        action_name = "context_compaction" if summary else "model_response"
+        run["current_action"] = {"name": action_name, "started_at": timestamp()}
+        self._checkpoint(principal, run, event)
         operation = asyncio.create_task(
             self.model.decide(
                 messages=messages, tools=tools, cancel=signal, max_input_chars=maximum, **options,
@@ -1526,12 +1551,20 @@ class HarnessRuntime:
             raise
         except ValueError:
             raise ModelDecisionError("Модель вернула некорректный формат решения.") from None
+        finally:
+            run["current_action"] = None
+            self._checkpoint(principal, run, event)
+        self._trace(run, action_name, {},
+                    "Модель вернула результат сжатия истории." if summary
+                    else "Модель ответила; проверяем результат и следующий шаг.")
         if not isinstance(result, dict) or not isinstance(result.get("tool_calls", []), list):
             raise ModelDecisionError("Модель вернула некорректный формат решения.")
+        if result.get("incomplete_tool_calls"):
+            raise ModelDecisionError("Модель не завершила описание действия.")
         if (not result.get("tool_calls") and
                 (not isinstance(result.get("content"), str) or not result["content"].strip())):
             raise ModelDecisionError("Модель вернула пустой ответ.")
-        if result.get("tool_calls") and result.get("finish_reason") in {"length", "max_tokens"}:
+        if result.get("tool_calls") and result.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
             raise ModelDecisionError("Модель не завершила описание действия.")
         metrics["output_tokens_estimated"] = metrics.get("output_tokens_estimated", 0) + (
             self._count_tokens(run, result)
@@ -1552,6 +1585,7 @@ class HarnessRuntime:
         # One bounded formatting repair, still under the outer run deadline. No
         # tool action is replayed and quick mode pays for it only after a failure.
         retries = self._runtime_limits(run).max_answer_retries
+        partial: dict[str, Any] | None = None
         for attempt in range(retries + 1):
             if event.is_set():
                 return
@@ -1559,7 +1593,9 @@ class HarnessRuntime:
                 decision = await self._decide(principal, run, event, [])
                 if decision.get("tool_calls"):
                     raise ModelDecisionError("Итоговый ответ не может запускать инструменты.")
-                incomplete = decision.get("finish_reason") in {"length", "max_tokens"}
+                incomplete = decision.get("finish_reason") in RETRYABLE_FINISH_REASONS
+                if incomplete and decision.get("content"):
+                    partial = decision
                 if (not incomplete or attempt == retries) and self._answer(run, decision):
                     return
             except ConversationUnavailable:
@@ -1567,6 +1603,10 @@ class HarnessRuntime:
                 return
             except ModelDecisionError:
                 run["metrics"]["decision_errors"] = run["metrics"].get("decision_errors", 0) + 1
+            except ModelTransientError as exc:
+                self._trace(run, "model_retry", {}, str(exc))
+                if attempt == retries:
+                    self._warn(run, str(exc))
             if attempt < retries:
                 run["metrics"]["answer_retries"] = run["metrics"].get("answer_retries", 0) + 1
                 self._trace(run, "answer_recovery", {},
@@ -1574,6 +1614,8 @@ class HarnessRuntime:
                             "Верните законченный ответ в content без инструментов. "
                             "Будьте краткими и явно перечислите оставшиеся ограничения.")
                 self._checkpoint(principal, run, event)
+        if partial:
+            self._answer(run, partial)
         run["status"] = "partial"
         self._warn(run, "Модель не сформировала законченный ответ после повторной попытки.")
 
@@ -1588,11 +1630,18 @@ class HarnessRuntime:
             self._warn(run, "Ответ превышает настроенный размер и показан не полностью.")
             marker = "\n\n[Ответ сокращён по ограничению размера.]"
             run["answer"] = content[:answer_chars - len(marker)] + marker
-        if decision.get("finish_reason") in {"length", "max_tokens", "content_filter"}:
+        if decision.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
             self._warn(run, "Модель остановила генерацию до завершения ответа.")
         plan = run.get("research_plan", {})
+        if run.get("_unconfirmed_research") or (
+            run["mode"] == "autonomous" and run.get("_goal_review_requested")
+            and not run["metrics"]["tool_calls"] and not plan.get("ready_to_answer")
+        ):
+            self._warn(run, "Модель не подтвердила завершение исследования.")
         if plan.get("model_updated") and plan.get("gaps"):
             self._warn(run, "План исследования содержит непроверенные вопросы.")
+        elif plan.get("model_updated") and not plan.get("ready_to_answer"):
+            self._warn(run, "Проверки плана не подтверждены как завершённые.")
         if plan:
             plan["completion_reason"] = (
                 "Ответ подготовлен, ограничения перечислены." if run["warnings"]

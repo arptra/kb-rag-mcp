@@ -203,13 +203,24 @@ svg { width: 22px; height: 22px; flex-shrink: 0; }
 .chat-turn { min-width: 0; }
 .chat-role { color: #a8a8ad; font-size: 15px; font-weight: 600; letter-spacing: .02em; margin-bottom: 10px; }
 .chat-user { margin-left: auto; max-width: 88%; padding: 19px 24px; border: 1px solid #3b3b3f; border-radius: 24px 24px 7px 24px; background: #252528; }
-.chat-user-text { margin: 0; color: #f5f5f7; font-size: 21px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
-.chat-assistant { margin-top: 25px; padding: 0 3px; min-width: 0; }
+.chat-user-text { margin: 0; color: #f5f5f7; font-size: 19px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-assistant { margin-top: 22px; padding: 23px 25px; min-width: 0; border: 1px solid #303033; border-radius: 20px; background: #181819; }
+.chat-assistant-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 19px; margin-bottom: 22px; border-bottom: 1px solid #303033; }
+.chat-assistant-heading .chat-role { color: #f5f5f7; font-size: 16px; margin: 0; }
+.chat-user > .chat-role { display: block; margin-bottom: 7px; }
+.chat-status { font-size: 13px; line-height: 1.4; color: #afafb3; text-align: right; }
+.chat-status.is-active { color: #e8e8eb; }
 .chat-assistant > .chat-role { color: #e5e5e9; margin-bottom: 16px; }
 .chat-assistant .run-panel { margin: 0; padding: 0; background: transparent; border: 0; border-radius: 0; box-shadow: none; }
 .chat-assistant .run-topline { margin-bottom: 14px; }
-.chat-assistant .run-progress { border-top: 0; padding: 0 0 17px; }
-.chat-assistant .answer { font-size: 21px; line-height: 1.85; padding-top: 0; }
+.chat-assistant .run-progress { padding: 17px 18px; margin: 0 0 22px; border: 1px solid #454548; border-radius: 13px; background: #242426; flex-wrap: wrap; align-items: flex-start; }
+.run-progress .progress-description { flex: 1 1 180px; min-width: 0; }
+.run-progress .run-waiting { font-size: 13px; color: #a8a8ad; }
+.run-last-step { flex-basis: 100%; margin: 0; border-top: 1px solid #3b3b3e; padding-top: 12px; color: #bcbcc1; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.run-status-dot.active { animation: activity-pulse 1.8s ease-in-out infinite; }
+@keyframes activity-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .run-status-dot.active { animation: none; } }
+.chat-assistant .answer { font-size: 19px; line-height: 1.8; padding-top: 0; }
 .chat-turn-status { font-size: 16px; color: #a8a8ad; margin: 0 0 12px; }
 .chat-inspect { font-size: 16px; padding: 8px 0; }
 .chat-answer > :first-child { margin-top: 0; }
@@ -219,7 +230,7 @@ svg { width: 22px; height: 22px; flex-shrink: 0; }
 .composer-options .composer-environment { padding: 0 0 8px; }
 .composer-options .effort-description { margin: 8px 0 0; padding: 0; }
 .in-conversation .composer { border-color: #55555b; box-shadow: 0 12px 50px #0008; }
-.in-conversation .composer textarea { font-size: 20px; }
+.in-conversation .composer textarea { font-size: 19px; }
 .in-conversation .composer-footer { padding: 11px 18px; }
 .in-conversation .composer-footer p { font-size: 14px; }
 .in-conversation .composer-hint { background: #111111; padding: 10px 3px 0; font-size: 13px; }
@@ -240,8 +251,9 @@ svg { width: 22px; height: 22px; flex-shrink: 0; }
 @media (max-width: 680px) {
   .conversation-heading { gap: 14px; flex-direction: column; padding-bottom: 18px; }
   .chat-user { max-width: 95%; padding: 17px 18px; }
-  .chat-user-text, .chat-assistant .answer { font-size: 19px; }
-  .in-conversation .composer textarea { font-size: 19px; }
+  .chat-user-text, .chat-assistant .answer { font-size: 18px; }
+  .chat-assistant { padding: 18px 16px; }
+  .in-conversation .composer textarea { font-size: 18px; }
   .in-conversation .composer-footer p { display: none; }
   .in-conversation .composer-footer { justify-content: flex-end; }
   .research-activity { padding: 15px; }
@@ -260,29 +272,63 @@ svg { width: 22px; height: 22px; flex-shrink: 0; }
 .run-status-dot.failed { background: #a8a8a8; }
 .run-coverage { margin: 18px 0 0; color: #c6c6c6; font-size: 16px; line-height: 1.75; }
 .run-feedback { margin-top: 27px; padding-top: 23px; border-top: 1px solid #454545; }
-.run-feedback h3 { margin: 0 0 17px; font-size: 20px; font-weight: 550; }
+.run-feedback h3 { margin: 0; font-size: 15px; font-weight: 550; }
 .run-feedback textarea { min-height: 84px; }
-.run-feedback .resource-actions { margin-top: 15px; }
+.run-feedback .resource-actions { margin: 0; gap: 8px; }
+.feedback-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; justify-content: space-between; }
+.run-feedback .secondary-button { font-size: 14px; padding: 7px 11px; min-height: 36px; background: transparent; border-color: #48484b; }
+.feedback-comment { margin-top: 12px; }
+.feedback-comment > summary { font-size: 14px; color: #a8a8ad; cursor: pointer; }
+.feedback-comment textarea { margin-top: 12px; }
+.run-feedback .settings-field-help { font-size: 13px; margin-bottom: 0; }
 .run-feedback button[aria-pressed="true"] { background: #e8e8ed; border-color: #e8e8ed; color: #111111; }
 .text-button { font-size: 18px; color: #c6c6c6; padding: 10px 0; background: transparent; line-height: 1.5; }
 .text-button:hover { color: #dedede; }
-.run-warnings { padding: 17px 18px; margin-top: 24px; border-radius: 11px; background: #242424; border: 1px solid #454545; color: #c6c6c6; font-size: 16px; line-height: 1.85; overflow-wrap: anywhere; }
+.run-warnings { padding: 14px 16px; margin: 0 0 20px; border-radius: 11px; background: #242424; border: 1px solid #454545; color: #c6c6c6; font-size: 16px; line-height: 1.85; overflow-wrap: anywhere; }
 .run-warnings p { margin: 0; }
 .run-warnings p + p { margin-top: 10px; }
-.answer { padding-top: 8px; font-size: 20px; line-height: 1.95; color: #dedede; overflow-wrap: anywhere; }
-.answer p { margin: 22px 0; }
-.answer h3, .answer h4, .answer h5 { color: #f5f5f7; font-weight: 600; line-height: 1.6; margin: 29px 0 12px; font-size: 24px; }
+.answer { padding-top: 0; font-size: 19px; line-height: 1.8; color: #dedee2; overflow-wrap: anywhere; }
+.answer > :first-child { margin-top: 0; }
+.answer > :last-child { margin-bottom: 0; }
+.answer p { margin: 0 0 18px; }
+.answer h1, .answer h2, .answer h3, .answer h4, .answer h5, .answer h6 { color: #f5f5f7; font-weight: 600; line-height: 1.4; margin: 28px 0 14px; letter-spacing: -.25px; }
+.answer h1 { font-size: 27px; } .answer h2 { font-size: 24px; } .answer h3 { font-size: 21px; } .answer h4, .answer h5, .answer h6 { font-size: 19px; }
 .answer strong { color: #f5f5f7; font-weight: 600; }
-.answer a { color: #dedede; text-underline-offset: 4px; }
-.answer ul, .answer ol { padding-left: 25px; margin: 17px 0; }
-.answer li { padding-left: 4px; margin: 9px 0; }
-.answer pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #111111; border: 1px solid #454545; padding: 18px; border-radius: 11px; font-size: 16px; color: #c6c6c6; line-height: 1.8; }
-.answer code { font-family: ui-monospace,SFMono-Regular,Consolas,monospace; font-size: .9em; }
+.answer a { color: #e3e3e7; text-underline-offset: 4px; text-decoration-color: #77777d; }
+.answer a:hover { text-decoration-color: #f5f5f7; }
+.answer ul, .answer ol { padding-left: 25px; margin: 12px 0 20px; }
+.answer li { padding-left: 4px; margin: 7px 0; }
+.answer li > .markdown-tight { margin: 0; }
+.answer li > ul, .answer li > ol { margin: 7px 0; }
+.answer blockquote { margin: 20px 0; padding: 4px 0 4px 18px; border-left: 3px solid #69696e; color: #bdbdc3; }
+.answer blockquote > :last-child { margin-bottom: 0; }
+.answer hr { border: 0; border-top: 1px solid #3a3a3e; margin: 26px 0; }
+.answer .code-block { margin: 20px 0; border: 1px solid #3b3b3f; border-radius: 12px; overflow: clip; background: #111112; }
+.answer .code-language { padding: 8px 16px; border-bottom: 1px solid #303033; font-family: ui-monospace,SFMono-Regular,Consolas,monospace; font-size: 12px; color: #a8a8ad; }
+.answer pre { margin: 0; white-space: pre; overflow: auto; max-width: 100%; padding: 16px; font-size: 14px; color: #d1d1d7; line-height: 1.65; }
+.answer code { font-family: ui-monospace,SFMono-Regular,Consolas,monospace; font-size: .88em; }
+.answer :not(pre) > code { padding: 2px 5px; background: #2b2b2f; border-radius: 5px; }
 .answer pre code { font-size: 1em; }
+.answer-table { overflow: auto; max-width: 100%; margin: 20px 0; border: 1px solid #3b3b3f; border-radius: 12px; }
+.answer table { border-collapse: collapse; width: 100%; font-size: 15px; line-height: 1.6; }
+.answer th, .answer td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #3a3a3d; vertical-align: top; min-width: 100px; }
+.answer th { background: #252528; font-weight: 600; color: #f0f0f4; }
+.answer tbody tr:last-child td { border-bottom: 0; }
+.answer .align-right { text-align: right; } .answer .align-center { text-align: center; }
+.answer-plain { white-space: pre-wrap; }
+.run-details { margin-top: 22px; border-top: 1px solid #363639; border-bottom: 1px solid #363639; }
+.run-details > summary { cursor: pointer; padding: 16px 0; font-size: 15px; color: #d8d8dd; }
+.run-details-summary { display: block; margin: 5px 0 0 16px; color: #96969c; font-size: 13px; }
+.run-details-body { padding: 2px 0 18px; }
+.run-details-body .eyebrow, .run-details-body .muted { font-size: 13px; }
+.run-details-body .research-activity { margin: 14px 0; }
+.run-details-body .run-coverage { margin-top: 12px; font-size: 14px; }
 .answer-placeholder { display: flex; align-items: flex-start; gap: 16px; padding: 35px 3px; color: #c6c6c6; }
 .answer-placeholder p { font-size: 18px; line-height: 1.85; margin: 0; }
 .answer-placeholder p span { font-size: 16px; color: #a8a8a8; }
-.run-footer { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 27px; padding-top: 22px; border-top: 1px solid #454545; flex-wrap: wrap; }
+.run-footer { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 16px; padding-top: 0; border-top: 0; flex-wrap: wrap; }
+.run-footer .secondary-button, .run-footer .text-button { font-size: 14px; padding: 8px 10px; min-height: 36px; }
+.run-footer .secondary-button { background: #28282b; border-color: #48484c; }
 .secondary-button { display: inline-flex; gap: 13px; align-items: center; color: #dedede; background: #333333; border: 1px solid #636363; border-radius: 11px; font-size: 18px; font-weight: 550; padding: 12px 15px; min-height: 44px; line-height: 1.4; text-align: center; }
 .secondary-button:hover:not(:disabled) { background: #454545; border-color: #898989; }
 .auth-dialog { width: min(510px,calc(100% - 32px)); padding: 31px; border: 1px solid #454545; border-radius: 23px; color: #dedede; background: #242424; box-shadow: 0 30px 110px #00000088; }

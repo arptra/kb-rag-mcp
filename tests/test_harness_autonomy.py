@@ -71,6 +71,10 @@ def request(**changes: Any) -> dict[str, Any]:
 
 
 ANSWER = {"content": "Verified final answer [Explain].", "tool_calls": []}
+PLAN_READY = {"content": "", "tool_calls": [{"name": "update_research_plan", "args": {
+    "goal": "Explain", "completed": ["Verified source [Explain]"], "gaps": [],
+    "ready_to_answer": True,
+}}]}
 
 
 def build(tmp_path: Path, model: Model, **overrides: Any) -> HarnessRuntime:
@@ -230,7 +234,7 @@ async def test_repeated_extension_without_new_evidence_is_denied(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_time_grant_extends_outer_clock_not_just_displayed_budget(tmp_path: Path) -> None:
-    model = Model([request(timeout_seconds=2.0), ANSWER])
+    model = Model([request(timeout_seconds=2.0, model_calls=6), PLAN_READY, ANSWER])
     model.delay_second = 0.6
     runtime = build(tmp_path, model, timeout_seconds=0.4)
     await runtime.start()
@@ -384,7 +388,7 @@ async def test_provider_invocations_obey_separate_summary_and_decision_caps(tmp_
 async def test_low_initial_budget_triggers_model_review_before_investigation(
     tmp_path: Path,
 ) -> None:
-    model = Model([request(model_calls=6), ANSWER])
+    model = Model([request(model_calls=6), PLAN_READY, ANSWER])
     runtime = build(tmp_path, model, model_calls=2)
     await runtime.start()
     try:

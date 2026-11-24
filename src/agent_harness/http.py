@@ -386,6 +386,9 @@ def create_app(
     async def stylesheet(_: Request) -> Response:
         return _static("styles.css", "text/css")
 
+    async def markdown_library(_: Request) -> Response:
+        return _static("vendor/markdown-it.min.js", "text/javascript")
+
     async def error(_: Request, exc: Exception) -> Response:
         if isinstance(exc, HTTPException):
             return _json({"error": str(exc.detail)}, status=exc.status_code)
@@ -416,6 +419,7 @@ def create_app(
             Route("/", index),
             Route("/assets/app.js", javascript),
             Route("/assets/styles.css", stylesheet),
+            Route("/assets/vendor/markdown-it.min.js", markdown_library),
             Route("/api/status", status),
             Route("/api/sandbox/profiles", sandbox_profiles),
             Route("/api/model", model_status),

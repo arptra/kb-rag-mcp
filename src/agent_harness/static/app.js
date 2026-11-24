@@ -198,7 +198,7 @@
     const controller = new AbortController(), abort = () => controller.abort();
     let timedOut = false, mutationStarted = false;
     if (signal?.aborted) abort(); else signal?.addEventListener("abort", abort, { once: true });
-    const wait = timeoutMs || (path === "model/connection/probe" ? Math.min(300, Number(body?.timeout_seconds || modelConnectionState.settings?.timeout_seconds) || 60) * 1000 + 5000 : method === "GET" ? 20000 : 45000);
+    const wait = timeoutMs || (path === "model/connection/probe" ? Math.min(3600, Number(body?.timeout_seconds || modelConnectionState.settings?.timeout_seconds) || 60) * 1000 + 5000 : method === "GET" ? 20000 : 45000);
     const timer = window.setTimeout(() => { timedOut = true; abort(); }, wait);
     try {
       if (method !== "GET" && /^(settings|model|credentials)(\/|$)/.test(path)) {
@@ -297,7 +297,7 @@
     Object.assign(modelConnectionState, { settings: null, saved: "", controller: null, busy: false, dirty: false });
     Object.assign(tlsState, { credentials: [], controller: null, busy: false });
     for (const id of ["direct-model-url", "direct-model-name", "direct-model-token"]) $(id).value = "";
-    $("model-provider").value = "gigacode"; $("direct-model-timeout").value = "60"; $("model-output-tokens").value = "4096"; fillTlsSelect("");
+    $("model-provider").value = "gigacode"; $("model-profile").value = "auto"; modelConnectionState.metadata = null; modelConnectionState.profileDefaults = null; $("direct-model-timeout").value = "60"; $("model-output-tokens").value = "4096"; fillTlsSelect("");
     for (const id of ["ssh-feedback", "tls-feedback", "model-connection-feedback"]) $(id).textContent = "";
     updateModelConnection();
     if (sshState.controller) sshState.controller.abort();
@@ -697,13 +697,42 @@
       Date.now().toString(36) + Math.random().toString(36).slice(2, 7));
   }
   function modelConnectionValue() {
-    return { provider: $("model-provider").value, base_url: $("direct-model-url").value.trim(), model: $("direct-model-name").value.trim(),
+    return { provider: $("model-provider").value, profile: $("model-profile").value || "auto", base_url: $("direct-model-url").value.trim(), model: $("direct-model-name").value.trim(),
       api_key_env: $("direct-model-token").value.trim(), tls_bundle_id: $("direct-model-tls").value, timeout_seconds: Number($("direct-model-timeout").value) || 60,
       output_tokens: Number($("model-output-tokens").value) || 4096 };
+  }
+  function selectedProfileDefaults() {
+    const selected = $("model-profile").value || "auto", metadata = modelConnectionState.metadata || {};
+    if (selected === "auto") return $("direct-model-name").value.trim() === (modelConnectionState.settings?.model || "") ? metadata.profile_defaults || null : null;
+    return metadata.profiles?.find((profile) => profile.id === selected)?.defaults ||
+      (selected === "deepseek_v4_flash" ? { timeout_seconds: 1800, output_tokens: 32768, model_window_tokens: 256000 } : { timeout_seconds: 60, output_tokens: 4096, model_window_tokens: 65536 });
+  }
+  function changeModelProfile() {
+    const previous = modelConnectionState.profileDefaults, next = selectedProfileDefaults();
+    if (previous && next) {
+      // Carry untouched defaults to the new profile; retain each custom override independently.
+      for (const [field, input] of [["timeout_seconds", "direct-model-timeout"], ["output_tokens", "model-output-tokens"]]) {
+        if (Number($(input).value) === previous[field]) $(input).value = next[field];
+      }
+    }
+    modelConnectionState.profileDefaults = next;
+    updateModelConnection();
+  }
+  function applyProfileDefaults() {
+    const defaults = selectedProfileDefaults();
+    if (!defaults || modelConnectionState.busy) return;
+    $("direct-model-timeout").value = defaults.timeout_seconds;
+    $("model-output-tokens").value = defaults.output_tokens;
+    modelConnectionState.profileDefaults = defaults;
+    updateModelConnection();
+    $("model-connection-feedback").textContent = "Рекомендуемые значения применены. Сохраните подключение, чтобы использовать их в новых запросах.";
   }
   function updateModelConnection() {
     const direct = $("model-provider").value === "openai";
     $("direct-model-fields").hidden = !direct;
+    const defaults = selectedProfileDefaults();
+    $("model-profile-apply").disabled = modelConnectionState.busy || !defaults;
+    $("model-profile-description").textContent = defaults ? "Рекомендация: контекст " + Number(defaults.model_window_tokens).toLocaleString("ru-RU") + " токенов · ожидание " + Math.round(defaults.timeout_seconds / 60) + " мин · ответ до " + Number(defaults.output_tokens).toLocaleString("ru-RU") + " токенов." : "Сохраните подключение, чтобы определить профиль, или выберите его вручную.";
     modelConnectionState.dirty = Boolean(modelConnectionState.saved) && JSON.stringify(modelConnectionValue()) !== modelConnectionState.saved;
     $("model-connection-save").disabled = modelConnectionState.busy || !modelConnectionState.settings || !modelConnectionState.dirty;
     $("model-connection-probe").disabled = modelConnectionState.busy || !modelConnectionState.settings;
@@ -717,13 +746,17 @@
     if (value && !tlsState.credentials.some((item) => item.id === value)) { const item = element("option", "", "Недоступный набор · " + value); item.value = value; select.append(item); }
     select.value = value || "";
   }
-  function applyModelConnection(settings) {
+  function applyModelConnection(settings, metadata = {}) {
     modelConnectionState.settings = settings;
+    modelConnectionState.metadata = metadata;
+    $("model-profile").value = settings.profile || "auto";
     $("model-provider").value = settings.provider === "openai" ? "openai" : "gigacode";
     $("direct-model-url").value = settings.base_url || ""; $("direct-model-name").value = settings.model || "";
     $("direct-model-token").value = settings.api_key_env || ""; $("direct-model-timeout").value = settings.timeout_seconds || 60;
     $("model-output-tokens").value = settings.output_tokens || 4096;
     fillTlsSelect(settings.tls_bundle_id);
+    modelConnectionState.profileDefaults = selectedProfileDefaults() ||
+      (!(settings.profile && settings.profile !== "auto") && !metadata.resolved_profile ? { timeout_seconds: 60, output_tokens: 4096, model_window_tokens: 65536 } : null);
     modelConnectionState.saved = JSON.stringify(modelConnectionValue()); modelConnectionState.dirty = false;
     updateModelConnection();
   }
@@ -736,7 +769,7 @@
       const response = await api("model/connection", { signal: controller.signal });
       if (controller.signal.aborted || epoch !== state.identityEpoch || !settingsState.canManage) return;
       tlsState.credentials = Array.isArray(response.tls_bundles) ? response.tls_bundles : [];
-      applyModelConnection(response.settings || {}); renderTlsBundles();
+      applyModelConnection(response.settings || {}, response); renderTlsBundles();
     } catch (error) { if (error.name !== "AbortError" && error.status !== 401 && epoch === state.identityEpoch) $("model-connection-feedback").textContent = errorMessage(error); }
     finally { if (modelConnectionState.controller === controller) { modelConnectionState.controller = null; modelConnectionState.busy = false; updateModelConnection(); } }
   }
@@ -757,7 +790,7 @@
         (modelConnectionState.dirty ? " Настройки ещё не сохранены." : "");
       else {
         if (Array.isArray(response.tls_bundles)) tlsState.credentials = response.tls_bundles;
-        applyModelConnection(response.settings || config);
+        applyModelConnection(response.settings || config, response);
         $("model-connection-feedback").textContent = "Подключение сохранено. Новые запросы будут использовать выбранную модель.";
       }
       if (!probe) {
@@ -1662,7 +1695,7 @@
     $("refresh-conversation").disabled = conversationState.loading;
     $("composer-section").classList.toggle("in-conversation", hasConversation);
     $("question").placeholder = hasConversation ? "Уточните вопрос или продолжите исследование…" : "Что хотите узнать о системе?";
-    const signature = JSON.stringify([idOf(state.current), conversationState.runs.map((run) => [idOf(run), run.question, run.answer, run.phase, run.status, run.evidence?.length, run.research_plan, run.memory_used])]);
+    const signature = JSON.stringify([idOf(state.current), conversationState.runs.map((run) => [idOf(run), run.question, run.answer, run.phase, run.status, run.evidence?.length, run.research_plan, run.memory_used, run.current_action, run.research_trace?.at(-1)])]);
     if (signature === conversationState.signature) return;
     conversationState.signature = signature;
     const fragment = document.createDocumentFragment();
@@ -1671,13 +1704,14 @@
       const user = element("div", "chat-user");
       user.append(element("span", "chat-role", "Вы"), element("p", "chat-user-text", run.question || "Сообщение"));
       const assistant = element("div", "chat-assistant");
-      assistant.append(element("div", "chat-role", "Harness"));
+      const heading = element("div", "chat-assistant-heading");
+      heading.append(element("span", "chat-role", "Ответ Harness"), element("span", "chat-status" + (ACTIVE.has(run.status) ? " is-active" : ""), STATUS_LABELS[run.status] || "Ответ"));
+      assistant.append(heading);
       if (idOf(run) === idOf(state.current)) assistant.append(panel);
       else {
-        const status = element("p", "chat-turn-status", ACTIVE.has(run.status) ? (PHASE_LABELS[run.phase] || STATUS_LABELS[run.status]) : STATUS_LABELS[run.status] || "Ответ");
-        assistant.append(status);
+        if (ACTIVE.has(run.status)) assistant.append(element("p", "chat-turn-status", actionLabel(run.current_action?.name) || PHASE_LABELS[run.phase] || STATUS_LABELS[run.status]));
         const answer = element("div", "answer chat-answer"); renderAnswer(typeof run.answer === "string" ? run.answer : "", answer); assistant.append(answer);
-        const inspect = element("button", "text-button chat-inspect", "Материалы, ход работы и оценка"); inspect.type = "button";
+        const inspect = element("button", "text-button chat-inspect", "Показать ход работы и материалы"); inspect.type = "button";
         inspect.addEventListener("click", () => selectRun(run)); assistant.append(inspect);
       }
       turn.append(user, assistant); fragment.append(turn);
@@ -1720,66 +1754,56 @@
     $("evidence-empty").textContent = state.current && !ACTIVE.has(state.current.status) ?
       "В этом запросе подтверждения не найдены." : "Здесь появятся материалы, найденные для вашего запроса.";
   }
-  function inlineText(target, text) {
-    const pattern = /(\*\*([^*\n]+)\*\*|`([^`\n]+)`|\[([^\]\n]+)\]\(([^)\s]+)\))/g;
-    let start = 0;
-    for (const match of text.matchAll(pattern)) {
-      target.append(document.createTextNode(text.slice(start, match.index)));
-      if (match[2]) target.append(element("strong", "", match[2]));
-      else if (match[3]) target.append(element("code", "", match[3]));
-      else if (safeUrl(match[5])) {
-        const anchor = element("a", "", match[4]);
-        link(anchor, match[5]);
-        target.append(anchor);
-      } else target.append(document.createTextNode(match[0]));
-      start = match.index + match[0].length;
+  // markdown-it owns parsing; construct DOM from its tokens, never model-supplied HTML.
+  const markdown = typeof window.markdownit === "function" ? window.markdownit({ html: false, linkify: true, breaks: false }) : null;
+  const markdownTags = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "ul", "ol", "li", "em", "strong", "s", "table", "thead", "tbody", "tr", "th", "td"]);
+  function appendMarkdown(target, tokens) {
+    const stack = [target];
+    for (const token of tokens) {
+      const parent = stack[stack.length - 1];
+      if (token.type === "inline") { appendMarkdown(parent, token.children || []); continue; }
+      if (token.type === "text" || token.type === "html_inline" || token.type === "html_block") { parent.append(document.createTextNode(token.content)); continue; }
+      if (token.type === "softbreak" || token.type === "hardbreak") { parent.append(token.type === "hardbreak" ? element("br") : document.createTextNode("\n")); continue; }
+      if (token.type === "code_inline") { parent.append(element("code", "", token.content)); continue; }
+      if (token.type === "fence" || token.type === "code_block") {
+        const block = element("div", "code-block"), language = String(token.info || "").trim().split(/\s/)[0];
+        if (language) block.append(element("div", "code-language", language.slice(0, 48)));
+        const pre = element("pre"); pre.append(element("code", "", token.content.replace(/\n$/, ""))); block.append(pre); parent.append(block); continue;
+      }
+      if (token.type === "image") {
+        // Remote images are links, so generated answers cannot silently load tracking resources.
+        const url = token.attrGet("src"), label = token.content || "Изображение";
+        if (safeUrl(url)) { const anchor = element("a", "answer-image-link", label); link(anchor, url); parent.append(anchor); }
+        else parent.append(document.createTextNode(label));
+        continue;
+      }
+      if (token.type === "hr") { parent.append(element("hr")); continue; }
+      if (token.nesting === -1) { if (stack.length > 1) stack.pop(); continue; }
+      if (token.nesting === 1) {
+        let node;
+        if (token.type === "link_open") {
+          const url = token.attrGet("href"); node = element(safeUrl(url) ? "a" : "span");
+          if (safeUrl(url)) link(node, url);
+        } else node = element(markdownTags.has(token.tag) ? token.tag : "span");
+        if (token.tag === "ol" && /^\d+$/.test(token.attrGet("start") || "")) node.setAttribute("start", token.attrGet("start"));
+        if (["th", "td"].includes(token.tag)) {
+          const alignment = /^text-align:(left|right|center)$/.exec(token.attrGet("style") || "");
+          if (alignment) node.className = "align-" + alignment[1];
+        }
+        if (token.hidden) node.className = "markdown-tight";
+        if (token.tag === "table") { const scroll = element("div", "answer-table"); scroll.tabIndex = 0; scroll.setAttribute("role", "region"); scroll.setAttribute("aria-label", "Таблица в ответе"); scroll.append(node); parent.append(scroll); }
+        else parent.append(node);
+        stack.push(node);
+      }
     }
-    target.append(document.createTextNode(text.slice(start)));
   }
   function renderAnswer(text, target = $("answer")) {
     const selected = target === $("answer");
     if (selected && text === state.answerSignature) return;
     if (selected) state.answerSignature = text;
     const fragment = document.createDocumentFragment();
-    let paragraph = [], list = null, code = null;
-    const flush = () => {
-      if (paragraph.length) {
-        const node = element("p");
-        inlineText(node, paragraph.join("\n"));
-        fragment.append(node);
-        paragraph = [];
-      }
-      list = null;
-    };
-    for (const line of text.split("\n")) {
-      if (/^\s*```/.test(line)) {
-        flush();
-        if (code !== null) {
-          const pre = element("pre");
-          pre.append(element("code", "", code.join("\n")));
-          fragment.append(pre);
-          code = null;
-        } else code = [];
-        continue;
-      }
-      if (code !== null) { code.push(line); continue; }
-      const heading = line.match(/^#{1,6}\s+(.+)/);
-      const bullet = line.match(/^\s*(?:[-*+]\s+|\d+[.)]\s+)(.+)/);
-      if (heading) {
-        flush();
-        const node = element("h3");
-        inlineText(node, heading[1]);
-        fragment.append(node);
-      } else if (bullet) {
-        if (paragraph.length) flush();
-        const type = /^\s*\d/.test(line) ? "ol" : "ul";
-        if (!list || list.tagName.toLowerCase() !== type) { list = element(type); fragment.append(list); }
-        const item = element("li"); inlineText(item, bullet[1]); list.append(item);
-      } else if (!line.trim()) flush();
-      else { if (list) list = null; paragraph.push(line); }
-    }
-    flush();
-    if (code !== null) { const pre = element("pre"); pre.append(element("code", "", code.join("\n"))); fragment.append(pre); }
+    if (markdown) appendMarkdown(fragment, markdown.parse(text, {}));
+    else fragment.append(element("p", "answer-plain", text));
     target.replaceChildren(fragment);
     if (selected && text) appear(target);
   }
@@ -1798,6 +1822,7 @@
       feedbackState.runId = idOf(run);
       feedbackState.message = "";
       $("run-feedback-comment").value = run.feedback?.comment || "";
+      $("feedback-comment-details").open = Boolean(run.feedback?.comment);
     }
     for (const rating of ["helpful", "unhelpful"]) {
       const button = $("feedback-" + rating);
@@ -1806,8 +1831,8 @@
     }
     $("run-feedback-comment").disabled = feedbackState.busy;
     $("run-feedback-status").textContent = feedbackState.busy ? "Сохраняем оценку…" : feedbackState.message ||
-      (run.feedback?.rating ? "Ваша оценка: «" + (run.feedback.rating === "helpful" ? "Помогло" : "Не помогло") + "». Можно изменить оценку или добавить комментарий." :
-        memoryState.enabled ? "Оценка уточнит общий опыт АС для похожих запросов пользователей с доступом к источникам." : "Оценка сохранится в вашем чате. Если опыт уже есть в общей памяти, он тоже обновится.");
+      (run.feedback?.rating ? "Оценка сохранена. Её можно изменить." :
+        memoryState.enabled ? "Оценка поможет уточнить общий опыт АС." : "Оценка сохранится в вашем чате.");
   }
   async function saveRunFeedback(rating) {
     const run = state.current;
@@ -1835,6 +1860,19 @@
       }
     }
   }
+  function actionLabel(name) {
+      if (!name) return "";
+      const steps = { update_research_plan: "Обновление плана", request_budget: "Запрос дополнительных ресурсов", budget_review: "Проверка необходимого бюджета", research_round: "Проверка результатов поиска", goal_check: "Проверка оставшихся вопросов", answer_recovery: "Повторная подготовка ответа", model_response: "Модель анализирует материалы и готовит ответ", model_received: "Получен ответ модели", model_call: "Ожидаем ответ модели", context_compaction: "Обновляем сводку беседы", mcp_list_tools: "Изучаем доступные инструменты", mcp_tool_schema: "Проверяем параметры инструмента", compact_conversation: "Сохранение сводки беседы", conversation_compaction: "Сохранение сводки беседы" };
+      if (steps[name]) return steps[name];
+      if (/search.*(knowledge|index|document)|^search$/.test(name)) return "Поиск в базе знаний";
+      if (/read.*document/.test(name)) return "Чтение документа";
+      if (/clone|prepare.*repository/.test(name)) return "Подготовка репозитория";
+      if (/search.*(code|repository|repo)|read.*(code|file)|repository/.test(name)) return "Изучение кода сервиса";
+      if (/execute|sandbox|run_code|run_command/.test(name)) return "Проверка в песочнице";
+      if (/a2a|agent/.test(name)) return "Запрос подключённому агенту";
+      if (/mcp/.test(name)) return "Запрос подключённому инструменту";
+      return "Проверка источника";
+  }
   function renderResearchActivity(run) {
     const plan = run.research_plan && typeof run.research_plan === "object" ? run.research_plan : {};
     const trace = Array.isArray(run.research_trace) ? run.research_trace.filter((item) => item && typeof item.name === "string") : [];
@@ -1858,23 +1896,11 @@
       block.append(list); blocks.push(block);
     }
     $("research-plan").replaceChildren(...blocks);
-    const toolLabel = (name) => {
-      const steps = { update_research_plan: "Обновление плана", request_budget: "Запрос дополнительных ресурсов", budget_review: "Проверка необходимого бюджета", research_round: "Проверка результатов поиска", goal_check: "Проверка оставшихся вопросов", answer_recovery: "Повторная подготовка ответа", model_response: "Проверка ответа модели", compact_conversation: "Сохранение сводки беседы", conversation_compaction: "Сохранение сводки беседы" };
-      if (steps[name]) return steps[name];
-      if (/search.*(knowledge|index|document)|^search$/.test(name)) return "Поиск в базе знаний";
-      if (/read.*document/.test(name)) return "Чтение документа";
-      if (/clone|prepare.*repository/.test(name)) return "Подготовка репозитория";
-      if (/search.*(code|repository|repo)|read.*(code|file)|repository/.test(name)) return "Изучение кода сервиса";
-      if (/execute|sandbox|run_code|run_command/.test(name)) return "Проверка в песочнице";
-      if (/a2a|agent/.test(name)) return "Запрос подключённому агенту";
-      if (/mcp/.test(name)) return "Запрос подключённому инструменту";
-      return "Проверка источника";
-    };
-    $("research-current").textContent = currentAction ? "Сейчас: " + toolLabel(currentAction) : "";
+    $("research-current").textContent = currentAction ? "Сейчас: " + actionLabel(currentAction) : "";
     $("research-current").hidden = !currentAction;
     $("research-timeline").replaceChildren(...trace.slice(-18).map((item) => {
       const row = element("li", "research-event"), identifiers = item.args && typeof item.args === "object" ? item.args : {};
-      const label = toolLabel(item.name), scope = identifiers.index_id ? sourceName(identifiers.index_id) : identifiers.repository_id || identifiers.connection_id || "";
+      const label = actionLabel(item.name), scope = identifiers.index_id ? sourceName(identifiers.index_id) : identifiers.repository_id || identifiers.connection_id || "";
       row.append(element("strong", "", label + (scope ? " · " + scope : "")));
       if (typeof item.result === "string" && item.result) row.append(element("p", "", item.result.slice(0, 400)));
       if (item.timestamp) row.append(element("time", "", dateLabel(item.timestamp, true)));
@@ -1921,7 +1947,20 @@
     const evidenceCount = Array.isArray(run.evidence) ? run.evidence.length : 0;
     const status = run.status === "partial" && !evidenceCount ? "Недостаточно данных" :
       STATUS_LABELS[run.status] || "Состояние запроса обновляется";
-    $("run-status").textContent = status;
+    $("run-status").textContent = active ? actionLabel(run.current_action?.name) || status : status;
+    $("run-progress").hidden = !active && run.status === "completed";
+    const actionStart = Date.parse(run.current_action?.started_at || "");
+    const elapsed = Number.isFinite(actionStart) ? Math.max(0, Math.floor((Date.now() - actionStart) / 1000)) : 0;
+    $("run-waiting").hidden = !active || !Number.isFinite(actionStart);
+    $("run-waiting").textContent = "Текущее действие: " + (elapsed >= 60 ? Math.floor(elapsed / 60) + " мин " + elapsed % 60 + " сек" : elapsed + " сек") +
+      (/model_response|model_call/.test(run.current_action?.name || "") ? " · Ожидаем модель; медленный ответ не прерывает исследование." : " · Статус обновляется автоматически.");
+    const lastStep = (run.research_trace || []).filter((item) => item?.name).at(-1);
+    $("run-last-step").hidden = !active || !lastStep;
+    $("run-last-step").textContent = lastStep ? "Последнее действие: " + actionLabel(lastStep.name) + (lastStep.result ? " · " + String(lastStep.result).slice(0, 180) : "") : "";
+    if (newPresentation || $("run-details").dataset.active !== String(active)) $("run-details").open = false;
+    $("run-details").dataset.active = String(active);
+    $("run-details-label").textContent = active ? "План и ход исследования" : "Как получен ответ";
+    $("run-details-summary").textContent = "Подтверждений: " + evidenceCount + (run.metrics?.tool_calls ? " · Действий: " + run.metrics.tool_calls : "");
     const phase = run.status === "cancelling" ? "Ожидаем завершения текущего действия." :
       active ? (PHASE_LABELS[run.phase] || "Ожидаем обновления от сервера.") :
       run.status === "partial" ? "Ответ может быть неполным. Проверьте найденные материалы и замечания." :
@@ -1938,7 +1977,7 @@
       (failed ? " · Недоступно: " + failed : "") + (pending ? " · Ещё не проверено: " + pending : "");
     renderResearchActivity(run);
     renderBudget(run);
-    const announcement = [status, phase, "Найдено подтверждений: " + evidenceCount].filter(Boolean).join(". ");
+    const announcement = [active ? actionLabel(run.current_action?.name) : status, phase, "Найдено подтверждений: " + evidenceCount].filter(Boolean).join(". ");
     if ($("progress-live").textContent !== announcement) $("progress-live").textContent = announcement;
     $("cancel-run").hidden = !active;
     $("deepen-run").hidden = active || ["failed", "interrupted"].includes(run.status);
@@ -2243,6 +2282,8 @@
     if (generation === sshState.generation) $("ssh-file").value = "";
   });
   $("model-provider").addEventListener("change", updateModelConnection);
+  $("model-profile-apply").addEventListener("click", applyProfileDefaults);
+  $("model-profile").addEventListener("change", changeModelProfile);
   for (const id of ["direct-model-url", "direct-model-name", "direct-model-token", "direct-model-tls", "direct-model-timeout", "model-output-tokens"]) $(id).addEventListener("input", updateModelConnection);
   $("model-connection-save").addEventListener("click", () => changeModelConnection());
   $("model-connection-probe").addEventListener("click", () => changeModelConnection(true));

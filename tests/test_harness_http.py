@@ -450,13 +450,15 @@ async def test_static_files_are_public_and_allowlisted(
     (tmp_path / "index.html").write_text("<!doctype html><title>Harness</title>")
     (tmp_path / "app.js").write_text("'use strict';")
     (tmp_path / "styles.css").write_text("body { color: black; }")
+    (tmp_path / "vendor").mkdir()
+    (tmp_path / "vendor" / "markdown-it.min.js").write_text("'use strict';")
     (tmp_path / "secret.txt").write_text("not served")
-    for path in ("/", "/assets/app.js", "/assets/styles.css"):
+    for path in ("/", "/assets/app.js", "/assets/styles.css", "/assets/vendor/markdown-it.min.js"):
         response = await client.get(path)
         assert response.status_code == 200
         assert response.headers["cache-control"] == "no-store"
         assert "script-src 'self'" in response.headers["content-security-policy"]
-    for path in ("/assets/secret.txt", "/assets/../secret.txt"):
+    for path in ("/assets/secret.txt", "/assets/../secret.txt", "/assets/vendor/secret.txt"):
         response = await client.get(path)
         assert response.status_code == 404
         assert "not served" not in response.text

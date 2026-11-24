@@ -17,8 +17,10 @@ from langgraph.runtime import Runtime
 
 from agent_harness.budgets import BUDGET_TOOL
 from agent_harness.contracts import ConversationUnavailable, ModelDecisionError, Principal
+from agent_harness.model_connection import INCOMPLETE_FINISH_REASONS, ModelTransientError
 from agent_harness.policy import TOOLS, validate_call
 from agent_harness.research import PLAN_TOOL, evidence_signature, initialize_plan, update_plan
+from agent_harness.store import timestamp
 
 if TYPE_CHECKING:
     from agent_harness.runtime import HarnessRuntime
@@ -161,6 +163,10 @@ class HarnessGraph:
 
     def _reserve_deadline(self, context: ExecutionContext) -> float:
         settings = self.engine._runtime_limits(context.run)
+        if context.run.get("_control", {}).get("model_profile") == "deepseek_v4_flash":
+            return self._deadline(context) - min(
+                settings.final_reserve_seconds, self.engine._run_timeout(context.run) / 2,
+            )
         return self._deadline(context) - min(
             settings.final_reserve_seconds, self.engine._run_timeout(context.run) / 4
         )
@@ -201,6 +207,7 @@ class HarnessGraph:
         run, principal, event = context.run, context.principal, context.cancel
         engine = self.engine
         run["phase"] = "searching"
+        run["current_action"] = {"name": "search_knowledge", "started_at": timestamp()}
         engine._checkpoint(principal, run, event)
         budget = engine._budget(run)
         engine._semaphores[run["id"]] = asyncio.Semaphore(budget.parallelism)
@@ -247,6 +254,10 @@ class HarnessGraph:
                 for index in bootstrap
             )
         )
+        run["current_action"] = None
+        engine._trace(run, "search_knowledge", {},
+                      f"Начальный поиск завершён: источников {len(bootstrap)}.")
+        engine._checkpoint(principal, run, event)
         if event.is_set():
             return self._result(context, "done")
         model = await engine._model_status()
@@ -322,7 +333,10 @@ class HarnessGraph:
             previous_timeout = budget.timeout_seconds
             if await engine._review_budget(
                 context.principal, run, event, started=context.started,
-                deadline=self._deadline(context), reason="Достигнут рабочий бюджет исследования.",
+                deadline=(self._reserve_deadline(context)
+                          if run.get("_control", {}).get("model_profile") == "deepseek_v4_flash"
+                          else self._deadline(context)),
+                reason="Достигнут рабочий бюджет исследования.",
             ):
                 if (engine._budget(run).timeout_seconds > previous_timeout
                         and any(item["status"] == "pending"
@@ -356,6 +370,10 @@ class HarnessGraph:
         except ConversationUnavailable:
             run["status"] = "partial"
             return self._result(context, "done")
+        except ModelTransientError as exc:
+            engine._trace(run, "model_retry", {},
+                          f"{exc} Готовим итог повторным запросом без повторения действий.")
+            return self._result(context, "synthesize")
         except ModelDecisionError:
             run["metrics"]["decision_errors"] = run["metrics"].get("decision_errors", 0) + 1
             engine._trace(run, "model_response", {},
@@ -367,19 +385,37 @@ class HarnessGraph:
             return self._result(context, "synthesize")
         calls = decision.get("tool_calls", [])
         if not calls:
-            if decision.get("finish_reason") in {"length", "max_tokens"}:
+            if decision.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
                 engine._trace(run, "answer_recovery", {},
                               "Предыдущий ответ был обрезан. Подготовьте краткий законченный итог.")
                 return self._result(context, "synthesize")
             plan = run.get("research_plan", {})
-            if (plan.get("model_updated") and plan.get("gaps")
-                    and not plan.get("ready_to_answer")
-                    and not run.get("_gap_review_requested")):
-                run["_gap_review_requested"] = True
+            if (not plan.get("model_updated") and not run["metrics"]["tool_calls"]
+                    and not run.get("_goal_review_requested")):
+                run["_goal_review_requested"] = True
                 engine._trace(run, "goal_check", {},
-                              "Остались проверки. Уточните поиск или явно укажите "
-                              "недоступные проверки перед итоговым ответом.")
+                              "Ответ без действий ещё не подтверждает завершение исследования. "
+                              "Выполните конкретную проверку инструментом и обновите план. "
+                              "Если данных достаточно, подтвердите ready_to_answer в плане; "
+                              "не ограничивайтесь обещанием провести исследование.")
                 return self._result(context, "decide")
+            if (run["mode"] == "autonomous" and run.get("_goal_review_requested")
+                    and not plan.get("model_updated") and not run["metrics"]["tool_calls"]):
+                run["_unconfirmed_research"] = True
+                return self._result(context, "synthesize")
+            if plan.get("model_updated") and not plan.get("ready_to_answer"):
+                if not run.get("_gap_review_requested"):
+                    run["_gap_review_requested"] = True
+                    engine._trace(run, "goal_check", {},
+                                  "План ещё не завершён. Выполните проверки инструментами "
+                                  "или укажите конкретную причину недоступности проверки.")
+                    return self._result(context, "decide")
+                # A planning-only response is never the final answer. A separate
+                # synthesis call must report actual findings and remaining gaps.
+                engine._trace(run, "goal_check", {},
+                              "План не подтверждён как завершённый. Нужен итог по фактам; "
+                              "перечислите непроверенные вопросы.")
+                return self._result(context, "synthesize")
             return self._result(context, "done" if engine._answer(run, decision) else "synthesize")
         run["_round_evidence"] = evidence_signature(run)
         return self._result(
@@ -414,7 +450,7 @@ class HarnessGraph:
                   "clone_repository": "reading_code", "run_in_sandbox": "running_code",
                   "update_research_plan": "planning", "request_budget": "budget_review"}
         run["phase"] = phases.get(name, "checking")
-        run["current_action"] = {"name": name}
+        run["current_action"] = {"name": name, "started_at": timestamp()}
         engine._checkpoint(principal, run, event)
         try:
             signature = hashlib.sha256(json.dumps(

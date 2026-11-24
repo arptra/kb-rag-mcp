@@ -17,7 +17,18 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from agent_harness.contracts import ModelPort
+from agent_harness.contracts import ModelDecisionError, ModelPort
+from agent_harness.model_profiles import (
+    ModelProfile,
+    ResolvedModelProfile,
+    model_profile_defaults,
+    resolve_model_profile,
+)
+
+RETRYABLE_FINISH_REASONS = frozenset({
+    "length", "max_tokens", "insufficient_system_resource", "aborted",
+})
+INCOMPLETE_FINISH_REASONS = RETRYABLE_FINISH_REASONS | {"content_filter"}
 
 
 class ModelConnection(BaseModel):
@@ -25,10 +36,31 @@ class ModelConnection(BaseModel):
     provider: Literal["gigacode", "openai"] = "gigacode"
     base_url: str = Field(default="", max_length=2000)
     model: str = Field(default="", max_length=200)
+    profile: ModelProfile = "auto"
     api_key_env: str = Field(default="", pattern=r"^([A-Z][A-Z0-9_]{0,127})?$")
     tls_bundle_id: str = Field(default="", pattern=r"^([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})?$")
-    timeout_seconds: int = Field(default=60, ge=5, le=300)
-    output_tokens: int = Field(default=4096, ge=128, le=32768)
+    timeout_seconds: int = Field(default=60, ge=5, le=3600)
+    output_tokens: int = Field(default=4096, ge=128, le=131072)
+
+    @model_validator(mode="before")
+    @classmethod
+    def profile_defaults(cls, value: Any) -> Any:
+        if isinstance(value, dict) and value.get("provider") == "openai":
+            value = dict(value)
+            profile = resolve_model_profile(
+                str(value.get("profile", "auto")), str(value.get("model", "")),
+            )
+            defaults = model_profile_defaults(profile)
+            for key in ("timeout_seconds", "output_tokens"):
+                value.setdefault(key, defaults[key])
+        return value
+
+    @property
+    def resolved_profile(self) -> ResolvedModelProfile:
+        return (
+            resolve_model_profile(self.profile, self.model)
+            if self.provider == "openai" else "generic"
+        )
 
     @field_validator("base_url", "model", "api_key_env", "tls_bundle_id", mode="before")
     @classmethod
@@ -90,7 +122,22 @@ class ModelConnectionStore:
     def load(self) -> ModelConnection:
         with self._connect() as db:
             row = db.execute("SELECT data FROM model_connection WHERE id=1").fetchone()
-        return ModelConnection.model_validate_json(row[0]) if row else ModelConnection()
+        if not row:
+            return ModelConnection()
+        data = json.loads(row[0])
+        # Older releases saved their small generic defaults even for DeepSeek.
+        # Upgrade those defaults once; retain every non-default operator value.
+        # Explicit profiles mark new configurations, including deliberate small
+        # limits, so subsequent reads never silently retune them.
+        if (
+            isinstance(data, dict) and "profile" not in data
+            and data.get("provider") == "openai"
+            and resolve_model_profile("auto", str(data.get("model", ""))) == "deepseek_v4_flash"
+        ):
+            for key, old in (("timeout_seconds", 60), ("output_tokens", 4096)):
+                if data.get(key) == old:
+                    data.pop(key)
+        return ModelConnection.model_validate(data)
 
     def save(self, settings: ModelConnection) -> None:
         with self._connect() as db:
@@ -103,6 +150,10 @@ class ModelConnectionStore:
 
 class ModelConnectionError(RuntimeError):
     """Safe operator-facing error; never includes a raw upstream body or request headers."""
+
+
+class ModelTransientError(ModelConnectionError):
+    """A temporary upstream failure; the run may retry within its reserved budget."""
 
 
 class ModelRouter:
@@ -145,6 +196,7 @@ class ModelRouter:
         return {
             "name": settings.model or "API модели",
             "provider": "openai",
+            "profile": settings.resolved_profile,
             "available": available,
             "enabled": True,
             "state": "configured" if available else "not_configured",
@@ -186,7 +238,7 @@ class ModelRouter:
                         raise asyncio.CancelledError
                 return await task
         except TimeoutError:
-            raise ModelConnectionError("API модели не ответил вовремя.") from None
+            raise ModelTransientError("API модели не ответил вовремя.") from None
         finally:
             if not task.done():
                 task.cancel()
@@ -220,6 +272,12 @@ class ModelRouter:
             payload["model"] = settings.model
         if tools:
             payload.update(tools=tools, tool_choice="auto")
+        if settings.resolved_profile == "deepseek_v4_flash":
+            # DeepSeek otherwise enables thinking by default. Its thinking tool
+            # protocol requires opaque reasoning_content on every subsequent
+            # turn; ModelPort deliberately carries only decisions and evidence.
+            # Harness research still plans, calls tools and verifies findings.
+            payload["thinking"] = {"type": "disabled"}
         try:
             context = self._ssl(settings)
         except (ValueError, KeyError, OSError):
@@ -235,7 +293,12 @@ class ModelRouter:
                     # same verified TLS context is used by probes and real runs.
                     trust_env=True,
                     follow_redirects=False,
-                    timeout=settings.timeout_seconds,
+                    timeout=httpx.Timeout(
+                        settings.timeout_seconds,
+                        connect=min(30, settings.timeout_seconds),
+                        write=min(60, settings.timeout_seconds),
+                        pool=min(30, settings.timeout_seconds),
+                    ),
                     transport=self.transport,
                 ) as client,
                 client.stream(
@@ -251,7 +314,11 @@ class ModelRouter:
                         "API-ключ нужен только по требованию сервера."
                     )
                 if response.status_code == 429:
-                    raise ModelConnectionError("API модели ограничил частоту запросов.")
+                    raise ModelTransientError("API модели ограничил частоту запросов.")
+                if response.status_code in {500, 502, 503, 504}:
+                    raise ModelTransientError(
+                        f"API модели временно недоступен (HTTP {response.status_code})."
+                    )
                 if response.status_code == 404:
                     raise ModelConnectionError(
                         "API вернул HTTP 404. Укажите базовый адрес API или полный адрес "
@@ -268,26 +335,43 @@ class ModelRouter:
                 data = bytearray()
                 async for chunk in response.aiter_bytes():
                     data.extend(chunk)
-                    if len(data) > 2_000_000:
+                    if len(data) > 8_000_000:
                         raise ModelConnectionError("Ответ API превышает допустимый размер.")
             decoded = json.loads(data)
-            message = decoded["choices"][0]["message"]
+            choice = decoded["choices"][0]
+            message = choice["message"]
+            reason = choice.get("finish_reason")
             content = message.get("content") or ""
             if not isinstance(content, str):
                 raise ValueError("Invalid content")
-            calls = message.get("tool_calls") or []
+            calls = message.get("tool_calls")
+            if calls is None:
+                calls = []
             if not isinstance(calls, list) or len(calls) > 32:
-                raise ValueError("Invalid calls")
+                raise ModelDecisionError("Модель вернула некорректный список действий.")
+            incomplete_calls = bool(calls) and reason in INCOMPLETE_FINISH_REASONS
+            if incomplete_calls:
+                # A length stop may cut arguments in the middle of JSON. Never
+                # parse or execute any action from this unfinished generation.
+                calls = []
             parsed_calls = []
             allowed_names = {tool["function"]["name"] for tool in tools}
-            for call in calls:
-                function = call["function"]
-                if function["name"] not in allowed_names:
-                    raise ValueError("Unknown tool")
-                arguments = json.loads(function["arguments"])
-                if not isinstance(arguments, dict):
-                    raise ValueError("Invalid arguments")
-                parsed_calls.append({"name": function["name"], "args": arguments})
+            try:
+                for call in calls:
+                    function = call["function"]
+                    if function["name"] not in allowed_names:
+                        raise ValueError("Unknown tool")
+                    arguments = json.loads(function["arguments"])
+                    if not isinstance(arguments, dict):
+                        raise ValueError("Invalid arguments")
+                    parsed_calls.append({"name": function["name"], "args": arguments})
+            except (ValueError, KeyError, TypeError):
+                # A valid API envelope can contain a bad model decision. Let the
+                # existing bounded repair loop ask for corrected actions; never
+                # execute a partially accepted batch or expose raw arguments.
+                raise ModelDecisionError(
+                    "Модель вернула недопустимый инструмент или некорректные аргументы действия."
+                ) from None
 
             def redact(value: Any) -> Any:
                 if isinstance(value, str) and secret:
@@ -301,9 +385,10 @@ class ModelRouter:
             # The response-byte guard bounds transport memory. The run's configured
             # answer limit is applied by the runtime; do not silently clip it here.
             decision = {"content": redact(content), "tool_calls": redact(parsed_calls)}
-            reason = decoded["choices"][0].get("finish_reason")
-            if reason in {"length", "max_tokens", "content_filter"}:
+            if reason in INCOMPLETE_FINISH_REASONS:
                 decision["finish_reason"] = reason
+            if incomplete_calls:
+                decision["incomplete_tool_calls"] = True
             usage = decoded.get("usage")
             if isinstance(usage, dict):
                 counters = {key: value for key in ("prompt_tokens", "completion_tokens")
@@ -312,15 +397,26 @@ class ModelRouter:
                 if counters:
                     decision["usage"] = counters
             return decision
-        except ModelConnectionError:
+        except (ModelConnectionError, ModelDecisionError):
             raise
         except httpx.TimeoutException:
-            raise ModelConnectionError(
+            raise ModelTransientError(
                 "API модели не ответил вовремя. Проверьте сеть или увеличьте время ожидания."
             ) from None
         except httpx.ProxyError:
             raise ModelConnectionError(
                 "Ошибка подключения через прокси. Проверьте HTTPS_PROXY и NO_PROXY на сервере."
+            ) from None
+        except (httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+            cause: BaseException | None = exc
+            for _ in range(8):
+                if isinstance(cause, ssl.SSLError):
+                    raise ModelConnectionError(
+                        "Ошибка проверки TLS-сертификата API модели. Проверьте сертификаты."
+                    ) from None
+                cause = (cause.__cause__ or cause.__context__) if cause is not None else None
+            raise ModelTransientError(
+                "Соединение не установлено. Проверьте адрес API, сеть, прокси и сертификаты."
             ) from None
         except httpx.HTTPError:
             raise ModelConnectionError(
@@ -345,10 +441,19 @@ class ModelRouter:
                 )
             if not result["content"].strip():
                 raise ModelConnectionError("API не вернул текстовый ответ.")
+            if result.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
+                raise ModelConnectionError(
+                    "API не завершил проверочный ответ. Проверьте профиль модели.",
+                )
             return {"available": True, "message": "Соединение и генерация ответа проверены."}
-        except ModelConnectionError as exc:
+        except (ModelConnectionError, ModelDecisionError) as exc:
             return {"available": False, "message": str(exc)}
-        except (TimeoutError, ValueError, KeyError, OSError):
+        except TimeoutError:
+            return {
+                "available": False,
+                "message": "API модели не ответил вовремя. Увеличьте время ожидания.",
+            }
+        except (ValueError, KeyError, OSError):
             return {
                 "available": False,
                 "message": "Проверка API не пройдена. Проверьте сертификаты и адрес.",

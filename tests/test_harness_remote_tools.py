@@ -30,6 +30,8 @@ class Peer:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
         self.schema: dict[str, Any] = _SCHEMA
+        self.extra_tools: list[dict[str, Any]] = []
+        self.tool_pages: list[list[dict[str, Any]]] | None = None
         self.text = "Relevant system description"
         self.mcp_error = False
         self.rpc_error = False
@@ -65,7 +67,12 @@ class Peer:
             return Response(status_code=202)
         elif method == "tools/list":
             result = {"tools": [{"name": "search", "description": "Search source",
-                                 "inputSchema": self.schema}]}
+                                 "inputSchema": self.schema}, *self.extra_tools]}
+            if self.tool_pages is not None:
+                page = int(body.get("params", {}).get("cursor", "0"))
+                result = {"tools": self.tool_pages[page]}
+                if page + 1 < len(self.tool_pages):
+                    result["nextCursor"] = str(page + 1)
         elif method == "tools/call":
             if self.block_mcp:
                 self.started.set()
@@ -160,6 +167,70 @@ async def test_mcp_sdk_discovery_and_call_validate_and_preserve_provenance(peer:
     assert all(client.is_closed for client in clients)
     assert evidence.id == (await call(tools, config))[0].id
     assert evidence.id != (await call(tools, config, run_id="another-run"))[0].id
+
+
+async def test_agent_discovers_only_allowed_tools_and_can_search_a_large_catalog(peer: Any) -> None:
+    server, clients = peer
+    # Unselected tools must neither leak into the result nor consume its item limit.
+    server.extra_tools = [
+        {"name": f"private_{i}", "description": "Private database", "inputSchema": _SCHEMA}
+        for i in range(140)
+    ] + [
+        {"name": f"inspect_{i}", "description": ("Details " * 80) + f" target{i}",
+         "inputSchema": _SCHEMA}
+        for i in range(99)
+    ]
+    config = connection(allowed_tools=["search", *[f"inspect_{i}" for i in range(99)]])
+    tools = RemoteTools()
+    evidence = (await call(tools, config, name="mcp_list_tools", args={
+        "connection_id": "source",
+    }))[0]
+    catalog = json.loads(evidence.text)
+    assert evidence.kind == "tool_metadata"
+    assert catalog["matched_count"] == 100
+    assert catalog["truncated"] is True
+    assert catalog["tools"][0] == {"name": "search", "description": "Search source"}
+    assert "private_" not in evidence.text
+    filtered = (await call(tools, config, name="mcp_list_tools", args={
+        "connection_id": "source", "query": "target98",
+    }))[0]
+    assert [item["name"] for item in json.loads(filtered.text)["tools"]] == ["inspect_98"]
+    assert json.loads(filtered.text)["truncated"] is False
+    assert not any(item["body"].get("method") == "tools/call" for item in server.requests)
+    assert all(client.is_closed for client in clients)
+
+
+async def test_agent_catalog_requires_allowed_tools_and_redacts_remote_secrets(peer: Any) -> None:
+    server, _ = peer
+    with pytest.raises(RemoteToolError):
+        await call(RemoteTools(), connection(allowed_tools=[]), name="mcp_list_tools",
+                   args={"connection_id": "source"})
+    assert not server.requests
+    server.extra_tools = [{"name": "inspect", "description": f"Inspect {_SECRET}",
+                           "inputSchema": _SCHEMA}]
+    item = (await call(RemoteTools(), connection(allowed_tools=["inspect"]),
+                       name="mcp_list_tools", args={"connection_id": "source"}))[0]
+    assert _SECRET not in item.text
+    assert "[redacted]" in item.text
+
+
+async def test_agent_catalog_follows_pagination_past_unpermitted_tools(peer: Any) -> None:
+    server, _ = peer
+    server.tool_pages = [
+        [{"name": f"private_{i}", "description": "Private", "inputSchema": _SCHEMA}
+         for i in range(140)],
+        [{"name": "search", "description": "Find incidents", "inputSchema": _SCHEMA}],
+    ]
+    item = (await call(RemoteTools(), connection(), name="mcp_list_tools", args={
+        "connection_id": "source", "query": "incidents",
+    }))[0]
+    assert json.loads(item.text)["tools"] == [
+        {"name": "search", "description": "Find incidents"},
+    ]
+    requests = [item["body"] for item in server.requests
+                if item["body"].get("method") == "tools/list"]
+    assert len(requests) == 2
+    assert requests[-1]["params"]["cursor"] == "1"
 
 
 @pytest.mark.parametrize("changes,owner", [
