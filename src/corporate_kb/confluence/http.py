@@ -167,6 +167,14 @@ def register_confluence_routes(
             "job": await asyncio.to_thread(registry.queue_sync, request.path_params["source_id"])
         }
 
+    @route("/sources/{source_id}/images/analyze", ["POST"], manage=True)
+    async def analyze_images(request: Request) -> dict[str, Any]:
+        return {
+            "job": await asyncio.to_thread(
+                registry.queue_image_analysis, request.path_params["source_id"]
+            )
+        }
+
     @route("/sources/{source_id}/pause", ["POST"], manage=True)
     async def pause(request: Request) -> dict[str, Any]:
         data = await body(request, 8192)

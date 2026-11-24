@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS assets (
  extraction_json TEXT, error TEXT, created_at TEXT NOT NULL,
  UNIQUE(source_id,attachment_id,version)
 );
+CREATE INDEX IF NOT EXISTS assets_source_page ON assets(source_id,page_id);
 CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id),
  timestamp TEXT NOT NULL, stage TEXT NOT NULL, level TEXT NOT NULL,
@@ -151,6 +152,10 @@ class PageSyncError(Exception):
     def __init__(self, error: Exception, stage: str, *, current_page: bool = False) -> None:
         super().__init__(type(error).__name__)
         self.error, self.stage, self.current_page = error, stage, current_page
+
+
+class SourceBusyError(RuntimeError):
+    """Different source operations cannot modify the same documents concurrently."""
 
 
 class ConfluenceRegistry:
@@ -537,29 +542,71 @@ class ConfluenceRegistry:
         return {"id": source_id, "status": "disconnected", "archive_retained": True}
 
     def queue_sync(self, source_id: str) -> dict[str, Any]:
+        return self._queue_operation(source_id, "sync")
+
+    def queue_image_analysis(self, source_id: str) -> dict[str, Any]:
+        return self._queue_operation(source_id, "analyze_images")
+
+    def _queue_operation(self, source_id: str, operation: str) -> dict[str, Any]:
         with self._db() as connection:
             connection.execute("BEGIN IMMEDIATE")
             source = self._source_row(connection, source_id)
             existing = connection.execute(
-                "SELECT id FROM jobs WHERE source_id=? AND status IN ('queued','running')",
+                "SELECT id,progress_json FROM jobs WHERE source_id=? "
+                "AND status IN ('queued','running')",
                 (source_id,),
             ).fetchone()
             if existing:
+                active_operation = json.loads(existing["progress_json"]).get("operation", "sync")
+                if active_operation != operation:
+                    raise SourceBusyError(
+                        "Дождитесь завершения текущей операции Confluence или отмените её "
+                        "перед запуском другой операции."
+                    )
                 job_id = existing["id"]
             else:
                 config = SourceConfig.model_validate_json(source["config_json"])
                 if not self.index_exists(config.index_id):
                     raise ValueError("The bound RAG index no longer exists")
+                if operation == "analyze_images":
+                    if not connection.execute(
+                        "SELECT 1 FROM pages WHERE source_id=? AND state='current' LIMIT 1",
+                        (source_id,),
+                    ).fetchone():
+                        raise ValueError("Сначала загрузите страницы источника Confluence.")
+                    if self.image_extractor is None:
+                        raise RuntimeError(
+                            "Обработка изображений GigaCode не настроена на сервере."
+                        )
                 job_id = uuid.uuid4().hex
                 connection.execute(
                     (
                         "INSERT INTO "
-                        "jobs(id,source_id,index_id,status,message,created_at) "
-                        "VALUES(?,?,?,'queued','Synchronization queued',?)"
+                        "jobs(id,source_id,index_id,status,message,created_at,progress_json) "
+                        "VALUES(?,?,?,'queued',?,?,?)"
                     ),
-                    (job_id, source_id, config.index_id, _now()),
+                    (
+                        job_id, source_id, config.index_id,
+                        "Image recognition queued" if operation == "analyze_images"
+                        else "Synchronization queued",
+                        _now(), _json({"operation": operation}),
+                    ),
                 )
-        logger.info("Confluence synchronization queued: job=%s source=%s", job_id, source_id)
+                if operation == "analyze_images":
+                    # Snapshot the current scope with the queued job. Resume must
+                    # keep this scope even if a page later becomes inaccessible.
+                    connection.execute(
+                        "INSERT INTO sync_items(job_id,task_kind,page_id,title,url) "
+                        "SELECT ?,'page',page_id,title,url FROM pages "
+                        "WHERE source_id=? AND state='current'",
+                        (job_id, source_id),
+                    )
+        logger.info(
+            "Confluence image recognition queued: job=%s source=%s operation=%s"
+            if operation == "analyze_images"
+            else "Confluence synchronization queued: job=%s source=%s operation=%s",
+            job_id, source_id, operation,
+        )
         self._wake.set()
         return self.job_status(job_id)
 
@@ -568,6 +615,7 @@ class ConfluenceRegistry:
         result = dict(row)
         result["type"] = "confluence"
         result["progress"] = json.loads(result.pop("progress_json"))
+        result["operation"] = result["progress"].get("operation", "sync")
         result["result"] = json.loads(result.pop("result_json"))
         if result["status"] != "running" and "authentication_required" in result["progress"]:
             result["progress"].update(
@@ -778,6 +826,8 @@ class ConfluenceRegistry:
             "page_limit",
             "content_kind",
             "authentication_required",
+            "operation",
+            "tree_scan_performed",
         }
         summary = _json({key: value for key, value in details.items() if key in progress_keys})
         with self._state_lock:
@@ -1007,7 +1057,10 @@ class ConfluenceRegistry:
                         and source["next_check_at"]
                         and source["next_check_at"] <= _now()
                     ):
-                        self.queue_sync(source["id"])
+                        # A manual image operation must still get dispatched;
+                        # the scheduled tree scan remains due for the next loop.
+                        with suppress(SourceBusyError):
+                            self.queue_sync(source["id"])
                 with self._db() as connection:
                     job = connection.execute(
                         "SELECT id FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1"
@@ -1032,6 +1085,8 @@ class ConfluenceRegistry:
                 return self._job_payload(job)
             source = self._source_row(connection, job["source_id"])
             config = SourceConfig.model_validate_json(source["config_json"])
+            operation = json.loads(job["progress_json"]).get("operation", "sync")
+            images_only = operation == "analyze_images"
             connection.execute(
                 (
                     "UPDATE jobs SET "
@@ -1053,7 +1108,9 @@ class ConfluenceRegistry:
                 raise ValueError("Bound index no longer exists")
             client = self.client_factory(config, token)
             logger.info(
-                "Confluence synchronization started: job=%s source=%s index=%s trace=%s",
+                "Confluence image recognition started: job=%s source=%s index=%s trace=%s"
+                if images_only
+                else "Confluence synchronization started: job=%s source=%s index=%s trace=%s",
                 job_id,
                 source["id"],
                 config.index_id,
@@ -1062,24 +1119,28 @@ class ConfluenceRegistry:
             if hasattr(client, "cancel"):
                 client.cancel = cancel
             with self._guard(config.index_id, cancel):
-                result = self._synchronize(job_id, source["id"], config, client, cancel)
+                result = self._synchronize(
+                    job_id, source["id"], config, client, cancel, images_only=images_only
+                )
             now = _now()
+            operation_label = "Image recognition" if images_only else "Synchronization"
             message = (
-                f"Synchronization completed with {result['failed_items']} unresolved item(s)"
+                f"{operation_label} completed with {result['failed_items']} unresolved item(s)"
                 if result["failed_items"]
-                else "Synchronization completed"
+                else f"{operation_label} completed"
                 if result["changed"]
-                else "No changes"
+                else "No images require recognition" if images_only else "No changes"
             )
             with self._db() as connection:
-                connection.execute(
-                    (
-                        "UPDATE sources SET "
-                        "last_checked_at=?,last_success_at=?,next_check_at=?,"
-                        "last_error=NULL,failure_count=0 WHERE id=?"
-                    ),
-                    (now, now, config.schedule.next_at(), source["id"]),
-                )
+                if not images_only:
+                    connection.execute(
+                        (
+                            "UPDATE sources SET "
+                            "last_checked_at=?,last_success_at=?,next_check_at=?,"
+                            "last_error=NULL,failure_count=0 WHERE id=?"
+                        ),
+                        (now, now, config.schedule.next_at(), source["id"]),
+                    )
                 connection.execute(
                     "UPDATE jobs SET status=?,completed_at=?,result_json=?,message=? WHERE id=?",
                     (
@@ -1137,21 +1198,22 @@ class ConfluenceRegistry:
                 level="error",
             )
             with self._db() as connection:
-                failures = int(source["failure_count"]) + 1
-                connection.execute(
-                    (
-                        "UPDATE sources SET "
-                        "last_checked_at=?,next_check_at=?,last_error=?,failure_count=? "
-                        "WHERE id=?"
-                    ),
-                    (
-                        _now(),
-                        config.schedule.next_at(failures=failures),
-                        message,
-                        failures,
-                        source["id"],
-                    ),
-                )
+                if not images_only:
+                    failures = int(source["failure_count"]) + 1
+                    connection.execute(
+                        (
+                            "UPDATE sources SET "
+                            "last_checked_at=?,next_check_at=?,last_error=?,failure_count=? "
+                            "WHERE id=?"
+                        ),
+                        (
+                            _now(),
+                            config.schedule.next_at(failures=failures),
+                            message,
+                            failures,
+                            source["id"],
+                        ),
+                    )
                 connection.execute(
                     "UPDATE jobs SET status='failed',completed_at=?,error=? WHERE id=?",
                     (_now(), message, job_id),
@@ -1502,10 +1564,24 @@ class ConfluenceRegistry:
         config: SourceConfig,
         client: Any,
         cancel: threading.Event,
+        *,
+        images_only: bool = False,
     ) -> dict[str, Any]:
-        result: dict[str, Any] = {"warnings": [], "index_id": config.index_id}
-        self._discover_pages(job_id, config, client, cancel)
+        result: dict[str, Any] = {
+            "warnings": [], "index_id": config.index_id,
+            "operation": "analyze_images" if images_only else "sync",
+            "tree_scan_performed": not images_only,
+        }
+        if images_only:
+            self._log(
+                job_id, "images", "Recognizing images on previously loaded pages",
+                operation="analyze_images", tree_scan_performed=False,
+            )
+        else:
+            self._discover_pages(job_id, config, client, cancel)
         result.update(self._queue_counts(job_id))
+        if images_only:
+            result["discovery_complete"] = None
         self._save_sync_result(job_id, result)
         for retry_round in range(self.RETRY_ROUNDS + 1):
             if retry_round and self._next_item(job_id, "page", retry_round):
@@ -1523,7 +1599,10 @@ class ConfluenceRegistry:
                     **result,
                 )
                 try:
-                    self._sync_page(job_id, source_id, config, client, cancel, item["page_id"])
+                    self._sync_page(
+                        job_id, source_id, config, client, cancel, item["page_id"],
+                        analyze_images=images_only,
+                    )
                     self._complete_item(item)
                 except SyncCancelled:
                     raise
@@ -1556,7 +1635,7 @@ class ConfluenceRegistry:
                 )
         self._check_cancel(cancel)
         self._save_sync_result(job_id, result)
-        if result["discovery_complete"]:
+        if not images_only and result["discovery_complete"]:
             # Only complete discovery proves absence. Failed reads of discovered pages
             # must never be mistaken for deletion from the tree.
             with self._db() as connection:
@@ -1571,7 +1650,7 @@ class ConfluenceRegistry:
                     config.index_id, source_id, row["page_id"], "removed_from_tree", job_id
                 )
             result["changed"] += len(missing)
-        else:
+        elif not images_only:
             result["warnings"].append("Tree discovery incomplete; previously saved pages retained")
         if result["failed_items"]:
             result["warnings"].append(
@@ -1634,6 +1713,55 @@ class ConfluenceRegistry:
             self._log(job_id, "publication", "No changes; index build is unnecessary")
         return result
 
+    @staticmethod
+    def _cached_image_extraction(row: Any) -> dict[str, Any]:
+        try:
+            parsed = json.loads(row["extraction_json"]) if row["extraction_json"] else {}
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _page_needs_image_analysis(
+        self,
+        source_id: str,
+        page_id: str,
+        page_version: int,
+        attachments: list[Attachment],
+    ) -> bool:
+        """Avoid rewriting unchanged pages whose current images already have evidence."""
+        wanted = {
+            (attachment.id, attachment.version)
+            for attachment in attachments
+            if attachment.media_type.lower().startswith("image/")
+            or Path(attachment.title).suffix.lower() in _IMAGE_SUFFIXES
+        }
+        with self._db() as connection:
+            rows = connection.execute(
+                "SELECT * FROM assets WHERE source_id=? AND page_id=?", (source_id, page_id)
+            ).fetchall()
+        # Inline diagrams were archived with the page version on its initial import.
+        wanted.update(
+            (row["attachment_id"], row["version"])
+            for row in rows
+            if row["attachment_id"].startswith("inline-svg-") and row["version"] == page_version
+        )
+        existing = {(row["attachment_id"], row["version"]): row for row in rows}
+        identity = getattr(self.image_extractor, "identity", "unknown")
+        for key in wanted:
+            row = existing.get(key)
+            if row is None or not (self.root / row["path"]).is_file():
+                return True
+            cached = self._cached_image_extraction(row)
+            result = cached.get("result")
+            if (
+                cached.get("extractor") != identity
+                or not isinstance(cached.get("markdown"), str)
+                or not isinstance(result, dict)
+                or result.get("status") != "ok"
+            ):
+                return True
+        return False
+
     def _sync_page(
         self,
         job_id: str,
@@ -1642,6 +1770,8 @@ class ConfluenceRegistry:
         client: Any,
         cancel: threading.Event,
         page_id: str,
+        *,
+        analyze_images: bool = False,
     ) -> None:
         result: dict[str, Any] = {
             "changed": 0,
@@ -1687,6 +1817,9 @@ class ConfluenceRegistry:
                 or previous["fingerprint"] != fingerprint
                 or previous["state"] != "current"
                 or not current_path.is_file()
+                or (analyze_images and self._page_needs_image_analysis(
+                    source_id, page_id, summary.version, attachments
+                ))
             )
             if changed:
                 stage, current_page = "fetch", True
@@ -1727,7 +1860,10 @@ class ConfluenceRegistry:
                     self._check_cancel(cancel)
                     try:
                         asset, block = self._asset(
-                            job_id, source_id, page_id, attachment, config, client, cancel
+                            job_id, source_id, page_id, attachment,
+                            config.model_copy(update={"analyze_images": True})
+                            if analyze_images else config,
+                            client, cancel,
                         )
                         result["assets"] += 1
                         asset_metadata.append(
@@ -2064,29 +2200,48 @@ class ConfluenceRegistry:
             )
         text = ""
         path = self.root / row["path"]
-        if config.analyze_images and is_image:
-            try:
-                cached_extraction = (
-                    json.loads(row["extraction_json"]) if row["extraction_json"] else {}
-                )
-            except (TypeError, ValueError):
-                cached_extraction = {}
-            if not isinstance(cached_extraction, dict):
-                cached_extraction = {}
-            cached_result = cached_extraction.get("result")
+        if is_image:
+            cached_extraction = self._cached_image_extraction(row)
             identity = getattr(self.image_extractor, "identity", "unknown")
-            if (
-                cached_extraction.get("extractor") == identity
-                and isinstance(cached_result, dict)
-                and isinstance(cached_extraction.get("markdown"), str)
-                and cached_result.get("status") == "ok"
-            ):
+
+            def usable(extraction: dict[str, Any]) -> bool:
+                result = extraction.get("result")
+                return (
+                    (not config.analyze_images or extraction.get("extractor") == identity)
+                    and isinstance(result, dict)
+                    and isinstance(extraction.get("markdown"), str)
+                    and result.get("status") == "ok"
+                )
+
+            if not usable(cached_extraction):
+                # Inline SVG versions follow the page version, even if only its
+                # prose changed. Preserve proven image evidence for identical
+                # bytes across attachment versions without running GigaCode again.
+                with self._db() as connection:
+                    previous_extractions = connection.execute(
+                        "SELECT extraction_json FROM assets WHERE source_id=? "
+                        "AND attachment_id=? AND sha256=? AND id!=? "
+                        "AND extraction_json IS NOT NULL ORDER BY version DESC",
+                        (source_id, attachment.id, row["sha256"], row["id"]),
+                    ).fetchall()
+                for previous in previous_extractions:
+                    prior_extraction = self._cached_image_extraction(previous)
+                    if usable(prior_extraction):
+                        row["extraction_json"] = previous["extraction_json"]
+                        cached_extraction = prior_extraction
+                        with self._db() as connection:
+                            connection.execute(
+                                "UPDATE assets SET extraction_json=?,error=NULL WHERE id=?",
+                                (row["extraction_json"], row["id"]),
+                            )
+                        break
+            if usable(cached_extraction):
                 text = cached_extraction["markdown"]
-                row["extraction_status"] = cached_result["status"]
+                row["extraction_status"] = "ok"
                 self._log(
                     job_id, "images", "Image extraction cache hit", attachment_id=attachment.id
                 )
-            elif self.image_extractor:
+            elif config.analyze_images and self.image_extractor:
                 self._log(
                     job_id, "images", "Analyzing image with GigaCode", attachment_id=attachment.id,
                     page_id=page_id, input_extension=path.suffix.lower(),
@@ -2159,7 +2314,7 @@ class ConfluenceRegistry:
                         connection.execute(
                             "UPDATE assets SET error=? WHERE id=?", (type(exc).__name__, row["id"])
                         )
-            else:
+            elif config.analyze_images:
                 row["extraction_status"] = "error"
                 text = "Image extraction unavailable: GigaCode image extractor is not configured."
                 self._log(

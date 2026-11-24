@@ -66,7 +66,7 @@ and retried as an incomplete branch instead of looping indefinitely.
 The source journal records each checked parent (`page_id`), children returned,
 new branches, completed branches and branches still unresolved. `depth_limit: null`
 means no depth limit; `page_limit` is the total-item safety limit. After updating the
-backend, use **Проверить** on an existing source to rescan its entire tree. Previously
+backend, use **Синхронизировать** on an existing source to rescan its entire tree. Previously
 downloaded unchanged pages reuse their saved content. A branch that fails after
 retries remains in the failure report, and its old descendants are not removed.
 
@@ -106,8 +106,9 @@ stores timestamps in UTC and evaluates daily/weekly wall times in the chosen IAN
 timezone. Pausing stops scheduled checks; a manual sync remains available. The backend
 must be running for scheduled work. A missed check is queued once after startup.
 
-Manual and scheduled requests share a durable queue and duplicate active requests for
-one source resolve to the same job. Only one scheduler owns a state directory. Interrupted
+Manual and scheduled requests share a durable queue. Duplicate active requests for the
+same source and operation resolve to the same job; different operations run separately.
+Only one scheduler owns a state directory. Interrupted
 jobs resume after restart, reusing saved current pages, attachments and indexing
 checkpoints. Canceling a job retains completed checkpoints. The scheduler and embedding
 worker propagate cancellation while waiting for an index lock, downloading, extracting
@@ -129,7 +130,7 @@ refreshes while the selected job runs and remains available after completion. A 
 that still has failed pages or branches finishes with warnings and publishes the
 successfully loaded pages. Previously saved current pages are retained on transient errors;
 confirmed access denial retains the existing access-loss behavior. Incomplete discovery
-never treats unseen pages as deleted. Run **Проверить** on the source to start another
+never treats unseen pages as deleted. Run **Синхронизировать** on the source to start another
 synchronization after resolving a persistent error.
 
 Global failures, such as an unavailable state database or index publication failure,
@@ -178,6 +179,22 @@ No Confluence credential enters the prompt. Image bytes plus extractor/model ide
 key the cache; source/version provenance is added by the server. Inline SVG diagrams are
 also archived and passed to extraction. Unsupported or unreadable images remain visible
 as warnings with their originals; an extraction failure does not discard page text.
+
+Administrators can use **Распознать изображения** on a source card to process images
+in its already imported current pages. This creates a separate durable operation in
+the same journal, with progress, cancellation, retries and browser-login links. It
+checks the current page and attachment versions but does not rediscover the subtree;
+run **Синхронизировать** first to import newly added pages. Recognized descriptions are
+published to the source's existing index. Successful cached results are reused, and
+an unchanged repeat does not rerun GigaCode or rebuild the index.
+
+Manual recognition does not enable automatic recognition or change the source's
+schedule. Saved successful image descriptions remain available during later ordinary
+syncs, including when automatic recognition is disabled. The cache can reuse identical
+image bytes across attachment versions, including an unchanged inline SVG on an edited
+page; changed image bytes do not inherit the previous description. Source cards separate primary
+actions from settings, scheduling and cleanup actions; readers can view pages and
+journals, while management actions remain administrator-only.
 
 Only successful (`ok`) image results are reused from the extraction cache. A previous
 `partial`, `unsupported` or `unreadable` result is analyzed again on retry, including
@@ -256,6 +273,10 @@ Main endpoints:
 - `POST /admin/api/confluence/test` — read-only root connection check.
 - `GET|POST /admin/api/confluence/sources` — list/create connections; creation also queues
   the initial synchronization.
+- `POST /admin/api/confluence/sources/{id}/images/analyze` — queue manual recognition for
+  already imported current pages. Jobs retain `type=confluence` and expose
+  `operation=analyze_images`; existing synchronization jobs use `operation=sync`.
+  A duplicate active operation returns its job; a conflicting operation returns 409.
 - `PATCH /admin/api/confluence/sources/{id}` — update configuration or token.
 - `POST /admin/api/confluence/sources/{id}/sync` — manual synchronization.
 - `POST /admin/api/confluence/sources/{id}/pause` — pause/resume schedule.
