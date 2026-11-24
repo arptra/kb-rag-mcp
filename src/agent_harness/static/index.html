@@ -135,12 +135,11 @@
                   <div class="composer-mode">
                     <label class="sr-only" for="response-mode">Режим ответа</label>
                     <select id="response-mode" name="mode" aria-describedby="mode-description">
-                      <option value="search">Поиск без модели</option>
                       <option value="quick" selected>Быстрый ответ</option>
                       <option value="investigate">Исследование</option>
                       <option id="mode-autonomous" value="autonomous">Автопилот</option>
                     </select>
-                    <p id="mode-description">Краткий ответ по источникам.</p>
+                    <p id="mode-description">Ответ по базам знаний и MCP.</p>
                   </div>
                   <button id="submit-question" class="primary-button" type="submit"><span>Отправить</span><span aria-hidden="true">↗</span></button>
                 </div>
@@ -224,7 +223,7 @@
               <p id="settings-repositories-empty" class="settings-empty">Репозитории пока не добавлены.</p>
             </section>
             <section id="settings-panel-connections" role="tabpanel" aria-labelledby="settings-tab-connections" tabindex="0" hidden>
-              <div class="settings-section-heading"><div><h3>Инструменты и агенты</h3><p>MCP подключает внешние инструменты, A2A — других агентов. Они используются в режиме «Исследовать».</p></div><button id="settings-add-connection" class="secondary-button" type="button">Добавить подключение</button></div>
+              <div class="settings-section-heading"><div><h3>Инструменты и агенты</h3><p>Быстрый ответ использует инструменты чтения MCP. В исследовании и Автопилоте доступны также другие разрешённые инструменты и агенты A2A.</p></div><button id="settings-add-connection" class="secondary-button" type="button">Добавить подключение</button></div>
               <div id="settings-connections" class="settings-items"></div>
               <p id="settings-connections-empty" class="settings-empty">Подключения пока не добавлены.</p>
             </section>

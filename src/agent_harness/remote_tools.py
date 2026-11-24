@@ -253,6 +253,7 @@ class RemoteTools:
         principal: Principal,
         run_id: str,
         cancel: Event,
+        require_read_only: bool = False,
     ) -> list[Evidence]:
         observed_catalog: list[str] = []
         try:
@@ -276,6 +277,7 @@ class RemoteTools:
                 secret = self._credential(connection)
                 text = await self._bounded(
                     lambda: self._call_mcp(connection, None, None, secret, query=query,
+                                           require_read_only=require_read_only,
                                            observed_catalog=observed_catalog), cancel,
                 )
                 title = f"{connection.name}: доступные инструменты"
@@ -296,6 +298,7 @@ class RemoteTools:
                 secret = self._credential(connection)
                 text = await self._bounded(
                     lambda: self._call_mcp(connection, tool, arguments, secret,
+                                           require_read_only=require_read_only,
                                            expected_revision=args.get("schema_revision"),
                                            observed_catalog=observed_catalog),
                     cancel,
@@ -350,7 +353,8 @@ class RemoteTools:
 
     async def _tools(
         self, session: ClientSession, allowed_names: set[str] | None = None,
-        *, include_read_only: bool = False, name: str | None = None, query: str = "",
+        *, include_read_only: bool = False, require_read_only: bool = False,
+        name: str | None = None, query: str = "",
     ) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
         cursor = None
@@ -361,12 +365,14 @@ class RemoteTools:
             for tool in page.tools:
                 if name is not None and tool.name != name:
                     continue
-                if allowed_names is not None and tool.name not in allowed_names:
-                    annotations = tool.annotations
-                    if not (include_read_only and annotations is not None
-                            and annotations.readOnlyHint is True
-                            and annotations.destructiveHint is not True):
-                        continue
+                annotations = tool.annotations
+                read_only = (annotations is not None and annotations.readOnlyHint is True
+                             and annotations.destructiveHint is not True)
+                if require_read_only and not read_only:
+                    continue
+                if (allowed_names is not None and tool.name not in allowed_names
+                        and not (include_read_only and read_only)):
+                    continue
                 if terms and not all(term in (tool.name + " " + (tool.description or "")).casefold()
                                      for term in terms):
                     continue
@@ -375,6 +381,7 @@ class RemoteTools:
                         "name": tool.name,
                         "description": (tool.description or "")[:1000],
                         "inputSchema": tool.inputSchema,
+                        **({"read_only": True} if read_only else {}),
                     }
                 )
                 if len(tools) >= _MAX_TOOLS:
@@ -423,6 +430,7 @@ class RemoteTools:
         *,
         query: str = "",
         expected_revision: str | None = None,
+        require_read_only: bool = False,
         observed_catalog: list[str] | None = None,
     ) -> str:
         async with (
@@ -438,6 +446,7 @@ class RemoteTools:
             definitions = await self._tools(
                 session, set(connection.allowed_tools),
                 include_read_only=connection.include_read_only_tools,
+                require_read_only=require_read_only,
             )
             for item in definitions:
                 item["revision"] = _revision(item, secret)
@@ -451,6 +460,7 @@ class RemoteTools:
                 definitions = await self._tools(
                     session, set(connection.allowed_tools), name=tool, query=query,
                     include_read_only=connection.include_read_only_tools,
+                    require_read_only=require_read_only,
                 )
                 for item in definitions:
                     item["revision"] = _revision(item, secret)
@@ -470,6 +480,7 @@ class RemoteTools:
                     catalog["tools"].append(_redact_tree({
                         "name": item["name"], "description": item["description"][:500],
                         "revision": item["revision"],
+                        **({"read_only": True} if item.get("read_only") else {}),
                     }, secret))
                     if len(_json(catalog)) > _MAX_CHARS:
                         catalog["tools"].pop()

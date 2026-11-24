@@ -153,7 +153,7 @@ def _source_choices(run: dict[str, Any]) -> list[dict[str, Any]]:
             candidates.append((item, origin))
     if not candidates:
         return []
-    if run["status"] == "completed":
+    if run["status"] == "completed" or run.get("_accepted_with_warnings"):
         cited = cited_evidence_ids(
             run.get("answer", ""), evidence, question=run.get("question", ""),
         )
@@ -613,8 +613,11 @@ class MemoryStore:
             return
         rating = (run.get("feedback") or {}).get("rating", "")
         rating = rating if rating in {"helpful", "unhelpful"} else ""
-        cited_routes = (_route_keys(_source_choices(run)) if status == "completed"
-                        and not run.get("_final_quality_issue") else set())
+        accepted = status == "completed" or (
+            status == "partial" and run.get("_accepted_with_warnings")
+        )
+        cited_routes = (_route_keys(_source_choices(run))
+                        if accepted and not run.get("_final_quality_issue") else set())
         with self.runs._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             stored = db.execute(
@@ -775,6 +778,9 @@ class MemoryStore:
         bad = (feedback or {}).get("rating") == "unhelpful"
         outcome = run.get("status", "failed")
         incomplete = outcome != "completed"
+        # One source can fail while an independent, current tool result supports
+        # the answer. Remember only the cited route and keep the failure as a lesson.
+        proven = not incomplete or (outcome == "partial" and run.get("_accepted_with_warnings"))
         research_plan = self._research_plan(run)
         question = str(run.get("question", ""))[:2000]
         sources = [
@@ -799,8 +805,8 @@ class MemoryStore:
                     if isinstance(step, dict) and step.get("name") in _ATTEMPT_TOOLS
                 )
             )[:20],
-            "successful_tools": choices if not incomplete and not bad else [],
-            "observed_tools": choices if incomplete and not bad else [],
+            "successful_tools": choices if proven and not bad else [],
+            "observed_tools": choices if not proven and not bad else [],
             "coverage": {
                 str(index_id)[:200]: {
                     "status": value.get("status", "pending"),
@@ -864,7 +870,8 @@ class MemoryStore:
                 )[:500]
                 + "\n"
             )
-        if (not bad and run.get("answer")
+        if (not bad and run.get("answer") and run.get("answer_kind") not in {
+                "incomplete", "clarification", "search_results"}
                 and run.get("stop_reason") not in {"model_policy_stop", "model_refusal_text"}
                 and not run.get("_final_quality_issue")):
             text += _PREVIOUS_CONCLUSION + str(run["answer"])[:1000]

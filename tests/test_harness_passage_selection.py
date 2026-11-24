@@ -9,11 +9,12 @@ import pytest
 from test_harness_api_recovery import client_for, finish
 
 QUOTE = "payment-service retries require investigation."
+ANSWER = "Для повторов в payment-service причина задержки ещё требует проверки."
 DRAFT = "Операции завершаются через 999 секунд [foreign-id]."
 
 
 @pytest.mark.parametrize("selection", [
-    "valid", "encoded", "unknown_number", "foreign_id", "empty",
+    "valid", "encoded", "unknown_number", "foreign_id", "empty", "missing_answer", "foreign_cite",
 ])
 async def test_passage_repair_only_credits_offered_source_text(
     tmp_path: Path, selection: str,
@@ -35,9 +36,13 @@ async def test_passage_repair_only_credits_offered_source_text(
             match = next(number for number, item in passages.items()
                          if item == {"source_id": "entry", "quote": QUOTE})
             numbers = {"valid": [match], "encoded": repr([match]), "unknown_number": ["9999"],
-                       "foreign_id": ["foreign-id"], "empty": []}[selection]
+                       "foreign_id": ["foreign-id"], "empty": [],
+                       "missing_answer": [match], "foreign_cite": [match]}[selection]
+            args = {"numbers": numbers}
+            if selection != "missing_answer":
+                args["answer"] = ANSWER + (" [foreign-id]" if selection == "foreign_cite" else "")
             message = {"tool_calls": [{"type": "function", "function": {
-                "name": "select_passages", "arguments": json.dumps({"numbers": numbers}),
+                "name": "select_passages", "arguments": json.dumps(args),
             }}]}
         elif not reads and "read_document" in names:
             reads += 1
@@ -61,7 +66,7 @@ async def test_passage_repair_only_credits_offered_source_text(
     assert "999 секунд" not in run["answer"] and "foreign-id" not in run["answer"]
     if selection in {"valid", "encoded"}:
         assert run["status"] == "completed", run["warnings"]
-        assert run["answer"] == f"{QUOTE} [entry]"
+        assert run["answer"] == f"{ANSWER} [entry]"
     else:
         assert run["status"] == "partial" and run["stop_reason"] == "answer_quality"
         assert run["metrics"]["decision_errors"] >= 1

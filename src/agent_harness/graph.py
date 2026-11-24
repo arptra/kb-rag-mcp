@@ -17,16 +17,25 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
+from agent_harness.answer_quality import requested_field, requested_field_label
 from agent_harness.budgets import BUDGET_TOOL, BudgetChanges, BudgetRequest
 from agent_harness.contracts import ConversationUnavailable, ModelDecisionError, Principal
 from agent_harness.material_archive import ARCHIVE_TOOL, search_materials
 from agent_harness.material_archive import available as archive_available
 from agent_harness.mcp_catalog import (
     METADATA,
+    all_mcp_tools_inspected,
+    linked_read,
     manifest_needs_refresh,
+    native_read_tools,
+    question_record_id,
+    question_record_lookup,
+    quick_schema_reads,
+    read_chat,
     record_metadata,
     repair_call,
     schema_key,
+    text_read_call,
 )
 from agent_harness.model_connection import (
     RETRYABLE_FINISH_REASONS,
@@ -49,7 +58,6 @@ from agent_harness.research import (
     simple_service_count_question,
     update_plan,
 )
-from agent_harness.search_results import render_search_results
 from agent_harness.store import timestamp
 
 if TYPE_CHECKING:
@@ -136,6 +144,7 @@ class HarnessGraph:
         config["recursion_limit"] = self.engine._runtime_limits(context.run).graph_recursion_limit
         state: GraphState | None = {"run": copy.deepcopy(context.run)}
         if resume:
+            context.run.pop("_question_bound_mcp_call", None)
             context.run.pop("_goal_review_requested", None)
             snapshot = await self.graph.aget_state(config)
             if not snapshot.values:
@@ -249,21 +258,18 @@ class HarnessGraph:
             run["status"] = "failed"
             self.engine._warn(run, "Один или несколько выбранных индексов недоступны.")
             return self._result(context, "done")
-        direct = run["mode"] == "search"
-        selected = requested or sorted(
-            item["id"] for item in catalog if not direct or item["direct_search"]
-        )
+        selected = requested or sorted(item["id"] for item in catalog
+                                       if run["mode"] != "quick" or item["quick_search"])
         if len(selected) > self.engine._runtime_limits(run).max_indexes:
             self.engine._warn(run, "Область поиска ограничена бюджетом числа индексов.")
         run["index_ids"] = selected[: self.engine._runtime_limits(run).max_indexes]
+        if (len(run["index_ids"]) == 1 and question_record_id(run["question"])
+                and requested_field_label(run["question"]) and any(
+                    i["id"] == selected[0] and not i["direct_search"] and i["quick_search"]
+                    for i in catalog)):
+            run["_mcp_record_lookup"] = True
         if not run["index_ids"]:
-            run["status"] = "partial"
-            if run["mode"] == "search":
-                run.update(answer_kind="search_results", answer="Нет доступных источников поиска.")
             self.engine._warn(run, "Нет доступных источников; состояние системы не проверено.")
-            return self._result(context, "done")
-        if run["mode"] == "search":
-            return self._result(context, "collect")
         return self._result(context, "plan", calls=[], exchange=[])
 
     async def plan(self, state: GraphState, runtime: Runtime[ExecutionContext]) -> GraphState:
@@ -285,47 +291,43 @@ class HarnessGraph:
         available = {item["id"] for item in catalog}
         if set(run["index_ids"]) - available:
             raise ValueError("Source access changed during the investigation")
-        direct = run["mode"] == "search"
-        parent = None if direct else engine._parent_context(principal, run, available)
+        parent = engine._parent_context(principal, run, available)
         run["parent_question"] = parent["question"] if parent else None
-        query = run["question"] if direct else initial_search_query(run)
-        external = (
-            await engine.tools.describe(principal, run["index_ids"])
-            if engine.tools and run["mode"] in {"investigate", "autonomous"}
-            else []
-        )
+        query = initial_search_query(run)
+        quick = read_chat(run)
+        tool_indexes = [i["id"] for i in catalog if i["id"] in run["index_ids"]
+                        and not i["direct_search"] and (not quick or i["quick_search"])]
+        external = await engine.tools.describe(
+            principal, tool_indexes, **({"read_only_mcp": True} if quick else {}),
+        ) if (
+            engine.tools and tool_indexes
+        ) else []
+        if quick:
+            external = [t for t in external if t["function"]["name"] in {*METADATA, "mcp_call"}]
         external_ids = {item["id"] for item in catalog if not item["direct_search"]}
         knowledge = [item for item in run["index_ids"] if item not in external_ids]
-        if run["mode"] == "quick" and set(run["index_ids"]) & external_ids:
+        if quick and set(run["index_ids"]) - set(knowledge) - set(tool_indexes):
             engine._warn(
-                run, "Быстрый ответ использует RAG. Код, MCP и A2A доступны в исследовании."
+                run, "Для выбранных репозиториев и A2A используйте «Исследование»."
             )
         pending_only = bool(run.pop("_collect_pending", False))
         if not pending_only:
             run["coverage"] = {index: {"status": "pending", "count": 0} for index in knowledge}
-        if direct:
-            skipped = [index for index in run["index_ids"] if index in external_ids]
-            for index in skipped:
-                run["coverage"][index] = {"status": "skipped", "count": 0}
-            if skipped:
-                engine._warn(run, "Для поиска по коду, MCP и A2A выберите «Исследование».")
         bootstrap = [index for index in knowledge if not pending_only
                      or run["coverage"].get(index, {}).get("status") == "pending"] \
             if engine.source else []
-        if direct:
-            sweep_deadline = self._deadline(context)
-        elif run["mode"] == "quick":
+        if quick:
             sweep_deadline = self._deadline(context) - engine._run_timeout(run) * 2 / 3
         else:
             sweep_deadline = self._reserve_deadline(context)
-        if (not direct and "graph:system" in bootstrap and not run.get("parent_run_id")
+        if ("graph:system" in bootstrap and not run.get("parent_run_id")
                 and not run.get("resume_count") and simple_service_count_question(query)):
             bootstrap.remove("graph:system")
             await engine._search(principal, run, event, "graph:system", query,
                                  initial=True, deadline=sweep_deadline)
             if event.is_set():
                 return self._result(context, "done")
-            if engine._answer_snapshot_count(run):
+            if run["mode"] == "autonomous" and engine._answer_snapshot_count(run):
                 run["current_action"] = None
                 return self._result(context, "done")
         await asyncio.gather(
@@ -348,13 +350,6 @@ class HarnessGraph:
         engine._checkpoint(principal, run, event)
         if event.is_set():
             return self._result(context, "done")
-        if direct:
-            run["answer_kind"] = "search_results"
-            run["answer"] = render_search_results(
-                run, max_chars=engine._runtime_limits(run).answer_chars,
-            )
-            run["status"] = "partial" if run["warnings"] else "completed"
-            return self._result(context, "done")
         model = await engine._model_status()
         while model.get("state") == "authentication_required" and not event.is_set():
             await engine._refresh_authentication(run)
@@ -364,20 +359,17 @@ class HarnessGraph:
         if event.is_set():
             return self._result(context, "done")
         await engine._refresh_authentication(run)
-        if not model["available"] or (
-            not run["evidence"] and not external and run["mode"] == "quick"
-        ):
+        if not model["available"]:
             run["status"] = "partial"
-            engine._warn(
-                run,
-                model["reason"]
-                if not model["available"]
-                else "Подтверждающие источники не найдены.",
-            )
+            run["stop_reason"] = "model_unavailable"
+            engine._warn(run, model["reason"])
             return self._result(context, "done")
+        if not run["evidence"] and not external and (quick or not knowledge):
+            engine._warn(run, "Доступные источники не подтвердили сведения по вопросу.")
+            return self._result(context, "synthesize", calls=[], exchange=[])
         return self._result(
             context,
-            "synthesize" if run["mode"] == "quick" else "inspect",
+            "synthesize" if quick and not external else "inspect",
             external=external,
             knowledge_ids=knowledge,
             exchange=[],
@@ -446,11 +438,27 @@ class HarnessGraph:
             if (key not in attempted and engine._now(run) < self._reserve_deadline(context)
                     and run["metrics"]["tool_calls"] + reserve_calls < budget.tool_calls
                     and engine._followup_calls(run) + reserve_calls < budget.source_calls
-                    and budget.model_calls >= 3 + reserve_calls):
+                    and budget.model_calls >= (2 if read_chat(run) else 3) + reserve_calls):
                 run["_initial_mcp_route"] = {"key": key, "memory_id": memory_id}
                 run["_round_evidence"] = evidence_signature(run)
                 return self._result(context, "tools", attempted_lookups=sorted(attempted),
                                     calls=[{"name": tool, "args": args}])
+        if (read_chat(run) and "mcp_list_tools" in available_tools
+                and engine._decision_calls(run) == 0 and budget.model_calls > 1
+                and not context.cancel.is_set()):
+            discovery = next(t["function"] for t in state["external"]
+                             if t["function"]["name"] == "mcp_list_tools")
+            selected = discovery["parameters"]["properties"]["connection_id"].get("enum", [])
+            remaining = min(budget.tool_calls - run["metrics"]["tool_calls"],
+                            budget.source_calls - engine._followup_calls(run))
+            # Preserve at least one schema read per manifest and two substantive reads.
+            limit = min(3, max(0, (remaining - 2) // 2))
+            calls = [{"name": "mcp_list_tools", "args": {"connection_id": name}}
+                     for name in selected[:limit]]
+            if calls:
+                run["_round_evidence"] = evidence_signature(run)
+                return self._result(context, "tools", attempted_lookups=sorted(attempted),
+                                    calls=calls)
         return self._result(context, "decide", attempted_lookups=sorted(attempted))
 
     def _recover_draft(
@@ -549,6 +557,8 @@ class HarnessGraph:
             or run["metrics"]["tool_calls"] >= budget.tool_calls
             or engine._followup_calls(run) >= budget.source_calls
         ):
+            if run["mode"] == "quick":
+                return self._result(context, "synthesize")
             plan = run.get("research_plan", {})
             covered = {index for index, value in run.get("coverage", {}).items()
                        if value["status"] in {"searched", "empty"}}
@@ -581,12 +591,22 @@ class HarnessGraph:
         run["phase"] = "investigating"
         engine.store.save(context.principal.owner_id, run)
         catalog = self._tool_catalog(state)
+        use_native = read_chat(run) or isinstance(engine.model, ModelRouter)
+        native, targets = native_read_tools(run, catalog) if use_native else ([], {})
+        if native and read_chat(run):
+            discovery = next((t for t in catalog if t["function"]["name"] == "mcp_list_tools"),
+                             None)
+            inspected = discovery is not None and all_mcp_tools_inspected(run, discovery, targets)
+            # A small complete manifest needs only the actual remote functions.
+            # With a partial or remembered manifest keep discovery for other leads.
+            hidden = {*METADATA, "mcp_call"} if inspected else {"mcp_call"}
+            catalog = [t for t in catalog if t["function"]["name"] not in hidden]
         try:
             decision = await engine._decide(
                 context.principal,
                 run,
                 event,
-                catalog,
+                [*native, *catalog],
                 state.get("exchange", []),
                 self._reserve_deadline(context),
             )
@@ -632,6 +652,16 @@ class HarnessGraph:
             engine._warn(run, "Модель не смогла сформировать корректные действия; готовим итог.")
             return self._result(context, "synthesize")
         calls = decision.get("tool_calls", [])
+        if targets:
+            if (not calls and isinstance(decision.get("content"), str)
+                    and decision.get("finish_reason") not in RETRYABLE_FINISH_REASONS):
+                calls = text_read_call(decision["content"], targets)
+            calls = [
+                {"name": "mcp_call", "args": {**targets[call["name"]], "arguments": call["args"]}}
+                if (isinstance(call, dict) and isinstance(call.get("name"), str)
+                    and call["name"] in targets and isinstance(call.get("args"), dict)) else call
+                for call in calls
+            ]
         if calls and state.get("branch_waiting"):
             allowed_names = {item["function"]["name"] for item in catalog}
             useful_calls = []
@@ -651,6 +681,16 @@ class HarnessGraph:
                                     branch_reason="Предложенная проверка уже выполнялась.")
             calls = useful_calls
         if not calls:
+            if (read_chat(run) and state.get("external") and not targets
+                    and not any(item.get("tool_origin", {}).get("tool") == "mcp_call"
+                                for item in run["evidence"])
+                    and (lookup := next_external_lookup(
+                        run, state["external"], set(state.get("attempted_lookups", [])),
+                    ))):
+                # A text-only planning reply is common on small models. A catalog
+                # or schema can be read safely before the next native tool decision.
+                run["_round_evidence"] = evidence_signature(run)
+                return self._result(context, "tools", calls=[lookup])
             if decision.get("finish_reason") in RETRYABLE_FINISH_REASONS:
                 engine._trace(run, "answer_recovery", {},
                               "Предыдущий ответ был обрезан. Подготовьте краткий законченный итог.")
@@ -715,6 +755,8 @@ class HarnessGraph:
     @staticmethod
     def _tool_catalog(state: GraphState) -> list[dict[str, Any]]:
         run = state["run"]
+        if read_chat(run):
+            return [*(TOOLS if state.get("knowledge_ids") else []), *state.get("external", [])]
         return [*([BUDGET_TOOL] if run["mode"] == "autonomous" else []),
                 PLAN_TOOL, *(TOOLS if state.get("knowledge_ids") else []),
                 *([ARCHIVE_TOOL] if archive_available(run) else []),
@@ -875,8 +917,9 @@ class HarnessGraph:
             elif cached_ref:
                 result = "Описание инструментов уже получено и доступно в материалах."
             elif (not refresh and name not in {"update_research_plan", "request_budget"}
-                  and (signature in seen or (name == "search_knowledge"
-                                             and key in run.get("_issued_calls", [])))):
+                  and (signature in seen or ((name == "search_knowledge"
+                       or (name == "mcp_call" and read_chat(run)))
+                       and key in run.get("_issued_calls", [])))):
                 if name == "search_knowledge":
                     run["metrics"]["tool_calls"] -= 1
                 result = "Повтор без новых данных пропущен. Измените запрос или источник."
@@ -1017,6 +1060,16 @@ class HarnessGraph:
                 detail = ". ".join(f"{labels[k]}: {', '.join(v)}" for k, v in changes.items())
                 engine._trace(run, "mcp_catalog_changed", args, detail)
             run.setdefault("_mcp_metadata_refs", {})[key] = refs[0]
+        answer_ready = False
+        answered = False
+        bound = False
+        if name == "mcp_call" and isinstance(args, dict):
+            bound = (run.pop("_question_bound_mcp_call", None) == key
+                     or question_record_lookup(run["question"], args.get("arguments")))
+            if bound:
+                verified = run.setdefault("_question_bound_mcp_refs", [])
+                verified.extend(item["id"] for item in fresh if item.get("checked_with") == name
+                                and item["id"] not in verified)
         if fresh and manifest_needs_refresh(run, name, args, fresh[0]):
             # The SDK already listed the live manifest. Present its change
             # before issuing any dependent actions from the old plan.
@@ -1025,6 +1078,31 @@ class HarnessGraph:
             }}]
             engine._trace(run, "mcp_contract_refresh", args,
                           "Состав каталога MCP изменился. Получаем свежий список.")
+        elif read_chat(run) and name == "mcp_list_tools" and fresh:
+            # Leave room to use the inspected contracts and follow a reference.
+            remaining = min(budget.tool_calls - run["metrics"]["tool_calls"],
+                            budget.source_calls - engine._followup_calls(run))
+            reserved = 2 + sum(2 if c.get("name") == "mcp_list_tools" else 1 for c in calls)
+            reads = quick_schema_reads(fresh[0], args["connection_id"], remaining - reserved,
+                                       attempted, run["question"])
+            calls = [*calls, *reads]
+        elif read_chat(run) and name == "mcp_call" and len(fresh) == 1 and not calls:
+            field_value = requested_field(run, run["evidence"])
+            if field_value and field_value[2] == fresh[0]["id"]:
+                answer_ready = True
+                engine._trace(run, "goal_check", args, "Инструмент вернул запрошенное поле.")
+                if bound:
+                    label, value, ref_id = field_value
+                    label = label[:1].upper() + label[1:]
+                    answered = engine._answer(run, {"content": f"{label} — {value} [{ref_id}]."})
+            elif follow := linked_read(run, fresh[0], state.get("external", [])):
+                engine._trace(run, "mcp_reference", follow["args"],
+                              "В результате найден идентификатор для следующего чтения MCP.")
+                calls = [follow]
+                if bound:
+                    run["_question_bound_mcp_call"] = lookup_key("mcp_call", follow["args"])
+            elif run["mode"] != "quick":
+                run.pop("_mcp_record_lookup", None)  # Ambiguous record; continue investigation.
         plan = run.get("research_plan", {})
         branch = plan.get("current_branch")
         if branch and branch.get("status") == "open" and name not in {
@@ -1044,9 +1122,12 @@ class HarnessGraph:
             else:
                 branch["status"] = "no_result"
             plan["branches"][-1] = branch
+        next_step = "tools" if calls else "reflect"
+        if answer_ready:
+            next_step = "done" if answered else "synthesize"
         return self._result(
             context,
-            "tools" if calls else "reflect",
+            next_step,
             calls=calls,
             attempted_lookups=sorted(attempted),
             recovery_lookup=False,

@@ -116,6 +116,8 @@ DESCRIPTIONS = {
 
 
 class IntegrationHub:
+    supports_read_only_mcp = True
+
     def __init__(
         self,
         store: IntegrationStore,
@@ -187,7 +189,8 @@ class IntegrationHub:
                 if settings.sandbox.enabled and item.allows(principal.owner_id)
             ],
             *[
-                {"id": "connection:" + item.id, "name": item.kind.upper() + " · " + item.name}
+                {"id": "connection:" + item.id, "name": item.kind.upper() + " · " + item.name,
+                 "kind": item.kind}
                 for item in settings.connections
                 if item.allows(principal.owner_id) and (item.kind == "a2a" or item.has_tools)
             ],
@@ -210,6 +213,7 @@ class IntegrationHub:
         self,
         principal: Principal,
         index_ids: list[str],
+        *, read_only_mcp: bool = False,
     ) -> list[dict[str, Any]]:
         available = {item["id"] for item in await self.indexes(principal)} & set(index_ids)
         settings = self.store.load()
@@ -255,7 +259,8 @@ class IntegrationHub:
                     "description": DESCRIPTIONS[name]
                     + (
                         " Allowed connection IDs: " + ", ".join(mcp_ids)
-                        + ". Tool name hints: " + allowed
+                        + (". Discover read-only operations with mcp_list_tools." if read_only_mcp
+                           else ". Tool name hints: " + allowed)
                         if name in {"mcp_list_tools", "mcp_call", "mcp_tool_schema"}
                         else ""
                     ),
@@ -275,10 +280,13 @@ class IntegrationHub:
         index_ids: list[str],
         cancel: Event,
         sandbox_profile_id: str = "",
+        read_only_mcp: bool = False,
     ) -> list[Evidence]:
         await self._check(principal, cancel)
         if name not in ARGUMENTS:
             raise ValueError("Tool is not allowed")
+        if read_only_mcp and name not in {"mcp_list_tools", "mcp_tool_schema", "mcp_call"}:
+            raise ValueError("Only MCP read operations are allowed in this run")
         validated = ARGUMENTS[name].model_validate(args).model_dump()
         # Refresh controls only the graph's metadata cache. The remote reader
         # always performs a live MCP list and uses a stable evidence ID.
@@ -338,6 +346,7 @@ class IntegrationHub:
                 result = await self.remote.call(
                     name, validated, connection=connection, principal=principal,
                     run_id=run_id, cancel=cancel,
+                    **({"require_read_only": True} if read_only_mcp else {}),
                 )
             except Exception as exc:
                 if name != "mcp_call":

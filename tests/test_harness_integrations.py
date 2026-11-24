@@ -307,7 +307,8 @@ async def test_tool_only_answer_without_external_calls_is_unverified(tmp_path: P
     class DirectAnswerModel(ToolModel):
         async def decide(self, **kwargs: Any) -> dict[str, Any]:
             self.requests.append(kwargs)
-            return {"content": answer, "tool_calls": []}
+            return {"content": answer if kwargs["tools"] else "Какой номер заказа?",
+                    "tool_calls": []}
 
     model = DirectAnswerModel()
     runtime = HarnessRuntime(
@@ -324,14 +325,13 @@ async def test_tool_only_answer_without_external_calls_is_unverified(tmp_path: P
             ),
         )
         result = await wait_finished(runtime, run["id"])
-        assert result["answer"] == answer
+        assert result["answer_kind"] == "clarification" and result["stop_reason"] == "no_sources"
+        assert result["answer"].endswith("Какой номер заказа?") and answer not in result["answer"]
         assert result["status"] == "partial"
         assert result["evidence"] == []
-        assert any("не подтверждён источниками" in warning for warning in result["warnings"])
         assert result["metrics"]["tool_calls"] == 0
         assert not integrations._sandbox.calls and not integrations._remote.calls
-        # One explicit goal check gives the model a chance to actually inspect
-        # the selected sources instead of accepting an unsupported assertion.
+        # The unsupported planner claim is replaced with a targeted question.
         assert len(model.requests) == 2
         assert model.requests[0]["tools"]
     finally:
@@ -384,21 +384,22 @@ async def test_tool_metadata_stays_in_context_but_does_not_confirm_answer(tmp_pa
             ),
         )
         result = await wait_finished(runtime, run["id"])
-        assert result["answer"] == "Состояние заказа известно."
+        assert result["answer_kind"] == "incomplete"
+        assert "Состояние заказа известно." not in result["answer"]
         assert result["status"] == "partial"
-        assert any("не подтверждён источниками" in warning for warning in result["warnings"])
-        assert result["metrics"]["tool_calls"] == 1
-        assert len(result["evidence"]) == 1
-        assert result["evidence"][0]["kind"] == "tool_metadata"
-        assert [call["name"] for call in integrations._remote.calls] == ["mcp_tool_schema"]
-        assert len(model.requests) == 2
-        context = json.loads(model.requests[1]["messages"][-1]["content"])
-        assert context["evidence"] == result["evidence"]
+        names = [call["name"] for call in integrations._remote.calls]
+        assert "mcp_tool_schema" in names and set(names) <= {"mcp_list_tools", "mcp_tool_schema"}
+        assert result["metrics"]["tool_calls"] == len(names)
+        assert result["evidence"] and all(e["kind"] == "tool_metadata" for e in result["evidence"])
+        contexts = [json.loads(request["messages"][-1]["content"]) for request in model.requests]
+        assert any(any(e["id"] == "jira-search-schema" for e in ctx.get("evidence", []))
+                   for ctx in contexts)
+        assert len([request for request in model.requests if not request["tools"]]) == 2
     finally:
         await runtime.stop()
 
 
-async def test_quick_mode_never_starts_repository_or_remote_tools(tmp_path: Path) -> None:
+async def test_quick_mode_discovers_mcp_but_never_starts_repository_or_a2a(tmp_path: Path) -> None:
     integrations = hub(tmp_path)
     model = ToolModel()
     runtime = HarnessRuntime(
@@ -409,8 +410,10 @@ async def test_quick_mode_never_starts_repository_or_remote_tools(tmp_path: Path
         run = await runtime.submit(Principal("alice"), RunRequest(question="Check", mode="quick"))
         result = await wait_finished(runtime, run["id"])
         assert result["status"] == "partial"
-        assert not integrations._sandbox.calls and not integrations._remote.calls
-        assert not model.requests
+        assert not integrations._sandbox.calls
+        assert [call["name"] for call in integrations._remote.calls] == ["mcp_list_tools"]
+        assert all(call["require_read_only"] for call in integrations._remote.calls)
+        assert model.requests and not model.requests[-1]["tools"]
     finally:
         await runtime.stop()
 

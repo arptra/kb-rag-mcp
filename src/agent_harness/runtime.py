@@ -15,18 +15,25 @@ from uuid import uuid4
 from langchain_core.messages import HumanMessage
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from pydantic import ValidationError
 
 from agent_harness.answer_quality import (
+    MISSING_REASON,
     InvalidWriterAnswer,
+    WrittenFindings,
+    answer_from_selected_quotes,
     answer_quality_issue,
     decode_writer_answer,
+    explanation_gap,
     format_source_reference,
     is_answer_source,
     named_values,
+    passage_arguments,
     quote_options,
     render_quoted_findings,
     requested_json,
     selected_quotes,
+    supporting_reason,
 )
 from agent_harness.budgets import BUDGET_TOOL, apply_request
 from agent_harness.config import HarnessSettings
@@ -56,7 +63,7 @@ from agent_harness.control.settings import (
     SearchLimits,
 )
 from agent_harness.graph import ExecutionContext, HarnessGraph
-from agent_harness.mcp_catalog import PREFLIGHT_FAILURES
+from agent_harness.mcp_catalog import PREFLIGHT_FAILURES, read_chat
 from agent_harness.memory import LIST_LIMIT, MemoryFeedback, MemoryInput, MemoryStore
 from agent_harness.model_connection import (
     INCOMPLETE_FINISH_REASONS,
@@ -76,12 +83,15 @@ from agent_harness.planning_context import (
     planning_evidence,
 )
 from agent_harness.policy import (
+    ANSWER_REPAIR_PROMPT,
     AUTOPILOT_ANSWER_PROMPT,
     AUTOPILOT_PLANNING_PROMPT,
     AUTOPILOT_QUOTE_PROMPT,
     AUTOPILOT_SELECT_PROMPT,
+    CLARIFICATION_PROMPT,
     INVESTIGATION_ANSWER_PROMPT,
     QUICK_ANSWER_PROMPT,
+    QUICK_TOOL_PROMPT,
     SYSTEM_PROMPT,
     WRITER_ANSWER_PROMPT,
 )
@@ -91,7 +101,7 @@ from agent_harness.research import (
     needs_source_check,
     simple_service_count_question,
 )
-from agent_harness.search_results import render_search_results, source_passage
+from agent_harness.search_results import source_passage
 from agent_harness.store import ACTIVE, RunStore, timestamp
 
 _LOG = logging.getLogger(__name__)
@@ -114,6 +124,10 @@ class HarnessUnavailableError(RuntimeError):
 
 class _AuthenticationTimeout(TimeoutError):
     """The run's cumulative allowance for human authorization was exhausted."""
+
+
+class _GatewayWait(Exception):
+    """Release the worker until the model gateway's retry time."""
 
 
 class _RunClock:
@@ -160,11 +174,13 @@ class HarnessRuntime:
         self._graph: HarnessGraph | None = None
         self._conversation_context: ConversationContext | None = None
         self._graph_lifespan = AsyncExitStack()
-        self._queues: dict[str, asyncio.Queue[tuple[Principal, str]]] = {
+        self._queues: dict[str, asyncio.Queue[tuple[Principal, str, Event]]] = {
             lane: asyncio.Queue(maxsize=settings.queue_max) for lane in ("quick", "investigate")
         }
         self._workers: list[asyncio.Task[None]] = []
         self._signals: dict[str, Event] = {}
+        self._shutdown_runs: set[str] = set()
+        self._gateway_waiters: dict[str, asyncio.Task[None]] = {}
         self._semaphores: dict[str, asyncio.Semaphore] = {}
         self._clocks: dict[str, _RunClock] = {}
         self._last_checkpoints: dict[str, float] = {}
@@ -219,6 +235,11 @@ class HarnessRuntime:
 
     async def stop(self) -> None:
         self._started = False
+        timers = list(self._gateway_waiters.values())
+        for task in timers:
+            task.cancel()
+        await asyncio.gather(*timers, return_exceptions=True)
+        self._shutdown_runs = {key for key, event in self._signals.items() if not event.is_set()}
         for event in self._signals.values():
             event.set()
         for worker in self._workers:
@@ -227,17 +248,24 @@ class HarnessRuntime:
         self._workers.clear()
         for queue in self._queues.values():
             while not queue.empty():
-                principal, run_id = queue.get_nowait()
+                principal, run_id, signal = queue.get_nowait()
+                if self._signals.get(run_id) is not signal:
+                    queue.task_done()
+                    continue
                 try:
                     run = self.store.get(principal.owner_id, run_id)
                 except KeyError:
                     queue.task_done()
                     continue
                 if run["status"] in ACTIVE:
-                    run.update(status="cancelled", phase="finished", completed_at=timestamp())
+                    if run_id in self._shutdown_runs and run["mode"] == "autonomous":
+                        self.store.interrupt_autopilot(run)
+                    else:
+                        run.update(status="cancelled", phase="finished", completed_at=timestamp())
                     self.store.save(principal.owner_id, run)
                 queue.task_done()
         self._signals.clear()
+        self._shutdown_runs.clear()
         self._clocks.clear()
         await self._graph_lifespan.aclose()
         self._graph = None
@@ -254,7 +282,7 @@ class HarnessRuntime:
         controls = self.control_store.load()
         if request.mode == "autonomous" and not controls.autonomy.enabled:
             raise ValueError("Режим «Автопилот» отключён администратором.")
-        queue = self._queues["quick" if request.mode in {"quick", "search"} else "investigate"]
+        queue = self._queues["quick" if request.mode == "quick" else "investigate"]
         if queue.full():
             raise QueueFullError("Очередь заполнена; повторите запрос позже.")
         run_id, now = uuid4().hex, timestamp()
@@ -295,7 +323,7 @@ class HarnessRuntime:
         except Exception as exc:
             _LOG.warning("Harness retention deferred (%s)", type(exc).__name__)
         self._signals[run_id] = Event()
-        queue.put_nowait((principal, run_id))
+        queue.put_nowait((principal, run_id, self._signals[run_id]))
         return {key: value for key, value in run.items() if not key.startswith("_")}
 
     def _initialize_budget(self, run: dict[str, Any], controls: ControlSettings) -> None:
@@ -406,6 +434,18 @@ class HarnessRuntime:
 
     async def get(self, principal: Principal, run_id: str) -> dict[str, Any]:
         run = self.store.get(principal.owner_id, run_id)
+        if self._started and run.get("_continue_after_restart") and run["status"] == "interrupted":
+            wait_reason = ""
+            try:
+                await self.resume(principal, run_id)
+            except QueueFullError:
+                wait_reason = "Очередь занята. Автопилот повторит попытку при открытии запроса."
+            except ValueError:
+                wait_reason = ("Автопилот пока не может продолжить. Проверьте доступ к источникам, "
+                               "настройки Автопилота и оставшийся бюджет запроса.")
+            run = self.store.get(principal.owner_id, run_id)
+            if wait_reason and run["status"] == "interrupted":
+                run["answer"] = wait_reason
         run["resumable"] = await self._can_resume(principal, run)
         return self._visible(run, await self._indexes(principal))
 
@@ -419,19 +459,21 @@ class HarnessRuntime:
     async def _can_resume(self, principal: Principal, run: dict[str, Any]) -> bool:
         if (
             self._graph is None
+            or run.get("mode") == "search"
             or run["status"] not in {"interrupted", "timed_out", "failed", "partial", "cancelled"}
             or run.get("stop_reason") in {"model_policy_stop", "model_refusal_text"}
             or not {"mode", "effort", "metrics"} <= run.keys()
-            or run.get("resume_count", 0) >= self._runtime_limits(run).max_resume_attempts
+            or (run.get("_continue_after_restart") not in {"gateway", "queued"}
+                and self._charged_resumes(run) >= self._runtime_limits(run).max_resume_attempts)
         ):
             return False
         budget = self._budget(run)
-        if run["mode"] != "search" and self._decision_calls(run) >= budget.model_calls:
+        if self._decision_calls(run) >= budget.model_calls:
             return False
-        if (run["mode"] not in {"quick", "search"}
-                and self._followup_calls(run) >= budget.source_calls):
+        if run["mode"] != "quick" and self._followup_calls(run) >= budget.source_calls:
             return False
-        return await self._graph.has_checkpoint(principal, run["id"])
+        return bool(run.get("_continue_after_restart") == "queued"
+                    or await self._graph.has_checkpoint(principal, run["id"]))
 
     async def resume(
         self, principal: Principal, run_id: str, index_ids: list[str] | None = None
@@ -439,6 +481,8 @@ class HarnessRuntime:
         if not self._started:
             raise HarnessUnavailableError("Harness has not started")
         run = self.store.get(principal.owner_id, run_id)
+        if run.get("mode") == "autonomous" and not self.control_store.load().autonomy.enabled:
+            raise ValueError("Режим «Автопилот» отключён администратором.")
         if not await self._can_resume(principal, run):
             raise ValueError("Продолжение недоступно или бюджет исчерпан. Создайте новый запрос.")
         if index_ids is not None and (
@@ -449,11 +493,11 @@ class HarnessRuntime:
         selected = set(index_ids if index_ids is not None else run["index_ids"])
         if not selected <= allowed:
             raise ValueError("Доступ к одному из выбранных источников отсутствует.")
-        queue = self._queues["quick" if run["mode"] in {"quick", "search"} else "investigate"]
-        if queue.full():
+        queue = self._queues["quick" if run["mode"] == "quick" else "investigate"]
+        if queue.full() and not run.get("_continue_after_restart"):
             raise QueueFullError("Очередь заполнена; повторите запрос позже.")
         current = self.store.get(principal.owner_id, run_id)
-        if current["status"] in ACTIVE or current.get("resume_count", 0) != run.get(
+        if current["status"] != run["status"] or current.get("resume_count", 0) != run.get(
             "resume_count", 0
         ):
             raise ValueError("Продолжение этого исследования уже запущено.")
@@ -469,16 +513,21 @@ class HarnessRuntime:
                 "_seen_tool_calls", "_round_evidence", "_stalled_rounds", "_gap_review_requested",
                 "_pending_source_checks",
                 "_mcp_metadata_refs", "_mcp_catalog_revisions", "_mcp_schema_revisions",
-                "_mcp_contract_repairs", "_initial_mcp_route",
+                "_mcp_contract_repairs", "_initial_mcp_route", "_question_bound_mcp_refs",
+                "_question_bound_mcp_call", "_mcp_record_lookup",
             ):
                 run.pop(key, None)
             self._warn(run, "Область изменилась; прежние данные исключены из продолжения.")
-        if run["mode"] == "search":
-            # The retry queries every selected index again. A document returned
-            # only by the old query must not survive as a current search hit.
-            run.update(evidence=[], coverage={}, warnings=[])
-            run.pop("_pending_source_checks", None)
-            run.pop("stop_reason", None)
+        pending = run.pop("_continue_after_restart", None)
+        if pending:
+            self._trace(run, "resume_after_restart", {}, "Сервис восстановлен. Продолжаю запрос.")
+        if pending in {"gateway", "queued"}:
+            # The dispatch was already admitted before shutdown. Advance the
+            # persistence generation without charging another retry for it.
+            run["_restored_dispatches"] = run.get("_restored_dispatches", 0) + 1
+        run.pop("stop_reason", None)
+        run.pop("answer_kind", None)
+        run.pop("_accepted_with_warnings", None)
         run.update(
             status="queued",
             phase="queued",
@@ -487,11 +536,17 @@ class HarnessRuntime:
             index_ids=sorted(selected),
             resume_count=run.get("resume_count", 0) + 1,
             resumable=False,
-            _resume_checkpoint=True,
+            _resume_checkpoint=pending != "queued",
         )
+        if pending and run.get("_gateway_retry_at", 0) > time.time():
+            run.update(phase="waiting_for_gateway",
+                       current_action={"name": "model_retry", "retry_at": run["_gateway_retry_at"]})
         self.store.save(principal.owner_id, run)
         self._signals[run_id] = Event()
-        queue.put_nowait((principal, run_id))
+        if run["phase"] == "waiting_for_gateway" or queue.full():
+            self._schedule_dispatch(principal, run)
+        else:
+            queue.put_nowait((principal, run_id, self._signals[run_id]))
         return {key: value for key, value in run.items() if not key.startswith("_")}
 
     async def list_memory(self, principal: Principal, *, offset: int = 0) -> dict[str, Any]:
@@ -694,10 +749,23 @@ class HarnessRuntime:
         self, principal: Principal, *, offset: int = 0, limit: int = 200
     ) -> dict[str, Any]:
         self._conversation_page(offset, limit)
-        summaries = [
-            self._conversation_summary(key, runs)
-            for key, runs in self._conversation_groups(principal).items()
-        ]
+        groups = self._conversation_groups(principal)
+        pending = [run for runs in groups.values() for run in runs
+                   if run["status"] == "interrupted" and run.get("_continue_after_restart")]
+        if pending:
+            # Opening Harness restores the owner's other interrupted chats, too.
+            # Each dispatch rechecks the current grant and uses the regular queue.
+            slots = asyncio.Semaphore(4)
+
+            async def reconnect(run: dict[str, Any]) -> None:
+                async with slots:
+                    try:
+                        run.update(await self.resume(principal, run["id"]))
+                    except (QueueFullError, ValueError, KeyError):
+                        return  # Removed, resumed by another poll, or no longer eligible.
+
+            await asyncio.gather(*(reconnect(run) for run in pending))
+        summaries = [self._conversation_summary(key, runs) for key, runs in groups.items()]
         summaries.sort(key=lambda item: (item["updated_at"], item["id"]), reverse=True)
         more = offset + limit < len(summaries)
         return {
@@ -722,7 +790,10 @@ class HarnessRuntime:
 
         selected = await asyncio.gather(*(snapshot(run) for run in runs[offset:offset + limit]))
         more = offset + limit < len(runs)
-        summary = self._conversation_summary(conversation_id, runs)
+        refreshed = {run["id"]: run for run in selected}
+        summary = self._conversation_summary(
+            conversation_id, [refreshed.get(run["id"], run) for run in runs],
+        )
         return {
             "id": conversation_id, "conversation_id": conversation_id,
             "conversation": summary, "runs": selected,
@@ -746,12 +817,23 @@ class HarnessRuntime:
 
     async def cancel(self, principal: Principal, run_id: str) -> dict[str, Any]:
         run = self.store.get(principal.owner_id, run_id)
+        self._shutdown_runs.discard(run_id)
+        if run["status"] == "interrupted" and run.pop("_continue_after_restart", None):
+            run.update(status="cancelled", stop_reason="cancelled", completed_at=timestamp(),
+                       answer="Запрос остановлен.", answer_kind="incomplete")
+            self.store.save(principal.owner_id, run)
         if run["status"] in ACTIVE:
             event = self._signals.get(run_id)
             if event is not None:
                 event.set()
             if run["status"] == "queued":
-                run.update(status="cancelled", phase="finished", completed_at=timestamp())
+                timer = self._gateway_waiters.get(run_id)
+                if timer is not None:
+                    timer.cancel()
+                    self._signals.pop(run_id, None)
+                run.update(status="cancelled", phase="finished", completed_at=timestamp(),
+                           current_action=None, stop_reason="cancelled",
+                           answer="Запрос остановлен.", answer_kind="incomplete")
                 self.store.save(principal.owner_id, run)
             else:
                 run["status"] = "cancelling"
@@ -763,10 +845,6 @@ class HarnessRuntime:
         indexes = await self._indexes(principal)
         model = await self._model_status()
         controls = self.control_store.load()
-        mode_profiles = dict(controls.profiles)
-        mode_profiles["search"] = {
-            effort: controls.search_limits(effort) for effort in controls.profiles["quick"]
-        }
         return {
             "enabled": self.settings.enabled,
             "control_enabled": self.settings.control_enabled,
@@ -801,7 +879,7 @@ class HarnessRuntime:
                         }
                         for effort, profile in profiles.items()
                     }
-                    for mode, profiles in mode_profiles.items()
+                    for mode, profiles in controls.profiles.items()
                 },
             },
         }
@@ -823,7 +901,11 @@ class HarnessRuntime:
         return list(
             {
                 str(item["id"]): {"id": str(item["id"]), "name": str(item.get("name", item["id"])),
-                                  "direct_search": provider is self.source}
+                                  "direct_search": provider is self.source,
+                                  "quick_search": provider is self.source or (
+                                      item.get("kind") == "mcp"
+                                      and getattr(provider, "supports_read_only_mcp", False)
+                                  )}
                 for provider, items in zip(providers, catalogs, strict=True)
                 for item in items
                 if item.get("id")
@@ -863,17 +945,49 @@ class HarnessRuntime:
                 "reason": "Проверка доступности модели завершилась ошибкой.",
             }
 
+    @staticmethod
+    def _charged_resumes(run: dict[str, Any]) -> int:
+        return max(0, int(run.get("resume_count", 0)) - int(run.get("_restored_dispatches", 0)))
+
+    def _schedule_dispatch(self, principal: Principal, run: dict[str, Any]) -> None:
+        run_id = run["id"]
+        signal = self._signals[run_id]
+
+        async def enqueue() -> None:
+            await asyncio.sleep(max(0, run.get("_gateway_retry_at", 0) - time.time()))
+            await self._queues["investigate"].put((principal, run_id, signal))
+
+        def forget(completed: asyncio.Task[None]) -> None:
+            if self._gateway_waiters.get(run_id) is completed:
+                self._gateway_waiters.pop(run_id)
+
+        task = asyncio.create_task(enqueue())
+        self._gateway_waiters[run_id] = task
+        task.add_done_callback(forget)
+
     async def _worker(self, lane: str) -> None:
         queue = self._queues[lane]
         while True:
-            principal, run_id = await queue.get()
+            principal, run_id, signal = await queue.get()
+            # A cancelled dispatch may still be in the FIFO after a new resume
+            # for the same run. Only the current event owns its worker resources.
+            if self._signals.get(run_id) is not signal:
+                queue.task_done()
+                continue
             run: dict[str, Any] | None = None
             try:
                 try:
                     run = self.store.get(principal.owner_id, run_id)
                 except KeyError:
                     continue
-                if run["status"] == "queued":
+                if (run["status"] == "queued" and run["phase"] == "waiting_for_gateway"
+                        and not self.control_store.load().autonomy.enabled):
+                    run.update(status="partial", phase="finished", completed_at=timestamp(),
+                               stop_reason="autonomy_disabled", current_action=None,
+                               answer="Продолжение отключено администратором.",
+                               answer_kind="incomplete")
+                    self.store.save(principal.owner_id, run)
+                elif run["status"] == "queued":
                     await self._execute(principal, run)
             except asyncio.CancelledError:
                 raise
@@ -894,14 +1008,19 @@ class HarnessRuntime:
                         _LOG.warning("Harness final state unavailable (%s)",
                                      type(save_error).__name__)
             finally:
-                self._signals.pop(run_id, None)
-                self._semaphores.pop(run_id, None)
-                self._last_checkpoints.pop(run_id, None)
-                self._checkpoint_evidence_counts.pop(run_id, None)
-                clock = self._clocks.pop(run_id, None)
-                if clock is not None and clock.probe is not None:
-                    clock.probe.cancel()
-                    await asyncio.gather(clock.probe, return_exceptions=True)
+                if self._signals.get(run_id) is signal:
+                    if (self._started and not signal.is_set() and run
+                            and run["phase"] == "waiting_for_gateway"):
+                        self._schedule_dispatch(principal, run)
+                    else:
+                        self._signals.pop(run_id, None)
+                    self._semaphores.pop(run_id, None)
+                    self._last_checkpoints.pop(run_id, None)
+                    self._checkpoint_evidence_counts.pop(run_id, None)
+                    clock = self._clocks.pop(run_id, None)
+                    if clock is not None and clock.probe is not None:
+                        clock.probe.cancel()
+                        await asyncio.gather(clock.probe, return_exceptions=True)
                 queue.task_done()
 
     async def _execute(self, principal: Principal, run: dict[str, Any]) -> None:
@@ -920,6 +1039,7 @@ class HarnessRuntime:
         operation = asyncio.create_task(self._research(principal, run, event, deadline))
         terminal: str | None = None
         model_stop: str | None = None
+        deferred = False
         try:
             while not operation.done():
                 await asyncio.wait({operation}, timeout=0.05)
@@ -942,6 +1062,8 @@ class HarnessRuntime:
                     "в GigaCode, затем повторить исследование.",
                 )
             await self._cleanup(operation, run)
+        except _GatewayWait:
+            deferred = True
         except asyncio.CancelledError:
             event.set()
             terminal = "cancelled"
@@ -985,29 +1107,59 @@ class HarnessRuntime:
                         )
                 except Exception:
                     self._warn(run, "Очистка песочницы не подтверждена; сообщите администратору.")
-            if terminal:
-                run["status"] = terminal
-                run["stop_reason"] = model_stop or {
-                    "timed_out": "time_limit", "cancelled": "cancelled",
-                }.get(terminal, "failed" if terminal == "failed" else "partial")
-            elif run["status"] in ACTIVE:
-                run["status"] = "partial"
-                self._warn(run, "Исследование остановилось без подтверждения готового ответа.")
-            if not run["answer"]:
-                self._evidence_answer(run)
-            run.setdefault("stop_reason", run["status"])
-            run.update(phase="finished", completed_at=timestamp(), current_action=None)
-            run["metrics"]["duration_ms"] = previous_duration + round(
-                (time.monotonic() - started) * 1000
-            )
-            self._record_run_outcome(principal.owner_id, run)
-            self.store.save(principal.owner_id, run)
+            if deferred and not event.is_set() and self._started:
+                run["_active_seconds_used"] = run.get("_active_seconds_used", 0) + max(
+                    0, self._now(run) - started,
+                )
+                run["resume_count"] = run.get("resume_count", 0) + 1
+                run.update(
+                    status="queued", phase="waiting_for_gateway", _resume_checkpoint=True,
+                    current_action={"name": "model_retry", "retry_at": run["_gateway_retry_at"]},
+                )
+                run["metrics"]["duration_ms"] = previous_duration + round(
+                    (time.monotonic() - started) * 1000
+                )
+                self.store.save(principal.owner_id, run)
+            else:
+                self._finish_execution(principal, run, "cancelled" if deferred else terminal,
+                                       model_stop, previous_duration,
+                                       started)
             try:
                 self.store.prune()
                 if self._graph is not None:
                     await self._graph.prune()
             except Exception as exc:
                 _LOG.warning("Harness retention deferred (%s)", type(exc).__name__)
+
+    def _finish_execution(
+        self, principal: Principal, run: dict[str, Any], terminal: str | None,
+        model_stop: str | None, previous_duration: int, started: float,
+    ) -> None:
+        if terminal:
+            run["status"] = terminal
+            run["stop_reason"] = model_stop or {
+                "timed_out": "time_limit", "cancelled": "cancelled",
+            }.get(terminal, "failed" if terminal == "failed" else "partial")
+        elif run["status"] in ACTIVE:
+            run["status"] = "partial"
+            self._warn(run, "Исследование остановилось без подтверждения готового ответа.")
+        shutdown = (terminal == "cancelled" and run["mode"] == "autonomous"
+                    and run["id"] in self._shutdown_runs)
+        if shutdown:
+            run["_active_seconds_used"] = run.get("_active_seconds_used", 0) + max(
+                0, self._now(run) - started,
+            )
+            self.store.interrupt_autopilot(run)
+        elif not run["answer"]:
+            self._evidence_answer(run)
+        run.setdefault("stop_reason", run["status"])
+        run.update(phase="finished", completed_at=timestamp(), current_action=None)
+        run["metrics"]["duration_ms"] = previous_duration + round(
+            (time.monotonic() - started) * 1000
+        )
+        if not shutdown:
+            self._record_run_outcome(principal.owner_id, run)
+        self.store.save(principal.owner_id, run)
 
     def _record_run_outcome(self, owner: str, run: dict[str, Any]) -> None:
         if run.get("mode") == "search":
@@ -1080,7 +1232,8 @@ class HarnessRuntime:
         return True
 
     def _run_timeout(self, run: dict[str, Any]) -> float:
-        return self._budget(run).timeout_seconds
+        spent = float(run.get("_active_seconds_used", 0))
+        return max(0.0, self._budget(run).timeout_seconds - spent)
 
     @staticmethod
     def _followup_calls(run: dict[str, Any]) -> int:
@@ -1225,11 +1378,16 @@ class HarnessRuntime:
         try:
             timeout = min(self._runtime_limits(run).external_tool_timeout_seconds,
                           max(0.01, deadline - self._now(run)))
-            environment = (
+            environment: dict[str, Any] = (
                 {"sandbox_profile_id": run["sandbox_profile_id"]}
                 if run.get("sandbox_profile_id")
                 else {}
             )
+            if read_chat(run):
+                if (not getattr(self.tools, "supports_read_only_mcp", False)
+                        or name not in {"mcp_list_tools", "mcp_tool_schema", "mcp_call"}):
+                    raise ValueError("Quick mode can only use read-only MCP tools")
+                environment["read_only_mcp"] = True
             items = await asyncio.wait_for(
                 self.tools.call(
                     name,
@@ -1251,6 +1409,8 @@ class HarnessRuntime:
             for item in items:
                 if item.index_id not in run["index_ids"]:
                     raise ValueError("Tool evidence is outside run scope")
+                if name in {"mcp_list_tools", "mcp_tool_schema"}:
+                    item = item.model_copy(update={"kind": "tool_metadata"})
                 if item.tool_outcome == "failed":
                     failed = True
                     self._record_tool_failure(
@@ -1385,7 +1545,7 @@ class HarnessRuntime:
     ) -> dict[str, tuple[dict[str, str], str]]:
         """Choose the initial document read and one relevant MCP discovery step."""
         routes: dict[str, tuple[dict[str, str], str]] = {}
-        if run["mode"] != "autonomous" or not (knowledge or mcp):
+        if not (knowledge or mcp):
             return routes
         sources = {item["id"]: item["name"] for item in await self._indexes(principal)}
         allowed = set(sources)
@@ -1557,7 +1717,8 @@ class HarnessRuntime:
             if origin_tool == "mcp_call" and item.remote_tool:
                 origin["remote_tool"] = item.remote_tool
             payload["tool_origin"] = origin
-        if checked_with and run.get("mode") == "autonomous" and substantive:
+        if checked_with and substantive and (run.get("mode") == "autonomous"
+                                             or checked_with == "mcp_call"):
             payload["checked_with"] = checked_with
         payload["title"] = payload["title"][:300]
         payload["id"] = payload["id"][:1000]
@@ -1715,21 +1876,37 @@ class HarnessRuntime:
             },
         }
         raw_plan = run.get("research_plan", {})
-        planning = run["mode"] == "autonomous" and bool(tools) and not (
+        planning = run["mode"] == "autonomous" and not read_chat(run) and bool(tools) and not (
             raw_plan.get("model_updated") and raw_plan.get("ready_to_answer")
             and not raw_plan.get("gaps") and not needs_source_check(run)
             and (raw_plan.get("current_branch") or {}).get("status") != "open"
         )
         system_prompt = SYSTEM_PROMPT
         reporting = not tools and run["phase"] == "synthesizing"
-        source_quotes = reporting and run["mode"] == "autonomous" and run.get(
-            "_final_quality_issue"
-        ) and any(
-            is_answer_source(item) and (item.get("read_document") or item.get("checked_with"))
-            for item in run["evidence"]
+        correcting = reporting and bool(run.get("_final_quality_issue"))
+        # A weak planner reply isn't a writer attempt. First ask for an actual
+        # answer. Offer the checked passages on the writer's bounded retry.
+        compound = re.search(
+            r"\b(?:почему|зачем|причин\w*|как (?:устроен\w*|работа\w*)|why|how does)\b",
+            run["question"], re.I,
+        )
+        passage_repair = (
+            run["mode"] != "autonomous" and isinstance(self.model, ModelRouter)
+            and not requested_json(run["question"])
+            and (compound or any(marker in run.get("_final_quality_issue", "") for marker in (
+                "русском объяснении", "Название сервиса расходится",
+            )))
+        )
+        source_quotes = correcting and run["metrics"].get("answer_retries", 0) and (
+            passage_repair or (run["mode"] == "autonomous" and any(
+                is_answer_source(item) and (item.get("read_document") or item.get("checked_with"))
+                for item in run["evidence"]
+            ))
         )
         if planning:
             system_prompt = AUTOPILOT_PLANNING_PROMPT
+        elif tools and read_chat(run):
+            system_prompt = QUICK_TOOL_PROMPT
         elif reporting:
             system_prompt = {
                 "quick": QUICK_ANSWER_PROMPT,
@@ -1853,8 +2030,14 @@ class HarnessRuntime:
             ranked = [{**item, "citation_number": ordinals[(item["index_id"], item["id"])],
                        "citation": "[" + item["id"] + "]"} for item in ranked
                       if is_answer_source(item) and (
-                          not source_quotes or item.get("read_document") or item.get("checked_with")
+                          not source_quotes or passage_repair
+                          or item.get("read_document") or item.get("checked_with")
                       )]
+            if correcting and not source_quotes:
+                for item in ranked:
+                    if len(item["text"]) > 1200:
+                        item["text"] = source_passage(item["text"], run["question"], 1200)
+                        item["context_truncated"] = True
         originals: list[dict[str, Any]] = []
         planning_chars = 0
         for item in ranked:
@@ -1869,7 +2052,9 @@ class HarnessRuntime:
                 continue
             metadata = item.get("kind") == "tool_metadata"
             compact = {**item, "text": item["text"] if metadata else item["text"][:500]}
-            compact["context_truncated"] = len(compact["text"]) < len(item["text"])
+            compact["context_truncated"] = (
+                bool(item.get("context_truncated")) or len(compact["text"]) < len(item["text"])
+            )
             candidate = {**context, "evidence": [*context["evidence"], compact]}
             if ((metadata or len(json.dumps(candidate["evidence"], ensure_ascii=False))
                  < maximum // 2)
@@ -1942,28 +2127,35 @@ class HarnessRuntime:
                     messages[0] = {"role": "system", "content": AUTOPILOT_SELECT_PROMPT}
                     tools = [{"type": "function", "function": {
                         "name": "select_passages",
-                        "description": "Return matching source passages.",
+                        "description": "Answer the question using the selected passages.",
                         "parameters": {"type": "object", "properties": {
                             "numbers": {"type": "array", "items": {"type": "string",
                                                                    "enum": list(choices)},
-                                        "maxItems": 8}},
-                            "required": ["numbers"], "additionalProperties": False},
+                                        "maxItems": 8},
+                                "answer": {"type": "string"}},
+                            "required": ["numbers", "answer"], "additionalProperties": False},
                     }}]
+                    if passage_repair:
+                        messages[0]["content"] += (
+                            " Выбери одно или два предложения, которые вместе прямо отвечают "
+                            "на вопрос. Если готовый ответ уже есть в них, укажи только numbers."
+                        )
+                        tools[0]["function"]["parameters"]["required"] = ["numbers"]
                     run["context_summary"].update(
                         evidence_view="passages", tools_available=1,
                         evidence_included=len({item.source_id for item in choices.values()}),
                     )
                 else:
                     context["response_schema"] = {
-                        "findings": [{"source_id": "id", "quote": "text"}],
+                        "answer": "ответ по вопросу", "findings": [{"source_id": "id",
+                                                                    "quote": "text"}],
                     }
             else:
                 context["answer_correction"] = run["_final_quality_issue"]
             included_memories = []
         writer_refs: dict[int, str] = {}
-        if reporting and run["mode"] in {"quick", "investigate"} and isinstance(
-            self.model, ModelRouter,
-        ):
+        if (reporting and not source_quotes and run["mode"] in {"quick", "investigate"}
+                and isinstance(self.model, ModelRouter)):
             # The writer needs facts and their references. Keep routing state in the
             # graph and use the same short numbers the user sees in the evidence panel.
             ids = {entry["id"] for entry in run["evidence"]}
@@ -1985,11 +2177,13 @@ class HarnessRuntime:
             names = named_values(run["question"], context["evidence"]) if writer_refs else {}
             numbers = {item["id"]: item["citation_number"] for item in context["evidence"]}
             if writer_refs:
-                instruction = WRITER_ANSWER_PROMPT
+                # Relax the wire format for a model which has just missed it.
+                # Markdown citations are validated against this same source set.
+                instruction = ANSWER_REPAIR_PROMPT if correcting else WRITER_ANSWER_PROMPT
                 if names:
                     instruction += (
                         " Пользователь спрашивает точное название. Если оно подтверждено, "
-                        "скопируй название дословно в answer и номер документа в sources."
+                        "скопируй название дословно и укажи источник."
                     )
                 elif run["mode"] == "investigate":
                     instruction += (
@@ -2014,6 +2208,37 @@ class HarnessRuntime:
                 candidate = {**context, "names_in_sources": options}
                 if fits(candidate):
                     context = candidate
+        if reporting and not any(is_answer_source(item) for item in run["evidence"]):
+            messages[0] = {"role": "system", "content": CLARIFICATION_PROMPT}
+            context = {"question": run["question"], "stage": run["phase"],
+                       "source_gaps": context.get("source_gaps", [])}
+            included_memories = []
+        elif correcting and not source_quotes and not writer_refs and not requested_json(
+            run["question"],
+        ):
+            messages[0] = {"role": "system", "content": ANSWER_REPAIR_PROMPT}
+        if (tools and not reporting and read_chat(run)
+                and isinstance(self.model, ModelRouter)):
+            visible_names = {tool["function"]["name"] for tool in tools}
+            need_manifest = "mcp_tool_schema" in visible_names
+            findings = []
+            for item in context["evidence"]:
+                if item.get("kind") == "tool_metadata":
+                    if need_manifest:  # More tools may be discovered on this connection.
+                        findings.append(item)
+                    continue
+                if is_answer_source(item):
+                    findings.append({
+                        "id": item["id"], "title": item["title"], "text": item["text"],
+                        "tool": item.get("tool_origin", {}).get("remote_tool", ""),
+                    })
+            context = {
+                "question": run["question"], "evidence": findings,
+                **{key: context[key] for key in ("source_gaps", "shared_memory_not_evidence")
+                   if context.get(key)},
+                "last_action": next((s["result"] for s in reversed(run["research_trace"])
+                                     if s["name"] == "mcp_call"), ""),
+            }
         messages.append({"role": "user", "content": json.dumps(context, ensure_ascii=False)})
         used = {item["id"]: item for item in run.get("memory_used", [])}
         for item in included_memories:
@@ -2033,27 +2258,53 @@ class HarnessRuntime:
         if (writer_refs and not decision.get("tool_calls")
                 and isinstance(decision.get("content"), str)):
             try:
-                answer = decode_writer_answer(decision["content"], writer_refs)
+                answer = decode_writer_answer(
+                    decision["content"], writer_refs, visible_ids=set(numbers),
+                )
             except InvalidWriterAnswer as exc:
                 if decision.get("finish_reason") in RETRYABLE_FINISH_REASONS:
                     raise ModelDecisionError(str(exc)) from None
                 raise
-            return {**decision, "content": answer}
-        if choices and (calls := decision.get("tool_calls")):
-            if len(calls) == 1 and calls[0].get("name") == "select_passages":
-                numbers = calls[0].get("args", {}).get("numbers")
-                report = selected_quotes(numbers, choices)
-                if report and (verified := render_quoted_findings(run, report.model_dump_json())):
+            return {**decision, "content": format_source_reference(run, answer)}
+        calls = decision.get("tool_calls", [])
+        if (choices and not calls and isinstance(decision.get("content"), str)
+                and (text_call := passage_arguments(decision["content"]))):
+            calls = [{"name": "select_passages", "args": text_call}]
+        if choices and calls:
+            if (len(calls) == 1 and isinstance(calls[0], dict)
+                    and calls[0].get("name") == "select_passages"
+                    and isinstance(args := calls[0].get("args"), dict)):
+                report = selected_quotes(args.get("numbers"), choices)
+                verified = None
+                if report:
+                    verified = answer_from_selected_quotes(run, args.get("answer"), report)
+                    if (passage_repair and len(report.findings) <= 2 and (
+                        not args.get("answer") or (verified and self._draft_quality_issue(
+                            run, verified))
+                    )):
+                        verified = render_quoted_findings(run, report.model_dump_json())
+                if report and verified:
+                    if (passage_repair
+                            and self._draft_quality_issue(run, verified) == MISSING_REASON
+                            and (reason := supporting_reason(run, verified, choices))):
+                        verified += "\n\n" + reason
                     self._trace(run, "select_passages", {},
                                 f"Проверено цитат: {len(report.findings)}.")
                     return {**decision, "content": verified, "tool_calls": [],
                             "finish_reason": "stop"}
-            raise ModelDecisionError("Модель не выбрала подтверждающий фрагмент.")
+            raise ModelDecisionError("Модель не подготовила ответ по выбранным фрагментам.")
         if (source_quotes and not decision.get("tool_calls")
                 and isinstance(decision.get("content"), str)):
             body = decision["content"].lstrip()
             if body.startswith(("{", "```json")):
-                if verified := render_quoted_findings(run, body):
+                if body.startswith("```"):
+                    body = body.partition("\n")[2].removesuffix("```").strip()
+                try:
+                    written = WrittenFindings.model_validate_json(body)
+                except ValidationError:
+                    raise ModelDecisionError("Отсутствует ответ по проверенным фрагментам.") \
+                        from None
+                if verified := answer_from_selected_quotes(run, written.answer, written):
                     return {**decision, "content": verified}
                 raise ModelDecisionError("Цитата из итогового ответа отсутствует в источнике.")
         return decision
@@ -2077,6 +2328,17 @@ class HarnessRuntime:
             delay = retry_at - time.time()
             run_remaining = run["_execution_started"] + self._run_timeout(run) - now
             if delay >= run_remaining:
+                limits = self._runtime_limits(run)
+                waited = run["metrics"].get("gateway_wait_seconds", 0)
+                if (run["mode"] == "autonomous" and run_remaining > 0
+                        and self._charged_resumes(run) < limits.max_resume_attempts
+                        and self._decision_calls(run) < self._budget(run).model_calls
+                        and len(self._gateway_waiters) < limits.queue_max
+                        and delay + waited <= limits.gateway_wait_seconds):
+                    run["metrics"]["gateway_wait_seconds"] = waited + delay
+                    self._trace(run, "model_retry", {}, f"Шлюз просит паузу. Продолжу "
+                                f"автоматически через {delay:.0f} сек.")
+                    raise _GatewayWait
                 raise ModelConnectionError(
                     "Шлюз попросил подождать дольше оставшегося времени запроса."
                 )
@@ -2237,24 +2499,20 @@ class HarnessRuntime:
                 incomplete = decision.get("finish_reason") in RETRYABLE_FINISH_REASONS
                 if incomplete and decision.get("content"):
                     partial = decision
-                if not incomplete or attempt == retries:
-                    if self._answer(run, decision):
-                        return
-                    if run.get("_final_quality_issue"):
-                        self._checkpoint(principal, run, event)
-                        if run["mode"] == "quick":
-                            # The user already has search hits. Don't wait for another
-                            # generation just to replace an empty or ungrounded draft.
-                            break
+                    if attempt < retries:
+                        run["_final_quality_issue"] = "Генерация оборвалась. Завершите ответ."
+                if (not incomplete or attempt == retries) and self._answer(
+                    run, decision, last_attempt=attempt == retries,
+                ):
+                    return
             except ConversationUnavailable:
                 run["status"] = "partial"
                 return
             except InvalidWriterAnswer as exc:
                 run["_final_quality_issue"] = str(exc)
                 self._trace(run, "answer_quality_rejected", {}, str(exc))
-                if run["mode"] == "quick":
-                    break
-            except ModelDecisionError:
+            except ModelDecisionError as exc:
+                run.setdefault("_final_quality_issue", str(exc))
                 run["metrics"]["decision_errors"] = run["metrics"].get("decision_errors", 0) + 1
             except ModelTransientError as exc:
                 self._trace(run, "model_retry", {}, str(exc))
@@ -2263,9 +2521,7 @@ class HarnessRuntime:
             if attempt < retries:
                 run["metrics"]["answer_retries"] = run["metrics"].get("answer_retries", 0) + 1
                 self._trace(run, "answer_recovery", {},
-                            "Предыдущий ответ не завершён или имеет неверный формат. "
-                            "Верните законченный ответ в content без инструментов. "
-                            "Будьте краткими и явно перечислите оставшиеся ограничения.")
+                            "Готовлю ответ повторно по проверенным материалам.")
                 self._checkpoint(principal, run, event)
         if partial:
             self._answer(run, partial)
@@ -2277,22 +2533,59 @@ class HarnessRuntime:
             self._warn(run, "Модель не сформировала законченный ответ после повторной попытки.")
 
     def _draft_quality_issue(self, run: dict[str, Any], content: str) -> str | None:
+        if (run.get("phase") in {"synthesizing", "investigating"} and
+                not any(is_answer_source(item) for item in run["evidence"])):
+            # With no data the writer can ask for a concrete missing detail, but
+            # cannot use an unverified system claim or an invented citation.
+            if (run["phase"] != "synthesizing" or len(content.strip()) > 600 or
+                    not re.fullmatch(r"[^\[\]{}?!\n]+\?", content.strip()) or
+                    re.search(r"\.\s", content.strip())):
+                return "Для ответа нет подтверждений. Задайте один уточняющий вопрос."
+            return None
         limit = self._runtime_limits(run).answer_chars
         if len(content) > limit:
             content = content[:limit - len(_ANSWER_TRUNCATED)]
-        return answer_quality_issue(run, content) or inventory_citation_issue(run, content)
+        return (answer_quality_issue(run, content) or inventory_citation_issue(run, content)
+                or explanation_gap(run, content))
 
-    def _answer(self, run: dict[str, Any], decision: dict[str, Any]) -> bool:
+    def _answer(
+        self, run: dict[str, Any], decision: dict[str, Any], *, last_attempt: bool = False,
+    ) -> bool:
         content = decision.get("content")
         if not isinstance(content, str) or not content.strip():
             return False
         content = content.strip()
+        incomplete = decision.get("finish_reason") in INCOMPLETE_FINISH_REASONS
+        if incomplete and (content.startswith(("{", "```json")) or (
+                requested_json(run["question"]) and content.startswith("["))):
+            raw = (content.partition("\n")[2].removesuffix("```").strip()
+                   if content.startswith("```json") else content)
+            try:
+                json.loads(raw)
+            except (ValueError, RecursionError):
+                run["_final_quality_issue"] = "Ответ оборвался внутри JSON."
+                return False
         issue = self._draft_quality_issue(run, content)
+        if last_attempt and issue == MISSING_REASON:
+            gap = "Причину по собранным материалам объяснить не удалось."
+            self._warn(run, gap)
+            run["answer_kind"] = "incomplete"
+            content += "\n\n" + gap
+            issue = None
         if issue:
             run["_final_quality_issue"] = issue
             self._trace(run, "answer_quality_rejected", {}, issue)
             return False
         run.pop("_final_quality_issue", None)
+        if (run.get("phase") == "synthesizing"
+                and not any(is_answer_source(item) for item in run["evidence"])):
+            if incomplete:
+                run["_final_quality_issue"] = "Модель не закончила уточняющий вопрос."
+                return False
+            run.update(answer="По выбранным источникам подтвердить ответ пока не удалось.\n\n"
+                       + content, answer_kind="clarification", status="partial")
+            run.setdefault("stop_reason", "no_sources")
+            return True
         if run["mode"] == "autonomous":
             self._trace(run, "answer_quality_check", {},
                         "Ссылки из ответа найдены в материалах этого исследования.")
@@ -2301,7 +2594,9 @@ class HarnessRuntime:
         if len(content) > answer_chars:
             self._warn(run, "Ответ превышает настроенный размер и показан не полностью.")
             run["answer"] = content[:answer_chars - len(_ANSWER_TRUNCATED)] + _ANSWER_TRUNCATED
-        if decision.get("finish_reason") in INCOMPLETE_FINISH_REASONS:
+        if incomplete:
+            run["answer_kind"] = "incomplete"
+            run.setdefault("stop_reason", "incomplete_generation")
             self._warn(run, "Модель остановила генерацию до завершения ответа.")
         plan = run.get("research_plan", {})
         if needs_source_check(run):
@@ -2318,6 +2613,9 @@ class HarnessRuntime:
                 else "Ответ подготовлен по собранным подтверждениям."
             )
         run["status"] = "partial" if run["warnings"] else "completed"
+        if (run["status"] == "partial" and not incomplete and len(content) <= answer_chars
+                and any(item.get("tool_origin") for item in run["evidence"])):
+            run["_accepted_with_warnings"] = True
         return True
 
     @staticmethod
@@ -2326,10 +2624,19 @@ class HarnessRuntime:
             run["warnings"].append(message)
 
     def _evidence_answer(self, run: dict[str, Any]) -> None:
-        if run["mode"] == "search" or any(is_answer_source(item) for item in run["evidence"]):
-            run["answer"] = render_search_results(
-                run, max_chars=self._runtime_limits(run).answer_chars,
-            )
-            run["answer_kind"] = "search_results"
-        else:
-            run["answer"] = "Подтверждённых данных для ответа пока нет."
+        reason = run.get("stop_reason") or run["status"]
+        messages = {
+            "model_unavailable": "Модель недоступна. Проверьте подключение в настройках модели.",
+            "answer_quality": "Модель не смогла подтвердить вывод по собранным материалам.",
+            "time_limit": "Время запроса истекло до получения законченного ответа.",
+            "budget_ceiling": "До получения ответа был исчерпан выделенный бюджет.",
+            "context_limit": "Контекст беседы превысил доступный объём для ответа.",
+            "cancelled": "Запрос остановлен.",
+        }
+        answer = messages.get(reason, "Подготовка ответа прервана.")
+        count = sum(is_answer_source(item) for item in run["evidence"])
+        if count:
+            answer += f" Найденные материалы доступны в разделе «Источники» ({count})."
+        elif reason != "cancelled":
+            answer += " Подтверждённых данных по вопросу пока нет."
+        run.update(answer=answer, answer_kind="incomplete")

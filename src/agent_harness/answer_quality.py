@@ -5,16 +5,33 @@
 import json
 import re
 from decimal import Decimal
-from typing import Any
+from typing import Any, Self
 
 from markdown_it import MarkdownIt
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agent_harness.contracts import ModelDecisionError
+from agent_harness.mcp_catalog import question_record_id
 from agent_harness.model_connection import ModelPolicyStop, check_model_policy
 
 _MARKDOWN = MarkdownIt("commonmark", {"html": False})
 _REFERENCE = re.compile(r"\[([^\[\]\n]+)\]")
+# An unexpected word from a third writing system in otherwise Russian prose can
+# indicate decoder corruption. Latin identifiers, Greek formulas, and code are common.
+_OTHER_WRITING = re.compile(
+    r"[\u0590-\u05ff\u0600-\u06ff\u0900-\u097f\u0e00-\u0e7f"
+    r"\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]{2,}|"
+    r"\b[A-Za-zА-Яа-яЁё]*(?:[а-яё][a-z]|[a-z][а-яё])[A-Za-zА-Яа-яЁё]*\b"
+)
+_LANGUAGE_TASK = re.compile(
+    r"\b(?:перевед\w*|перевод\w*|транслит\w*|translate|английск\w*|корейск\w*|"
+    r"китайск\w*|арабск\w*|японск\w*|иврит\w*|хинди|тайск\w*)\b", re.I,
+)
+_ASKS_WHY_TOO = re.compile(r"\b(?:и (?:почему|зачем)|and why)\b", re.I)
+_REASON = re.compile(
+    r"\b(?:потому что|поскольку|так как|чтобы|из-за|because|so that|in order to)\b", re.I,
+)
+MISSING_REASON = "Указан результат, но осталось объяснить причину, о которой спросил пользователь."
 _NAMED_SOURCE = re.compile(
     r"""(?:\b(?:в|из|по|согласно|from|in|according to)\s+(?:(?:the|a)\s+)?"""
     r"""(?:карточк[еи]|документ[еау]|файл[еау]|стать[еи]|инструкции|"""
@@ -128,12 +145,109 @@ def requested_json(question: str) -> bool:
 
 
 _TECHNICAL_NAME = re.compile(
-    r"\b(?:(?:как называется|како(?:й|е|ая))\s+(?:(?:этот|это|эта)\s+)?"
+    r"\b(?:(?:как называется|как(?:ой|ое|ая))\s+(?:(?:этот|это|эта)\s+)?"
     r"(?:событие|топик|поле|сервис|метод|класс|таблица|эндпоинт|параметр|функция)|"
     r"(?:what|which|what is the name of (?:the|this))\s+"
     r"(?:event|topic|field|service|method|class|table|endpoint|parameter|function))\b", re.I,
 )
 _CODE_NAME = re.compile(r"(?<!`)`([a-zA-Z_][\w./:-]{1,179})`(?!`)")
+_SERVICE_NAME = re.compile(r"(?<![a-zA-Z0-9_-])(?:[a-z][a-z0-9]*-)+service(?![a-zA-Z0-9_-])")
+_DESIGN_REQUEST = re.compile(
+    r"\b(?:придум\w*|предлож\w*|спроектир\w*|созда\w*|напиш\w*|пример\w*|например|"
+    r"design|propose|implement|example|invent|create)\b", re.I,
+)
+_FIELD_QUESTION = re.compile(
+    r"(?:как(?:ой|ое|ая)|каков[оа]?|назови(?:те)?|покажи(?:те)?|узнай(?:те)?|уточни(?:те)?|"
+    r"what(?:'s| is)|show|get)\s+(?:(?:the|current|сейчас|текущ\w+|актуальн\w+)\s+)*"
+    r"(?:значение (?:у )?поля\s+)?`?([\w-]+)`?", re.I,
+)
+_FIELD_ALIASES = {
+    "статус": {"статус", "состояние", "status", "state"},
+    "версия": {"версия", "version"},
+    "приоритет": {"приоритет", "priority"},
+    "регион": {"регион", "region"},
+}
+_SCALAR = re.compile(r"[\w][\w ./+-]{0,64}")
+
+
+def _field_values(text: str, aliases: set[str]) -> list[str]:
+    def matches(key: str) -> bool:
+        return re.sub(r"^(?:current|текущ\w+)\s+", "", key.strip().casefold()) in aliases
+
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        line = re.fullmatch(r"\s*([\w -]+?)\s*[:=]\s*[\"']?([\w][\w ./+-]{0,64}?)[\"']?\s*", text)
+        return [line[2].strip()] if line and matches(line[1]) else []
+    # Traverse object fields. Arrays describe collections, not a unique entity.
+    pending = [data] if isinstance(data, dict) else []
+    values = []
+    while pending:
+        for key, value in pending.pop().items():
+            if matches(key):
+                value = value.get("name") if isinstance(value, dict) else value
+                if isinstance(value, str) and _SCALAR.fullmatch(value):
+                    values.append(value)
+            elif isinstance(value, dict):
+                pending.append(value)
+    return values
+
+
+def requested_field_label(question: str) -> str | None:
+    question = question.strip()
+    lead, _, tail = question.partition("?")
+    request = _FIELD_QUESTION.match(lead)
+    tail = tail.strip()
+    if (tail and ("?" in tail or not re.match(r"(?:проверь|сверь|verify|check)\b", tail, re.I))):
+        return None
+    if (not request or requested_json(question) or
+            re.search(r"[,;]|\b(?:и|или|and|or|почему|why)\b", lead, re.I)):
+        return None
+    return request[1].casefold()
+
+
+def requested_field(
+    run: dict[str, Any], sources: list[dict[str, Any]],
+) -> tuple[str, str, str] | None:
+    """Return the requested field, value and source only for a unique live MCP result."""
+    field = requested_field_label(run.get("question", ""))
+    if not field:
+        return None
+    label, aliases = next(((k, v) for k, v in _FIELD_ALIASES.items() if field in v),
+                          (field, {field}))
+    candidates: list[tuple[str, str]] = []
+    for item in sources:
+        if item.get("checked_with") == "mcp_call" and is_answer_source(item):
+            candidates.extend((value, item["id"]) for value in _field_values(item["text"], aliases))
+    if len(candidates) != 1:
+        return None
+    value, ref = candidates[0]
+    if (value.isdecimal() or re.search(r"[\[\]\r\n]", ref)
+            or sum(item["id"] == ref for item in sources) != 1):
+        return None
+    return label, value, ref
+
+
+def _reported_field(run: dict[str, Any], content: str, sources: list[dict[str, Any]]) -> str | None:
+    """Bind a model-selected value or source without crediting ungrounded extra prose."""
+    result = requested_field(run, sources)
+    if not result or re.search(
+        r"\b(?:не|нет|not|возможно|maybe|perhaps|possibly)\b", content, re.I,
+    ):
+        return None
+    label, value, ref = result
+    if question_record_id(run["question"]) and ref not in run.get("_question_bound_mcp_refs", []):
+        return None
+    if "[" in content:
+        # A model can copy the evidence number correctly but corrupt the value
+        # itself. A single selected, current field supplies its canonical value.
+        aliases_by_ref = _source_references(run["evidence"])
+        _, _, refs, metadata = _inspect_markdown(content, set(aliases_by_ref))
+        if metadata or refs - aliases_by_ref.keys() or ref not in {aliases_by_ref[r] for r in refs}:
+            return None
+    elif not re.search(r"(?<![\w.-])" + re.escape(value) + r"(?![\w-]|\.\w)", content, re.I):
+        return None
+    return f"{label[:1].upper()}{label[1:]} — {value} [{ref}]."
 
 
 def named_values(question: str, evidence: list[dict[str, Any]]) -> dict[str, list[str]]:
@@ -155,13 +269,22 @@ class WriterAnswer(BaseModel):
 
     answer: str = Field(min_length=1)
     sources: list[int] = Field(min_length=1)
+    number: int | None = None
+
+    @model_validator(mode="after")
+    def redundant_number_matches(self) -> Self:
+        if "number" in self.model_fields_set and self.sources != [self.number]:
+            raise ValueError("Redundant source number does not match selected source")
+        return self
 
 
 class InvalidWriterAnswer(ModelDecisionError):
     """A final answer could not be tied to the sources shown in its particular request."""
 
 
-def decode_writer_answer(content: str, visible: dict[int, str]) -> str:
+def decode_writer_answer(
+    content: str, visible: dict[int, str], *, visible_ids: set[str] | None = None,
+) -> str:
     """Read a text-only answer envelope and attach only its selected, offered citations."""
     raw = content.strip()
     if raw.startswith(("```json\n", "```\n")):
@@ -172,6 +295,10 @@ def decode_writer_answer(content: str, visible: dict[int, str]) -> str:
     if not raw.startswith("{"):
         if re.search(r"""(?:^|\n)\s*(?:[^\n{}]*:\s*)?\{\s*"(?:answer|sources)"\s*:""", raw):
             raise InvalidWriterAnswer("Модель добавила текст вне итогового JSON-объекта.")
+        offered = set(visible.values()) | (visible_ids or set())
+        _, _, refs, _ = _inspect_markdown(raw, offered)
+        if refs - offered:
+            raise InvalidWriterAnswer("В ответе есть ссылка за пределами переданных материалов.")
         return content
     try:
         writer = WriterAnswer.model_validate_json(raw)
@@ -213,6 +340,22 @@ def answer_quality_issue(run: dict[str, Any], content: str) -> str | None:
         content, sources, require_citation=bool(sources) or run.get("mode") == "autonomous",
         requested_json=requested_json(run.get("question", "")),
     )
+    if not issue and _unexpected_writing(run, content):
+        return ("В русском объяснении появились посторонние слова. Ответьте кратко и простыми "
+                "предложениями. Точные имена компонентов скопируйте из источников.")
+    if (not issue and sources and _SERVICE_NAME.search(content)
+            and not _DESIGN_REQUEST.search(run.get("question", ""))):
+        names = set(_SERVICE_NAME.findall(_REFERENCE.sub("", content)))
+        cited = cited_evidence_ids(content, run["evidence"], question=run.get("question", ""))
+        confirmed = {name for item in run["evidence"] if item["id"] in cited
+                     and is_answer_source(item) for key in ("title", "text", "source_path")
+                     for name in _SERVICE_NAME.findall(item.get(key) or "")}
+        if confirmed and names - confirmed:
+            return "Название сервиса расходится с приведёнными источниками. Скопируйте его точно."
+    if not issue and question_record_id(run.get("question", "")):
+        field = requested_field(run, run.get("evidence", []))
+        if field and field[2] not in run.get("_question_bound_mcp_refs", []):
+            return "Вызов источника не подтвердил, что значение относится к указанной записи."
     if not issue and run.get("mode") in {"quick", "investigate"} and sources:
         options = named_values(run.get("question", ""), run["evidence"])
         if options:
@@ -234,10 +377,48 @@ def answer_quality_issue(run: dict[str, Any], content: str) -> str | None:
     return None
 
 
+def explanation_gap(run: dict[str, Any], content: str) -> str | None:
+    if not _ASKS_WHY_TOO.search(run.get("question", "")) or _REASON.search(content):
+        return None
+    # A paraphrase can explain the cause without an explicit conjunction.
+    def words(text: str) -> set[str]:
+        return set(re.findall(r"[\w-]{4,}", text.casefold()))
+
+    pattern = _REASON.pattern + r"([^.!?]{8,400})"
+    reasons = [match[1] for item in run.get("evidence", []) if is_answer_source(item)
+               for match in re.finditer(pattern, " ".join(item["text"].split()), re.I)]
+    if reasons and not any(len(words(reason) & words(content)) >= 2 for reason in reasons):
+        return MISSING_REASON
+    return None
+
+
+def _unexpected_writing(run: dict[str, Any], content: str) -> bool:
+    question = run.get("question", "")
+    if (not _OTHER_WRITING.search(content) or not re.search(r"[а-яё]{3}", question, re.I)
+            or _LANGUAGE_TASK.search(question)
+            or len(re.findall(r"[а-яё]{2,}", content, re.I)) < 6):
+        return False
+    # Only inspect visible prose. Quoted names or log text present in the sources,
+    # Markdown code, links and their visible labels are legitimate verbatim content.
+    known = [question, *(text for item in run.get("evidence", []) if is_answer_source(item)
+                         for text in (item["text"], item.get("title", "")))]
+    for block in _MARKDOWN.parse(content):
+        link = False
+        for token in block.children or []:
+            if token.type in {"link_open", "link_close"}:
+                link = token.type == "link_open"
+            if token.type == "text" and not link:
+                for word in _OTHER_WRITING.findall(token.content):
+                    if word.isalpha() and all(word not in text for text in known):
+                        return True
+    return False
+
+
 def format_source_reference(run: dict[str, Any], content: str) -> str:
     """Resolve a writer's explicit quoted source name or a verbatim sourced answer."""
     if (run.get("mode") not in {"quick", "investigate", "autonomous"}
-            or "[" in content or not content.strip()
+            or not content.strip()
+            or ("[" in content and not _FIELD_QUESTION.match(run.get("question", "").strip()))
             or content.lstrip().startswith(("{", "```"))):
         return content
     sources = [item for item in run.get("evidence", []) if is_answer_source(item)
@@ -252,6 +433,12 @@ def format_source_reference(run: dict[str, Any], content: str) -> str:
             return f"{match[0]} [{matches[0]['id']}]"
         return match[0]
 
+    if not requested_json(run.get("question", "")) and (field := _reported_field(
+        run, content, sources,
+    )):
+        return field
+    if "[" in content:
+        return content
     result = _NAMED_SOURCE.sub(resolve, content)
     if result != content:
         return result
@@ -281,6 +468,10 @@ class QuotedFindings(BaseModel):
     findings: list[SourceQuote] = Field(min_length=1, max_length=8)
 
 
+class WrittenFindings(QuotedFindings):
+    answer: str = Field(min_length=1)
+
+
 def render_quoted_findings(run: dict[str, Any], content: str) -> str | None:
     """Publish only verbatim excerpts found in the unique, verified current source."""
     body = content.strip()
@@ -297,7 +488,8 @@ def render_quoted_findings(run: dict[str, Any], content: str) -> str | None:
             return None
         sources = [source for source in run["evidence"] if source["id"] == ref
                    and is_answer_source(source)
-                   and (source.get("read_document") or source.get("checked_with"))]
+                   and (run.get("mode") in {"quick", "investigate"}
+                        or source.get("read_document") or source.get("checked_with"))]
         quote = " ".join(item.quote.split())
         if len(sources) != 1 or len(quote) < 8 or quote not in " ".join(sources[0]["text"].split()):
             return None
@@ -311,16 +503,27 @@ def quote_options(evidence: list[dict[str, Any]], question: str) -> dict[str, So
 
     split = RecursiveCharacterTextSplitter(chunk_size=540, chunk_overlap=60)
     terms = set(re.findall(r"[\w-]{3,}", question.casefold()))
-    choices: dict[str, SourceQuote] = {}
+    choices: list[tuple[tuple[bool, int, bool], SourceQuote]] = []
+    wants_reason = bool(_ASKS_WHY_TOO.search(question))
+    russian = bool(re.search(r"[а-яё]{3}", question, re.I))
+    seen = set()
     for item in evidence[:8]:
         if not 0 < len(item["id"]) <= 512 or re.search(r"[\[\]\r\n]", item["id"]):
             continue
-        chunks = split.split_text(item["text"])
-        chunks.sort(key=lambda s: sum(term in s.casefold() for term in terms), reverse=True)
-        for chunk in chunks[:2]:
-            if len(chunk) >= 8:
-                choices[str(len(choices) + 1)] = SourceQuote(source_id=item["id"], quote=chunk)
-    return choices
+        ranked = []
+        for paragraph in re.split(r"\n\s*\n", item["text"]):
+            for chunk in split.split_text(paragraph):
+                key = " ".join(chunk.split())
+                if len(key) < 8 or key.startswith("#") or key in seen:
+                    continue
+                matches = len(terms & set(re.findall(r"[\w-]{3,}", chunk.casefold())))
+                score = (bool(matches and wants_reason and _REASON.search(chunk)), matches,
+                         russian and bool(re.search(r"[а-яё]{3,}", chunk, re.I)))
+                ranked.append((score, SourceQuote(source_id=item["id"], quote=chunk)))
+                seen.add(key)
+        choices.extend(sorted(ranked, key=lambda pair: pair[0], reverse=True)[:2])
+    choices.sort(key=lambda pair: pair[0], reverse=True)
+    return {str(n): choice for n, (_, choice) in enumerate(choices, 1)}
 
 
 def selected_quotes(numbers: Any, choices: dict[str, SourceQuote]) -> QuotedFindings | None:
@@ -337,6 +540,74 @@ def selected_quotes(numbers: Any, choices: dict[str, SourceQuote]) -> QuotedFind
             or any(type(n) not in (int, str) or str(n) not in choices for n in numbers)):
         return None
     return QuotedFindings(findings=[choices[n] for n in dict.fromkeys(str(n) for n in numbers)])
+
+
+def passage_arguments(content: str) -> dict[str, Any] | None:
+    """Read the one offered, local passage selector when a model writes its call as text."""
+    raw = content.strip()
+    if raw.startswith("```json\n") and raw.endswith("```"):
+        raw = raw.partition("\n")[2].removesuffix("```").strip()
+    if not raw.startswith("{") or len(raw) > 16_000 or '"select_passages"' not in raw:
+        return None
+    # Some models double-escape quotes around decimal array entries. Restrict
+    # this repair to numbered items, never arbitrary strings or tool arguments.
+    raw = re.sub(r'(?<=[\[,\s])\\"([0-9]{1,3})\\"(?=\s*[,\]])', r'"\1"', raw)
+    try:
+        item = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(item, dict) or item.keys() != {"name", "parameters"}:
+        return None
+    args = item["parameters"]
+    if (item["name"] == "select_passages" and isinstance(args, dict)
+            and "numbers" in args and args.keys() <= {"numbers", "answer"}):
+        return args
+    return None
+
+
+def answer_from_selected_quotes(
+    run: dict[str, Any], answer: Any, report: QuotedFindings,
+) -> str | None:
+    """Keep the writer's explanation and attach only references to checked passages."""
+    if (not isinstance(answer, str) or not answer.strip()
+            or not render_quoted_findings(run, report.model_dump_json())):
+        return None
+    check_model_policy({"content": answer}, None)
+    ids = list(dict.fromkeys(item.source_id for item in report.findings))
+    _, _, refs, metadata = _inspect_markdown(answer, set(ids))
+    if metadata or refs - set(ids):
+        return None
+    citations = " ".join(f"[{ref}]" for ref in ids if ref not in refs)
+    return f"{answer.strip()} {citations}".rstrip()
+
+
+def supporting_reason(
+    run: dict[str, Any], answer: str, choices: dict[str, SourceQuote],
+) -> str | None:
+    """Complete a compound answer only with one explicit cause for its named component."""
+    entities = set(_SERVICE_NAME.findall(_REFERENCE.sub("", answer)))
+    subject = set(re.findall(r"[\w-]{4,}", run["question"].casefold())) - {
+        "почему", "какой", "какие", "назови", "какая", "который", "этому", "сервису",
+        "этого", "сервис", "система", "what", "service", "does", "this", "which",
+    }
+    if not entities or not subject:
+        return None
+    candidates = {}
+    for passage in choices.values():
+        excerpt = " ".join(passage.quote.split())
+        if (not entities.intersection(_SERVICE_NAME.findall(excerpt))
+                or not subject.intersection(re.findall(r"[\w-]{4,}", excerpt.casefold()))):
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", excerpt):
+            if (_REASON.search(sentence) and 8 <= len(sentence) <= 600
+                    and (_REASON.match(sentence)
+                         or entities.intersection(_SERVICE_NAME.findall(sentence)))):
+                fact = SourceQuote(source_id=passage.source_id, quote=sentence)
+                candidates[fact.quote.casefold()] = fact
+    if len(candidates) == 1:
+        report = QuotedFindings(findings=list(candidates.values()))
+        return render_quoted_findings(run, report.model_dump_json())
+    return None
 
 
 def answer_for_history(content: str | None) -> str:

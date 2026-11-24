@@ -294,67 +294,88 @@ test("deepening an autonomous run preserves the mode and selected sandbox", asyn
   assert.equal(submitted.parent_run_id, "first");
 });
 
-test("visible search mode sends only searchable sources through the form without a model or an execution environment", async (t) => {
+test("composer offers three answer modes, selects read-only MCP for quick replies and preserves other sources", async (t) => {
   const html = fs.readFileSync(path.join(staticPath, "index.html"), "utf8");
   const composer = html.match(/<form id="question-form"[^>]*>([\s\S]*?)<\/form>/)[1];
   assert(composer.indexOf("</details>") < composer.indexOf('id="response-mode"'));
+  const options = composer.match(/<select id="response-mode"[^>]*>([\s\S]+?)<\/select>/)[1];
+  assert.deepEqual([...options.matchAll(/value="(\w+)"/g)].map((match) => match[1]), ["quick", "investigate", "autonomous"]);
   let submitted;
   const { ui, nodes } = fixture(t, ({ path: route, method, body }) => {
-    if (route === "runs" && method === "POST") {
-      submitted = JSON.parse(body); return run("found", { ...submitted });
-    }
+    if (route === "runs" && method === "POST") submitted = JSON.parse(body);
     return run("found", { ...submitted });
   });
   const choose = (value) => { nodes.get("response-mode").value = value; nodes.get("response-mode").listeners.change(); };
-  ui.state.status.model = { available: false, state: "disabled" };
-  const sources = [
-    { id: "wiki", direct_search: true }, { id: "graph:system", direct_search: true },
-    { id: "private-adapter", direct_search: false }, { id: "connection:jira" }, { id: "repo:billing" },
+  ui.state.status.indexes = [
+    { id: "wiki", direct_search: true }, { id: "graph:system", quick_search: true },
+    { id: "connection:jira", direct_search: false, quick_search: true },
+    { id: "connection:agent", quick_search: false }, { id: "repo:billing", quick_search: false },
   ];
-  ui.state.status.indexes = sources;
-  ui.state.selectedSandboxProfile = "removed-profile";
+  ui.state.selectedSandboxProfile = "unavailable";
   ui.renderStatus();
-  choose("search");
-  assert.equal(nodes.get("submit-question").disabled, false);
-  assert.equal(nodes.get("submit-question").firstElementChild.textContent, "Найти");
-  assert.equal(nodes.get("notice").hidden, true);
+  choose("quick");
+  assert.equal(nodes.get("submit-question").firstElementChild.textContent, "Отправить");
   assert.equal(nodes.get("composer-environment").hidden, true);
-  assert.equal(nodes.get("source-count").textContent, "2 / 2");
-  assert.deepEqual(nodes.get("source-list").children.map((row) => row.firstElementChild.value), ["wiki", "graph:system"]);
+  assert.deepEqual(nodes.get("source-list").children.map((row) => row.firstElementChild.value), ["wiki", "graph:system", "connection:jira"]);
   nodes.get("select-all-sources").checked = false; nodes.get("select-all-sources").listeners.change();
-  assert.equal(nodes.get("source-count").textContent, "0 / 2");
+  assert.equal(nodes.get("source-count").textContent, "0 / 3");
   choose("investigate");
-  assert.equal(nodes.get("source-count").textContent, "3 / 5");
+  assert.equal(nodes.get("source-count").textContent, "2 / 5");
   assert.equal(nodes.get("composer-environment").hidden, false);
-  choose("search");
-  nodes.get("question").value = "Порядок оплаты";
+  choose("quick");
+  nodes.get("question").value = "В каком статусе PAY-42?";
   nodes.get("question-form").listeners.submit({ preventDefault() {} });
   assert.equal(submitted, undefined);
-  assert.match(nodes.get("error-banner").textContent, /базу знаний или граф/);
-  nodes.get("select-all-sources").checked = true; nodes.get("select-all-sources").listeners.change();
+  assert.match(nodes.get("error-banner").textContent, /MCP/);
+  const jira = nodes.get("source-list").children[2].firstElementChild;
+  jira.checked = true; jira.listeners.change();
   nodes.get("question-form").listeners.submit({ preventDefault() {} });
   await new Promise(setImmediate);
-  assert.equal(submitted.mode, "search");
-  assert.equal(submitted.question, "Порядок оплаты");
-  assert.deepEqual(submitted.index_ids, ["wiki", "graph:system"]);
+  assert.equal(submitted.mode, "quick");
+  assert.deepEqual(submitted.index_ids, ["connection:jira"]);
   assert.equal(submitted.sandbox_profile_id, "");
-  assert.match(nodes.get("conversation-messages").textContent, /Результаты поиска/);
 });
 
-test("opening a search chat restores its mode and sends a search follow-up to its latest turn", async (t) => {
-  const last = run("searched", { mode: "search", effort: "low" });
+test("a disconnected model shows a connection warning and keeps the selected answer mode", (t) => {
+  const { ui, nodes } = fixture(t);
+  nodes.get("response-mode").value = "investigate";
+  ui.state.status.model = { available: false, state: "disabled" };
+  ui.renderStatus();
+  assert.equal(nodes.get("notice").hidden, false);
+  assert.match(nodes.get("notice").textContent, /подключение/);
+  assert.match(nodes.get("connection-state").className, /warning/);
+  assert.equal(nodes.get("response-mode").value, "investigate");
+});
+
+test("a model asking for a missing identifier keeps the chat open for a follow-up", (t) => {
+  const { ui, nodes } = fixture(t);
+  const clarification = run("first", { status: "partial", stop_reason: "no_sources", answer_kind: "clarification",
+    answer: "Какой номер у обращения в Jira?" });
+  ui.conversationState.id = "chat"; ui.conversationState.runs = [clarification]; ui.state.current = clarification;
+  ui.renderRun();
+  assert.match(nodes.get("conversation-messages").textContent, /Уточнение Harness/);
+  assert.equal(nodes.get("run-status").textContent, "Ждём уточнения");
+  assert.equal(nodes.get("answer").textContent, "Какой номер у обращения в Jira?");
+  assert.equal(nodes.get("submit-question").disabled, false);
+});
+
+test("opening an archived search chat preserves its results and uses the model for its follow-up", async (t) => {
+  const last = run("searched", { mode: "search", effort: "low", resumable: true });
   let submitted;
   const { ui, nodes } = fixture(t, ({ path: route, method, body }) => {
     if (route.startsWith("conversations/chat?")) return { runs: [last], total_runs: 1 };
     if (route === "runs" && method === "POST") submitted = JSON.parse(body);
     return run("next", { ...submitted });
   });
+  nodes.get("response-mode").value = "autonomous";
   await ui.loadConversation({ id: "chat" });
-  assert.equal(nodes.get("response-mode").value, "search");
+  assert.match(nodes.get("conversation-messages").textContent, /Результаты поиска/);
+  assert.equal(nodes.get("response-mode").value, "quick");
+  assert.equal(nodes.get("resume-run").hidden, true);
   assert.equal(nodes.get("effort").value, "low");
   nodes.get("question").value = "Где лимиты?";
   await ui.submitRun();
-  assert.equal(submitted.mode, "search");
+  assert.equal(submitted.mode, "quick");
   assert.equal(submitted.parent_run_id, "searched");
   assert.equal(submitted.effort, "low");
 });
@@ -396,6 +417,24 @@ test("long source IDs become links to their own cards and quoted or unknown IDs 
   link.click();
   assert.equal(document.activeElement, nodes.get("evidence-list").children[1]);
   assert.equal(nodes.get("context-content").hidden, false);
+});
+
+test("model answers link their literal source IDs and numbered references to this turn's evidence", (t) => {
+  const { ui, nodes, document } = fixture(t);
+  const hash = "f".repeat(64);
+  const result = run("model-answer", {
+    answer: "Сумма проверена [" + hash + "]. Второй источник [2]. Настройка `items[2]`, [см. [2]](https://example.org/) и [unknown].",
+    evidence: [{ id: hash, index_id: "a", text: "Предел" }, { id: "doc", index_id: "a", text: "Сумма" }],
+  });
+  ui.conversationState.id = "chat"; ui.conversationState.runs = [result]; ui.state.current = result;
+  ui.renderRun();
+  const paragraph = nodes.get("answer").firstElementChild;
+  const citations = paragraph.children.filter((node) => node.tagName === "button");
+  assert.deepEqual(citations.map((node) => node.textContent), ["[1]", "[2]"]);
+  assert.deepEqual(citations.map((node) => node.title), [hash, "doc"]);
+  assert.match(paragraph.textContent, /items\[2\].*см\. \[2\].*\[unknown\]/);
+  citations[1].click();
+  assert.equal(document.activeElement, nodes.get("evidence-list").children[1]);
 });
 
 test("budget UI separates main and summary calls and shows actual grants", (t) => {
@@ -660,6 +699,25 @@ test("live activity shows model waiting and elapsed time, then collapses complet
   assert.equal(nodes.get("run-progress").hidden, true);
   assert.equal(nodes.get("run-details").open, false);
   assert.equal(nodes.get("answer").textContent, "Answer active");
+});
+
+test("Autopilot shows its next attempt when a gateway delays a request, and Stop cancels the wait", async (t) => {
+  const next = Math.ceil(Date.now() / 1000) + 120;
+  const waiting = run("auto", { mode: "autonomous", status: "queued", phase: "waiting_for_gateway",
+    answer: "", current_action: { name: "model_retry", retry_at: next } });
+  const stopped = { ...waiting, status: "cancelled", phase: "finished", current_action: null };
+  const { ui, nodes, requests } = fixture(t, () => stopped);
+  ui.conversationState.id = "chat"; ui.conversationState.runs = [waiting]; ui.state.current = waiting;
+  ui.renderRun();
+  assert.equal(nodes.get("run-waiting").hidden, false);
+  assert.match(nodes.get("run-status").textContent, /Ожидаем шлюз модели/);
+  assert.match(nodes.get("run-phase").textContent, /отложить запрос/);
+  assert(nodes.get("run-waiting").textContent.includes(new Date(next * 1000).toLocaleTimeString("ru-RU")));
+  assert.equal(nodes.get("cancel-run").hidden, false);
+  await nodes.get("cancel-run").listeners.click();
+  assert(requests.some((call) => call.path === "runs/auto/cancel" && call.method === "POST"));
+  assert.equal(nodes.get("run-waiting").hidden, true);
+  assert.equal(nodes.get("cancel-run").hidden, true);
 });
 
 test("one poll shows why research continued, the active target, and earlier steps from the server", async (t) => {

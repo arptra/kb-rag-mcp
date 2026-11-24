@@ -150,11 +150,12 @@ async def test_unsuccessful_result_cannot_support_citation_or_fallback(
         run["evidence"] = [bad, good]
         assert not app._answer(run, {"content": "The gateway checks orders first [bad]."})
         app._evidence_answer(run)
-        assert "[doc]" in run["answer"] and "[bad]" not in run["answer"]
+        assert run["answer_kind"] == "incomplete" and "«Источники» (1)" in run["answer"]
+        assert "Process output" not in run["answer"]
         run["evidence"] = [bad]
         run.pop("_final_quality_issue")
         app._evidence_answer(run)
-        assert run["answer"] == "Подтверждённых данных для ответа пока нет."
+        assert "Подтверждённых данных по вопросу пока нет" in run["answer"]
         run["mode"] = "investigate"
         assert app._answer(run, {"content": "The gateway checks orders first."})
         assert run["status"] == "partial"

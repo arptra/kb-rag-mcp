@@ -13,6 +13,7 @@
   };
   const PHASE_LABELS = {
     queued: "Ожидаем свободное место для запуска.", searching: "Ищем подтверждения в выбранных источниках.",
+    waiting_for_gateway: "Шлюз модели попросил отложить запрос. Автопилот продолжит автоматически.",
     reading: "Читаем документы и проверяем подробности за пределами поисковых фрагментов.",
     planning: "Определяем, какие сведения нужны для ответа.",
     replanning: "Ищем другой способ проверить вопрос.",
@@ -161,10 +162,11 @@
       day: "numeric", month: "short", ...(full ? { hour: "2-digit", minute: "2-digit" } : {}),
     }).format(date);
   }
-  const MODE_LABELS = { search: "Поиск без модели", quick: "Быстрый ответ", investigate: "Исследование", autonomous: "Автопилот" };
-  function modeLabel(value) { return MODE_LABELS[value] || "Запрос"; }
-  function composerMode() { return $("response-mode").value || "quick"; }
-  function usesTools(mode) { return mode === "investigate" || mode === "autonomous"; }
+  const MODE_LABELS = { quick: "Быстрый ответ", investigate: "Исследование", autonomous: "Автопилот" };
+  function modeLabel(value) { return value === "search" ? "Поиск по источникам" : MODE_LABELS[value] || "Запрос"; }
+  function replyMode(value) { return Object.hasOwn(MODE_LABELS, value) ? value : "quick"; }
+  function composerMode() { return replyMode($("response-mode").value); }
+  function usesSandbox(mode) { return mode === "investigate" || mode === "autonomous"; }
   function effortLabel(value) { return { low: "низкое", medium: "обычное", high: "высокое" }[value] || "не указано"; }
   function showError(message) {
     $("error-banner").textContent = message || "";
@@ -1353,9 +1355,9 @@
     const unavailable = selected && !state.sandboxProfiles.some((profile) => profile.id === selected);
     if (unavailable) { const item = element("option", "", "Недоступная среда · " + selected); item.value = selected; item.disabled = true; select.append(item); }
     select.value = selected;
-    const withTools = usesTools(composerMode());
-    $("composer-environment").hidden = !withTools;
-    select.disabled = !withTools || state.needsAuth || Boolean(state.current && !Array.isArray(state.current.index_ids));
+    const withSandbox = usesSandbox(composerMode());
+    $("composer-environment").hidden = !withSandbox;
+    select.disabled = !withSandbox || state.needsAuth || Boolean(state.current && !Array.isArray(state.current.index_ids));
     $("environment-description").textContent = unavailable ?
       "Выбранная среда сейчас недоступна. Выберите другую среду." : state.sandboxProfiles.length ?
       "Подготовленная среда для запуска кода." : "Среды включаются в настройках песочниц.";
@@ -1377,14 +1379,14 @@
     } finally { if (state.sandboxProfilesController === controller) state.sandboxProfilesController = null; }
   }
   function renderRunEnvironment(run) {
-    $("run-environment").hidden = !usesTools(run.mode);
+    $("run-environment").hidden = !usesSandbox(run.mode);
     $("run-environment").textContent = "Среда выполнения: " + sandboxProfileName(run.sandbox_profile_id || "") +
       (run.resumable ? ". Продолжение использует исходную среду. Для смены среды начните новый запрос." : ".");
   }
   function indexes() { return Array.isArray(state.status?.indexes) ? state.status.indexes : []; }
-  function supportsDirectSearch(item) { return item.direct_search ?? !/^(repo|connection):/.test(item.id); }
   function modeIndexes(mode) {
-    return mode === "search" ? indexes().filter(supportsDirectSearch) : indexes();
+    return mode === "quick" ? indexes().filter((item) =>
+      item.quick_search ?? item.direct_search ?? !/^(repo|connection):/.test(item.id)) : indexes();
   }
   function renderEffortDescription() {
     $("mode-autonomous").disabled = state.status?.limits?.autonomous_enabled === false;
@@ -1392,16 +1394,14 @@
     const mode = composerMode();
     const policy = state.status?.limits?.effort_policy?.[mode]?.[$("effort").value];
     $("mode-description").textContent = {
-      search: "Фрагменты из баз знаний и графа.",
-      quick: "Краткий ответ по источникам.",
+      quick: "Ответ по базам знаний и MCP.",
       investigate: "Проверка по документам, коду и инструментам.",
       autonomous: "Агент выбирает и проверяет следующие шаги.",
     }[mode];
-    const parts = [mode === "search" ? "Усилие задаёт время поиска и число параллельных обращений к индексам."
-      : usesTools(mode) ? "Сначала обходим все выбранные базы знаний." : "Все выбранные базы знаний и один итоговый ответ."];
-    if (mode === "search" && policy?.evidence_per_index) parts.push("Материалов из каждого индекса: до " + policy.evidence_per_index + ".");
+    const parts = [mode === "quick" ? "Модель отвечает по выбранным базам знаний и инструментам чтения MCP."
+      : "Сначала обходим все выбранные базы знаний."];
     if (mode === "autonomous") parts.push("Агент сам запрашивает дополнительные ресурсы в пределах потолков администратора. Все расширения видны в чате.");
-    if (policy && usesTools(mode)) {
+    if (policy && usesSandbox(mode)) {
       parts.push("Чтение документов: до " + policy.document_reads + ". Уточняющих обращений: до " + policy.source_calls + ".");
     } else if (mode === "quick") parts.push("Усилие определяет объём найденных материалов для ответа.");
     if (Number(policy?.timeout_seconds) > 0) parts.push((mode === "autonomous" ? "Стартовое время: " : "Время работы: до ") + Math.ceil(policy.timeout_seconds / 60) + " мин.");
@@ -1414,7 +1414,7 @@
   function updateSubmit() {
     const disabled = state.submitting || state.needsAuth || !state.status || state.status.enabled === false || conversationState.loading || Boolean(activeConversationRun());
     $("submit-question").disabled = disabled;
-    $("submit-question").firstElementChild.textContent = state.submitting ? "Отправляем…" : composerMode() === "search" ? "Найти" : "Отправить";
+    $("submit-question").firstElementChild.textContent = state.submitting ? "Отправляем…" : "Отправить";
     const scopeLoading = Boolean(state.current && !Array.isArray(state.current.index_ids));
     $("deepen-run").disabled = disabled || scopeLoading;
     $("resume-run").disabled = disabled || scopeLoading;
@@ -1446,8 +1446,8 @@
     }
     $("source-list").replaceChildren(fragment);
     $("sources-empty").hidden = available.length > 0;
-    $("sources-empty").textContent = composerMode() === "search" ?
-      "Для прямого поиска нужна база знаний или граф. Для подключений и репозиториев выберите «Исследование»." :
+    $("sources-empty").textContent = composerMode() === "quick" && indexes().length ?
+      "Для быстрого ответа подключите базу знаний или MCP. Репозитории и агенты A2A доступны в исследовании." :
       "Доступные источники пока не подключены.";
     updateSourceCount();
   }
@@ -1475,8 +1475,11 @@
       notice = "Источники пока недоступны. Запрос не сможет получить подтверждения, пока доступ не восстановлен.";
       connection("Нет источников", "warning");
     } else if (!status.model?.available) {
-      if (composerMode() !== "search") notice = "Модель сейчас недоступна. «Поиск без модели» показывает найденные фрагменты и источники.";
-      connection("Поиск по источникам", "ready");
+      notice = {
+        authentication_required: "Для ответа нужен вход в GigaCode. Состояние подключения видно в панели источников.",
+        starting: "Модель запускается. Состояние подключения обновится автоматически.",
+      }[modelState()] || "Модель недоступна. Проверьте подключение в настройках модели.";
+      connection("Ожидаем модель", "warning");
     } else connection("Готов к работе", "ready");
     $("notice").textContent = notice;
     $("notice").hidden = !notice;
@@ -1742,7 +1745,7 @@
         state.current = conversationState.runs.find((run) => idOf(run) === selectedId) || conversationState.runs.at(-1) || null;
         if (!sameConversation) {
           const latest = conversationState.runs.at(-1);
-          if (latest && Object.hasOwn(MODE_LABELS, latest.mode)) $("response-mode").value = latest.mode;
+          if (latest) $("response-mode").value = replyMode(latest.mode);
           if (latest?.effort) $("effort").value = latest.effort;
           renderEffortDescription();
         }
@@ -1785,7 +1788,8 @@
       const assistant = element("div", "chat-assistant");
       const heading = element("div", "chat-assistant-heading");
       const searchResults = run.mode === "search" || run.answer_kind === "search_results";
-      heading.append(element("span", "chat-role", searchResults ? "Результаты поиска" : "Ответ Harness"),
+      const role = searchResults ? "Результаты поиска" : run.answer_kind === "clarification" ? "Уточнение Harness" : "Ответ Harness";
+      heading.append(element("span", "chat-role", role),
         element("span", "chat-status" + (ACTIVE.has(run.status) ? " is-active" : ""), runStatusLabel(run)));
       if (!searchResults && run.answer && run.evidence?.length && !ACTIVE.has(run.status)) {
         const sources = element("button", "chat-sources", "Источники · " + run.evidence.length);
@@ -1903,26 +1907,51 @@
   function renderAnswer(text, target = $("answer"), run = state.current) {
     const selected = target === $("answer");
     const search = run?.answer_kind === "search_results" || run?.mode === "search";
-    const signature = search ? JSON.stringify([idOf(run), text, run.evidence?.map((item) => item.id)]) : text;
+    const signature = JSON.stringify([idOf(run), search, text, run?.evidence?.map((item) => item.id)]);
     if (selected && signature === state.answerSignature) return;
     if (selected) state.answerSignature = signature;
     const fragment = document.createDocumentFragment();
     const body = search ? text.replace(/^\*\*Результаты поиска\*\*\n\n/, "") : text;
     if (markdown) {
       const tokens = markdown.parse(body, {});
-      if (search) {
+      if (run?.evidence?.length) {
         const positions = new Map();
-        (run.evidence || []).forEach((item, i) => positions.set(item.id, positions.has(item.id) ? -1 : i));
-        // A direct-search card ends its source line with the retained ID. Leave
-        // quoted document contents, links and ambiguous IDs exactly as returned.
+        run.evidence.forEach((item, i) => positions.set(item.id, positions.has(item.id) ? -1 : i));
+        run.evidence.forEach((item, i) => {
+          if (!positions.has(String(i + 1))) positions.set(String(i + 1), i);
+        });
         for (const token of tokens) {
-          if (token.type !== "inline" || token.level !== 1) continue;
-          const tail = token.children?.at(-1);
-          const match = tail?.type === "text" && /\[([\da-f]{64})\]$/i.exec(tail.content);
-          const position = match ? positions.get(match[1]) : null;
-          if (position == null || position < 0) continue;
-          tail.content = tail.content.slice(0, match.index);
-          token.children.push({ type: "harness_citation", run, id: match[1], position });
+          if (token.type !== "inline") continue;
+          if (search) {
+            // Archived search answers quote the original document verbatim.
+            // Its source ID appears at the end of a separate, top-level line.
+            if (token.level !== 1) continue;
+            const tail = token.children?.at(-1);
+            const match = tail?.type === "text" && /\[([\da-f]{64})\]$/i.exec(tail.content);
+            const position = match ? positions.get(match[1]) : null;
+            if (position == null || position < 0) continue;
+            tail.content = tail.content.slice(0, match.index);
+            token.children.push({ type: "harness_citation", run, id: match[1], position });
+            continue;
+          }
+          let insideLink = false;
+          token.children = token.children.flatMap((child) => {
+            if (child.type === "link_open") insideLink = true;
+            if (child.type === "link_close") insideLink = false;
+            if (insideLink || child.type !== "text") return [child];
+            const parts = [];
+            let start = 0;
+            for (const match of child.content.matchAll(/\[([^\[\]\r\n]{1,1000})\]/g)) {
+              const position = positions.get(match[1]);
+              if (position == null || position < 0) continue;
+              if (match.index > start) parts.push({ type: "text", content: child.content.slice(start, match.index) });
+              parts.push({ type: "harness_citation", run, id: run.evidence[position].id, position });
+              start = match.index + match[0].length;
+            }
+            if (start === 0) return [child];
+            if (start < child.content.length) parts.push({ type: "text", content: child.content.slice(start) });
+            return parts;
+          });
         }
       }
       appendMarkdown(fragment, tokens);
@@ -2039,12 +2068,16 @@
   }
   function actionDescription(action) {
     if (!action?.name) return "";
+    if (action.name === "model_retry" && Number.isFinite(action.retry_at)) return "Ожидаем шлюз модели";
     const ids = action.args || {};
     const scope = ids.index_id ? sourceName(ids.index_id) : ids.repository_id || ids.connection_id;
     return [actionLabel(action.name), scope, ids.document_id].filter(Boolean).join(" · ");
   }
   function runStatusLabel(run) {
+    if (run.status === "queued" && run.phase === "waiting_for_gateway") return "Ожидаем шлюз модели";
+    if (run.answer_kind === "clarification") return "Ждём уточнения";
     if (["partial", "failed"].includes(run.status) && Object.hasOwn(ANSWER_STOP_LABELS, run.stop_reason)) return ANSWER_STOP_LABELS[run.stop_reason];
+    if (run.answer_kind === "incomplete") return "Ответ не завершён";
     if (run.status === "partial" && !run.evidence?.length) return "Недостаточно данных";
     return STATUS_LABELS[run.status] || "Состояние запроса обновляется";
   }
@@ -2142,9 +2175,18 @@
     $("run-progress").hidden = !active && run.status === "completed";
     const actionStart = Date.parse(run.current_action?.started_at || "");
     const elapsed = Number.isFinite(actionStart) ? Math.max(0, Math.floor((Date.now() - actionStart) / 1000)) : 0;
-    $("run-waiting").hidden = !active || !Number.isFinite(actionStart);
-    $("run-waiting").textContent = "Текущее действие: " + (elapsed >= 60 ? Math.floor(elapsed / 60) + " мин " + elapsed % 60 + " сек" : elapsed + " сек") +
-      (["model_response", "model_call", "model_planning", "model_budget_review", "context_compaction"].includes(run.current_action?.name) ? " · Ожидаем ответ модели." : "");
+    const retryTime = run.status === "queued" && run.phase === "waiting_for_gateway" && Number.isFinite(run.current_action?.retry_at)
+      ? new Date(run.current_action.retry_at * 1000) : null;
+    if (retryTime && Number.isFinite(retryTime.getTime())) {
+      $("run-waiting").hidden = false;
+      $("run-waiting").textContent = retryTime.getTime() > Date.now()
+        ? "Повторный запрос после " + retryTime.toLocaleTimeString("ru-RU") + " по вашему времени."
+        : "Пауза завершилась. Ожидаем возобновления запроса.";
+    } else {
+      $("run-waiting").hidden = !active || !Number.isFinite(actionStart);
+      $("run-waiting").textContent = "Текущее действие: " + (elapsed >= 60 ? Math.floor(elapsed / 60) + " мин " + elapsed % 60 + " сек" : elapsed + " сек") +
+        (["model_response", "model_call", "model_planning", "model_budget_review", "context_compaction"].includes(run.current_action?.name) ? " · Ожидаем ответ модели." : "");
+    }
     const trace = Array.isArray(run.research_trace) ? run.research_trace : [];
     const lastStep = trace.at(-1);
     const rejected = trace.findLast((item) => item?.name === "answer_quality_rejected");
@@ -2159,6 +2201,7 @@
     $("run-details-summary").textContent = "Подтверждений: " + evidenceCount + (run.metrics?.tool_calls ? " · Действий: " + run.metrics.tool_calls : "");
     const phase = run.status === "cancelling" ? "Ожидаем завершения текущего действия." :
       active ? (PHASE_LABELS[run.phase] || "Ожидаем обновления от сервера.") :
+      run.answer_kind === "clarification" ? "Напишите уточнение в этом чате, чтобы продолжить." :
       run.status === "partial" ? "Ответ может быть неполным. Проверьте найденные материалы и замечания." :
       ["failed", "interrupted", "timed_out"].includes(run.status) ? "Найденные до остановки материалы сохранены." : "";
     $("run-phase").textContent = phase;
@@ -2177,7 +2220,7 @@
     if ($("progress-live").textContent !== announcement) $("progress-live").textContent = announcement;
     $("cancel-run").hidden = !active;
     $("deepen-run").hidden = active || ["failed", "interrupted"].includes(run.status);
-    $("resume-run").hidden = active || run.resumable !== true;
+    $("resume-run").hidden = active || run.resumable !== true || run.mode === "search";
     $("remember-run").hidden = active || !memoryState.available;
     const memories = Array.isArray(run.memory_used) ? run.memory_used : [];
     $("run-memory-used").replaceChildren(element("strong", "", "Учтено из общей памяти АС: " + memories.length), ...memories.map((item) => {
@@ -2344,8 +2387,8 @@
     const mode = parent ? (parent.mode === "autonomous" ? "autonomous" : "investigate") : composerMode();
     const selected = parent ? (Array.isArray(parent.index_ids) ? parent.index_ids : [])
       : modeIndexes(mode).filter((item) => state.selected.has(item.id)).map((item) => item.id);
-    if (!parent && (indexes().length || mode === "search") && !selected.length) {
-      showError(mode === "search" ? "Для поиска выберите базу знаний или граф в области поиска." : "Выберите хотя бы один источник в области поиска.");
+    if (!parent && indexes().length && !selected.length) {
+      showError(mode === "quick" ? "Выберите базу знаний, граф или MCP для быстрого ответа." : "Выберите хотя бы один источник в области поиска.");
       setPanelCollapsed("context", false);
       const summary = $("sources-disclosure").querySelector("summary");
       if (summary.getAttribute("aria-expanded") !== "true") summary.click();
@@ -2360,7 +2403,7 @@
       ...(followup ? { parent_run_id: idOf(followup) } : {}),
     };
     if (payload.mode === "autonomous" && state.status?.limits?.autonomous_enabled === false) { showError("Автопилот отключён администратором. Выберите другой режим."); return; }
-    payload.sandbox_profile_id = usesTools(mode) ? state.selectedSandboxProfile : "";
+    payload.sandbox_profile_id = usesSandbox(mode) ? state.selectedSandboxProfile : "";
     if (payload.sandbox_profile_id && !state.sandboxProfiles.some((profile) => profile.id === payload.sandbox_profile_id)) {
       showError("Выбранная среда выполнения недоступна. Выберите другую среду или вариант по умолчанию."); return;
     }
@@ -2406,9 +2449,9 @@
     finally { if (identityEpoch === state.identityEpoch) { state.cancelling = false; updateSubmit(); schedulePoll(); } }
   }
   async function resumeRun() {
-    if (!state.current?.resumable || state.submitting || state.needsAuth) return;
-    const scopeMode = state.current.mode === "search" ? "search" : composerMode();
-    const selected = modeIndexes(scopeMode).filter((item) => state.selected.has(item.id)).map((item) => item.id);
+    if (!state.current?.resumable || state.current.mode === "search" || state.submitting || state.needsAuth) return;
+    const visible = new Set(modeIndexes(composerMode()).map((item) => item.id));
+    const selected = modeIndexes(state.current.mode).filter((item) => visible.has(item.id) && state.selected.has(item.id)).map((item) => item.id);
     if (!selected.length) { showError("Выберите источники для продолжения."); setPanelCollapsed("context", false); return; }
     const epoch = state.identityEpoch, generation = state.generation, id = idOf(state.current);
     state.submitting = true; showError(""); updateSubmit();

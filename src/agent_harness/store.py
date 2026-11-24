@@ -284,6 +284,23 @@ class RunStore:
                     f"AND runs.owner={table}.owner)"
                 )
 
+    @staticmethod
+    def interrupt_autopilot(run: dict[str, Any]) -> None:
+        # No credentials are persisted. The owner's next authenticated chat request
+        # supplies current permissions before any stored work can be continued.
+        untouched = (not run.get("_resume_checkpoint") and not run.get("research_trace")
+                     and not run.get("evidence") and not run.get("_inflight_action")
+                     and not run.get("_completed_effects")
+                     and not any(run.get("metrics", {}).get(k) for k in
+                                 ("model_calls", "source_calls", "bootstrap_calls", "tool_calls")))
+        kind = "queued" if untouched else "checkpoint"
+        if run.get("phase") == "waiting_for_gateway":
+            kind = "gateway"
+        run.update(status="interrupted", phase="finished", completed_at=timestamp(),
+                   stop_reason="service_restart", current_action=None, answer_kind="incomplete",
+                   answer="Сервис перезапущен. Запрос ожидает продолжения при открытии чата.",
+                   _continue_after_restart=kind)
+
     def recover(
         self, on_interrupted: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
@@ -294,6 +311,15 @@ class RunStore:
             interrupted = list(rows)
         for owner, data in interrupted:
             run = json.loads(data)
+            if run["status"] == "cancelling":
+                run.update(status="cancelled", phase="finished", completed_at=timestamp(),
+                           stop_reason="cancelled", current_action=None)
+                self.save(owner, run)
+                continue
+            if run.get("mode") == "autonomous":
+                self.interrupt_autopilot(run)
+                self.save(owner, run)
+                continue
             run.update(status="interrupted", phase="finished", completed_at=timestamp(),
                        stop_reason="interrupted", current_action=None)
             run["warnings"].append(

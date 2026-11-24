@@ -37,6 +37,23 @@ async def manager(request: Request) -> bool:
     return request.headers.get("x-owner") == "operator"
 
 
+def test_legacy_quick_budget_gains_mcp_and_keeps_later_operator_opt_out(tmp_path: Path) -> None:
+    store = ControlStore(settings(tmp_path))
+    data = store.load().model_dump()
+    data.pop("schema_version")
+    for limits in data["profiles"]["quick"].values():
+        limits.update(model_calls=1, source_calls=0, tool_calls=0, timeout_seconds=75.0)
+    with store._connect() as db:
+        db.execute("INSERT INTO control VALUES(1,?)", (json.dumps(data),))
+    upgraded = store.load()
+    quick = upgraded.profiles["quick"]["low"]
+    assert quick.tool_calls >= 3 and quick.model_calls >= 3 and quick.timeout_seconds == 75
+    quick.model_calls, quick.source_calls, quick.tool_calls = 1, 0, 0
+    store.save(upgraded, expected_revision=0)
+    persisted = store.load().profiles["quick"]["low"]
+    assert (persisted.model_calls, persisted.source_calls, persisted.tool_calls) == (1, 0, 0)
+
+
 def test_default_load_is_lazy_and_revision_is_atomic(tmp_path: Path) -> None:
     store = ControlStore(settings(tmp_path))
     first = store.load()
@@ -85,7 +102,7 @@ def test_operator_policy_rejects_invalid_limits(tmp_path: Path, change: str) -> 
     elif change == "keep_trigger":
         payload["context"]["keep_fraction"] = payload["context"]["trigger_fraction"]
     elif change == "quick_tools":
-        payload["profiles"]["quick"]["low"]["tool_calls"] = 1
+        payload["profiles"]["quick"]["low"]["tool_calls"] = -1
     elif change == "unknown_field":
         payload["allow_all_sources"] = True
     elif change == "negative_memory":

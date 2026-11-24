@@ -23,7 +23,7 @@ function settings() {
     profiles: Object.fromEntries(["quick", "investigate", "autonomous"].map((mode) => [mode, Object.fromEntries(["low", "medium", "high"].map((effort) => [effort, { ...profile }]))])),
     autonomy: { enabled: true, max_extensions: 4, minimum_progress: true, caps: { ...profile, model_calls: 128 } },
     context: { enabled: true, window_tokens: 65536, keep_fraction: .35 },
-    runtime: { queue_max: 32, quick_workers: 2, external_tool_timeout_seconds: 600, max_decision_errors: 3 },
+    runtime: { queue_max: 32, quick_workers: 2, external_tool_timeout_seconds: 600, max_decision_errors: 3, gateway_wait_seconds: 300 },
   }, schema: { $defs: { RunLimits: { properties: { model_calls: { type: "integer", minimum: 1, maximum: 1000 } } }, AutonomySettings: { properties: {} }, ContextSettings: { properties: {} }, RuntimeLimits: { properties: {} } } }, activation: { restart_fields: ["quick_workers", "queue_max"], restart_required: [] } };
 }
 function metrics() {
@@ -55,12 +55,17 @@ test("edits a typed profile, keeps other profiles, and saves the server revision
   const edit = input(nodes, "profiles.autonomous.medium.model_calls"); edit.value = "16"; edit.listeners.input();
   assert.equal(ui.state.settings.profiles.autonomous.medium.model_calls, 16);
   assert.equal(ui.state.settings.profiles.investigate.medium.model_calls, 8);
+  const waitingLimit = input(nodes, "runtime.gateway_wait_seconds");
+  assert.equal(Number(waitingLimit.value), 300);
+  assert.match(nodes.get("runtime-fields").textContent, /Общее ожидание шлюза за запуск Автопилота/);
+  waitingLimit.value = "600"; waitingLimit.listeners.input();
   const pending = ui.saveSettings();
   assert.equal(edit.disabled, true);
   await new Promise(setImmediate);
   const mutation = calls.find((item) => item.method === "PUT");
   assert.equal(mutation.headers["X-CSRF-Token"], "test-admin-csrf");
   const submitted = JSON.parse(mutation.body); assert.equal(submitted.revision, 7); assert.equal("revision" in submitted.settings, false);
+  assert.equal(submitted.settings.runtime.gateway_wait_seconds, 600);
   release(); await pending;
   assert.equal(ui.state.revision, 8); assert.equal(ui.dirty(), false);
   assert.equal(input(nodes, "profiles.autonomous.medium.model_calls").disabled, false);

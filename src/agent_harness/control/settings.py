@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -110,12 +111,17 @@ class RuntimeLimits(StrictSettings):
     max_answer_retries: int = Field(default=1, ge=0, le=10)
     max_decision_errors: int = Field(default=3, ge=1, le=20)
     max_resume_attempts: int = Field(default=3, ge=0, le=100)
+    gateway_wait_seconds: float = Field(
+        default=300, ge=0, le=86400,
+        description="Ожидание отложенных повторов Автопилота в секундах",
+    )
     memory_max_records: int = Field(default=10_000, ge=1, le=1_000_000)
     memory_retrieval_count: int = Field(default=3, ge=0, le=100)
     memory_context_tokens: int = Field(default=2000, ge=0, le=32_000)
 
 
 class ControlSettings(StrictSettings):
+    schema_version: Literal[2] = 2
     revision: int = Field(default=0, ge=0)
     model_profile: Literal["generic", "deepseek_v4_flash"] = "generic"
     profiles: dict[str, dict[str, RunLimits]]
@@ -141,8 +147,6 @@ class ControlSettings(StrictSettings):
             if set(profiles) != set(EFFORTS):
                 raise ValueError("Для каждого режима требуются три уровня усилия.")
             for profile in profiles.values():
-                if mode == "quick" and (profile.tool_calls or profile.source_calls):
-                    raise ValueError("Быстрый режим не запускает дополнительные инструменты.")
                 if mode == "autonomous":
                     for field in RunLimits.model_fields:
                         if getattr(profile, field) > getattr(self.autonomy.caps, field):
@@ -320,7 +324,19 @@ class ControlStore:
             return defaults
         with self._connect() as db:
             row = db.execute("SELECT data FROM control WHERE id=1").fetchone()
-        current = ControlSettings.model_validate_json(row[0]) if row else defaults
+        if not row:
+            return defaults
+        data = json.loads(row[0])
+        if "schema_version" not in data:
+            # The old validator mandated zero follow-up and tool calls for
+            # quick. Preserve every other operator setting and future opt-outs.
+            for effort, limits in data["profiles"]["quick"].items():
+                if limits["source_calls"] == limits["tool_calls"] == 0:
+                    profile = defaults.profiles["quick"][effort]
+                    limits.update(source_calls=profile.source_calls, tool_calls=profile.tool_calls)
+                    if limits["model_calls"] == 1:
+                        limits["model_calls"] = profile.model_calls
+        current = ControlSettings.model_validate(data)
         if current.model_profile != defaults.model_profile:
             current = _migrate_profile(
                 current, default_settings(self.settings, current.model_profile), defaults,

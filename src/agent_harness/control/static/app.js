@@ -2,16 +2,18 @@
 (() => {
   const $ = (id) => document.getElementById(id), AUTH_KEY = "agent-harness.auth.v1";
   const ACTIVE = new Set(["queued", "running", "cancelling"]);
-  const MODES = { search: "Поиск без модели", quick: "Быстрый ответ", investigate: "Исследование", autonomous: "Автопилот" };
+  const MODES = { search: "Поиск по источникам (архив)", quick: "Быстрый ответ", investigate: "Исследование", autonomous: "Автопилот" };
   const STATUSES = { queued: "В очереди", running: "В работе", cancelling: "Останавливается", completed: "Готово", partial: "С ограничениями", cancelled: "Остановлен", timed_out: "Истекло время", failed: "Ошибка", interrupted: "Прерван" };
   const STOP_REASONS = { completed: "Ответ завершён", time_limit: "Исчерпано время", cancelled: "Остановлено", failed: "Ошибка выполнения", interrupted: "Прервано перезапуском", budget_ceiling: "Потолок бюджета", context_limit: "Ограничение контекста", no_new_evidence: "Нет новых материалов", partial: "Ответ с ограничениями", active: "Выполняется" };
   const LABELS = {
+    gateway_wait_seconds: "Общее ожидание шлюза за запуск Автопилота, секунды",
     model_calls: "Основные вызовы модели", summary_calls: "Вызовы для сжатия беседы", source_calls: "Повторные обращения к источникам", tool_calls: "Вызовы инструментов", parallelism: "Параллельные обращения", document_reads: "Чтение документов", evidence_per_index: "Материалы из одного индекса", evidence_chars: "Размер выдержки, символы", document_chars: "Размер документа, символы", timeout_seconds: "Время работы, секунды", context_tokens: "Входной контекст, токены ≈",
     external_tool_timeout_seconds: "Ожидание внешнего инструмента, секунды", max_decision_errors: "Ошибки решения модели до остановки",
     enabled: "Включено", max_extensions: "Разрешённые расширения бюджета", minimum_progress: "Требовать продвижения исследования", window_tokens: "Окно модели, токены", response_reserve_tokens: "Резерв под ответ, токены", history_fraction: "Доля контекста для беседы", trigger_fraction: "Порог сжатия истории", keep_fraction: "Доля последних сообщений", summary_output_tokens: "Размер сводки, токены ≈", chars_per_token: "Символов на токен, оценка", summary_input_fraction: "Доля окна для подготовки сводки",
     quick_workers: "Одновременные быстрые запросы", investigate_workers: "Одновременные исследования", queue_max: "Размер каждой очереди", authentication_timeout_seconds: "Ожидание авторизации, секунды", cleanup_timeout_seconds: "Очистка ресурсов, секунды", source_timeout_seconds: "Ожидание источника, секунды", final_reserve_seconds: "Резерв времени для ответа, секунды", max_indexes: "Выбранные источники", results_per_index: "Общий предел материалов на индекс", max_evidence: "Материалы на запрос", answer_chars: "Размер показанного ответа, символы", retention_days: "Хранение истории, дни", max_runs_per_owner: "Запросы в истории пользователя", max_total_runs: "Запросы в общей истории", graph_recursion_limit: "Шаги графа на запуск", max_stalled_rounds: "Раунды без новых данных", max_answer_retries: "Повторы подготовки ответа", max_resume_attempts: "Продолжения прерванного запроса", memory_max_records: "Записи общей памяти", memory_retrieval_count: "Записи памяти на один ответ", memory_context_tokens: "Контекст общей памяти, токены ≈",
   };
   const HELP = {
+    gateway_wait_seconds: "Суммарное время, которое Автопилот может ждать между запросами по указанию шлюза модели.",
     history_fraction: "От 0 до 0,8. Например, 0,35 означает 35% входного контекста.",
     trigger_fraction: "Запуск сжатия при заполнении этой доли бюджета истории. Например, 0,8 = 80%.",
     keep_fraction: "Последние сообщения остаются без пересказа. Значение должно быть ниже порога сжатия.",
@@ -71,7 +73,7 @@
     const legends = { "autonomy-fields": "Самостоятельность", "profile-fields": "Начальный бюджет", "ceiling-fields": "Максимальные бюджеты Автопилота", "context-fields": "Автоматическое сжатие", "runtime-fields": "Ограничения сервиса" };
     target.replaceChildren(node("legend", legends[id] || "Настройки"), fragment);
   }
-  function renderProfile() { if (!state.settings) return; const mode = $("profile-mode").value, effort = $("profile-effort").value; fieldset("profile-fields", ["profiles", mode, effort], "RunLimits"); $("profile-help").textContent = mode === "autonomous" ? "Стартовый бюджет. Агент может запросить расширение до потолков ниже." : mode === "quick" ? "Фиксированный бюджет. Дополнительные инструменты и поиски в этом режиме не запускаются." : "Фиксированный бюджет исследования без самостоятельного расширения."; }
+  function renderProfile() { if (!state.settings) return; const mode = $("profile-mode").value, effort = $("profile-effort").value; fieldset("profile-fields", ["profiles", mode, effort], "RunLimits"); $("profile-help").textContent = mode === "autonomous" ? "Стартовый бюджет. Агент может запросить расширение до потолков ниже." : mode === "quick" ? "Бюджет ответа по базам знаний и разрешённым инструментам чтения MCP." : "Фиксированный бюджет исследования без самостоятельного расширения."; }
   function applySettings(data) {
     state.settings = clone(data.settings); state.schema = data.schema; state.revision = data.revision; state.saved = JSON.stringify(state.settings); state.activation = data.activation || {};
     $("revision").textContent = "Редакция " + state.revision;

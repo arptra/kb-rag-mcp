@@ -50,7 +50,7 @@ class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     question: str = Field(min_length=1, max_length=8000)
-    mode: Literal["quick", "investigate", "autonomous", "search"] = "quick"
+    mode: Literal["quick", "investigate", "autonomous"] = "quick"
     effort: Literal["low", "medium", "high"] = "medium"
     index_ids: list[str] = Field(default_factory=list, max_length=1000)
     parent_run_id: str | None = Field(default=None, max_length=80)
@@ -147,7 +147,7 @@ class ToolPort(Protocol):
     async def indexes(self, principal: Principal) -> list[dict[str, str]]: ...
 
     async def describe(
-        self, principal: Principal, index_ids: list[str]
+        self, principal: Principal, index_ids: list[str], *, read_only_mcp: bool = False,
     ) -> list[dict[str, Any]]: ...
 
     async def call(
@@ -160,6 +160,7 @@ class ToolPort(Protocol):
         index_ids: list[str],
         cancel: Event,
         sandbox_profile_id: str = "",
+        read_only_mcp: bool = False,
     ) -> list[Evidence]: ...
 
     async def close_run(self, run_id: str) -> None: ...

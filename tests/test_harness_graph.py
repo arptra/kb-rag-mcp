@@ -97,6 +97,54 @@ async def finished(runtime: HarnessRuntime, run_id: str) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+async def test_cancel_then_resume_in_busy_queue_keeps_new_worker_cancellable(
+    tmp_path: Path,
+) -> None:
+    entered: asyncio.Queue[str] = asyncio.Queue()
+    release = asyncio.Event()
+
+    class WaitingSource(Source):
+        async def search(self, **kwargs: Any) -> list[Evidence]:
+            question = kwargs["query"]
+            entered.put_nowait(question)
+            if question == "Target":
+                while not kwargs["cancel"].is_set():
+                    await asyncio.sleep(0.005)
+                raise asyncio.CancelledError
+            await release.wait()
+            return await super().search(**kwargs)
+
+    runtime = HarnessRuntime(settings(tmp_path, investigate_workers=2), WaitingSource(), Model())
+    await runtime.start()
+    try:
+        async with asyncio.timeout(8):
+            request = RunRequest(question="Target", mode="investigate", index_ids=["a"])
+            run_id = (await runtime.submit(OWNER, request))["id"]
+            assert await entered.get() == "Target"
+            await runtime.cancel(OWNER, run_id)
+            assert (await finished(runtime, run_id))["resumable"]
+            await runtime._queues["investigate"].join()
+            for name in ("First", "Second"):
+                await runtime.submit(OWNER, request.model_copy(update={"question": name}))
+            assert {await entered.get(), await entered.get()} == {"First", "Second"}
+
+            await runtime.resume(OWNER, run_id)
+            assert (await runtime.cancel(OWNER, run_id))["status"] == "cancelled"
+            await runtime.resume(OWNER, run_id)
+            assert runtime._queues["investigate"].qsize() == 2
+            release.set()
+            assert await entered.get() == "Target"
+            while runtime._queues["investigate"].qsize():
+                await asyncio.sleep(0.005)
+            await runtime.cancel(OWNER, run_id)
+            assert (await finished(runtime, run_id))["status"] == "cancelled"
+            assert entered.empty()
+    finally:
+        release.set()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
 async def test_real_langgraph_nodes_checkpoints_and_delete(tmp_path: Path) -> None:
     runtime = HarnessRuntime(settings(tmp_path), Source(), Model())
     await runtime.start()
@@ -209,15 +257,18 @@ async def test_native_autopilot_batch_resumes_without_replaying_remote_calls(
     finally:
         await first.stop()
     interrupted = first.store.get(OWNER.owner_id, run["id"])
-    assert interrupted["status"] == "cancelled"
+    assert interrupted["status"] == "interrupted"
     assert len(interrupted["_completed_effects"]) == 1 and interrupted["_inflight_action"]
     assert remote.calls == 2 and interrupted["metrics"]["agent_rounds"] == 1
     second = HarnessRuntime(settings(tmp_path), Source(), Batch(), remote)
     await second.start()
     try:
-        await second.resume(OWNER, run["id"])
+        # Reopening the chat through two simultaneous reads resumes it exactly once.
+        await asyncio.gather(second.get_conversation(OWNER, run["id"]),
+                             second.get(OWNER, run["id"]))
         result = await finished(second, run["id"])
         assert remote.calls == 2 and result["resume_count"] == 1
+        assert any(step["name"] == "resume_after_restart" for step in result["research_trace"])
         assert result["metrics"]["model_calls"] > interrupted["metrics"]["model_calls"]
         receipts = [step["result"] for step in result["research_trace"]
                     if step["name"] == "a2a_ask"]
@@ -297,4 +348,78 @@ async def test_concurrent_resume_enqueues_only_one_attempt(tmp_path: Path) -> No
         assert sum(isinstance(item, ValueError) for item in results) == 1
         assert (await finished(second, run["id"]))["resume_count"] == 1
     finally:
+        await second.stop()
+
+
+@pytest.mark.parametrize("stop_before_reconnect", [False, True])
+async def test_queued_autopilot_can_resume_without_a_graph_checkpoint(
+    tmp_path: Path, stop_before_reconnect: bool,
+) -> None:
+    first = HarnessRuntime(settings(tmp_path), Source(), Model())
+    await first.start()
+    request = await first.submit(OWNER, RunRequest(question="Check orders",
+                                                  mode="autonomous", index_ids=["a"]))
+    await first.stop()
+    source, model = Source(), Model()
+    second = HarnessRuntime(settings(tmp_path), source, model)
+    await second.start()
+    key = request["id"]
+    try:
+        with pytest.raises(KeyError):
+            await second.get(OTHER, key)
+        if stop_before_reconnect:
+            await second.cancel(OWNER, key)
+            result = await second.get(OWNER, key)
+            assert result["status"] == "cancelled" and model.calls == 0
+        else:
+            source.allowed = []
+            assert (await second.get(OWNER, key))["status"] == "interrupted"
+            assert not model.calls
+            source.allowed = ["a"]
+            first_view = await second.get_conversation(OWNER, key)
+            assert first_view["conversation"]["status"] in {"queued", "running"}
+            result = await finished(second, key)
+            assert result["resume_count"] == 1 and model.calls
+            assert "[doc]" in result["answer"]
+    finally:
+        await second.stop()
+
+
+async def test_reconnect_during_full_queue_continues_without_another_poll(tmp_path: Path) -> None:
+    limits = settings(tmp_path, investigate_workers=1, queue_max=1)
+    first = HarnessRuntime(limits, Source(), Model())
+    await first.start()
+    waiting = await first.submit(OWNER, RunRequest(question="Recover old question",
+                                                  mode="autonomous", index_ids=["a"]))
+    await first.stop()
+
+    class Busy(Model):
+        def __init__(self) -> None:
+            super().__init__()
+            self.occupied = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def decide(self, **kwargs: Any) -> dict[str, Any]:
+            self.occupied.set()
+            await self.release.wait()
+            return await super().decide(**kwargs)
+
+    model = Busy()
+    second = HarnessRuntime(limits, Source(), model)
+    await second.start()
+    try:
+        fresh = RunRequest(question="Check document", mode="investigate", index_ids=["a"])
+        await second.submit(OTHER, fresh)
+        await asyncio.wait_for(model.occupied.wait(), 2)
+        await second.submit(OTHER, fresh)
+        key = waiting["id"]
+        sidebar = await second.list_conversations(OWNER)
+        assert sidebar["conversations"][0]["status"] == "queued"
+        model.release.set()
+        async with asyncio.timeout(5):
+            while second.store.get(OWNER.owner_id, key)["status"] in {"queued", "running"}:
+                await asyncio.sleep(.02)
+        assert "[doc]" in second.store.get(OWNER.owner_id, key)["answer"]
+    finally:
+        model.release.set()
         await second.stop()

@@ -184,8 +184,8 @@ async def test_empty_final_answer_gets_one_bounded_repair(tmp_path: Path, recove
         assert result["answer"]
         assert len(model.contexts) == 2
         assert result["metrics"]["answer_retries"] == 1
-        assert any(item["name"] == "answer_recovery"
-                   for item in model.contexts[-1]["prior_tool_attempts"])
+        assert model.contexts[-1]["answer_correction"]
+        assert any(item["name"] == "answer_recovery" for item in result["research_trace"])
     finally:
         await runtime.stop()
 
@@ -209,6 +209,9 @@ async def test_long_or_incomplete_answer_is_never_silently_presented_as_complete
             assert result["answer"].endswith("[Ответ сокращён по ограничению размера.]")
         else:
             assert result["answer"] == content
+        if finish_reason == "length":
+            assert result["answer_kind"] == "incomplete"
+            assert result["stop_reason"] == "incomplete_generation" and result["warnings"]
     finally:
         await runtime.stop()
 

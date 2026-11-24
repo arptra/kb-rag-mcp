@@ -206,3 +206,84 @@ async def test_autopilot_uses_library_tool_observations_for_its_next_decision(
         assert source.queries == ["Где проходит обработка?", "ledger"]
         assert run["metrics"]["agent_rounds"] == 2 and run["metrics"]["tool_calls"] == 2
         assert len(requests) == run["metrics"]["model_calls"] == 3
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_autopilot_releases_worker_and_continues_after_gateway_pause(
+    tmp_path: Path, cancel: bool,
+) -> None:
+    import json
+
+    primary_requests = []
+
+    def gateway(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if "orders" in payload["messages"][-1]["content"]:
+            primary_requests.append(time.monotonic())
+            if len(primary_requests) == 1:
+                return httpx.Response(429, headers={"Retry-After": "3"})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "content": "Проверен документ [entry].",
+        }}]})
+
+    async with client_for(tmp_path, gateway, investigate_timeout_seconds=2,
+                          investigate_workers=1) as (client, _):
+        created = await client.post("/api/runs", json={"question": "orders", "mode": "autonomous",
+                                                       "index_ids": ["a"]})
+        path = "/api/runs/" + created.json()["id"]
+        async with asyncio.timeout(4):
+            while (parked := (await client.get(path)).json())["phase"] != "waiting_for_gateway":
+                assert parked["status"] in {"queued", "running"}, parked
+                await asyncio.sleep(.02)
+        assert parked["current_action"]["retry_at"] > time.time()
+        second = await client.post("/api/runs", json={"question": "other", "mode": "investigate",
+                                                      "index_ids": ["a"]})
+        other = await finish(client, "/api/runs/" + second.json()["id"])
+        assert other["answer"] and len(primary_requests) == 1
+        if cancel:
+            assert (await client.post(path + "/cancel")).status_code == 200
+            await asyncio.sleep(max(0, parked["current_action"]["retry_at"] - time.time()) + .05)
+        async with asyncio.timeout(5):
+            while (result := (await client.get(path)).json())["status"] in {"queued", "running"}:
+                await asyncio.sleep(.02)
+        if cancel:
+            assert result["status"] == "cancelled" and len(primary_requests) == 1
+        else:
+            assert primary_requests[1] - primary_requests[0] >= 2.95
+            assert result["resume_count"] == 1 and "[entry]" in result["answer"], result
+
+
+async def test_admitted_gateway_retry_survives_restart_with_one_retry(tmp_path: Path) -> None:
+    from agent_harness.control.settings import ControlStore
+
+    control = ControlStore(HarnessSettings(_env_file=None, enabled=True, state_dir=tmp_path,
+                                           investigate_timeout_seconds=2))
+    settings = control.load()
+    settings.runtime.max_resume_attempts = 1
+    control.save(settings, expected_revision=0)
+    attempts = []
+
+    def gateway(_: httpx.Request) -> httpx.Response:
+        attempts.append(time.monotonic())
+        if len(attempts) == 1:
+            return httpx.Response(429, headers={"Retry-After": "3"})
+        return httpx.Response(200, json={"choices": [{"message": {
+            "content": "Проверен документ [entry].",
+        }}]})
+
+    async with client_for(tmp_path, gateway) as (client, _):
+        submission = await client.post("/api/runs", json={
+            "question": "orders", "mode": "autonomous", "index_ids": ["a"],
+        })
+        path = "/api/runs/" + submission.json()["id"]
+        async with asyncio.timeout(3):
+            while (await client.get(path)).json()["phase"] != "waiting_for_gateway":
+                await asyncio.sleep(.01)
+    async with client_for(tmp_path, gateway) as (client, _):
+        # First authenticated poll reconnects the admitted dispatch. It must still
+        # honor Retry-After and get its result with a single charged retry.
+        async with asyncio.timeout(5):
+            while (result := (await client.get(path)).json())["status"] in {"queued", "running"}:
+                await asyncio.sleep(.02)
+        assert "[entry]" in result["answer"], result
+        assert attempts[1] - attempts[0] >= 2.95
