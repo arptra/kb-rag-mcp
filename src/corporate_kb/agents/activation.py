@@ -27,6 +27,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from corporate_kb.config import Settings
 from corporate_kb.gigacode_runner import (
     CancellationSignal,
+    GigaCodeAccessError,
     GigaCodeCancelled,
     GigaCodeInvalidOutput,
     GigaCodeJsonResult,
@@ -293,6 +294,8 @@ class GigaCodeAgentController:
             )
         elif isinstance(exc, GigaCodePolicyStop):
             message = "Провайдер GigaCode ограничил проверочный запрос."
+        elif isinstance(exc, GigaCodeAccessError):
+            message = "GigaCode отклонил доступ. Проверьте вход и права учётной записи на модель."
         else:
             message = (
                 "GigaCode не завершил запрос. Нажмите «Включить агента» для повторной проверки."
@@ -391,6 +394,9 @@ class GigaCodeAgentController:
                         )
                     else:
                         self._set_state("ready", "Провайдер GigaCode ограничил ответ на запрос.")
+            raise
+        except GigaCodeAccessError as exc:
+            self._failed(generation, exc)
             raise
         except GigaCodeDecisionError:
             self._update(

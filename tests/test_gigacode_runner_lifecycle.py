@@ -13,11 +13,13 @@ import pytest
 
 import corporate_kb.gigacode_runner as module
 from corporate_kb.gigacode_runner import (
+    GigaCodeAccessError,
     GigaCodeCancelled,
     GigaCodeInvalidOutput,
     GigaCodePolicyStop,
     GigaCodeRunner,
     GigaCodeTimedOut,
+    GigaCodeTransientError,
 )
 
 
@@ -248,6 +250,49 @@ def test_native_error_on_stderr_preserves_its_type(settings_factory, tmp_path, e
             "raise SystemExit(1)\n")
     with pytest.raises(expected):
         execute(settings_factory, tmp_path, body)
+
+
+@pytest.mark.parametrize(("event", "status", "reason"), [
+    ({"error": {"type": "rate_limit_error", "status_code": "429"}}, 429, "rate-limit"),
+    ({"error": {"code": 500}}, 500, None),
+    ({"error": "OVERLOADED_ERROR"}, None, "overload"),
+    ({"error": "timeout", "status": 504}, 504, "timeout"),
+    ({"error": {"code": "private", "type": "server_error"}}, None, "server-error"),
+])
+def test_native_status_and_reason_survive_generic_result_error(
+    settings_factory, tmp_path, event, status, reason,
+):
+    report = json.dumps({"type": "error", **event})
+    body = f"sys.stdin.read()\nprint({report!r}, flush=True)\n" + terminal(is_error=True,
+                                                                         error=True)
+    with pytest.raises(GigaCodeTransientError) as failure:
+        execute(settings_factory, tmp_path, body)
+    assert (failure.value.status, failure.value.reason) == (status, reason)
+    assert "private" not in str(failure.value)
+
+
+@pytest.mark.parametrize(("error", "status"), [
+    ({"type": "server_error", "status_code": 401}, 401),
+    ({"code": "api_error", "type": "authentication_error", "status_code": 500}, None),
+    ({"code": "AUTHENTICATION_ERROR", "status": 500}, None),
+    ({"code": "rate_limit", "status_code": 403}, 403),
+])
+def test_explicit_auth_denial_wins_over_transient_metadata_and_later_errors(
+    settings_factory, tmp_path, error, status,
+):
+    reports = [{"type": "error", "error": {**error, "message": "private detail"}},
+               {"type": "error", "error": "api_error"}]
+    body = "sys.stdin.read()\n" + "".join(f"print({json.dumps(r)!r})\n" for r in reports)
+    with pytest.raises(GigaCodeAccessError) as failure:
+        execute(settings_factory, tmp_path, body + "raise SystemExit(1)\n")
+    assert failure.value.status == status and "private detail" not in str(failure.value)
+
+
+def test_success_after_native_auth_refresh_is_accepted(settings_factory, tmp_path):
+    body = ("sys.stdin.read()\n"
+            "print(json.dumps({'type':'error','error':{'status_code':401}}), flush=True)\n"
+            + terminal())
+    assert execute(settings_factory, tmp_path, body).payload["content"] == "answer"
 
 
 def test_truncated_native_message_invalidates_complete_looking_cli_result(

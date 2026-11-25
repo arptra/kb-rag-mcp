@@ -24,6 +24,51 @@ def native_reply(message, reason):
     })
 
 
+async def test_corporate_v1_preserves_tool_constraints_when_adapting_optional_fields():
+    nullable = {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}],
+                "default": None, "description": "Maximum matches"}
+    multiple = {"anyOf": [{"type": "integer"}, {"type": "string"}, {"type": "null"}],
+                "default": None}
+    nullable_choice = {"anyOf": [{"type": "array", "items": multiple}, {"type": "null"}],
+                       "default": None}
+    parameters = {
+        "type": "object", "required": ["pattern", "required_nullable"],
+        "properties": {
+            "pattern": {"type": "string"}, "limit": nullable,
+            "required_nullable": nullable, "mode": multiple, "choice": nullable_choice,
+            "nested": {"type": "array", "items": {"type": "object",
+                                                  "properties": {"limit": nullable}}},
+            "with_default": {**nullable, "default": 3},
+        },
+    }
+    definitions = []
+
+    def serve(request):
+        definitions.extend(json.loads(request.content)["functions"])
+        return native_reply({"role": "assistant", "content": "done"}, "stop")
+
+    async with (
+        httpx.AsyncClient(base_url="https://corporate.test/v1",
+                          transport=httpx.MockTransport(serve)) as native,
+        httpx.AsyncClient(base_url=_LOCAL_URL,
+                          transport=_GigaChatBridge(native, "DeepSeek-V4-Flash", None)) as client,
+    ):
+        reply = await client.post("chat/completions", json={
+            "messages": [{"role": "user", "content": "Look up an index"}],
+            "tools": [{"type": "function",
+                       "function": {"name": "lookup", "parameters": parameters}}],
+        })
+        reply.raise_for_status()
+
+    received = definitions[0]["parameters"]
+    assert received["required"] == parameters["required"]
+    expected = {"type": "integer", "minimum": 1, "description": "Maximum matches"}
+    assert received["properties"]["limit"] == expected
+    assert received["properties"]["nested"]["items"]["properties"]["limit"] == expected
+    for name in ("pattern", "required_nullable", "mode", "choice", "with_default"):
+        assert received["properties"][name] == parameters["properties"][name]
+
+
 async def test_bridge_preserves_tool_round_trip_and_profile_boundaries(monkeypatch):
     monkeypatch.setenv("GIGACHAT_ACCESS_TOKEN", "unrelated")
     monkeypatch.setenv("GIGACHAT_MODEL", "unrelated")

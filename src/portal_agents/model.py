@@ -27,6 +27,17 @@ from corporate_kb.confluence.diagnostics import safe_http_logging
 from corporate_kb.gigacode_runner import GigaCodeModelProfile, GigaCodeRunner
 
 
+def short_call_options(model: BaseChatModel, limit: int) -> dict[str, Any]:
+    """Limit a helper's reply while retaining the configured corporate wire options."""
+    from langchain_openai import ChatOpenAI
+
+    if not isinstance(model, ChatOpenAI):
+        return {}
+    body = dict(model.extra_body or {})
+    body["max_tokens"] = min(body.get("max_tokens") or model.max_tokens or limit, limit)
+    return {"extra_body": body}
+
+
 class _ActivatedGigaCode(BaseChatModel):
     """Adapt the portal's existing authenticated, decision-only GigaCode controller."""
 

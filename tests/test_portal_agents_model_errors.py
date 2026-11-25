@@ -5,12 +5,14 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from langchain_core.exceptions import ModelAPIError
 from langchain_openai import ChatOpenAI
 from test_a2a import indexed
 
+from corporate_kb.gigacode_runner import GigaCodeAccessError, GigaCodeTransientError
 from corporate_kb.mcp.http_server import create_http_app
 from portal_agents import http
-from portal_agents.model_errors import check_gateway_reply
+from portal_agents.model_errors import check_gateway_reply, gateway_exception
 
 
 @pytest.mark.parametrize("form", ["http", "envelope", "text", "bare", "text-envelope"])
@@ -73,11 +75,24 @@ async def test_rejected_chat_and_probe_show_safe_error_and_do_not_publish_transc
         assert secret not in probe.text
     assert calls == ["/v1/chat/completions"] * 2
     assert secret not in caplog.text
+    assert "on_llm_error callback" not in caplog.text
 
 
 def test_answer_explaining_error_name_is_preserved():
     check_gateway_reply("Ошибка OpenAIInvalidRequestError возникает при несовместимой схеме.")
     check_gateway_reply('{"example": {"type": "invalid_request_error"}}')
+
+
+@pytest.mark.parametrize(("exc", "category", "status", "retryable"), [
+    (ModelAPIError("PRIVATE"), "provider", None, True),
+    (GigaCodeTransientError(reason="rate-limit"), "rate-limit", None, True),
+    (GigaCodeTransientError(status=429, reason="server-error"), "rate-limit", 429, True),
+    (GigaCodeAccessError(status=403), "access", 403, False),
+])
+def test_model_failure_reports_only_the_provider_evidence(exc, category, status, retryable):
+    failure = gateway_exception(exc)
+    assert (failure.category, failure.status, failure.retryable) == (category, status, retryable)
+    assert "недоступен" not in str(failure) and "PRIVATE" not in str(failure)
 
 
 async def test_persistent_model_outage_is_a_status_with_traceable_reference(
@@ -119,6 +134,8 @@ async def test_persistent_model_outage_is_a_status_with_traceable_reference(
         assert [event["event"] for event in events].count("model_retry") == calls - 1
         assert calls == 4
         assert final["reference"] in caplog.text and "status=500 attempts=4" in caplog.text
+        assert "stage=native tools=0" in caplog.text
+        assert "on_llm_error callback" not in caplog.text
         assert "PRIVATE_FAILURE" not in caplog.text
         assert (await client.get("/agents/api/chats/" + chat_id, headers=reader)).json() == {
             "messages": [],

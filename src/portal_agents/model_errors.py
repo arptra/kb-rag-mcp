@@ -1,4 +1,5 @@
 """Classify model errors without exposing upstream payloads or private URLs."""
+# ruff: noqa: RUF001 -- Russian diagnostics.
 from __future__ import annotations
 
 import json
@@ -13,7 +14,11 @@ import httpx
 from langchain_core.exceptions import ModelAPIError, ModelConnectionError, ModelTimeoutError
 
 from corporate_kb.confluence.diagnostics import network_error
-from corporate_kb.gigacode_runner import GigaCodeTimedOut, GigaCodeTransientError
+from corporate_kb.gigacode_runner import (
+    GigaCodeAccessError,
+    GigaCodeTimedOut,
+    GigaCodeTransientError,
+)
 
 _INVALID_REQUEST = re.compile(r"(?:openai[.:]?)?invalidrequesterror", re.IGNORECASE)
 _ERROR_PREFIX = re.compile(
@@ -41,6 +46,8 @@ class ModelGatewayError(RuntimeError):
         self.request_id = request_id
         self.category = category
         self.attempts = 1
+        self.stage = "model"
+        self.tool_count = 0
         suffix = f" (HTTP {status})" if status is not None else ""
         if message:
             detail = message + suffix + "."
@@ -51,7 +58,7 @@ class ModelGatewayError(RuntimeError):
         elif status == 408:
             detail = f"Сервис модели не успел обработать запрос{suffix}."
         elif status is not None and status >= 500 and status in _TRANSIENT_STATUS:
-            detail = f"Сервис модели временно недоступен{suffix}."
+            detail = f"API модели вернул ошибку при обработке этого запроса{suffix}."
         elif status == 404:
             detail = f"Модель или адрес API не найдены{suffix}."
         elif status == 413:
@@ -87,6 +94,9 @@ def gateway_exception(exc: BaseException) -> ModelGatewayError | None:
     """Only call at the model boundary; tool HTTP errors have different causes."""
     if isinstance(exc, ModelGatewayError):
         return exc
+    if isinstance(exc, GigaCodeAccessError):
+        return ModelGatewayError(exc.status, message="GigaCode отклонил доступ к модели",
+                                 retryable=False, category="access")
     response = getattr(exc, "response", None)
     status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
     if type(status) is int and 400 <= status <= 599:
@@ -103,9 +113,20 @@ def gateway_exception(exc: BaseException) -> ModelGatewayError | None:
     if isinstance(exc, (GigaCodeTimedOut, ModelTimeoutError, httpx.TimeoutException)):
         return ModelGatewayError(message="Время ожидания ответа модели истекло",
                                  retryable=True, category="timeout")
-    if isinstance(exc, (GigaCodeTransientError, ModelAPIError)):
-        return ModelGatewayError(message="Сервис модели временно недоступен", retryable=True,
-                                 category="provider")
+    if isinstance(exc, GigaCodeTransientError):
+        hints = {
+            "rate-limit": "Достигнут лимит запросов GigaCode",
+            "overload": "GigaCode сообщил о перегрузке",
+            "timeout": "Истекло время обработки запроса GigaCode",
+            "server-error": "GigaCode сообщил об ошибке при обработке запроса",
+        }
+        reason = {408: "timeout", 429: "rate-limit"}.get(exc.status, exc.reason)
+        category = reason if reason in hints else "provider"
+        return ModelGatewayError(exc.status, message=hints.get(category, "Ошибка вызова GigaCode"),
+                                 retryable=True, category=category)
+    if isinstance(exc, ModelAPIError):
+        return ModelGatewayError(message="Модель сообщила об ошибке при обработке запроса",
+                                 retryable=True, category="provider")
     if isinstance(exc, (ModelConnectionError, httpx.TransportError)):
         # LangChain wraps the OpenAI exception, which wraps the actual transport error.
         cause: BaseException | None = exc

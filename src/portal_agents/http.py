@@ -129,10 +129,10 @@ def _log_model_failure(profile: ModelProfile, error: ModelGatewayError, operatio
     reference = uuid4().hex[:16]
     _LOG.warning(
         "Model call failed ref=%s operation=%s provider=%s adapter=%s category=%s "
-        "status=%s attempts=%d upstream_request_id=%s",
+        "status=%s attempts=%d stage=%s tools=%d upstream_request_id=%s",
         reference, operation, profile.provider,
         profile.adapter if profile.provider == "api" else "-", error.category,
-        error.status, error.attempts, error.request_id or "-",
+        error.status, error.attempts, error.stage, error.tool_count, error.request_id or "-",
     )
     return reference
 
@@ -448,7 +448,7 @@ def create_app(
                     await report("error", "Доступ к запросу ограничен.")
                 except ModelGatewayError as exc:
                     reference = _log_model_failure(profile, exc, "chat")
-                    if exc.status == 429:
+                    if exc.status == 429 or exc.category == "rate-limit":
                         detail = "Достигнут лимит запросов к модели. Попробуйте позже."
                     elif exc.retryable or (exc.status is not None and exc.status >= 500):
                         detail = "Не удалось получить ответ от модели. Попробуйте позже."

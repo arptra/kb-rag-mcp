@@ -19,6 +19,7 @@ from gigachat.api.chat import chat_async
 from gigachat.exceptions import ResponseError
 from gigachat.models import Chat
 from gpt2giga.common.client_params import ClientCompatibilityError
+from gpt2giga.common.tool_schema import normalize_tool_schema
 from gpt2giga.models.config import GigaChatCLI, ProxyConfig, ProxySettings
 from gpt2giga.protocol.request.transformer import RequestTransformer
 from gpt2giga.protocol.response.processor import ResponseProcessor
@@ -98,6 +99,20 @@ class _CorporateTransformer(RequestTransformer):
         super().__init__(config, _CONVERTER_LOG)
         self.state_prefix = state_prefix
 
+    def _normalize_function_schemas(self, payload: dict, *, api_mode: str,
+                                    forced_model: str | None = None) -> None:
+        super()._normalize_function_schemas(payload, api_mode=api_mode, forced_model=forced_model)
+        if api_mode != "v1":
+            return
+        # gpt2giga normalizes the public GigaChat-2 endpoint. For remaining
+        # v1 schemas simplify only optional fields that default to null.
+        functions = payload.get("functions")
+        if isinstance(functions, list):
+            for index, definition in enumerate(functions):
+                function = self._dump_mapping(definition)
+                _normalize_optional_fields(function.get("parameters"))
+                functions[index] = function
+
     def _sanitize_legacy_message_state_ids(self, messages: list[dict]) -> None:
         # Upstream removes v1 state IDs because ordinary OpenAI call IDs can be
         # synthetic. Some corporate deployments require their own ID on the
@@ -110,6 +125,36 @@ class _CorporateTransformer(RequestTransformer):
                 _, separator, upstream_id = state[len(self.state_prefix):].partition("_")
                 if separator and upstream_id:
                     message["functions_state_id"] = upstream_id
+
+
+def _normalize_optional_fields(schema: object) -> None:
+    if not isinstance(schema, dict):
+        return
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        for name, field in properties.items():
+            if not isinstance(field, dict):
+                continue
+            _normalize_optional_fields(field)
+            if name in (schema.get("required") or []) or field.get("default", ...) is not None:
+                continue
+            for keyword in ("anyOf", "oneOf"):
+                variants = field.get(keyword)
+                if (not isinstance(variants, list) or len(variants) != 2
+                        or {"type": "null"} not in variants):
+                    continue
+                value = next((v for v in variants if v != {"type": "null"}), None)
+                if not isinstance(value, dict) or not isinstance(value.get("type"), str):
+                    continue
+                annotations = {k: v for k, v in field.items() if k not in {keyword, "default"}}
+                if annotations.keys() - {"title", "description", "examples", "deprecated"}:
+                    continue
+                # Reject lossy conversions inside the surviving branch (e.g. a nested union).
+                normalized = normalize_tool_schema({keyword: variants})
+                if normalized == value:
+                    properties[name] = {**normalized, **annotations}
+                break
+    _normalize_optional_fields(schema.get("items"))
 
 
 class _GigaChatBridge(httpx.AsyncBaseTransport, httpx.BaseTransport):

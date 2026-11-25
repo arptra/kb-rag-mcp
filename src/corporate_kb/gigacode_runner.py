@@ -110,8 +110,18 @@ class GigaCodeTimedOut(RuntimeError):
 class GigaCodeTransientError(RuntimeError):
     """The native provider reported a temporary failure on this decision."""
 
-    def __init__(self) -> None:
-        super().__init__("The GigaCode provider is temporarily unavailable")
+    def __init__(self, *, status: int | None = None, reason: str | None = None) -> None:
+        self.status = status
+        self.reason = reason
+        super().__init__("GigaCode reported a temporary request failure")
+
+
+class GigaCodeAccessError(PermissionError):
+    """The native provider rejected authentication or permission to run this request."""
+
+    def __init__(self, *, status: int | None = None) -> None:
+        self.status = status
+        super().__init__("GigaCode rejected access to the model")
 
 
 class GigaCodeInvalidOutput(RuntimeError):
@@ -524,7 +534,7 @@ class GigaCodeRunner:
         open_streams = {"stdout", "stderr", "stdin"}
         result_event: dict[str, Any] | None = None
         incomplete_decision = False
-        temporary_error = False
+        provider_error: GigaCodeTransientError | GigaCodeAccessError | None = None
         result_deadline: float | None = None
         cleanup_deadline: float | None = None
         process_cleaned = False
@@ -600,8 +610,11 @@ class GigaCodeRunner:
                     for metadata in self._native_stop_metadata(event):
                         if self._policy_stopped(metadata):
                             raise GigaCodePolicyStop()
-                        if metadata.get("error"):
-                            temporary_error = self._temporary_provider_error(metadata["error"])
+                        if metadata.get("error") and not isinstance(provider_error,
+                                                                    GigaCodeAccessError):
+                            reported = self._provider_error(metadata)
+                            if reported is not None or metadata["error"] is not True:
+                                provider_error = reported
                         if decision_only or model_profile is not None:
                             # A successful CLI wrapper can omit the model's actual stop reason.
                             incomplete_decision |= self._incomplete_result(metadata)
@@ -681,9 +694,9 @@ class GigaCodeRunner:
         failed_exit = return_code != 0 and not expected_shutdown
         # A native runner can recover internally. Honor its later successful result.
         # An explicit policy stop always takes priority in the event loop above.
-        if temporary_error and (failed_exit or result_event is None or result_event.get("is_error")
-                                or result_event.get("error")):
-            raise GigaCodeTransientError()
+        if provider_error and (failed_exit or result_event is None or result_event.get("is_error")
+                               or result_event.get("error")):
+            raise provider_error
         if incomplete_decision or (
             result_event is not None and self._incomplete_result(result_event)
         ):
@@ -1162,19 +1175,40 @@ class GigaCodeRunner:
         return (metadata,) if isinstance(metadata, dict) else ()
 
     @staticmethod
-    def _temporary_provider_error(error: Any) -> bool:
-        if isinstance(error, dict):
-            code = error.get("code") or error.get("type")
-            if code in ("insufficient_quota", "authentication_error", "permission_denied"):
-                return False
-            status = error.get("status_code") or error.get("status") or code
-            if str(status) in {"408", "425", "429", "500", "502", "503", "504", "529"}:
-                return True
-            error = code
-        return isinstance(error, str) and error.casefold() in {
-            "rate_limit", "rate_limit_error", "rate_limit_exceeded", "server_error", "api_error",
-            "internal_server_error", "overloaded_error", "service_unavailable", "timeout",
-        }
+    def _provider_error(
+        metadata: dict[str, Any],
+    ) -> GigaCodeTransientError | GigaCodeAccessError | None:
+        error = metadata["error"]
+        fields = error if isinstance(error, dict) else {"code": error}
+        labels = {v.strip().casefold() for v in (fields.get("code"), fields.get("type"))
+                  if isinstance(v, str)}
+        # Native envelopes can carry status beside the error or in its code.
+        # Only retain explicit numeric values and known reason labels.
+        values = (fields.get("status_code"), fields.get("status"), metadata.get("status_code"),
+                  metadata.get("status"), fields.get("code"))
+        statuses = [int(v) for v in values
+                    if isinstance(v, (str, int)) and re.fullmatch(r"[45][0-9]{2}", str(v))]
+        denied = next((status for status in statuses if status in (401, 403)), None)
+        if denied or labels & {"authentication_error", "permission_denied", "unauthorized",
+                               "permission_error", "forbidden", "invalid_api_key"}:
+            return GigaCodeAccessError(status=denied)
+        status = statuses[0] if statuses else None
+        if "insufficient_quota" in labels:
+            return None
+        if status is not None and status not in {408, 425, 429, 500, 502, 503, 504, 529}:
+            return None
+        reason = None
+        if labels & {"rate_limit", "rate_limit_error", "rate_limit_exceeded"}:
+            reason = "rate-limit"
+        elif "overloaded_error" in labels:
+            reason = "overload"
+        elif "timeout" in labels:
+            reason = "timeout"
+        elif labels & {"server_error", "internal_server_error", "service_unavailable", "api_error"}:
+            reason = "server-error"
+        if status or reason:
+            return GigaCodeTransientError(status=status, reason=reason)
+        return None
 
     @staticmethod
     def _policy_stopped(metadata: dict[str, Any]) -> bool:

@@ -13,6 +13,7 @@ import pytest
 
 from corporate_kb.agents.activation import GigaCodeAgentController
 from corporate_kb.gigacode_runner import (
+    GigaCodeAccessError,
     GigaCodeCancelled,
     GigaCodeInvalidOutput,
     GigaCodeTimedOut,
@@ -327,6 +328,17 @@ def test_incomplete_reply_during_pending_authentication_requires_reauthorization
     assert _URL not in str(caught.value)
     assert controller.status()["state"] == "error"
     assert not controller.status()["available"]
+    controller.stop()
+
+
+def test_provider_denies_account_and_controller_reports_access_issue(settings_factory):
+    controller, runner = activated(settings_factory)
+    runner.error = GigaCodeAccessError(status=403)
+    with pytest.raises(GigaCodeAccessError) as failure:
+        asyncio.run(decide(controller))
+    assert failure.value.status == 403
+    status = controller.status()
+    assert status["state"] == "error" and "доступ" in status["message"]
     controller.stop()
 
 
