@@ -77,7 +77,7 @@ async def create_model(
     ca_file: Path | None = None, cert_file: Path | None = None, key_file: Path | None = None,
     api_key: str | None = None, profile_path: Path | None = None,
     timeout_seconds: int | None = None, output_tokens: int | None = None,
-    max_retries: int = 2, disable_thinking: bool = False,
+    max_retries: int = 0, disable_thinking: bool = False,
     adapter: Literal["openai", "gpt2giga"] | None = None,
 ) -> AsyncIterator[BaseChatModel]:
     if not base_url:

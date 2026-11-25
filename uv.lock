@@ -348,6 +348,7 @@ agents = [
     { name = "langchain-core" },
     { name = "langchain-openai" },
     { name = "langgraph" },
+    { name = "tenacity" },
 ]
 semantic = [
     { name = "sentence-transformers" },
@@ -388,6 +389,7 @@ requires-dist = [
     { name = "python-frontmatter", specifier = ">=1.1,<2" },
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "sentence-transformers", marker = "extra == 'semantic'", specifier = ">=5.0,<6" },
+    { name = "tenacity", marker = "extra == 'agents'", specifier = ">=8.2,<10" },
     { name = "tree-sitter", specifier = ">=0.25,<0.26" },
     { name = "tree-sitter-java", specifier = ">=0.23.5,<0.24" },
     { name = "tree-sitter-kotlin", specifier = ">=1.1,<2" },

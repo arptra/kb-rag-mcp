@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -9,8 +10,10 @@ import pytest
 pytest.importorskip("gpt2giga")
 
 from gigachat.context import authorization_cvar, chat_url_cvar, custom_headers_cvar
+from langchain_openai import ChatOpenAI
 
 from portal_agents.gpt2giga_model import _LOCAL_URL, _GigaChatBridge
+from portal_agents.model_errors import gateway_exception
 
 
 def native_reply(message, reason):
@@ -89,10 +92,13 @@ async def test_bridge_preserves_tool_round_trip_and_profile_boundaries(monkeypat
             var.reset(handle)
 
 
-@pytest.mark.parametrize("status", [400, 403, 429, 502])
+@pytest.mark.parametrize("status", [400, 403, 429, 500, 502, 503])
 async def test_upstream_errors_keep_status_without_private_provider_content(status):
+    request_id = str(uuid4())
     reply = httpx.Response(status, content=b"internal-model-secret",
-                           headers={"X-Trace-Private": "token-detail"})
+                           headers={"X-Trace-Private": "token-detail", "X-Request-ID": request_id,
+                                    "Retry-After": "7", "X-Should-Retry": "false",
+                                    "X-Portal-Model-Error": "fake"})
     async with (
         httpx.AsyncClient(transport=httpx.MockTransport(lambda _: reply),
                           base_url="https://test.invalid/v1") as native,
@@ -105,6 +111,101 @@ async def test_upstream_errors_keep_status_without_private_provider_content(stat
     assert response.status_code == status
     assert "internal-model-secret" not in response.text
     assert "X-Trace-Private" not in response.headers
+    assert "X-Portal-Model-Error" not in response.headers
+    assert response.headers["Retry-After"] == "7"
+    assert response.headers["X-Should-Retry"] == "false"
+    assert response.headers["X-Request-ID"] == request_id
+
+
+@pytest.mark.parametrize("delay", ["Fri, 12 Dec 2031 10:00:00 GMT", "secret"])
+async def test_bridge_forwards_http_date_and_strips_untyped_diagnostics(delay):
+    reply = httpx.Response(503, headers={"Retry-After": delay, "X-Request-ID": "secret"})
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda _: reply),
+                          base_url="https://test.invalid/v1") as native,
+        httpx.AsyncClient(transport=_GigaChatBridge(native, "model", None),
+                          base_url=_LOCAL_URL) as client,
+    ):
+        response = await client.post("chat/completions", json={
+            "messages": [{"role": "user", "content": "Quick test"}],
+        })
+    assert response.headers.get("Retry-After") == (None if delay == "secret" else delay)
+    assert "X-Request-ID" not in response.headers
+
+
+@pytest.mark.parametrize("body", [b"<html>secret", b'["secret"]', b"{}"])
+async def test_bridge_identifies_malformed_replies_without_misreporting_network_failure(body):
+    reply = httpx.Response(200, content=body)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda _: reply),
+                          base_url="https://test.invalid/v1") as native,
+        httpx.AsyncClient(transport=_GigaChatBridge(native, "model", None),
+                          base_url=_LOCAL_URL) as client,
+    ):
+        response = await client.post("chat/completions", json={
+            "messages": [{"role": "user", "content": "Quick test"}],
+        })
+    assert response.status_code == 502
+    assert response.headers["X-Portal-Model-Error"] == "invalid-reply"
+    assert "secret" not in response.text
+
+
+async def test_native_http_200_rejection_is_not_retried_as_malformed_reply():
+    reply = httpx.Response(200, json={"error": {"type": "invalid_request_error",
+                                                "message": "private details"}})
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda _: reply),
+                          base_url="https://test.invalid/v1") as native,
+        httpx.AsyncClient(transport=_GigaChatBridge(native, "model", None)) as client,
+    ):
+        model = ChatOpenAI(model="model", base_url=_LOCAL_URL, api_key="local",
+                           http_async_client=client, use_responses_api=False, max_retries=0)
+        with pytest.raises(ValueError) as raised:
+            await model.ainvoke("Hello")
+    failure = gateway_exception(raised.value)
+    assert failure is not None and not failure.retryable
+    assert "private details" not in str(raised.value)
+
+
+async def test_parallel_history_from_previous_model_preserves_both_tool_results():
+    seen = []
+
+    def serve(request):
+        seen.append(json.loads(request.content)["messages"])
+        return native_reply({"role": "assistant", "content": "done"}, "stop")
+
+    calls = [{"type": "function", "id": "call_" + name,
+              "function": {"name": name, "arguments": "{}"}} for name in ("source_a", "source_b")]
+    messages = [
+        {"role": "user", "content": "Compare sources"},
+        {"role": "assistant", "content": "Comparing", "tool_calls": calls},
+        {"role": "tool", "tool_call_id": "call_source_b", "content": '{"evidence": "B"}'},
+        {"role": "tool", "tool_call_id": "call_source_a", "content": '{"evidence": "A"}'},
+        {"role": "assistant", "content": "Both found"},
+        {"role": "user", "content": "Which was published later?"},
+    ]
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(serve),
+                          base_url="https://test.invalid/v1") as native,
+        httpx.AsyncClient(transport=_GigaChatBridge(native, "model", None),
+                          base_url=_LOCAL_URL) as client,
+    ):
+        response = await client.post("chat/completions", json={"messages": messages})
+        response.raise_for_status()
+        # Missing results cannot be reconstructed or replayed by a protocol converter.
+        del messages[3]
+        invalid = await client.post("chat/completions", json={"messages": messages})
+        assert invalid.status_code == 422
+    assert len(seen) == 1
+    user, ask_a, result_a, ask_b, result_b, answer, followup = seen[0]
+    assert user["content"] == "Compare sources" and followup["content"].startswith("Which")
+    assert ask_a["content"] == "Comparing" and ask_b["content"] == ""
+    for call, result, name, evidence in ((ask_a, result_a, "source_a", "A"),
+                                         (ask_b, result_b, "source_b", "B")):
+        assert call["function_call"]["name"] == result["name"] == name
+        assert result["role"] == "function"
+        assert json.loads(result["content"]) == {"evidence": evidence}
+    assert answer["content"] == "Both found"
 
 
 async def test_native_blacklist_reaches_sdk_as_content_filter():

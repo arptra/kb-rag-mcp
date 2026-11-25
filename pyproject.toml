@@ -41,6 +41,7 @@ agents = [
     "jsonschema>=4.25,<5",
     "langchain-core>=1,<2",
     "langgraph>=1,<2",
+    "tenacity>=8.2,<10",
 ]
 
 [project.scripts]

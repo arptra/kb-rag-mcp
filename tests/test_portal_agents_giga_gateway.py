@@ -36,6 +36,14 @@ async def test_native_model_probe_and_tool_round_trip(settings_factory, tmp_path
                       if line.startswith(b"content-length:"))
         payload = json.loads(await stream.readexactly(int(length)))
         requests.append((headers.lower(), payload, writer.get_extra_info("peercert")))
+        # A transient failure after the index tool must retry only the model step.
+        if model_name == "DeepSeek-V4-Flash" and len(requests) == 3:
+            writer.write(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n"
+                         b"Connection: close\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
         msg = {"role": "assistant", "content": "OK"}
         reason = "stop"
         if len(requests) == 2:
@@ -83,12 +91,14 @@ async def test_native_model_probe_and_tool_round_trip(settings_factory, tmp_path
         events = [json.loads(line) for line in reply.text.splitlines()]
         assert events[-1]["event"] == "answer" and events[-1]["text"] == answer, events
         assert [e["text"] for e in events if e["event"] == "tool_start"] == ["list_indexes"]
+        retries = [e for e in events if e["event"] == "model_retry"]
+        assert len(retries) == int(model_name == "DeepSeek-V4-Flash")
         followup = await client.post("/agents/api/chat", headers=user, json={
             "chat": chat_id, "question": "Напомни результат предыдущей проверки.",
         })
         assert json.loads(followup.text.splitlines()[-1])["event"] == "answer"
 
-    assert len(requests) == 4
+    assert len(requests) == (5 if model_name == "DeepSeek-V4-Flash" else 4)
     for headers, body, certificate in requests:
         assert certificate and b"authorization:" not in headers
         assert headers.startswith(b"post /company/api/v1/chat/completions ")
@@ -96,6 +106,7 @@ async def test_native_model_probe_and_tool_round_trip(settings_factory, tmp_path
         assert "thinking" not in body
     if model_name == "DeepSeek-V4-Flash":
         assert requests[1][1]["max_tokens"] == 32768
+        assert requests[2][1]["messages"] == requests[3][1]["messages"]
     assert "list_indexes" in {f["name"] for f in requests[1][1]["functions"]}
     for _, body, _ in requests[2:]:
         messages = body["messages"]

@@ -258,16 +258,26 @@
       const stick = nearEnd();
       if (item.event === "start") timeline.summary.textContent = "Запрос принят";
       if (item.event === "waiting") return;
-      if (["tool_start", "tool_end", "model"].includes(item.event)) {
-        const name = tools[item.text] || item.text;
-        const status = item.event === "model" ? "Обращение к модели" :
-          (item.event === "tool_start" ? "Выполняется · " : "Завершено · ") + name;
+      if (["tool_start", "tool_end", "model", "model_retry"].includes(item.event)) {
+        let status;
+        if (item.event === "model_retry") status = item.text;
+        else if (item.event === "model") status = "Обращение к модели";
+        else {
+          const name = tools[item.text] || item.text;
+          status = (item.event === "tool_start" ? "Выполняется · " : "Завершено · ") + name;
+        }
         timeline.summary.textContent = status;
         timeline.steps.append(element("li", "", status));
       } else if (item.event === "answer" || item.event === "error") {
         ended = true;
-        timeline.details.hidden = !timeline.steps.childElementCount;
+        timeline.details.hidden = !timeline.steps.childElementCount && !item.reference;
         timeline.summary.textContent = "Ход работы · " + timeline.steps.childElementCount;
+        if (item.event === "error") {
+          turn.row.querySelector(".role").textContent = "Статус запроса";
+          if (item.reference) {
+            timeline.details.append(element("p", "", "Номер ошибки для администратора · " + item.reference));
+          }
+        }
         if (item.event === "answer" && item.html) turn.body.innerHTML = item.html;
         else turn.body.textContent = item.text;
         turn.body.classList.toggle("error", item.event === "error");

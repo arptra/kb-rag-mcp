@@ -5,11 +5,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import ssl
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from contextvars import Context
-from uuid import uuid4
+from datetime import UTC
+from email.utils import format_datetime, parsedate_to_datetime
+from uuid import UUID, uuid4
 
 import httpx
 from gigachat.api.chat import chat_async
@@ -23,11 +26,69 @@ from langchain_openai import ChatOpenAI
 from pydantic import SecretStr, ValidationError
 
 from corporate_kb.confluence.diagnostics import safe_http_logging
+from portal_agents.model_errors import invalid_request_payload
 
 # Protocol converter diagnostics can include the request contents. The portal
 # reports its own bounded model errors and never logs conversation data here.
 _CONVERTER_LOG = logging.Logger("portal_agents.gpt2giga", level=logging.CRITICAL + 1)
 _LOCAL_URL = "https://gpt2giga.invalid/v1"
+
+
+def _error_headers(headers: httpx.Headers | None) -> dict[str, str]:
+    safe = {}
+    if not headers:
+        return safe
+    if headers.get("x-should-retry") == "false":
+        safe["x-should-retry"] = "false"
+    if value := headers.get("x-request-id"):
+        with suppress(ValueError):
+            request_id = UUID(value)
+            if value.lower() in (request_id.hex, str(request_id)):
+                safe["x-request-id"] = value
+    if delay := headers.get("retry-after"):
+        if re.fullmatch(r"[0-9]{1,10}(?:\.[0-9]{1,6})?", delay):
+            safe["retry-after"] = delay
+        elif len(delay) <= 64:
+            try:
+                date = parsedate_to_datetime(delay)
+                if date.tzinfo is not None:
+                    safe["retry-after"] = format_datetime(date.astimezone(UTC), usegmt=True)
+            except (ValueError, TypeError, OverflowError):
+                pass
+    return safe
+
+
+def _bridge_error(status: int, code: str) -> httpx.Response:
+    return httpx.Response(status, headers={"X-Portal-Model-Error": code},
+                          json={"error": {"message": code}})
+
+
+def _serial_tool_history(messages: list[dict]) -> list[dict]:
+    """Represent completed parallel calls from another model as v1 call/result pairs."""
+    result = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        index += 1
+        calls = message.get("tool_calls") if message.get("role") == "assistant" else None
+        if not calls or len(calls) < 2:
+            result.append(message)
+            continue
+        replies = {}
+        start = index
+        while index < len(messages) and messages[index].get("role") == "tool":
+            reply = messages[index]
+            index += 1
+            replies[reply.get("tool_call_id")] = reply
+        if index - start != len(calls):
+            raise ClientCompatibilityError("Unexpected number of parallel tool results")
+        for position, call in enumerate(calls):
+            reply = replies.pop(call.get("id"), None)
+            if reply is None or not call.get("id"):
+                raise ClientCompatibilityError("Unmatched result for parallel tool call")
+            assistant = message if position == 0 else {"role": "assistant", "content": ""}
+            result.extend(({**assistant, "tool_calls": [call]}, reply))
+    return result
 
 
 class _CorporateTransformer(RequestTransformer):
@@ -83,24 +144,39 @@ class _GigaChatBridge(httpx.AsyncBaseTransport, httpx.BaseTransport):
         else:
             data.pop("model", None)  # Some corporate deployments select the model by URL.
         try:
+            data["messages"] = _serial_tool_history(data.get("messages", []))
             native = Chat.model_validate(await self.encoder.prepare_chat(data))
         except (ClientCompatibilityError, ValidationError):
-            return httpx.Response(422, json={"error": {"message": "Unsupported GigaChat request"}})
+            return _bridge_error(422, "invalid-request")
 
         async def complete() -> httpx.Response:
             with safe_http_logging():
                 try:
                     result = await chat_async(self.client, chat=native, access_token=self.token)
                 except ResponseError as exc:
-                    # Preserve the status for SDK diagnostics and retry handling. Provider
-                    # bodies and response headers can contain internal URLs and user text.
-                    return httpx.Response(exc.status_code, json={"error": {
-                        "message": "GigaChat API rejected the request",
-                    }})
-                except ValidationError:
-                    return httpx.Response(502, json={"error": {"message": "Invalid native reply"}})
+                    # Preserve only typed diagnostics; other headers and bodies can contain
+                    # internal URLs, authentication material and user text.
+                    return httpx.Response(
+                        exc.status_code, headers=_error_headers(exc.headers),
+                        json={"error": {"message": "GigaChat API rejected the request"}},
+                    )
+                except ValidationError as exc:
+                    # Some endpoints return a typed OpenAI error envelope with HTTP 200.
+                    # Keep the non-retryable rejection recognizable to ChatOpenAI.
+                    for field in exc.errors(include_url=False, include_context=False):
+                        payload = field.get("input")
+                        if (field["loc"] == ("choices",) and isinstance(payload, dict)
+                                and invalid_request_payload(payload.get("error"))):
+                            return httpx.Response(200, json={"error": {
+                                "type": "invalid_request_error",
+                                "message": "GigaChat API rejected the request",
+                            }})
+                    return _bridge_error(502, "invalid-reply")
+                except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+                    # The native SDK decodes JSON and unpacks it as keyword arguments.
+                    return _bridge_error(502, "invalid-reply")
             if not result.choices:
-                return httpx.Response(502, json={"error": {"message": "Missing GigaChat choices"}})
+                return _bridge_error(502, "invalid-reply")
             converted = self.decoder.process_response(result, self.model or result.model,
                                                       uuid4().hex, request_data=data)
             for choice in converted["choices"]:
@@ -110,7 +186,7 @@ class _GigaChatBridge(httpx.AsyncBaseTransport, httpx.BaseTransport):
                         # extensions on the OpenAI tool-call object may be discarded.
                         call["id"] = self.state_prefix + uuid4().hex + "_" + state
                 if choice.get("finish_reason") == "error":
-                    return httpx.Response(502, json={"error": {"message": "Generation failed"}})
+                    return _bridge_error(502, "generation-failed")
                 if choice.get("finish_reason") == "blacklist":
                     choice["finish_reason"] = "content_filter"
             return httpx.Response(200, json=converted)

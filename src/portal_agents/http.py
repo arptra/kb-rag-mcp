@@ -116,11 +116,25 @@ async def _body(request: Request, limit: int) -> bytearray:
     return data
 
 
-def _line(event: str, text: str) -> bytes:
+def _line(event: str, text: str, *, reference: str | None = None) -> bytes:
     payload = {"event": event, "text": text}
     if event == "answer":
         payload["html"] = _MARKDOWN.render(text)
+    if reference:
+        payload["reference"] = reference
     return (json.dumps(payload, ensure_ascii=False) + "\n").encode()
+
+
+def _log_model_failure(profile: ModelProfile, error: ModelGatewayError, operation: str) -> str:
+    reference = uuid4().hex[:16]
+    _LOG.warning(
+        "Model call failed ref=%s operation=%s provider=%s adapter=%s category=%s "
+        "status=%s attempts=%d upstream_request_id=%s",
+        reference, operation, profile.provider,
+        profile.adapter if profile.provider == "api" else "-", error.category,
+        error.status, error.attempts, error.request_id or "-",
+    )
+    return reference
 
 
 def _owner_chat(owner: str, chat: UUID) -> str:
@@ -275,8 +289,11 @@ def create_app(
                     check_gateway_reply(reply.text)
         except Exception as exc:
             failure = gateway_exception(exc)
-            detail = (str(failure) if failure is not None else
-                      "Нет ответа от модели. Проверьте доступность адреса и сертификаты TLS.")
+            if failure is not None:
+                reference = _log_model_failure(profile, failure, "probe")
+                detail = f"{failure} Номер ошибки {reference}."
+            else:
+                detail = "Нет ответа от модели. Проверьте доступность адреса и сертификаты TLS."
             raise HTTPException(502, detail) from None
         if (not isinstance(reply, AIMessage) or not reply.text.strip() or reply.tool_calls
                 or reply.additional_kwargs.get("refusal")
@@ -359,10 +376,10 @@ def create_app(
             return bool(grants.graph and authorize_graph and await authorize_graph(request))
 
         async def stream() -> AsyncIterator[bytes]:
-            events: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=64)
+            events: asyncio.Queue[tuple[str, str, str | None]] = asyncio.Queue(maxsize=64)
 
-            async def report(kind: str, detail: str) -> None:
-                await events.put((kind, detail))
+            async def report(kind: str, detail: str, *, reference: str | None = None) -> None:
+                await events.put((kind, detail, reference))
 
             async def execute() -> None:
                 workspace = (
@@ -428,11 +445,16 @@ def create_app(
                     await db.commit()
                     await report("answer", answer)
                 except PermissionError:
-                    await report(
-                        "error", "Доступ ограничен. Проверьте права в портале или ответ шлюза."
-                    )
+                    await report("error", "Доступ к запросу ограничен.")
                 except ModelGatewayError as exc:
-                    await report("error", str(exc))
+                    reference = _log_model_failure(profile, exc, "chat")
+                    if exc.status == 429:
+                        detail = "Достигнут лимит запросов к модели. Попробуйте позже."
+                    elif exc.retryable or (exc.status is not None and exc.status >= 500):
+                        detail = "Не удалось получить ответ от модели. Попробуйте позже."
+                    else:
+                        detail = str(exc)
+                    await report("error", detail, reference=reference)
                 except Exception as exc:
                     # Provider errors may contain prompts, API credentials or private addresses.
                     _LOG.warning("Agent turn stopped (%s)", type(exc).__name__)
@@ -454,14 +476,14 @@ def create_app(
                 yield _line("start", "")
                 while True:
                     try:
-                        kind, detail = await asyncio.wait_for(events.get(), timeout=10)
+                        kind, detail, reference = await asyncio.wait_for(events.get(), timeout=10)
                     except TimeoutError:
                         if task.done():
                             await task
                             break
                         yield _line("waiting", "")
                         continue
-                    yield _line(kind, detail)
+                    yield _line(kind, detail, reference=reference)
                     if kind in {"answer", "error"}:
                         await task
                         break
