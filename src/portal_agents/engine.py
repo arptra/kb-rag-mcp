@@ -55,6 +55,7 @@ from portal_agents.read_recovery import (
     KNOWLEDGE_TOOLS,
     READ_TOOLS,
     ReadDecisionError,
+    answer_from_observations,
     in_read_recovery,
     read_recovery_step,
 )
@@ -156,6 +157,7 @@ def _model_recovery(
     # These flags exist only for this run. Positive outcomes are published with the final reply.
     read_fallback = False
     native_fallback = False
+    cli_tool_fallback = False
 
     def can_retry(exc: BaseException) -> bool:
         return (isinstance(exc, ModelGatewayError) and exc.retryable and
@@ -171,7 +173,7 @@ def _model_recovery(
         request: ModelRequest[Any], handler: Callable[[ModelRequest[Any]],
                                                       Awaitable[ModelResponse[Any]]],
     ) -> ModelResponse[Any]:
-        nonlocal read_fallback, native_fallback
+        nonlocal read_fallback, native_fallback, cli_tool_fallback
         calls = 0
         processing_failures = 0
         user_index = _user_text_index(request.messages)
@@ -248,8 +250,10 @@ def _model_recovery(
                             try:
                                 decision = await read_recovery_step(
                                     request, question,
-                                    include_native=continuing_read or rejected_schema is not None,
-                                    native_schema_rejected=rejected_schema is not None,
+                                    include_native=(continuing_read or cli_tool_fallback
+                                                    or rejected_schema is not None),
+                                    native_schema_rejected=(cli_tool_fallback
+                                                            or rejected_schema is not None),
                                     correction=read_correction,
                                     larger_answer=larger_read_answer,
                                 )
@@ -284,6 +288,20 @@ def _model_recovery(
                                     category="invalid-decision",
                                     message="Модель не смогла выбрать следующий шаг исследования",
                                 )
+                            if cli_tool_fallback:
+                                strategy = "answer"
+                                await report_correction("Готовим итог по собранным данным")
+                                raise _CorrectStep from None
+                        elif stage == "answer":
+                            strategy = "answer"
+                            try:
+                                answer = await answer_from_observations(request, user_index)
+                            except (_UnusableReply, GigaCodeDecisionError, ReadDecisionError):
+                                raise ModelGatewayError(
+                                    category="incomplete-reply",
+                                    message="GigaCode не завершил итоговый ответ",
+                                ) from None
+                            return ModelResponse(result=[answer])
                         else:
                             draft = await _paraphrase(request.model, question)
                             if draft:
@@ -305,6 +323,11 @@ def _model_recovery(
                         outcomes.add("native_incomplete")
                         reason = exc.reason if isinstance(exc, GigaCodeDecisionError) else "format"
                         corrected = reason in native_corrections
+                        if reason == "native-read" and corrected:
+                            raise ModelGatewayError(
+                                category="runner-native-tool",
+                                message="GigaCode повторил встроенное действие",
+                            ) from None
                         if calls >= _MODEL_ATTEMPTS or (corrected and reason != "length"):
                             raise ModelGatewayError(
                                 category="incomplete-reply",
@@ -348,6 +371,17 @@ def _model_recovery(
                         raise
                     failure.stage = stage
                     failure.tool_count = len(current.tools) if stage == "native" else 0
+                    if (failure.category == "runner-native-tool" and stage != "answer"
+                            and question is not None and calls < _MODEL_ATTEMPTS):
+                        cli_tool_fallback = True
+                        if stage == "native" and has_reads:
+                            strategy = "read"
+                            read_fallback = True
+                            await report_correction("Продолжаем через источники портала")
+                        else:
+                            strategy = "answer"
+                            await report_correction("Готовим итог по собранным данным")
+                        raise _CorrectStep from None
                     if (stage == "native" and can_retry(failure)
                             and ((failure.status == 500 and failure.category == "upstream-http")
                                  or (failure.status in {None, 500}
@@ -366,7 +400,7 @@ def _model_recovery(
                         read_fallback = True
                         switch_format = True
                         strategy = "read"
-                    elif stage == "read" and (rejected_schema is not None or
+                    elif stage == "read" and (cli_tool_fallback or rejected_schema is not None or
                                               (continuing_read and calls + 2 <= _MODEL_ATTEMPTS)):
                         strategy = "read"
                     elif (processing_failures == 2 and calls + 2 <= _MODEL_ATTEMPTS

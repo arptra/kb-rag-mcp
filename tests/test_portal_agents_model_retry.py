@@ -11,7 +11,11 @@ from langchain_core.tools import tool
 from test_portal_agents_engine import Model, call
 
 from corporate_kb.agents.activation import GigaCodeDecisionError
-from corporate_kb.gigacode_runner import GigaCodePolicyStop, GigaCodeTransientError
+from corporate_kb.gigacode_runner import (
+    GigaCodePolicyStop,
+    GigaCodeRequestFailed,
+    GigaCodeTransientError,
+)
 from portal_agents import engine
 from portal_agents.model_errors import ModelGatewayError, gateway_exception
 
@@ -313,6 +317,35 @@ async def test_compact_gigacode_read_continues_after_an_incomplete_decision(reas
                                    [list_indexes], prefer_chat_reads=True, experience=outcomes)
     assert answer == "release-notes" and reads == [True] and len(frames) == 3
     assert "read_" + reason in outcomes
+
+
+async def test_answers_from_completed_action_after_a_blocked_cli_tool():
+    actions = []
+    model_calls = []
+
+    @tool
+    async def run_gradle(task: str) -> str:
+        """Run an authorized Gradle build task."""
+        actions.append(task)
+        return "Build completed. :service:test passed."
+
+    def respond(messages, names):
+        model_calls.append(names)
+        if len(model_calls) == 1:
+            return call("run_gradle", task=":service:test")
+        if names:
+            assert isinstance(messages[-1], ToolMessage)
+            raise GigaCodeRequestFailed(reason="native-tool")
+        frame = json.loads(messages[-1].text)
+        assert frame["observations"] == [{
+            "tool": "run_gradle", "status": "success",
+            "result": "Build completed. :service:test passed.", "truncated": False,
+        }]
+        return AIMessage(content=frame["observations"][0]["result"])
+
+    answer = await engine.run_turn(Model(respond=respond), "Run the service tests.", [run_gradle])
+    assert answer == "Build completed. :service:test passed."
+    assert actions == [":service:test"] and len(model_calls) == 3
 
 
 @pytest.mark.parametrize("param,forbidden,expected", [

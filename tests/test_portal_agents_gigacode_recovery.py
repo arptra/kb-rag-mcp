@@ -185,6 +185,13 @@ async def test_native_cli_tool_does_not_disable_gigacode(
                 payload = {"content": "Index " + indexes[0]["id"], "tool_calls": []}
             elif last["content"] == "Hello":
                 payload = {"content": "Welcome", "tool_calls": []}
+            elif not request["tools"]:
+                frame = json.loads(last["content"])
+                observed = frame["observations"][-1]
+                assert native_tool == "run_shell_command"
+                assert observed["tool"] == "list_indexes"
+                indexes = json.loads(observed["result"])
+                payload = "Index " + indexes[0]["id"]
             else:
                 payload = {"content": "", "tool_calls": [{"name": "list_indexes", "args": {}}]}
         print(json.dumps({"type": "result", "is_error": False, "result": payload}), flush=True)
@@ -202,19 +209,85 @@ async def test_native_cli_tool_does_not_disable_gigacode(
         assert [event["text"] for event in events if event["event"] == "tool_start"] == [
             "list_indexes",
         ]
-        if native_tool == "read_file":
-            assert events[-1]["event"] == "answer" and events[-1]["text"] == "Index default"
-            assert any(event["event"] == "model_retry" for event in events)
-            assert (tmp_path / "answer-calls").read_text() == "2"
-        else:
-            assert events[-1]["event"] == "error" and events[-1]["reference"]
-            assert (tmp_path / "answer-calls").read_text() == "1"
+        assert events[-1]["event"] == "answer" and events[-1]["text"] == "Index default"
+        assert any(event["event"] == "model_retry" for event in events)
+        attempts = "2" if native_tool == "read_file" else "1"
+        assert (tmp_path / "answer-calls").read_text() == attempts
         assert (await client.get("/agents/api/model", headers=READER)).json()["state"] == "ready"
         following = await client.post("/agents/api/chat", headers=READER,
                                       json={"chat": chat, "question": "Hello"})
         following.raise_for_status()
         last = json.loads(following.text.splitlines()[-1])
         assert last["event"] == "answer" and last["text"] == "Welcome"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires an executable script")
+async def test_cli_that_always_attempts_native_tools_completes_portal_research(
+    settings_factory, tmp_path: Path,
+):
+    executable = launcher(tmp_path, dedent(r"""
+        root = Path(__file__).parent
+        prompt = sys.stdin.read()
+        marker = "GIGACODE_AGENT_REQUEST\n"
+        if marker not in prompt:
+            payload = {"ready": True}
+        else:
+            request, _ = json.JSONDecoder().raw_decode(prompt.split(marker, 1)[1])
+            if request["tools"]:
+                with (root / "bound-calls").open("a") as calls:
+                    calls.write("bound\n")
+                print(json.dumps({
+                    "type": "assistant", "message": {"content": [
+                        {"type": "tool_use", "name": "task", "input": {}}
+                    ]}
+                }), flush=True)
+                raise SystemExit(0)
+            assert "MODEL DECISION OUTPUT CONTRACT" not in prompt
+            frame = json.loads(request["messages"][-1]["content"])
+            observations = frame["observations"]
+            if not observations:
+                payload = {"tool": "list_indexes", "args": {}}
+            elif observations[-1]["tool"] == "list_indexes":
+                indexes = json.loads(observations[-1]["result"])
+                payload = {"tool": "search_index", "args": {
+                    "index_id": indexes[0]["id"], "query": frame["question"]
+                }}
+            elif observations[-1]["tool"] == "search_index":
+                result = json.loads(observations[-1]["result"])
+                document = result["results"][0]
+                payload = {"tool": "read_document", "args": {
+                    "index_id": result["index_id"], "document_id": document["document_id"]
+                }}
+            else:
+                assert observations[-1]["tool"] == "read_document"
+                doc = json.loads(observations[-1]["result"])
+                payload = doc["content"].strip().splitlines()[-1] + " Source: " + doc["source_path"]
+                print(json.dumps({
+                    "type": "assistant", "message": {"content": [{"type": "text", "text":
+                        json.dumps({"content": "DRAFT_NOT_THE_FINAL_RESULT", "tool_calls": []})
+                    }]}
+                }), flush=True)
+                time.sleep(0.05)
+        print(json.dumps({"type": "result", "is_error": False, "result": payload}), flush=True)
+    """))
+    async with browser(gigacode_portal(settings_factory, executable)) as client:
+        await enable_gigacode(client)
+        chat = str(uuid4())
+        response = await client.post(
+            "/agents/api/chat", headers=READER,
+            json={"chat": chat, "question": "What is the daily limit?"},
+        )
+        response.raise_for_status()
+        events = [json.loads(line) for line in response.text.splitlines()]
+        assert [item["text"] for item in events if item["event"] == "tool_start"] == [
+            "list_indexes", "search_index", "read_document",
+        ]
+        assert events[-1]["event"] == "answer", events
+        assert events[-1]["text"] == "The daily limit is 500. Source: limits.md"
+        assert "DRAFT_NOT_THE_FINAL_RESULT" not in response.text
+        assert (tmp_path / "bound-calls").read_text() == "bound\n"
+        saved = (await client.get(f"/agents/api/chats/{chat}", headers=READER)).json()["messages"]
+        assert saved[-1]["text"] == events[-1]["text"]
 
 
 @pytest.fixture

@@ -355,6 +355,7 @@ class GigaCodeRunner:
         debug_directory: Path | None = None,
         allow_edits: bool = False,
         decision_only: bool = False,
+        text_reply: bool = False,
     ) -> GigaCodeJsonResult:
         """Execute a JSON analysis using the existing CLI command and login.
 
@@ -363,11 +364,13 @@ class GigaCodeRunner:
         This guard is not an OS sandbox: CLI settings and authentication are shared
         with ordinary analysis, and a reported tool may already have executed.
         """
+        if text_reply and not decision_only:
+            raise ValueError("Only decision requests can use a text reply")
         invocation = self._run_payload(
             checkout=checkout,
             prompt=prompt,
             schema=schema,
-            normalizer=lambda payload: payload,
+            normalizer=self._normalize_text_decision if text_reply else lambda payload: payload,
             allow_text_fallback=False,
             cancel=cancel,
             progress=progress,
@@ -376,6 +379,7 @@ class GigaCodeRunner:
             debug_directory=debug_directory,
             allow_edits=allow_edits,
             decision_only=decision_only,
+            text_reply=text_reply,
         )
         return self._json_result(invocation)
 
@@ -477,6 +481,7 @@ class GigaCodeRunner:
         allow_edits: bool = False,
         model_profile: GigaCodeModelProfile | None = None,
         decision_only: bool = False,
+        text_reply: bool = False,
     ) -> _InvocationResult:
         """Run the shared supervised process and return its structured payload."""
         if decision_only and allow_edits:
@@ -548,18 +553,19 @@ class GigaCodeRunner:
                 f"max_tools_advisory={self._settings.gigacode_max_tool_calls}; "
                 f"read_only={str(not allow_edits).lower()}; "
                 f"approval_mode={'auto-edit' if allow_edits else 'default'}; "
-                "schema_delivery=prompt; "
+                f"schema_delivery={'response-text' if text_reply else 'prompt'}; "
                 f"model_profile={model_profile.name if model_profile else 'none'}"
             )
-        bounded_prompt = (
-            self._model_prompt_with_output_contract(prompt, schema)
-            if model_profile is not None or decision_only
-            else self._prompt_with_output_contract(
+        if text_reply:
+            bounded_prompt = prompt.rstrip()
+        elif is_decision:
+            bounded_prompt = self._model_prompt_with_output_contract(prompt, schema)
+        else:
+            bounded_prompt = self._prompt_with_output_contract(
                 prompt,
                 schema=schema,
                 read_only=not allow_edits,
             )
-        )
         if debug_directory is not None:
             debug_directory.mkdir(parents=True, exist_ok=True)
             (debug_directory / "prompt.txt").write_text(bounded_prompt, encoding="utf-8")
@@ -893,6 +899,7 @@ class GigaCodeRunner:
             stream_text_parts,
             normalizer=normalizer,
             allow_text_fallback=allow_text_fallback,
+            text_reply=text_reply,
         )
         if progress is not None:
             progress(f"GigaCode output contract: mode={parse_mode}")
@@ -1108,6 +1115,7 @@ class GigaCodeRunner:
         *,
         normalizer: Callable[[dict[str, Any] | None], dict[str, Any] | None] | None = None,
         allow_text_fallback: bool = True,
+        text_reply: bool = False,
     ) -> tuple[dict[str, Any] | None, str]:
         normalize = normalizer or cls._normalize_result_mapping
         candidates: list[tuple[str, object]] = [
@@ -1127,6 +1135,10 @@ class GigaCodeRunner:
             normalized = normalize(decoded)
             if normalized is not None:
                 return normalized, f"{source}:json"
+            if text_reply:
+                text = cls._extract_text(raw_candidate).strip()
+                if text and not text.startswith(("{", "[", "```json")):
+                    return {"content": text, "tool_calls": []}, f"{source}:text"
 
         if allow_text_fallback:
             for source, raw_candidate in candidates:
@@ -1144,6 +1156,22 @@ class GigaCodeRunner:
                     f"{source}:markdown-fallback",
                 )
         return None, "unusable"
+
+    @staticmethod
+    def _normalize_text_decision(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+        if payload is None:
+            return None
+        if payload.keys() == {"content"} and isinstance(payload.get("content"), str):
+            return {**payload, "tool_calls": []}
+        if {"content", "tool_calls"} & payload.keys():
+            return payload
+        # A compact read is a model response. The graph validates and dispatches it later.
+        if (payload.keys() in ({"tool", "args"}, {"clarify"}, {"defer"})
+                or ("answer" in payload and payload.keys() <= {
+                    "answer", "source", "sources", "citation", "citations",
+                })):
+            return {"content": json.dumps(payload, ensure_ascii=False), "tool_calls": []}
+        return None
 
     @classmethod
     def _decode_structured_result(cls, raw_result: object) -> dict[str, Any] | None:

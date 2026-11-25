@@ -229,7 +229,7 @@ def gateway_exception(exc: BaseException) -> ModelGatewayError | None:
                 "runner-configuration", "Проверьте параметры запуска и авторизацию GigaCode",
             ),
             "native-tool": (
-                "runner-native-tool", "GigaCode прервал этот шаг. Можно продолжить в чате",
+                "runner-native-tool", "GigaCode запросил действие вне инструментов портала",
             ),
             "unexpected-exit": (
                 "runner-exit", "Процесс GigaCode завершился. Портал проверяет его готовность",
