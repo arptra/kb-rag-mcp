@@ -8,6 +8,7 @@
     { name: "/подключения", alias: "/connections", description: "Открыть подключения", admin: true,
       run: () => window.location.assign($("agent-connections").href) },
     { name: "/новый", alias: "/new", description: "Начать новый чат", run: () => switchChat(null) },
+    { name: "/ресурсы", alias: "/resources", description: "Песочницы и серверы MCP", run: openResources },
     { name: "/модель", alias: "/model", description: "Настройки модели", admin: true, run: openSettings },
   ];
   let matches = [];
@@ -25,7 +26,7 @@
     error: "Ошибка подключения",
   };
   const tools = {
-    list_indexes: "Список индексов", search_index: "Поиск по индексу",
+    list_indexes: "Список индексов", list_connections: "Доступные подключения", search_index: "Поиск по индексу",
     read_document: "Чтение документа", search_service_graph: "Поиск по графу сервисов",
     list_environment_tools: "Доступные инструменты среды", call_environment_tool: "Вызов инструмента среды",
     run_in_workspace: "Запуск кода в контейнере", task: "Запуск подагента",
@@ -268,14 +269,31 @@
         }
         timeline.summary.textContent = status;
         timeline.steps.append(element("li", "", status));
-      } else if (item.event === "answer" || item.event === "error") {
+      } else if (["answer", "restricted", "error"].includes(item.event)) {
         ended = true;
         timeline.details.hidden = !timeline.steps.childElementCount && !item.reference;
         timeline.summary.textContent = "Ход работы · " + timeline.steps.childElementCount;
-        if (item.event === "error") {
+        if (item.reference) {
+          timeline.details.append(element("p", "", "Номер диагностики для администратора · " + item.reference));
+        }
+        if (item.event === "restricted") {
+          turn.row.querySelector(".role").textContent = "Ограничение модели";
+          const clarify = element("button", "resource-shortcut", "Уточнить вопрос");
+          clarify.type = "button";
+          clarify.addEventListener("click", () => {
+            if (!question.value) question.value = text;
+            resize();
+            question.focus();
+            question.setSelectionRange(question.value.length, question.value.length);
+          });
+          turn.row.append(clarify);
+        } else if (item.event === "error") {
           turn.row.querySelector(".role").textContent = "Статус запроса";
           if (item.reference) {
-            timeline.details.append(element("p", "", "Номер ошибки для администратора · " + item.reference));
+            const resources = element("button", "resource-shortcut", "Посмотреть доступные ресурсы");
+            resources.type = "button";
+            resources.addEventListener("click", openResources);
+            turn.row.append(resources);
           }
         }
         if (item.event === "answer" && item.html) turn.body.innerHTML = item.html;
@@ -352,6 +370,86 @@
       if (revision === modelRequest) $("enable-model").disabled = false;
     }
   }
+  const resourcesDialog = $("agent-resources");
+  let resourcesRequest;
+  let resourcesOpener;
+
+  function resourceSection(title, rows, emptyText, renderRow) {
+    const section = element("section");
+    section.append(element("h3", "", title));
+    if (rows.length) {
+      const list = element("ul", "resource-items");
+      for (const row of rows) {
+        const item = element("li");
+        renderRow(item, row);
+        list.append(item);
+      }
+      section.append(list);
+    } else section.append(element("p", "", emptyText));
+    return section;
+  }
+
+  async function refreshResources() {
+    resourcesRequest?.abort();
+    resourcesRequest = new AbortController();
+    const { signal } = resourcesRequest;
+    const list = $("resources-list");
+    const status = $("resources-status");
+    list.replaceChildren();
+    list.hidden = true;
+    status.textContent = "Загружаем список…";
+    $("refresh-resources").disabled = true;
+    try {
+      const data = await (await request("api/resources", { signal })).json();
+      if (signal.aborted) return;
+      if (!Array.isArray(data.workspaces) || !Array.isArray(data.mcp)) {
+        throw new Error("Портал вернул неверный формат списка ресурсов.");
+      }
+      const workspaces = resourceSection("Песочницы", data.workspaces, "Нет доступных песочниц.", (item, row) => {
+        item.append(element("strong", "", row.name));
+        if (row.image !== row.name) item.append(element("code", "", row.image));
+      });
+      const servers = resourceSection("Серверы MCP", data.mcp, "Нет доступных серверов MCP.", (item, row) => {
+        item.append(element("strong", "", row.name));
+        if (row.id !== row.name) item.append(element("code", "", row.id));
+        if (row.tools.length) {
+          const details = element("details");
+          const names = element("ul", "resource-tools");
+          for (const name of row.tools) names.append(element("li", "", name));
+          details.append(element("summary", "", "Доступные инструменты · " + row.tools.length), names);
+          item.append(details);
+        }
+      });
+      list.replaceChildren(workspaces, servers);
+      list.hidden = false;
+      list.scrollTop = 0;
+      status.textContent = "";
+    } catch (error) {
+      if (!signal.aborted) status.textContent = error.status ? error.message : "Не удалось загрузить список ресурсов.";
+    } finally {
+      if (!signal.aborted) $("refresh-resources").disabled = false;
+    }
+  }
+
+  function openResources() {
+    const chatMenu = $("chat-menu");
+    resourcesOpener = chatMenu.contains(document.activeElement) ? chatMenu.querySelector("summary") : document.activeElement;
+    chatMenu.open = false;
+    resourcesDialog.showModal();
+    return refreshResources();
+  }
+  $("open-resources").addEventListener("click", openResources);
+  $("refresh-resources").addEventListener("click", refreshResources);
+  $("close-resources").addEventListener("click", () => resourcesDialog.close());
+  resourcesDialog.addEventListener("close", () => {
+    if (resourcesDialog.open) return;
+    resourcesRequest?.abort();
+    $("resources-list").replaceChildren();
+    $("resources-list").hidden = true;
+    if (resourcesOpener?.isConnected) resourcesOpener.focus();
+  });
+  window.addEventListener("pagehide", () => { if (resourcesDialog.open) resourcesDialog.close(); });
+
   const settingsDialog = $("model-settings");
   const settingsForm = $("settings-form");
   const files = ["ca", "cert", "key"];
@@ -382,6 +480,25 @@
     $("settings-source").hidden = !$("settings-source").textContent;
     $("settings-warning").textContent = info.warning || "";
     $("settings-warning").hidden = !info.warning;
+    const memory = info.experience;
+    $("settings-experience").hidden = !memory;
+    $("experience-counts").replaceChildren();
+    if (memory) {
+      const route = memory.prefer_chat_reads === true ? "Сначала обычный чат."
+        : memory.prefer_chat_reads === false ? "Сначала встроенные вызовы инструментов."
+        : "Действуют настройки подключения.";
+      $("experience-route").textContent = "Запросов с наблюдениями за 30 дней — " + memory.turns +
+        ". " + route + (memory.larger_read_answer ? " Для ответа по источникам увеличен запас токенов." : "");
+      const labels = {
+        read_format: "Исправление шага исследования", read_length: "Обрезанный ответ по источникам",
+        native_schema: "Отклонённый формат инструментов", native_incomplete: "Незавершённый ответ",
+        native_to_read_success: "Помог переход в обычный чат", read_to_native_success: "Помог переход к встроенным инструментам",
+        long_read_success: "Помог увеличенный ответ", policy: "Ограничение поставщика",
+      };
+      for (const [key, label] of Object.entries(labels)) {
+        if (memory.outcomes[key]) $("experience-counts").append(element("li", "", label + " · " + memory.outcomes[key]));
+      }
+    }
     for (const kind of files) $("saved-" + kind).textContent = info["has_" + kind] ? "Сохранён" : "";
     $("saved-api-key").textContent = info.has_api_key ? "Сохранён" : "";
     $("replace-field").hidden = ![info.has_ca, info.has_cert, info.has_key, info.has_api_key].some(Boolean);
@@ -390,6 +507,7 @@
   function disableSettings(disabled) {
     $("settings-fields").disabled = disabled;
     $("test-settings").disabled = disabled;
+    $("test-research").disabled = disabled;
     $("save-settings").disabled = disabled;
   }
   async function openSettings() {
@@ -431,19 +549,33 @@
     if (token || replace) draft.api_key = token;
     return draft;
   }
-  async function submitSettings(test) {
+  async function submitSettings(action) {
     if ($("settings-fields").disabled || !settingsForm.reportValidity()) return;
     const { signal } = settingsRequest;
     disableSettings(true);
-    settingsStatus(test ? "Отправляем короткий запрос модели…" : "Сохраняем подключение…");
+    const checks = { test: "Отправляем короткий запрос модели…", research: "Начинаем проверку поиска и чтения…" };
+    settingsStatus(checks[action] || "Сохраняем подключение…");
     try {
       const draft = await draftSettings();
-      const response = await request(test ? "api/model/test" : "api/model/settings", {
-        method: test ? "POST" : "PUT", headers: await adminHeaders(), body: JSON.stringify(draft), signal,
+      const paths = { test: "test", research: "test-research", save: "settings" };
+      const response = await request("api/model/" + paths[action], {
+        method: action === "save" ? "PUT" : "POST", headers: await adminHeaders(), body: JSON.stringify(draft), signal,
       });
       if (signal.aborted) return;
-      if (test) settingsStatus("Модель ответила на проверочный запрос.", "success");
-      else {
+      if (action === "research") {
+        let finished = false;
+        await consume(response, item => {
+          if (signal.aborted || finished) return;
+          if (item.event === "progress") settingsStatus(item.text);
+          if (item.event === "success" || item.event === "error") {
+            finished = true;
+            settingsStatus(item.text, item.event);
+          }
+        });
+        if (!signal.aborted && !finished) throw new Error("Связь прервалась до завершения проверки исследования.");
+      } else if (action === "test") {
+        settingsStatus("Модель ответила на проверочный запрос.", "success");
+      } else {
         const info = await response.json();
         if (signal.aborted) return;
         loadProfile(info);
@@ -466,8 +598,9 @@
   });
   $("settings-provider").addEventListener("change", selectProvider);
   settingsForm.addEventListener("input", () => settingsStatus(""));
-  settingsForm.addEventListener("submit", (e) => { e.preventDefault(); submitSettings(false); });
-  $("test-settings").addEventListener("click", () => submitSettings(true));
+  settingsForm.addEventListener("submit", (e) => { e.preventDefault(); submitSettings("save"); });
+  $("test-settings").addEventListener("click", () => submitSettings("test"));
+  $("test-research").addEventListener("click", () => submitSettings("research"));
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(); });
   question.addEventListener("input", () => { dismissedDraft = null; resize(); });
   question.addEventListener("focus", updateCommands);

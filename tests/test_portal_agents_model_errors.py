@@ -13,6 +13,7 @@ from corporate_kb.gigacode_runner import GigaCodeAccessError, GigaCodeTransientE
 from corporate_kb.mcp.http_server import create_http_app
 from portal_agents import http
 from portal_agents.model_errors import check_gateway_reply, gateway_exception
+from portal_agents.wire_diagnostics import validation_details
 
 
 @pytest.mark.parametrize("form", ["http", "envelope", "text", "bare", "text-envelope"])
@@ -81,6 +82,119 @@ async def test_rejected_chat_and_probe_show_safe_error_and_do_not_publish_transc
 def test_answer_explaining_error_name_is_preserved():
     check_gateway_reply("Ошибка OpenAIInvalidRequestError возникает при несовместимой схеме.")
     check_gateway_reply('{"example": {"type": "invalid_request_error"}}')
+
+
+@pytest.mark.parametrize(("payload", "field"), [
+    ({"error": {"param": "messages[3].tool_calls.0.function.arguments"}}, "messages"),
+    ({"detail": [{"loc": ["body", "functions", 1, "name"], "input": "private_key"},
+                 {"loc": ["body", "functions", 2, "parameters", "private_key"]}]}, "tools"),
+    ({"error": {"param": "model"}}, "model"),
+    ({"detail": [{"loc": ["body", "max_completion_tokens"]}]}, "max_tokens"),
+    ({"detail": [{"loc": ["header", "private_key", "functions"]}]}, None),
+    ({"detail": [{"loc": ["body", "tools", {"private": "value"}]}]}, None),
+    ({"detail": [{"loc": ["body", "messages"]}, {"loc": ["body", "private_key"]}]}, None),
+    ({"detail": [{"loc": ["body", "tools"]}, {"loc": ["body", "max_tokens"]}]}, None),
+    ({"error": {"param": "tools/private_key"}}, None),
+    ({"error": {"param": "private_key.tools"}}, None),
+    ({"error": {"message": "tools validation failed private_key"}}, None),
+])
+def test_validation_location_includes_only_the_known_common_request_field(payload, field):
+    response = httpx.Response(
+        422, json=payload, headers={"X-Portal-Model-Error": "invalid-request"},
+        request=httpx.Request("POST", "https://private.invalid"),
+    )
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        response.raise_for_status()
+    error = gateway_exception(raised.value)
+    assert error.validation_field == field
+    assert error.category == "upstream-http" and not error.retryable and not error.retry_forbidden
+    assert "API модели" in str(error) and "422" in str(error)
+    if field:
+        assert field in str(error)
+    assert "private" not in str(error) and "сертификат" not in str(error)
+
+
+@pytest.mark.parametrize(("body", "hint"), [
+    (b"Field required: SECRET model name", "field_required"),
+    (b'{"message":"Extra inputs are not permitted: SECRET"}', "extra_forbidden"),
+    (b'{"error":{"message":"This model\'s maximum context length is 12345 SECRET"}}',
+     "context_length"),
+    (b'{"detail":"Unsupported parameter SECRET"}', "unsupported_parameter"),
+    (b'{"input":"Field required","msg":"SECRET"}', "unknown"),
+])
+def test_free_text_yields_safe_hint_without_changing_recovery_decisions(body, hint):
+    details = validation_details(body)
+    assert details["message_hint"] == hint and "SECRET" not in json.dumps(details)
+    response = httpx.Response(422, content=body, request=httpx.Request("POST", "https://test/v1"))
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        response.raise_for_status()
+    error = gateway_exception(raised.value)
+    assert error.diagnostics["validation"] == details
+    assert error.validation_field is None and not error.retryable
+
+
+@pytest.mark.parametrize(("payload", "headers", "category"), [
+    ({"error": {"param": "tools", "code": "invalid_api_key"}}, {}, "access"),
+    ({"error": {"param": "tools", "innererror": {"code": "ResponsibleAIPolicyViolation"}}},
+     {}, "policy"),
+    ({"error": {"param": "tools", "refusal": "SECRET"}}, {}, "policy"),
+    ({"error": {"param": "tools"}}, {"X-Should-Retry": "False"}, "upstream-http"),
+])
+@pytest.mark.parametrize("status", [422, 500])
+def test_provider_no_retry_is_respected_across_compatibility_strategies(
+    payload, headers, category, status,
+):
+    response = httpx.Response(status, json=payload, headers=headers,
+                              request=httpx.Request("POST", "https://private.invalid"))
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        response.raise_for_status()
+    error = gateway_exception(raised.value)
+    assert (error.category, error.retryable, error.retry_forbidden) == (category, False, True)
+    assert "private" not in str(error) and "SECRET" not in str(error)
+
+
+@pytest.mark.parametrize(("body", "kind", "count"), [
+    (b"", "empty", 0), (b"SECRET_BODY", "text", 0), (b'"SECRET"', "string", 0),
+    (b'{"detail":"SECRET"}', "detail_string", 0), (b"{" * 70000, "oversized", 0),
+    (json.dumps({"detail": [{"loc": ["body", "functions", 0, "parameters", "properties",
+                                     "SECRET_PROPERTY", "name"],
+                             "type": "SECRET_TYPE", "msg": "SECRET_MSG", "input": "SECRET_INPUT"}]
+                            * 7}).encode(), "detail_array", 7),
+])
+def test_direct_422_wire_shape_and_opaque_responses_are_safe(body, kind, count):
+    request = httpx.Request("POST", "https://SECRET.invalid/v1/private/chat/completions",
+                            json={"model": "SECRET_MODEL", "messages": [
+                                {"role": "SECRET_ROLE", "content": "SECRET_TEXT"},
+                                {"role": "assistant", "tools_state_id": "SECRET_STATE",
+                                 "tool_calls": [{"id": "SECRET_ID"}]},
+                                {"role": "tool", "content": [{"text": "SECRET_RESULT"}]}],
+                                "tools": [{"name": "SECRET_TOOL"}], "stream": False,
+                                "thinking": {"type": "SECRET_CONFIG"}, "max_tokens": "SECRET"})
+    response = httpx.Response(422, content=body, request=request,
+                              headers={"X-Request-ID": "SECRET_ID"},
+                              extensions={"portal_wire_diagnostics": {"SECRET": "injected"}})
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        response.raise_for_status()
+    failure = gateway_exception(raised.value)
+    assert failure.request_id is None
+    diagnostics = failure.diagnostics
+    assert diagnostics["wire"] == "openai" and diagnostics["endpoint"]["kind"] == "chat/completions"
+    assert diagnostics["request"] == {
+        "body_type": "object", "body_bytes": len(request.content), "model": "set",
+        "tools": 1, "functions": 0, "stream": False, "thinking_present": True,
+        "function_choice_present": False, "max_tokens": "invalid", "messages": 3,
+        "roles": {"other": 1, "assistant": 1, "tool": 1}, "tool_calls": 1,
+        "tool_results": 1, "state_ids": 1, "text_chars": len("SECRET_TEXTSECRET_RESULT"),
+    }
+    validation = diagnostics["validation"]
+    assert (validation["body_type"], validation["error_count"]) == (kind, count)
+    assert len(validation["issues"]) == min(5, count)
+    if count:
+        assert validation["issues"][0] == {
+            "type": "other",
+            "path": ["body", "functions", 0, "parameters", "properties", "*", "name"],
+        }
+    assert "secret" not in json.dumps(diagnostics).lower()
 
 
 @pytest.mark.parametrize(("exc", "category", "status", "retryable"), [

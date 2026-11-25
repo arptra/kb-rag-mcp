@@ -11,6 +11,7 @@ pytest.importorskip("gpt2giga")
 
 from gigachat.context import authorization_cvar, chat_url_cvar, custom_headers_cvar
 from langchain_openai import ChatOpenAI
+from openai import UnprocessableEntityError
 
 from portal_agents.gpt2giga_model import _LOCAL_URL, _GigaChatBridge
 from portal_agents.model_errors import gateway_exception
@@ -162,6 +163,67 @@ async def test_upstream_errors_keep_status_without_private_provider_content(stat
     assert response.headers["X-Request-ID"] == request_id
 
 
+@pytest.mark.parametrize(("payload", "field", "category", "blocked"), [
+    ({"detail": [{"loc": ["body", "functions", 0, "parameters", "PRIVATE"],
+                  "input": "PRIVATE", "msg": "PRIVATE"}]}, "tools", "upstream-http", False),
+    ({"error": {"param": "messages[1].function_call", "message": "PRIVATE"}},
+     "messages", "upstream-http", False),
+    ({"error": {"param": "functions", "code": "content_filter", "message": "PRIVATE"}},
+     "tools", "policy", True),
+    ({"message": "messages Tool X failed PRIVATE"}, None, "upstream-http", False),
+])
+async def test_native_validation_through_both_sdks_is_sanitized(payload, field, category, blocked):
+    upstream = httpx.Response(422, json=payload,
+                              headers={"X-Portal-Model-Error": "invalid-request"})
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(lambda _: upstream),
+                          base_url="https://private.invalid/v1") as native,
+        httpx.AsyncClient(transport=_GigaChatBridge(native, "model", None)) as client,
+    ):
+        model = ChatOpenAI(model="model", base_url=_LOCAL_URL, api_key="local",
+                           http_async_client=client, use_responses_api=False, max_retries=0)
+        with pytest.raises(UnprocessableEntityError) as raised:
+            await model.ainvoke("Hello")
+    error = gateway_exception(raised.value)
+    assert (error.status, error.category, error.validation_field) == (422, category, field)
+    assert error.diagnostics["wire"] == "gigachat-v1"
+    assert error.diagnostics["endpoint"] == {"kind": "chat/completions",
+                                             "chat_completions_count": 1}
+    assert error.diagnostics["request"]["roles"] == {"user": 1}
+    assert error.diagnostics["request"]["text_chars"] == 5
+    assert "PRIVATE" not in json.dumps(error.diagnostics)
+    assert not error.retryable and error.retry_forbidden is blocked
+    assert "PRIVATE" not in raised.value.response.text and "PRIVATE" not in str(raised.value)
+    assert "private.invalid" not in str(error)
+
+
+async def test_local_native_request_validation_reports_the_field_without_sending_data(monkeypatch):
+    async def invalid(_):
+        return {"messages": "PRIVATE"}
+
+    def unexpected(_):
+        pytest.fail("local validation should finish before any native call")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(unexpected)) as native:
+        bridge = _GigaChatBridge(native, "model", None)
+        monkeypatch.setattr(bridge.encoder, "prepare_chat", invalid)
+        async with httpx.AsyncClient(transport=bridge) as client:
+            model = ChatOpenAI(model="model", base_url=_LOCAL_URL, api_key="local",
+                               http_async_client=client, use_responses_api=False, max_retries=0)
+            with pytest.raises(UnprocessableEntityError) as raised:
+                await model.ainvoke("Hello")
+    error = gateway_exception(raised.value)
+    assert (error.status, error.category) == (422, "invalid-request")
+    assert error.diagnostics["wire"] == "adapter-input" and "endpoint" not in error.diagnostics
+    assert error.diagnostics["request"]["messages"] == "invalid"
+    assert error.diagnostics["validation"]["issues"] == [{"type": "list_type",
+                                                         "path": ["messages"]}]
+    assert "PRIVATE" not in json.dumps(error.diagnostics)
+    assert error.validation_field == "messages"
+    assert "Адаптер" in str(error) and "messages" in str(error) and not error.retryable
+    assert "PRIVATE" not in raised.value.response.text and "PRIVATE" not in str(raised.value)
+
+
 @pytest.mark.parametrize("delay", ["Fri, 12 Dec 2031 10:00:00 GMT", "secret"])
 async def test_bridge_forwards_http_date_and_strips_untyped_diagnostics(delay):
     reply = httpx.Response(503, headers={"Retry-After": delay, "X-Request-ID": "secret"})
@@ -241,6 +303,7 @@ async def test_parallel_history_from_previous_model_preserves_both_tool_results(
         del messages[3]
         invalid = await client.post("chat/completions", json={"messages": messages})
         assert invalid.status_code == 422
+        assert invalid.json()["error"]["param"] == "messages"
     assert len(seen) == 1
     user, ask_a, result_a, ask_b, result_b, answer, followup = seen[0]
     assert user["content"] == "Compare sources" and followup["content"].startswith("Which")
@@ -251,6 +314,52 @@ async def test_parallel_history_from_previous_model_preserves_both_tool_results(
         assert result["role"] == "function"
         assert json.loads(result["content"]) == {"evidence": evidence}
     assert answer["content"] == "Both found"
+
+
+async def test_422_uses_sanitized_native_wire_shape_and_provider_validation_path():
+    req_id = str(uuid4())
+    payload = {"detail": [{"loc": ["body", "functions", 0, "parameters", "properties",
+                                   "SECRET_FIELD", "type"],
+                           "type": "extra_forbidden", "msg": "SECRET_MSG", "input": "SECRET_ARG"}]}
+    observed = []
+
+    def reject(req):
+        observed.append(json.loads(req.content))
+        return httpx.Response(422, json=payload, headers={"x-request-id": req_id})
+
+    async with (
+        httpx.AsyncClient(base_url="https://SECRET.test/private/chat/completions",
+                          transport=httpx.MockTransport(reject)) as native,
+        httpx.AsyncClient(base_url=_LOCAL_URL,
+                          transport=_GigaChatBridge(native, "SECRET_MODEL", None)) as client,
+    ):
+        body = {"tools": [{"type": "function", "function": {"name": "SECRET_FN",
+                 "parameters": {"type": "object", "properties": {}}}}], "max_tokens": 120,
+                "messages": [{"role": "user", "content": "SECRET_QUESTION"},
+                             {"role": "assistant", "content": "", "tool_calls": [{
+                                 "id": "SECRET_ID", "type": "function",
+                                 "function": {"name": "SECRET_FN", "arguments": "{}"}}]},
+                             {"role": "tool", "tool_call_id": "SECRET_ID",
+                              "content": "SECRET_OUT"}]}
+        response = await client.post("chat/completions", json=body)
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            response.raise_for_status()
+    error = gateway_exception(caught.value)
+    [sent] = observed
+    assert len(sent["functions"]) == 1 and "tools" not in sent
+    shape = error.diagnostics["request"]
+    assert (shape["tools"], shape["functions"]) == (0, 1)
+    assert (shape["model"], shape["max_tokens"]) == ("set", 120)
+    assert shape["roles"] == {"user": 1, "assistant": 1, "function": 1}
+    assert shape["tool_calls"] == shape["tool_results"] == 1
+    assert error.diagnostics["endpoint"] == {"kind": "chat/completions",
+                                             "chat_completions_count": 2}
+    assert error.diagnostics["validation"]["issues"] == [{
+        "type": "extra_forbidden",
+        "path": ["body", "functions", 0, "parameters", "properties", "*", "type"],
+    }]
+    assert error.request_id == req_id
+    assert "secret" not in json.dumps(error.diagnostics).lower()
 
 
 async def test_native_blacklist_reaches_sdk_as_content_filter():

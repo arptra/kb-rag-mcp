@@ -27,6 +27,7 @@ async def test_native_model_probe_and_tool_round_trip(settings_factory, tmp_path
     tls.verify_mode = ssl.CERT_REQUIRED
     monkeypatch.setenv("OPENAI_API_KEY", "unused-token-from-another-provider")
     requests = []
+    routing_questions = []
     state_id = str(uuid4())
     answer = "Доступен индекс default."
     question = "Какие индексы доступны?"
@@ -38,8 +39,17 @@ async def test_native_model_probe_and_tool_round_trip(settings_factory, tmp_path
         length = next(line.split(b":", 1)[1] for line in headers.lower().splitlines()
                       if line.startswith(b"content-length:"))
         payload = json.loads(await stream.readexactly(int(length)))
-        requests.append((headers.lower(), payload, writer.get_extra_info("peercert")))
         messages = payload["messages"]
+        # This deployment uses native function calls. Its text model asks the agent
+        # to continue with the full conversation on the first decision of each turn.
+        plain_plan = not payload.get("functions") and messages[-1]["content"].startswith("{")
+        if plain_plan:
+            frame = json.loads(messages[-1]["content"])
+            assert frame["available_tools"] and not frame["observations"]
+            assert writer.get_extra_info("peercert")
+            routing_questions.append(frame["question"])
+        else:
+            requests.append((headers.lower(), payload, writer.get_extra_info("peercert")))
         # This deployment fails on the solving call until it receives a paraphrase.
         if (model_name == "DeepSeek-V4-Flash" and payload.get("functions")
                 and any(m["role"] == "function" for m in messages)
@@ -54,7 +64,9 @@ async def test_native_model_probe_and_tool_round_trip(settings_factory, tmp_path
             return
         msg = {"role": "assistant", "content": "OK"}
         reason = "stop"
-        if len(requests) == 2:
+        if plain_plan:
+            msg["content"] = json.dumps({"defer": True})
+        elif len(requests) == 2:
             msg = {**msg, "content": "", "functions_state_id": state_id,
                    "function_call": {"name": "list_indexes", "arguments": {}}}
             reason = "function_call"
@@ -115,6 +127,7 @@ async def test_native_model_probe_and_tool_round_trip(settings_factory, tmp_path
         })
         assert json.loads(followup.text.splitlines()[-1])["event"] == "answer"
 
+    assert routing_questions == [question, followup_question]
     assert len(requests) == (7 if model_name == "DeepSeek-V4-Flash" else 4)
     for headers, body, certificate in requests:
         assert certificate and b"authorization:" not in headers

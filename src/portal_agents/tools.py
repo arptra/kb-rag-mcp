@@ -7,7 +7,7 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import httpx
 from jsonschema import Draft202012Validator, ValidationError
@@ -20,14 +20,17 @@ from referencing import Registry
 
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.mcp.servers import McpServerRegistry
-from corporate_kb.models import SearchFilters
+from corporate_kb.models import Document, SearchFilters
 
 Authorize = Callable[[], Awaitable[bool]]
+ConnectionKind = Literal["all", "workspaces", "mcp"]
 Query = Annotated[str, Field(min_length=1, max_length=4000)]
 Limit = Annotated[int, Field(ge=1, le=20)]
 _SOURCE_FIELDS = {"document_id", "title", "source_path", "source_url", "source_version",
                   "source_updated_at", "page_id", "revision_id"}
 _MCP_TIMEOUT = 30
+DOCUMENT_NOT_FOUND = ("The requested document is not available in this index. "
+                      "Use a document_id from search_index, not a reference inside a document.")
 
 
 async def _require(authorize: Authorize) -> None:
@@ -167,11 +170,34 @@ def _remote_tools(
             for fn in (list_environment_tools, call_environment_tool)]
 
 
+async def connection_inventory(
+    kind: ConnectionKind = "all", *, authorize: Authorize, workspace: tuple[str, str] | None,
+    mcp_servers: McpServerRegistry | None, mcp_read_tools: Mapping[str, Sequence[str]] | None,
+) -> dict[str, Any]:
+    """Read the locally published connection metadata visible to the current principal."""
+    await _require(authorize)
+    result: dict[str, Any] = {}
+    if kind in {"all", "workspaces"}:
+        result["workspaces"] = ([{"name": workspace[0], "image": workspace[1]}]
+                                if workspace else [])
+    if kind in {"all", "mcp"}:
+        servers = []
+        if mcp_servers and mcp_read_tools:
+            for server in await asyncio.to_thread(mcp_servers.list):
+                if names := mcp_read_tools.get(server.id):
+                    servers.append({"id": server.id, "name": server.name,
+                                    "tools": sorted(set(names))})
+        result["mcp"] = servers
+    await _require(authorize)
+    return result
+
+
 def build_tools(
     catalog: RagCatalog, *, authorize: Authorize, authorize_graph: Authorize | None = None,
     index_ids: Collection[str] | None = None, mcp_servers: McpServerRegistry | None = None,
     mcp_read_tools: Mapping[str, Sequence[str]] | None = None,
     mcp_credential: Callable[[str, str], str] | None = None,
+    workspace: tuple[str, str] | None = None,
 ) -> list[BaseTool]:
     """Bind the actual caller's grants; constructing the catalog never opens a source."""
     scope = frozenset(index_ids) if index_ids is not None else None
@@ -197,6 +223,11 @@ def build_tools(
         await _require(authorize)
         return [row for row in rows if scope is None or row["id"] in scope]
 
+    async def list_connections(kind: ConnectionKind = "all") -> dict[str, Any]:
+        """List this chat's published Docker sandboxes, MCP servers and approved MCP tool names."""
+        return await connection_inventory(kind, authorize=authorize, workspace=workspace,
+                                          mcp_servers=mcp_servers, mcp_read_tools=mcp_read_tools)
+
     async def search_index(query: Query, index_id: str = default_index,
                            limit: Limit = 5) -> dict[str, Any]:
         """Search current text in one index. Use a document ID from the results to read further."""
@@ -214,9 +245,14 @@ def build_tools(
         length: Annotated[int, Field(ge=1, le=16000)] = 6000,
     ) -> dict[str, Any]:
         """Read a current document by ID. Pass next_offset to read the next section in full."""
-        doc = await local(index_id, lambda: catalog.tools_for(index_id).read_current_document(
-            document_id=document_id,
-        ))
+        def current_document() -> Document:
+            kb = catalog.tools_for(index_id)
+            try:
+                return kb.read_current_document(document_id=document_id)
+            except KeyError:
+                raise ToolException(DOCUMENT_NOT_FOUND) from None
+
+        doc = await local(index_id, current_document)
         end = min(offset + length, len(doc.content))
         return {**doc.model_dump(mode="json", include=_SOURCE_FIELDS), "index_id": index_id,
                 "content": doc.content[offset:end], "offset": offset,
@@ -224,12 +260,14 @@ def build_tools(
 
     tools: list[BaseTool] = [StructuredTool.from_function(coroutine=fn, handle_tool_error=True)
                              for fn in (list_indexes, search_index, read_document)]
+    tools[-1].metadata = {"portal_rag_document": True}
     if scope:
         names = ", ".join(sorted(scope))
         hint = (f" The available index IDs are: {names}." if len(names) <= 1500 else
                 " Use list_indexes to get exact index IDs.")
         for index_tool in tools[1:]:
             index_tool.description += hint
+    tools.append(StructuredTool.from_function(coroutine=list_connections))
     if authorize_graph is not None:
         graph_grant = authorize_graph
 

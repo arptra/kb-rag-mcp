@@ -255,3 +255,79 @@ async def test_mcp_discovery_publication_live_calls_revocation_and_token_binding
         assert not changed["has_token"] and not changed["tools"]
         assert (await client.post(discover, headers=ADMIN, json={})).status_code == 502
         assert observed[-1] == (b"other.test", None)
+
+
+async def test_chat_lists_published_connections_without_starting_them(portal, monkeypatch):
+    monkeypatch.setattr(connections, "_images", AsyncMock(return_value=["gradle:8"]))
+    monkeypatch.setattr(connections, "_check_workspace", AsyncMock())
+
+    def unexpected_activity(*args, **kwargs):
+        pytest.fail("Listing connections must read only the local catalog")
+
+    monkeypatch.setattr("portal_agents.workspace._docker", unexpected_activity)
+    monkeypatch.setattr("portal_agents.tools._session", unexpected_activity)
+    workspace = {"name": "Java 21", "image": "gradle:8"}
+    question = "Какие песочницы и MCP тебе доступны?"
+    expected = {"workspaces": [], "mcp": []}
+    model_calls = []
+
+    def decide(messages, names):
+        if isinstance(messages[-1], HumanMessage):
+            assert "list_connections" in names
+            return call("list_connections")
+        assert isinstance(messages[-1], ToolMessage)
+        assert json.loads(messages[-1].text) == expected
+        return AIMessage(content=json.dumps(expected, ensure_ascii=False))
+
+    @asynccontextmanager
+    async def model(*args, **kwargs):
+        model_calls.append(True)
+        yield Model(respond=decide)
+
+    monkeypatch.setattr(http, "create_model", model)
+    async with browser(portal) as client:
+        resources = "/agents/api/resources"
+        assert (await client.get(resources)).status_code == 401
+        assert (await client.post(resources, headers=READER, json={})).status_code == 405
+
+        async def ask():
+            before = len(model_calls)
+            listing = await client.get(resources, headers=READER)
+            assert listing.status_code == 200 and listing.json() == expected
+            assert listing.headers["cache-control"] == "no-store"
+            assert len(model_calls) == before
+            response = await client.post("/agents/api/chat", headers=READER, json={
+                "chat": str(uuid4()), "question": question,
+            })
+            events = [json.loads(line) for line in response.text.splitlines()]
+            assert events[-1]["event"] == "answer", events
+            assert json.loads(events[-1]["text"]) == expected
+
+        await ask()
+        assert (await client.put(ROOT + "/workspace", headers=ADMIN, json=workspace)).is_success
+        added = await client.post(ROOT + "/servers", headers=ADMIN, json={
+            "name": "Issues", "url": "https://private-mcp.test/jira",
+        })
+        server = added.json()["id"]
+        path = f"{ROOT}/servers/{server}"
+        publication = {"tools": ["get_issue"], "token": "test-private-value"}
+        assert (await client.put(path, headers=ADMIN, json=publication)).is_success
+        expected = {"workspaces": [workspace],
+                    "mcp": [{"id": server, "name": "Issues", "tools": ["get_issue"]}]}
+        await ask()
+
+        assert (await client.put(path, headers=ADMIN, json={"tools": []})).is_success
+        expected["mcp"] = []
+        await ask()
+
+
+@pytest.mark.parametrize("updated", [{"name": "", "image": ""},
+                                     {"name": "Renamed", "image": "secret:1"}])
+async def test_resources_rechecks_grants_after_read(portal, monkeypatch, updated):
+    published = ({"name": "Private connection", "image": "secret:1"}, [], {})
+    states = iter((published, published, (updated, [], {})))
+    monkeypatch.setattr(connections.Connections, "snapshot", lambda self: next(states))
+    async with browser(portal) as client:
+        response = await client.get("/agents/api/resources", headers=READER)
+        assert response.status_code == 403
+        assert "Private connection" not in response.text and "secret:1" not in response.text

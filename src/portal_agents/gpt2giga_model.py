@@ -8,14 +8,14 @@ import logging
 import re
 import ssl
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from contextvars import Context
 from datetime import UTC
 from email.utils import format_datetime, parsedate_to_datetime
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import httpx
-from gigachat.api.chat import chat_async
+from gigachat.api.chat import _build_request_json, chat_async
 from gigachat.exceptions import ResponseError
 from gigachat.models import Chat
 from gpt2giga.common.client_params import ClientCompatibilityError
@@ -27,7 +27,8 @@ from langchain_openai import ChatOpenAI
 from pydantic import SecretStr, ValidationError
 
 from corporate_kb.confluence.diagnostics import safe_http_logging
-from portal_agents.model_errors import invalid_request_payload
+from portal_agents.model_errors import invalid_request_payload, model_error_metadata
+from portal_agents.wire_diagnostics import WireDiagnostics, safe_request_id
 
 # Protocol converter diagnostics can include the request contents. The portal
 # reports its own bounded model errors and never logs conversation data here.
@@ -39,13 +40,10 @@ def _error_headers(headers: httpx.Headers | None) -> dict[str, str]:
     safe = {}
     if not headers:
         return safe
-    if headers.get("x-should-retry") == "false":
+    if headers.get("x-should-retry", "").strip().lower() == "false":
         safe["x-should-retry"] = "false"
-    if value := headers.get("x-request-id"):
-        with suppress(ValueError):
-            request_id = UUID(value)
-            if value.lower() in (request_id.hex, str(request_id)):
-                safe["x-request-id"] = value
+    if request_id := safe_request_id(headers.get("x-request-id")):
+        safe["x-request-id"] = request_id
     if delay := headers.get("retry-after"):
         if re.fullmatch(r"[0-9]{1,10}(?:\.[0-9]{1,6})?", delay):
             safe["retry-after"] = delay
@@ -59,9 +57,25 @@ def _error_headers(headers: httpx.Headers | None) -> dict[str, str]:
     return safe
 
 
-def _bridge_error(status: int, code: str) -> httpx.Response:
+def _safe_error_body(message: str, payload: object) -> dict:
+    field, denial = model_error_metadata(payload)
+    error = {"message": message}
+    if field:
+        error["param"] = field
+    if denial:
+        error["code"] = {"policy": "content_filter", "access": "permission_denied"}[denial]
+    return {"error": error}
+
+
+def _bridge_error(status: int, code: str, payload: object = None,
+                  request_data: object = None) -> httpx.Response:
+    extensions: dict = {"portal_model_error": code}
+    if status == 422:
+        extensions["portal_wire_diagnostics"] = WireDiagnostics(
+            "adapter-input", request_data, payload,
+        )
     return httpx.Response(status, headers={"X-Portal-Model-Error": code},
-                          json={"error": {"message": code}})
+                          extensions=extensions, json=_safe_error_body(code, payload))
 
 
 def _serial_tool_history(messages: list[dict]) -> list[dict]:
@@ -82,11 +96,11 @@ def _serial_tool_history(messages: list[dict]) -> list[dict]:
             index += 1
             replies[reply.get("tool_call_id")] = reply
         if index - start != len(calls):
-            raise ClientCompatibilityError("Unexpected number of parallel tool results")
+            raise ClientCompatibilityError("Missing parallel tool results", param="messages")
         for position, call in enumerate(calls):
             reply = replies.pop(call.get("id"), None)
             if reply is None or not call.get("id"):
-                raise ClientCompatibilityError("Unmatched result for parallel tool call")
+                raise ClientCompatibilityError("Unmatched parallel tool result", param="messages")
             assistant = message if position == 0 else {"role": "assistant", "content": ""}
             result.extend(({**assistant, "tool_calls": [call]}, reply))
     return result
@@ -188,11 +202,17 @@ class _GigaChatBridge(httpx.AsyncBaseTransport, httpx.BaseTransport):
             data["model"] = self.model
         else:
             data.pop("model", None)  # Some corporate deployments select the model by URL.
+        converted_request = data
         try:
             data["messages"] = _serial_tool_history(data.get("messages", []))
-            native = Chat.model_validate(await self.encoder.prepare_chat(data))
-        except (ClientCompatibilityError, ValidationError):
-            return _bridge_error(422, "invalid-request")
+            converted_request = await self.encoder.prepare_chat(data)
+            native = Chat.model_validate(converted_request)
+        except ClientCompatibilityError as exc:
+            return _bridge_error(422, "invalid-request", {"param": exc.param, "code": exc.code,
+                                                         "type": exc.error_type}, converted_request)
+        except ValidationError as exc:
+            issues = exc.errors(include_url=False, include_context=False, include_input=False)
+            return _bridge_error(422, "invalid-request", {"detail": issues}, converted_request)
 
         async def complete() -> httpx.Response:
             with safe_http_logging():
@@ -201,21 +221,27 @@ class _GigaChatBridge(httpx.AsyncBaseTransport, httpx.BaseTransport):
                 except ResponseError as exc:
                     # Preserve only typed diagnostics; other headers and bodies can contain
                     # internal URLs, authentication material and user text.
+                    extensions = {}
+                    if exc.status_code == 422:
+                        wire = _build_request_json(chat=native, exclude_stream=True)
+                        extensions["portal_wire_diagnostics"] = WireDiagnostics(
+                            "gigachat-v1", wire, exc.content, exc.url,
+                        )
                     return httpx.Response(
-                        exc.status_code, headers=_error_headers(exc.headers),
-                        json={"error": {"message": "GigaChat API rejected the request"}},
+                        exc.status_code, headers=_error_headers(exc.headers), extensions=extensions,
+                        json=_safe_error_body("GigaChat API rejected the request", exc.content),
                     )
                 except ValidationError as exc:
                     # Some endpoints return a typed OpenAI error envelope with HTTP 200.
                     # Keep the non-retryable rejection recognizable to ChatOpenAI.
                     for field in exc.errors(include_url=False, include_context=False):
                         payload = field.get("input")
-                        if (field["loc"] == ("choices",) and isinstance(payload, dict)
-                                and invalid_request_payload(payload.get("error"))):
-                            return httpx.Response(200, json={"error": {
-                                "type": "invalid_request_error",
-                                "message": "GigaChat API rejected the request",
-                            }})
+                        if field["loc"] == ("choices",) and isinstance(payload, dict):
+                            error = _safe_error_body("GigaChat API rejected the request", payload)
+                            if (invalid_request_payload(payload.get("error"))
+                                    or "code" in error["error"]):
+                                error["error"]["type"] = "invalid_request_error"
+                                return httpx.Response(200, json=error)
                     return _bridge_error(502, "invalid-reply")
                 except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
                     # The native SDK decodes JSON and unpacks it as keyword arguments.
@@ -258,6 +284,7 @@ async def gpt2giga_model(
                     yield ChatOpenAI(
                         model=model_name or "gateway", base_url=_LOCAL_URL,
                         api_key=SecretStr("in-process"), cache=False, disable_streaming=True,
+                        metadata={"portal_chat_reads_first": True},
                         use_responses_api=False, http_client=sync_client, http_async_client=client,
                         timeout=timeout, max_retries=max_retries,
                         extra_body={"max_tokens": output_tokens} if output_tokens else None,

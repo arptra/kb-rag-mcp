@@ -17,6 +17,7 @@ pytest.importorskip("deepagents")
 
 from portal_agents.engine import run_turn
 from portal_agents.model import create_model
+from portal_agents.model_errors import ModelGatewayError
 
 
 class Model(BaseChatModel):
@@ -224,6 +225,6 @@ async def test_rejected_or_truncated_message_stops_before_a_tool_call(reason: st
         msg.response_metadata["finish_reason"] = reason
         return msg
 
-    with pytest.raises((PermissionError, ValueError)):
+    with pytest.raises(PermissionError if reason == "content_filter" else ModelGatewayError):
         await run_turn(Model(respond=decide), "Read", [read_document])
-    assert calls == ["model"]
+    assert calls == ["model"] * (1 if reason == "content_filter" else 2)

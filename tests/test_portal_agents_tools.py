@@ -69,6 +69,28 @@ async def test_revoked_grant_withholds_read_result_and_graph_has_separate_grant(
     catalog.graph_overview.assert_not_called()
 
 
+async def test_connection_inventory_filters_and_checks_permission_before_returning():
+    registry = Mock(spec=McpServerRegistry)
+    registry.list.return_value = [
+        McpServerDefinition(id="jira", name="Jira", url="https://internal.test/mcp"),
+        McpServerDefinition(id="hidden", name="Unpublished", url="https://other.test/mcp"),
+    ]
+    authorize = AsyncMock(return_value=True)
+    tools = build_tools(Mock(), authorize=authorize, workspace=("Gradle", "java:21"),
+                        mcp_servers=registry, mcp_read_tools={"jira": ["get_issue"]})
+    inventory = next(t for t in tools if t.name == "list_connections")
+    assert await inventory.ainvoke({"kind": "workspaces"}) == {
+        "workspaces": [{"name": "Gradle", "image": "java:21"}],
+    }
+    registry.list.assert_not_called()
+    assert await inventory.ainvoke({"kind": "mcp"}) == {
+        "mcp": [{"id": "jira", "name": "Jira", "tools": ["get_issue"]}],
+    }
+    authorize.side_effect = [True, False]
+    with pytest.raises(PermissionError):
+        await inventory.ainvoke({})
+
+
 async def test_published_environment_calls_live_mcp_and_rechecks_capabilities(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

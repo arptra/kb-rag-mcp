@@ -28,6 +28,7 @@
       <details id="chat-menu" class="popover"><summary aria-label="Действия с чатом" title="Действия с чатом">•••</summary>
         <div class="menu">
           <label id="recent-field" hidden>Чаты в этой вкладке<select id="recent"></select></label>
+          <button type="button" id="open-resources">Ресурсы агента</button>
           <button type="button" id="delete-chat">Удалить текущий чат</button>
         </div>
       </details>
@@ -60,6 +61,14 @@
       </div>
     </div>
   </main>
+  <dialog id="agent-resources" aria-labelledby="resources-title">
+    <div class="dialog-heading"><h2 id="resources-title">Ресурсы агента</h2>
+      <button type="button" id="close-resources" aria-label="Закрыть список ресурсов" autofocus>×</button>
+    </div>
+    <p id="resources-status" role="status"></p>
+    <div id="resources-list" role="region" aria-label="Доступные подключения" tabindex="0" hidden></div>
+    <div class="dialog-actions"><button id="refresh-resources" type="button">Обновить список</button></div>
+  </dialog>
   <dialog id="model-settings" aria-labelledby="settings-title">
     <div class="dialog-heading"><h2 id="settings-title">Настройки модели</h2>
       <button type="button" id="close-settings" aria-label="Закрыть настройки">×</button>
@@ -76,6 +85,11 @@
         </select>
         <p id="settings-source" hidden></p>
         <p id="settings-warning" hidden></p>
+        <details id="settings-experience" hidden>
+          <summary>Общий опыт этого подключения</summary>
+          <p id="experience-route" class="field-hint"></p>
+          <ul id="experience-counts"></ul>
+        </details>
         <fieldset id="api-fields" hidden disabled>
           <legend class="sr">Параметры корпоративного API</legend>
           <label for="settings-url">Базовый URL API</label>
@@ -109,6 +123,7 @@
       <p id="settings-status" role="status"></p>
       <div class="dialog-actions">
         <button type="button" id="test-settings" disabled>Проверить запросом</button>
+        <button type="button" id="test-research" disabled>Проверить исследование</button>
         <button type="submit" id="save-settings" class="primary" disabled>Сохранить</button>
       </div>
     </form>

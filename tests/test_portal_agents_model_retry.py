@@ -251,6 +251,63 @@ async def test_revoked_grant_during_wait_stops_new_model_call(monkeypatch):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("first", [
+    AIMessage(content="partial", response_metadata={"finish_reason": "length"}),
+    AIMessage(content="", invalid_tool_calls=[{"name": "read_document", "args": "{",
+                                               "id": "bad", "error": "invalid JSON"}]),
+    AIMessage(content=""),
+])
+async def test_incomplete_native_step_is_corrected_without_repeating_a_read(first):
+    invocations = []
+    reads = []
+
+    @tool
+    async def read_document() -> str:
+        """Read the current production record."""
+        reads.append(True)
+        return "Version 8 is deployed."
+
+    def respond(messages, names):
+        invocations.append(messages)
+        if len(invocations) == 1:
+            return call("read_document")
+        assert isinstance(messages[-1], ToolMessage) and "Version 8" in messages[-1].text
+        if len(invocations) == 2:
+            return first
+        assert "concise complete answer" in messages[0].text
+        assert all("partial" not in m.text for m in messages[1:])
+        return AIMessage(content="Version 8 is deployed.")
+
+    answer = await engine.run_turn(Model(respond=respond), "Which version is live?",
+                                   [read_document])
+    assert answer == "Version 8 is deployed." and len(invocations) == 3 and reads == [True]
+
+
+@pytest.mark.parametrize("param,forbidden,expected", [
+    ("tools", False, ["native", "read"]), ("tools", True, ["native"]),
+    ("model", False, ["native"]), (None, False, ["native"]),
+])
+async def test_schema_recovery_never_replays_a_permanent_request(param, forbidden, expected):
+    invocations = []
+
+    @tool
+    def list_indexes() -> list:
+        """List published indexes."""
+        pytest.fail("A deferred decision must never dispatch a tool")
+
+    def respond(messages, names):
+        invocations.append("native" if names else "read")
+        if names:
+            raise ModelGatewayError(422, category="upstream-http", validation_field=param,
+                                    retry_forbidden=forbidden)
+        return AIMessage(content='{"defer":true}')
+
+    with pytest.raises(ModelGatewayError) as caught:
+        await engine.run_turn(Model(respond=respond), "Look up the release.", [list_indexes])
+    assert invocations == expected
+    assert caught.value.status == 422 and caught.value.attempts == len(invocations)
+
+
 def test_http_date_retry_after_and_non_transient_certificate_error():
     date = datetime.now(UTC) + timedelta(seconds=7)
     error = gateway_exception(failure(429, **{"Retry-After": format_datetime(date, usegmt=True)}))
