@@ -4,6 +4,7 @@ import asyncio
 import json
 import subprocess
 from pathlib import Path
+from threading import Event
 
 import httpx
 import pytest
@@ -13,6 +14,7 @@ from mcp.client.streamable_http import streamable_http_client
 from corporate_kb.catalog import CatalogJob, RagCatalog
 from corporate_kb.config import Settings
 from corporate_kb.embeddings.hash_provider import HashEmbeddingProvider
+from corporate_kb.gigacode_runner import GigaCodeRunner
 from corporate_kb.mcp.http_server import (
     create_http_app,
     tls_uvicorn_config,
@@ -125,6 +127,44 @@ def test_tls_config_requires_the_certificate_pair(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/admin/api/overview", "/admin/api/catalog"])
+async def test_slow_gigacode_probe_does_not_block_other_portal_requests(
+    settings_factory, monkeypatch, route: str,
+) -> None:
+    service, settings = _indexed_service(settings_factory, protected=False)
+    probe_started = Event()
+    release_probe = Event()
+    probe_wait_expired = Event()
+
+    def slow_probe(_runner):
+        probe_started.set()
+        if not release_probe.wait(3):
+            probe_wait_expired.set()
+        return {"available": False}
+
+    monkeypatch.setattr(GigaCodeRunner, "_probe", slow_probe)
+    app = create_http_app(service, settings)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                          base_url="http://testserver") as client,
+    ):
+        request = asyncio.create_task(client.get(route))
+        try:
+            assert await asyncio.to_thread(probe_started.wait, 2)
+            async with asyncio.timeout(1):
+                assert (await client.get("/health")).status_code == 200
+                indexes = (await client.get("/admin/api/a2a")).json()["indexes"]
+                assert indexes[0]["id"] == "default"
+            assert not probe_wait_expired.is_set()
+            assert not request.done()
+        finally:
+            release_probe.set()
+            response = await request
+        assert response.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_http_mcp_and_admin_allow_password_free_local_access(settings_factory) -> None:
     service, settings = _indexed_service(settings_factory, protected=False)
     app = create_http_app(service, settings)
@@ -134,6 +174,9 @@ async def test_http_mcp_and_admin_allow_password_free_local_access(settings_fact
         app.router.lifespan_context(app),
         httpx.AsyncClient(transport=transport, base_url="http://testserver") as client,
     ):
+        portal = await client.get("/", follow_redirects=True)
+        assert portal.status_code == 200 and portal.url.path == "/admin"
+
         stats = await client.get("/api/v1/stats")
         assert stats.status_code == 200
         assert stats.json()["document_count"] == 1

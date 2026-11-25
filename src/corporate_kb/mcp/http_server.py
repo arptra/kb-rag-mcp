@@ -19,7 +19,7 @@ from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, TokenVerifier
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount
 from starlette.types import ASGIApp
 
@@ -403,7 +403,7 @@ def create_http_server(
         register_disabled_status(server)
 
     def integration_indexes() -> list[dict[str, Any]]:
-        return [{"id": item["id"], "name": item["name"]} for item in catalog.payload()["indexes"]]
+        return [{"id": item["id"], "name": item["name"]} for item in catalog.index_directory()]
 
     agent_controller = None
     if settings.a2a_enabled or (settings.agents_enabled and extension_apps is not None):
@@ -609,6 +609,10 @@ def create_http_server(
             managed_tools=definitions,
         )
 
+    @server.custom_route("/", methods=["GET"], include_in_schema=False)
+    async def portal_home(_request: Request) -> Response:
+        return RedirectResponse("/admin")
+
     @server.custom_route("/connect", methods=["GET"], include_in_schema=False)
     @server.custom_route("/connect/", methods=["GET"], include_in_schema=False)
     @server.custom_route("/access-admin", methods=["GET"], include_in_schema=False)
@@ -672,7 +676,7 @@ def create_http_server(
             payload["managed_tools"] = managed_tools.payload()
             payload["tool_catalog"] = await current_tool_catalog()
             payload["mcp_servers"] = current_mcp_servers(request)
-            payload["catalog"] = catalog.payload()
+            payload["catalog"] = await asyncio.to_thread(catalog.payload)
             payload["graph"] = await asyncio.to_thread(catalog.graph_overview)
             payload["service_map"] = await asyncio.to_thread(catalog.service_map_overview)
             payload["domscribe_agent"] = await asyncio.to_thread(domscribe_agent.status)
@@ -798,7 +802,7 @@ def create_http_server(
     async def admin_catalog(request: Request) -> JSONResponse:
         if not await dashboard_authorized(request):
             return _admin_denied(settings)
-        return JSONResponse(catalog.payload())
+        return JSONResponse(await asyncio.to_thread(catalog.payload))
 
     @server.custom_route("/admin/api/indexes", methods=["POST"], include_in_schema=False)
     async def admin_create_index(request: Request) -> JSONResponse:
