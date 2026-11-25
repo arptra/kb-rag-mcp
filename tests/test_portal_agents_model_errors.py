@@ -219,6 +219,37 @@ def test_model_failure_reports_only_the_provider_evidence(exc, category, status,
     assert "недоступен" not in str(failure) and "PRIVATE" not in str(failure)
 
 
+async def test_unexpected_chat_failure_has_a_reference_and_safe_origin(
+    settings_factory, monkeypatch, caplog,
+):
+    token = "runtime-error-test-token-of-sufficient-length"
+    app = create_http_app(*indexed(
+        settings_factory, agents_enabled=True, a2a_enabled=False,
+        agents_model_base_url="https://model.test/v1", agents_model_adapter="openai",
+        mcp_http_bearer_token=token,
+    ))
+
+    async def interrupted(*args, **kwargs):
+        raise RuntimeError("PRIVATE_EXCEPTION_TEXT")
+
+    monkeypatch.setattr(http, "run_turn", interrupted)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="https://portal") as client,
+    ):
+        response = await client.post(
+            "/agents/api/chat", headers={"Authorization": f"Bearer {token}"},
+            json={"chat": str(uuid4()), "question": "PRIVATE_QUESTION"},
+        )
+    response.raise_for_status()
+    last = json.loads(response.text.splitlines()[-1])
+    assert last["event"] == "error"
+    assert f"agent_turn_stopped ref={last['reference']}" in caplog.text
+    assert "stage=research exception=RuntimeError" in caplog.text
+    assert "(interrupted)" in caplog.text
+    assert "PRIVATE_" not in response.text + caplog.text
+
+
 async def test_persistent_model_outage_is_a_status_with_traceable_reference(
     settings_factory, monkeypatch, caplog,
 ):

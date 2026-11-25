@@ -19,6 +19,7 @@ from corporate_kb.confluence.diagnostics import network_error
 from corporate_kb.gigacode_runner import (
     GigaCodeAccessError,
     GigaCodePolicyStop,
+    GigaCodeProcessCrashed,
     GigaCodeRequestFailed,
     GigaCodeTimedOut,
     GigaCodeTransientError,
@@ -222,8 +223,22 @@ def gateway_exception(exc: BaseException) -> ModelGatewayError | None:
         return ModelGatewayError(category="incomplete-reply", retryable=False,
                                  message="GigaCode не вернул завершённый ответ")
     if isinstance(exc, GigaCodeRequestFailed):
-        return ModelGatewayError(category="runner-request", retryable=False,
-                                 message="GigaCode завершил этот запрос с ошибкой")
+        category, message = {
+            "request": ("runner-request", "GigaCode завершил этот запрос с ошибкой"),
+            "configuration": (
+                "runner-configuration", "Проверьте параметры запуска и авторизацию GigaCode",
+            ),
+            "native-tool": (
+                "runner-native-tool", "GigaCode попытался вызвать встроенный инструмент",
+            ),
+            "unexpected-exit": (
+                "runner-exit", "Процесс GigaCode завершился. Портал проверяет его готовность",
+            ),
+        }[exc.reason]
+        failure = ModelGatewayError(category=category, message=message)
+        if type(exc.returncode) is int:
+            failure.diagnostics["exit_code"] = exc.returncode
+        return failure
     if isinstance(exc, GigaCodeAccessError):
         return ModelGatewayError(exc.status, message="GigaCode отклонил доступ к модели",
                                  retryable=False, category="access")
@@ -278,8 +293,13 @@ def gateway_exception(exc: BaseException) -> ModelGatewayError | None:
         }
         reason = {408: "timeout", 429: "rate-limit"}.get(exc.status, exc.reason)
         category = reason if reason in hints else "provider"
-        return ModelGatewayError(exc.status, message=hints.get(category, "Ошибка вызова GigaCode"),
-                                 retryable=True, category=category)
+        failure = ModelGatewayError(
+            exc.status, message=hints.get(category, "Ошибка вызова GigaCode"),
+            retryable=True, category=category,
+        )
+        if isinstance(exc, GigaCodeProcessCrashed) and type(exc.returncode) is int:
+            failure.diagnostics["exit_code"] = exc.returncode
+        return failure
     if isinstance(exc, ModelAPIError):
         return ModelGatewayError(message="Модель сообщила об ошибке при обработке запроса",
                                  retryable=True, category="provider")

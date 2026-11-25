@@ -36,9 +36,11 @@ async def enable_gigacode(client):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires a POSIX signal and an executable script")
-async def test_chat_survives_a_killed_cli_after_tool_execution_and_accepts_other_chats(
-    settings_factory, tmp_path: Path,
+@pytest.mark.parametrize("failure", ["signal", "runtime-exit", "runtime-result"])
+async def test_chat_survives_a_cli_crash_after_tool_execution_and_accepts_other_chats(
+    settings_factory, tmp_path: Path, failure, caplog,
 ):
+    (tmp_path / "failure").write_text(failure)
     executable = launcher(tmp_path, dedent(r"""
         root = Path(__file__).parent
         calls = root / "calls"
@@ -58,8 +60,17 @@ async def test_chat_survives_a_killed_cli_after_tool_execution_and_accepts_other
             if message["role"] == "tool":
                 if not crashed.exists():
                     crashed.touch()
-                    print("RuntimeError: PRIVATE_CHILD_TRACE", file=sys.stderr, flush=True)
-                    os.kill(os.getpid(), signal.SIGKILL)
+                    failure = (root / "failure").read_text()
+                    if failure == "signal":
+                        os.kill(os.getpid(), signal.SIGKILL)
+                    if failure == "runtime-result":
+                        print(json.dumps({
+                            "type": "result", "is_error": True,
+                            "errors": ["RuntimeError: PRIVATE_CHILD_TRACE"],
+                        }), flush=True)
+                        raise SystemExit(1)
+                    print("[ERROR] RuntimeError: PRIVATE_CHILD_TRACE", file=sys.stderr, flush=True)
+                    raise SystemExit(2)
                 indexes = json.loads(message["content"])
                 step = "answer"
                 payload = {"content": "Available index " + indexes[0]["id"], "tool_calls": []}
@@ -129,6 +140,9 @@ async def test_chat_survives_a_killed_cli_after_tool_execution_and_accepts_other
         history = (await client.get(f"/agents/api/chats/{chat}", headers=READER)).json()["messages"]
         assert [m["text"] for m in history] == [question, turns[0][-1]["text"]]
         assert (await client.get("/agents/api/model", headers=READER)).json()["state"] == "ready"
+        code = {"signal": -9, "runtime-exit": 2, "runtime-result": 1}[failure]
+        assert f"cause=process-crash exit_code={code}" in caplog.text
+        assert "PRIVATE_CHILD_TRACE" not in caplog.text
         assert sorted((tmp_path / "calls").read_text().splitlines()) == [
             "answer", "hello", "lookup", "probe", "probe",
         ]

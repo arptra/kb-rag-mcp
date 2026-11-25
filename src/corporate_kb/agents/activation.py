@@ -113,7 +113,9 @@ def accepts_decisions(snapshot: Mapping[str, Any]) -> bool:
 
 
 def _log_interruption(phase: str, exc: Exception) -> None:
-    code = exc.returncode if isinstance(exc, GigaCodeProcessCrashed) else None
+    code = (
+        exc.returncode if isinstance(exc, (GigaCodeProcessCrashed, GigaCodeRequestFailed)) else None
+    )
     code = code if type(code) is int else None
     if isinstance(exc, GigaCodeProcessCrashed):
         cause = "process-crash"
@@ -125,10 +127,16 @@ def _log_interruption(phase: str, exc: Exception) -> None:
                                      "invalid-contract"} else "invalid-output"
     elif isinstance(exc, GigaCodeTransientError):
         cause = "provider-transient"
-    else:
+    elif isinstance(exc, GigaCodeRequestFailed):
+        cause = exc.reason
+    elif isinstance(exc, (GigaCodeDecisionError, ValidationError)):
         cause = "invalid-decision"
-    logger.warning("GigaCode invocation interrupted phase=%s cause=%s exit_code=%s signal=%s",
-                   phase, cause, code, -code if code is not None and code < 0 else None)
+    else:
+        cause = "internal-error"
+    logger.warning(
+        "GigaCode invocation interrupted phase=%s cause=%s exit_code=%s signal=%s exception=%s",
+        phase, cause, code, -code if code is not None and code < 0 else None, type(exc).__name__,
+    )
 
 
 class GigaCodeAgentController:
@@ -198,6 +206,12 @@ class GigaCodeAgentController:
         )
         self._workers.add(worker)
         worker.start()
+
+    def _recover(self) -> None:
+        # The decision still owns the execution slot while the replacement starts.
+        self._activated = False
+        self._set_state("recovering", "Процесс GigaCode прервался. Запускаем проверку готовности.")
+        self._start_probe(recovering=True)
 
     def disable(self) -> dict[str, Any]:
         with self._lock:
@@ -308,6 +322,9 @@ class GigaCodeAgentController:
                     raise GigaCodeProcessCrashed(code)
                 if status.get("probe_timed_out") is True:
                     raise GigaCodeTimedOut("GigaCode version check timed out")
+                code = status.get("unexpected_exit_code")
+                if type(code) is int:
+                    raise GigaCodeRequestFailed(reason="unexpected-exit", returncode=code)
                 raise _ConfigurationError(
                     "GigaCode недоступен на сервере. Проверьте установку, "
                     "KB_GIGACODE_ENABLED и KB_GIGACODE_COMMAND."
@@ -332,6 +349,7 @@ class GigaCodeAgentController:
     def _activate(
         self, generation: int, cancel: threading.Event, recovering: bool,
     ) -> None:
+        was_activated = recovering
         attempt = 0
         correction = False
         try:
@@ -348,16 +366,21 @@ class GigaCodeAgentController:
                     self._probe(generation, cancel, correction=correction)
                     return
                 except (GigaCodeTimedOut, GigaCodeTransientError, GigaCodeInvalidOutput,
-                        ValidationError) as exc:
+                        GigaCodeRequestFailed, ValidationError) as exc:
                     _log_interruption("readiness", exc)
                     with self._lock:
                         if not self._current(generation):
                             return
                         if self._state == "authentication_required":
                             raise
+                    if isinstance(exc, GigaCodeRequestFailed):
+                        if exc.reason in {"configuration", "native-tool"}:
+                            raise
+                        if exc.reason == "request" and not was_activated:
+                            raise
                     if (isinstance(exc, (GigaCodeInvalidOutput, ValidationError))
                             and not isinstance(exc, GigaCodeIncompleteOutput)):
-                        if correction:
+                        if correction and not was_activated:
                             raise
                         correction = True
                     recovering = True
@@ -373,6 +396,10 @@ class GigaCodeAgentController:
     def _failed(self, generation: int, exc: Exception) -> None:
         if isinstance(exc, _ConfigurationError):
             message = str(exc)
+        elif isinstance(exc, GigaCodeRequestFailed) and exc.reason == "configuration":
+            message = "GigaCode не запустился. Проверьте параметры запуска и авторизацию."
+        elif isinstance(exc, GigaCodeRequestFailed) and exc.reason == "native-tool":
+            message = "GigaCode попытался вызвать встроенный инструмент. Проверьте настройки CLI."
         elif isinstance(exc, GigaCodeTimedOut):
             message = (
                 "Истекло время ожидания GigaCode или авторизации. "
@@ -520,14 +547,6 @@ class GigaCodeAgentController:
         except GigaCodeAccessError as exc:
             self._failed(generation, exc)
             raise
-        except GigaCodeRequestFailed as exc:
-            with self._lock:
-                if self._current(generation):
-                    if self._state == "authentication_required":
-                        self._failed(generation, exc)
-                    else:
-                        self._set_state("ready", "Ошибка запроса. GigaCode готов к работе.")
-            raise
         except GigaCodeDecisionError as exc:
             _log_interruption("decision", exc)
             self._update(generation, "ready", "GigaCode вернул некорректный формат решения.")
@@ -557,10 +576,7 @@ class GigaCodeAgentController:
                         )
                         raise RuntimeError("GigaCode authentication did not complete") from None
                     if isinstance(exc, (GigaCodeProcessCrashed, GigaCodeTimedOut)):
-                        self._activated = False
-                        self._set_state("recovering", "Процесс GigaCode прервался. "
-                                        "Запускаем проверку готовности.")
-                        self._start_probe(recovering=True)
+                        self._recover()
                     else:
                         self._set_state("ready", "GigaCode готов к повторному запросу.")
             if isinstance(exc, GigaCodeTransientError):
@@ -580,11 +596,22 @@ class GigaCodeAgentController:
                         )
             raise
         except Exception as exc:
-            self._failed(generation, exc)
+            _log_interruption("decision", exc)
+            reason = exc.reason if isinstance(exc, GigaCodeRequestFailed) else None
+            with self._lock:
+                if self._current(generation):
+                    if self._state == "authentication_required" or reason in {
+                        "configuration", "native-tool",
+                    }:
+                        self._failed(generation, exc)
+                    elif reason == "unexpected-exit":
+                        self._recover()
+                    else:
+                        self._set_state("ready", "Вызов GigaCode прервался. Доступен новый запуск.")
+            if isinstance(exc, GigaCodeRequestFailed):
+                raise
             # Raw CLI errors may contain credentials, login URLs or document text.
-            raise RuntimeError(
-                "GigaCode decision failed; check the administrator agent status"
-            ) from None
+            raise RuntimeError("GigaCode decision failed") from None
 
 
 class _ConfigurationError(ValueError):

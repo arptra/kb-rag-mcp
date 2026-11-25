@@ -192,6 +192,10 @@ def test_missing_unusable_and_truncated_results_have_a_recoverable_type(
     ("sys.stdin.read()\nraise SystemExit(1)\n", 1),
     ("sys.stdin.read()\nprint('RuntimeError: PRIVATE DETAILS', file=sys.stderr)\n"
      "raise SystemExit(1)\n", 1),
+    ("sys.stdin.read()\nprint('FATAL ERROR: PRIVATE DETAILS', file=sys.stderr)\n"
+     "raise SystemExit(3)\n", 3),
+    ("print(json.dumps({'type':'assistant','message':{'content':'partial'}}),flush=True)\n"
+     "raise SystemExit(2)\n", 2),
     ('print(json.dumps({"type":"error","error":{"name":"RuntimeError","message":"PRIVATE"}}))\n'
      'raise SystemExit(1)\n', 1),
     ('print(json.dumps({"type":"result","is_error":True,"error":{"code":"runtime_error"}}))\n',
@@ -242,7 +246,7 @@ def test_valid_final_result_needs_no_trailing_newline(settings_factory, tmp_path
 
 @pytest.mark.parametrize("raw,error", [
     ('{"type":"stream_event","event":{"type":"content_block_start",'
-     '"content_block":{"type":"tool_use","name":"unsafe', RuntimeError),
+     '"content_block":{"type":"tool_use","name":"unsafe', GigaCodeRequestFailed),
     ('{"type":"result","stop_reason":"blacklist","result":"private', GigaCodePolicyStop),
 ])
 def test_partial_events_still_enforce_native_boundaries(settings_factory, tmp_path, raw, error):
@@ -252,12 +256,20 @@ def test_partial_events_still_enforce_native_boundaries(settings_factory, tmp_pa
     assert type(failure.value) is error
 
 
-@pytest.mark.parametrize("exit_code,crash", [(70, True), (2, False)])
+@pytest.mark.parametrize("exit_code,diagnostic,crash", [
+    (70, "", True),
+    (2, "[ERROR] RuntimeError: PRIVATE", True),
+    (2, "[ERROR] RuntimeError: invalid configuration", False),
+    (2, "", False),
+])
 def test_failed_version_probe_distinguishes_runtime_and_unsupported_command(
-    settings_factory, tmp_path, exit_code, crash,
+    settings_factory, tmp_path, exit_code, diagnostic, crash,
 ):
     command = tmp_path / "probe"
-    command.write_text(f"#!{sys.executable}\nraise SystemExit({exit_code})\n")
+    command.write_text(
+        f"#!{sys.executable}\nimport sys\nprint({diagnostic!r}, file=sys.stderr)\n"
+        f"raise SystemExit({exit_code})\n"
+    )
     command.chmod(0o755)
     runner = GigaCodeRunner(settings_factory(gigacode_command=str(command)))
     status = runner.status()
@@ -266,6 +278,10 @@ def test_failed_version_probe_distinguishes_runtime_and_unsupported_command(
     with pytest.raises(RuntimeError) as caught:
         runner.run_json(checkout=tmp_path, schema={}, prompt="test", decision_only=True)
     assert isinstance(caught.value, GigaCodeProcessCrashed) is crash
+    if not crash:
+        assert isinstance(caught.value, GigaCodeRequestFailed)
+        expected = "configuration" if diagnostic else "unexpected-exit"
+        assert caught.value.reason == expected
 
 
 def test_status_exposes_transient_version_timeout_only_for_a_recoverable_decision(
@@ -285,21 +301,30 @@ def test_status_exposes_transient_version_timeout_only_for_a_recoverable_decisio
     assert not isinstance(native.value, GigaCodeTimedOut)
 
 
-@pytest.mark.parametrize("body", [
-    terminal(is_error=True, error={"message": "No auth type is selected"}),
-    "print('unknown option: --bad', file=sys.stderr)\nraise SystemExit(1)\n",
-    "print('RuntimeError: invalid configuration', file=sys.stderr)\nraise SystemExit(1)\n",
-    "sys.stdin.read()\nraise SystemExit(2)\n",
-    "print('Open browser https://login.example.test/device', flush=True)\nraise SystemExit(1)\n",
-    'print(json.dumps({"type":"error","error":{"code":"invalid_request","status":422}}))\n'
-    'raise SystemExit(1)\n',
+@pytest.mark.parametrize("body,reason", [
+    (terminal(is_error=True, error={"message": "No auth type is selected"}), "configuration"),
+    ("print('unknown option: --bad', file=sys.stderr)\nraise SystemExit(1)\n", "configuration"),
+    ("print('RuntimeError: invalid configuration', file=sys.stderr)\nraise SystemExit(1)\n",
+     "configuration"),
+    ("sys.stdin.read()\nraise SystemExit(2)\n", "unexpected-exit"),
+    ('print(json.dumps({"type":"error","error":{"code":"invalid_request","status":422}}))\n'
+     'raise SystemExit(1)\n', "request"),
 ])
-def test_configuration_auth_and_unknown_rejections_are_not_process_crashes(
-    settings_factory, tmp_path, body,
+def test_explicit_configuration_and_request_failures_are_typed(
+    settings_factory, tmp_path, body, reason,
 ):
-    with pytest.raises(RuntimeError) as caught:
+    with pytest.raises(GigaCodeRequestFailed) as caught:
         execute(settings_factory, tmp_path, body)
-    assert not isinstance(caught.value, GigaCodeProcessCrashed)
+    assert caught.value.reason == reason
+
+
+def test_browser_auth_failure_is_not_retried_as_a_crash(settings_factory, tmp_path):
+    body = (
+        "print('Open browser https://login.example.test/device', flush=True)\n"
+        "print('RuntimeError: login process exited', file=sys.stderr)\nraise SystemExit(2)\n"
+    )
+    with pytest.raises(GigaCodeAccessError):
+        execute(settings_factory, tmp_path, body)
 
 
 @pytest.mark.parametrize("code", [0, 1])
@@ -312,9 +337,9 @@ def test_request_error_is_local_and_excludes_provider_content(settings_factory, 
 
 def test_structured_launcher_configuration_failure_is_terminal(settings_factory, tmp_path):
     body = terminal(is_error=True, error={"type": "configuration_error", "message": "PRIVATE"})
-    with pytest.raises(RuntimeError, match="launcher configuration") as caught:
+    with pytest.raises(GigaCodeRequestFailed, match="launcher configuration") as caught:
         execute(settings_factory, tmp_path, body)
-    assert type(caught.value) is RuntimeError and "PRIVATE" not in str(caught.value)
+    assert caught.value.reason == "configuration" and "PRIVATE" not in str(caught.value)
 
 
 @pytest.mark.parametrize("allow_edits", [False, True])

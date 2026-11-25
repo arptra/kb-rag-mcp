@@ -11,6 +11,7 @@ import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
+from traceback import walk_tb
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
@@ -157,11 +158,26 @@ def _log_model_failure(profile: ModelProfile, error: ModelGatewayError, operatio
     reference = uuid4().hex[:16]
     _LOG.warning(
         "Model call failed ref=%s operation=%s provider=%s adapter=%s category=%s "
-        "status=%s attempts=%d stage=%s tools=%d upstream_request_id=%s validation_field=%s",
+        "status=%s attempts=%d stage=%s tools=%d upstream_request_id=%s validation_field=%s "
+        "exit_code=%s",
         reference, operation, profile.provider,
         profile.adapter if profile.provider == "api" else "-", error.category,
         error.status, error.attempts, error.stage, error.tool_count, error.request_id or "-",
-        error.validation_field or "-",
+        error.validation_field or "-", error.diagnostics.get("exit_code", "-"),
+    )
+    return reference
+
+
+def _log_turn_failure(profile: ModelProfile, stage: str, error: Exception) -> str:
+    reference = uuid4().hex[:16]
+    # Record code locations without exception messages, source text or frame variables.
+    locations = [
+        f"{Path(frame.f_code.co_filename).name}:{line}({frame.f_code.co_name})"
+        for frame, line in walk_tb(error.__traceback__)
+    ]
+    _LOG.warning(
+        "agent_turn_stopped ref=%s provider=%s stage=%s exception=%s frames=%s",
+        reference, profile.provider, stage, type(error).__name__, " -> ".join(locations[-5:]),
     )
     return reference
 
@@ -505,6 +521,7 @@ def create_app(
                 workspace = (
                     OfflineWorkspace(grants.workspace, authorized) if grants.workspace else None
                 )
+                stage = "history"
                 try:
                     db: aiosqlite.Connection = request.app.state.transcript
                     saver: AsyncSqliteSaver = request.app.state.checkpoints
@@ -520,6 +537,7 @@ def create_app(
                         (key, owner_chat),
                     )
                     await db.commit()
+                    stage = "tools"
                     tools = build_tools(
                         catalog,
                         authorize=authorized,
@@ -544,6 +562,7 @@ def create_app(
                     except (OSError, sqlite3.Error):
                         _LOG.warning("Agent experience could not be read")
                         preferences = StrategyPreferences()
+                    stage = "research"
                     async with connected(profile) as model:
                         answer = await run_turn(
                             model,
@@ -558,6 +577,7 @@ def create_app(
                             larger_read_answer=preferences.larger_read_answer,
                             experience=outcomes,
                         )
+                    stage = "publish"
                     saved = await saver.aget_tuple({"configurable": {"thread_id": key}})
                     if saved is None or not await authorized():
                         raise PermissionError("Доступ к результату изменился.")
@@ -605,10 +625,9 @@ def create_app(
                             detail = str(exc)
                         await report("error", detail, reference=reference)
                     else:
-                        # Provider errors may contain prompts, credentials or private addresses.
-                        _LOG.warning("Agent turn stopped (%s)", type(exc).__name__)
-                        await report("error", "Запрос прерван. Проверьте подключение модели "
-                                     "и выбранной среды.")
+                        reference = _log_turn_failure(profile, stage, exc)
+                        await report("error", "Портал прервал запрос из-за внутренней ошибки.",
+                                     reference=reference)
                 finally:
                     if workspace:
                         await workspace.close()

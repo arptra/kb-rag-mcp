@@ -174,7 +174,9 @@ def test_unavailable_cli_rejected_before_auth_launch(settings_factory):
     assert not runner.calls
 
 
-@pytest.mark.parametrize("failure", [{"crash_returncode": -9}, {"probe_timed_out": True}])
+@pytest.mark.parametrize("failure", [
+    {"crash_returncode": -9}, {"probe_timed_out": True}, {"unexpected_exit_code": 2},
+])
 def test_failed_version_check_recovers_before_first_model_request(
     settings_factory, monkeypatch, failure,
 ):
@@ -341,15 +343,21 @@ def test_controller_preserves_the_model_correction_reason(settings_factory, erro
     controller.stop()
 
 
-def test_decision_timeout_rechecks_process_before_resuming(settings_factory, monkeypatch, caplog):
+@pytest.mark.parametrize("failure,cause", [
+    (GigaCodeTimedOut(_URL), "timeout"),
+    (GigaCodeRequestFailed(reason="unexpected-exit", returncode=2), "unexpected-exit"),
+])
+def test_interrupted_decision_rechecks_process_before_resuming(
+    settings_factory, monkeypatch, caplog, failure, cause,
+):
     controller, runner = activated(settings_factory)
     monkeypatch.setattr(activation, "_RESTART_DELAYS", (0.1,))
-    runner.error = GigaCodeTimedOut(_URL)
+    runner.error = failure
     try:
-        with pytest.raises(GigaCodeTimedOut) as caught:
+        with pytest.raises(type(failure)) as caught:
             asyncio.run(decide(controller))
         assert controller.status()["state"] == "recovering"
-        assert "phase=decision cause=timeout" in caplog.text
+        assert f"phase=decision cause={cause}" in caplog.text
         assert _URL not in str(caught.value) and _URL not in caplog.text
         runner.error = None
         assert wait_state(controller, "ready")["available"]
@@ -529,12 +537,16 @@ def test_malformed_readiness_reply_gets_one_corrected_probe(settings_factory, mo
         controller.stop()
 
 
-def test_process_restart_survives_truncated_readiness_replies(settings_factory, monkeypatch):
+@pytest.mark.parametrize("probe_error", [
+    GigaCodeIncompleteOutput("length"), GigaCodeInvalidOutput("bad JSON"), GigaCodeRequestFailed(),
+])
+def test_process_restart_survives_failed_readiness_replies(
+    settings_factory, monkeypatch, probe_error,
+):
     controller, runner = activated(settings_factory)
     monkeypatch.setattr(activation, "_RESTART_DELAYS", (0.001,))
     run = runner.run_json
-    failures = iter([GigaCodeProcessCrashed(-9), GigaCodeIncompleteOutput("length"),
-                     GigaCodeIncompleteOutput("length")])
+    failures = iter([GigaCodeProcessCrashed(-9), probe_error, probe_error])
 
     def respond(**kwargs):
         runner.error = next(failures, None)
@@ -668,12 +680,14 @@ def test_recovery_probe_respects_provider_stop(settings_factory, monkeypatch, en
         controller.stop()
 
 
-def test_one_rejected_decision_leaves_controller_ready(settings_factory):
+@pytest.mark.parametrize("failure", [GigaCodeRequestFailed(), RuntimeError(_URL)])
+def test_one_failed_decision_leaves_controller_ready(settings_factory, failure):
     controller, runner = activated(settings_factory)
     try:
-        runner.error = GigaCodeRequestFailed()
-        with pytest.raises(GigaCodeRequestFailed):
+        runner.error = failure
+        with pytest.raises(type(failure)) as caught:
             asyncio.run(decide(controller))
+        assert _URL not in str(caught.value)
         assert controller.status()["available"]
         runner.error = None
         assert asyncio.run(decide(controller)) == runner.decision
