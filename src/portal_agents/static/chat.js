@@ -234,7 +234,8 @@
       const response = await request("api/model", enable ? { method: "POST", headers: await adminHeaders(), body: "{}" } : {});
       const info = await response.json();
       if (revision !== modelRequest) return;
-      $("model-name").textContent = info.provider === "api" ? "API · " + info.model : info.model;
+      const protocol = info.adapter === "openai" ? "OpenAI API" : "gpt2giga";
+      $("model-name").textContent = info.provider === "api" ? protocol + " · " + info.model : info.model;
       $("model-label").textContent = info.model;
       $("model-dot").dataset.state = info.state;
       $("model-state").textContent = modelStates[info.state] || info.state;
@@ -282,13 +283,18 @@
     $("settings-status").dataset.state = state;
   }
   function selectProvider() {
-    const api = $("settings-provider").value === "api";
+    const selection = $("settings-provider").value;
+    const api = selection !== "gigacode";
+    const native = selection === "gpt2giga";
     $("api-fields").hidden = !api;
     $("api-fields").disabled = !api;
+    $("settings-url-hint").textContent = native
+      ? "Укажите базовый адрес корпоративного API GigaChat."
+      : "Укажите базовый адрес API или полный адрес Chat Completions.";
   }
   function loadProfile(info) {
     settingsForm.reset();
-    $("settings-provider").value = info.provider;
+    $("settings-provider").value = info.provider === "api" ? (info.adapter || "gpt2giga") : info.provider;
     $("settings-url").value = info.base_url || "";
     $("settings-model").value = info.model_name || "";
     $("settings-source").textContent = ({
@@ -329,8 +335,9 @@
     }
   }
   async function draftSettings() {
-    const draft = { provider: $("settings-provider").value };
-    if (draft.provider !== "api") return draft;
+    const selection = $("settings-provider").value;
+    if (selection === "gigacode") return { provider: "gigacode" };
+    const draft = { provider: "api", adapter: selection };
     draft.base_url = $("settings-url").value.trim();
     draft.model_name = $("settings-model").value.trim();
     const replace = $("replace-credentials").checked;

@@ -25,6 +25,8 @@ from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langsmith import tracing_context
 
+from portal_agents.model_errors import check_gateway_reply, gateway_exception
+
 Progress = Callable[[str, str], Awaitable[None]]
 Authorize = Callable[[], Awaitable[bool]]
 
@@ -95,6 +97,7 @@ class _RunEvents(AsyncCallbackHandler):
                 if not isinstance(generation, ChatGeneration):
                     continue
                 message = generation.message
+                check_gateway_reply(message.text)
                 if self.social and isinstance(message, AIMessage) and message.tool_calls:
                     raise ValueError("Для этой реплики вызов инструментов недоступен.")
                 reason = message.response_metadata.get("finish_reason")
@@ -103,6 +106,11 @@ class _RunEvents(AsyncCallbackHandler):
                 if (reason in {"length", "max_tokens", "max_output_tokens"} or
                         (isinstance(message, AIMessage) and message.invalid_tool_calls)):
                     raise ValueError("Модель вернула незавершённое сообщение.")
+
+    async def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
+        failure = gateway_exception(error)
+        if failure is not None:
+            raise failure from None
 
     async def on_tool_start(
         self, serialized: dict[str, Any], input_str: str, **kwargs: Any,

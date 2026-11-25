@@ -70,16 +70,18 @@
         <label for="settings-provider">Способ подключения</label>
         <select id="settings-provider">
           <option value="gigacode">GigaCode</option>
-          <option value="api">Корпоративный API · DeepSeek и другие</option>
+          <option value="gpt2giga">Корпоративный API · gpt2giga (по умолчанию)</option>
+          <option value="openai">Прямой OpenAI-совместимый API</option>
         </select>
         <p id="settings-source" hidden></p>
         <p id="settings-warning" hidden></p>
         <fieldset id="api-fields" hidden disabled>
           <legend class="sr">Параметры корпоративного API</legend>
           <label for="settings-url">Базовый URL API</label>
-          <input id="settings-url" type="url" placeholder="https://model.company.ru/v1" spellcheck="false" required>
+          <input id="settings-url" type="url" placeholder="https://model.company.ru/v1" spellcheck="false" aria-describedby="settings-url-hint" required>
+          <p class="field-hint" id="settings-url-hint"></p>
           <label for="settings-model">Имя модели на шлюзе</label>
-          <input id="settings-model" type="text" placeholder="Например, deepseek-v4-flash" spellcheck="false" aria-describedby="model-name-hint">
+          <input id="settings-model" type="text" placeholder="Имя модели на корпоративной платформе" spellcheck="false" aria-describedby="model-name-hint">
           <p class="field-hint" id="model-name-hint">Можно оставить пустым, если модель уже задана адресом.</p>
           <fieldset class="credentials">
             <legend>Сертификаты и ключи</legend>

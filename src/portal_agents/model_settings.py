@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from corporate_kb.config import Settings
 
 Provider = Literal["api", "gigacode"]
+Adapter = Literal["openai", "gpt2giga"]
 _BUNDLE_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}")
 _ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
 _TLS_UNAVAILABLE = "Комплект TLS прежнего Harness недоступен. Загрузите сертификаты модели."
@@ -36,6 +37,7 @@ def _deepseek_flash(name: str) -> bool:
 class ModelSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     provider: Provider
+    adapter: Adapter | None = None
     base_url: str | None = Field(default=None, max_length=2000)
     model_name: str | None = Field(default=None, max_length=200)
     ca_pem: str | None = Field(default=None, max_length=65536, repr=False)
@@ -64,6 +66,7 @@ def _origin(url: str) -> tuple[str, str, int]:
 class ModelProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     provider: Provider = "gigacode"
+    adapter: Adapter = "gpt2giga"
     base_url: str = ""
     model_name: str = ""
     source: Literal["portal", "legacy", "environment", "default"] = "default"
@@ -89,7 +92,8 @@ class ModelProfile(BaseModel):
 
     def public(self) -> dict[str, Any]:
         return {
-            "provider": self.provider, "base_url": self.base_url, "model_name": self.model_name,
+            "provider": self.provider, "adapter": self.adapter,
+            "base_url": self.base_url, "model_name": self.model_name,
             "source": self.source, "warning": self.warning,
             "has_ca": bool(self.ca_file or self.ca_pem),
             "has_cert": bool(self.cert_file or self.cert_pem),
@@ -114,8 +118,9 @@ class ModelProfile(BaseModel):
             "base_url": self.base_url.rstrip("/").removesuffix("/chat/completions"),
             "model_name": self.model_name,
             "api_key": api_key or None,
+            "adapter": self.adapter,
         }
-        if self.disable_thinking:
+        if self.disable_thinking and self.adapter == "openai":
             kwargs["disable_thinking"] = True
         if self.timeout_seconds is not None:
             kwargs["timeout_seconds"] = self.timeout_seconds
@@ -222,6 +227,7 @@ class ModelSettingsStore:
             cfg = self.settings
             profile = ModelProfile(
                 source="environment", provider="api", base_url=cfg.agents_model_base_url or "",
+                adapter=cfg.agents_model_adapter,
                 model_name=cfg.agents_model_name or "", ca_file=cfg.agents_model_ca_file,
                 cert_file=cfg.agents_model_cert_file, key_file=cfg.agents_model_key_file,
                 uses_env_api_key=bool(cfg.agents_model_api_key),
@@ -233,6 +239,8 @@ class ModelSettingsStore:
                 or _legacy_profile(self.settings.legacy_standalone_state_dir)
                 or ModelProfile()
             )
+        if "adapter" not in profile.model_fields_set:
+            profile.adapter = self.settings.agents_model_adapter
         if profile.base_url or profile.provider == "api":
             try:
                 _origin(profile.base_url)
@@ -268,6 +276,8 @@ class ModelSettingsStore:
         if name != profile.model_name or changed_endpoint:
             profile.model_name = name
             profile.use_model_defaults()
+        if update.adapter is not None:
+            profile.adapter = update.adapter
         profile.base_url = url
         profile.provider = update.provider
         if profile.warning == _RECONFIGURE and new_origin and update.base_url is not None:

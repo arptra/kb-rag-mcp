@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Event
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -78,8 +78,11 @@ async def create_model(
     api_key: str | None = None, profile_path: Path | None = None,
     timeout_seconds: int | None = None, output_tokens: int | None = None,
     max_retries: int = 2, disable_thinking: bool = False,
+    adapter: Literal["openai", "gpt2giga"] | None = None,
 ) -> AsyncIterator[BaseChatModel]:
     if not base_url:
+        if adapter == "gpt2giga":
+            raise ValueError("Для gpt2giga нужен адрес корпоративного API.")
         if profile_path is not None:
             profile = TypeAdapter(GigaCodeModelProfile).validate_json(profile_path.read_bytes())
             yield GigaCodeChatModel(runner=GigaCodeRunner(settings), launch_profile=profile)
@@ -108,6 +111,17 @@ async def create_model(
     if cert_file:
         tls.load_cert_chain(certfile=cert_file, keyfile=key_file, password=b"")
 
+    timeout = timeout_seconds or settings.gigacode_timeout_seconds
+    if (adapter or settings.agents_model_adapter) == "gpt2giga":
+        from portal_agents.gpt2giga_model import gpt2giga_model
+
+        async with gpt2giga_model(
+            base_url=base_url, model_name=model_name, tls=tls, token=api_key,
+            timeout=timeout, output_tokens=output_tokens, max_retries=max_retries,
+        ) as model:
+            yield model
+        return
+
     # ChatOpenAI's client requires an API key even when the gateway authenticates
     # with mTLS alone. Never inherit OPENAI_API_KEY or send a placeholder bearer.
     def headers(request: httpx.Request) -> None:
@@ -131,7 +145,6 @@ async def create_model(
         extra_body["max_tokens"] = output_tokens
     if disable_thinking:
         extra_body["thinking"] = {"type": "disabled"}
-    timeout = timeout_seconds or settings.gigacode_timeout_seconds
     with (
         safe_http_logging(),
         httpx.Client(verify=tls, timeout=timeout, event_hooks={"request": [headers]}) as client,

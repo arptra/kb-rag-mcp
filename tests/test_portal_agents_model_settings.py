@@ -55,7 +55,7 @@ def test_legacy_profile_usable_before_save_and_preserved_after_restart(
     store = ModelSettingsStore(settings)
     profile = store.load()
     assert profile.public() == {
-        "provider": "api", "base_url": "https://gateway/v1/chat/completions",
+        "provider": "api", "adapter": "gpt2giga", "base_url": "https://gateway/v1/chat/completions",
         "model_name": "DeepSeek", "source": "legacy", "has_ca": True, "has_cert": True,
         "has_key": True, "has_api_key": True, "warning": "",
     }
@@ -166,7 +166,7 @@ def test_legacy_deepseek_dialect_and_early_small_defaults(settings):
     legacy_connection(settings.harness_state_dir, model="DeepSeek-V4-Flash",
                       timeout_seconds=60, output_tokens=4096)
     with ModelSettingsStore(settings).load().model_kwargs() as kwargs:
-        assert kwargs["disable_thinking"] is True
+        assert kwargs["adapter"] == "gpt2giga" and "disable_thinking" not in kwargs
         assert (kwargs["timeout_seconds"], kwargs["output_tokens"]) == (1800, 32768)
 
 
@@ -201,8 +201,8 @@ def test_switching_model_resets_legacy_dialect_and_applies_deepseek_defaults(set
     legacy_connection(settings.harness_state_dir, model="corporate-alias",
                       profile="deepseek_v4_flash", timeout_seconds=1200, output_tokens=8192)
     store = ModelSettingsStore(settings)
-    with store.preview(ModelSettingsUpdate(provider="api", model_name="corporate-alias")
-                       ).model_kwargs() as kwargs:
+    with store.save(ModelSettingsUpdate(provider="api", model_name="corporate-alias",
+                                        adapter="openai")).model_kwargs() as kwargs:
         assert kwargs["disable_thinking"] and kwargs["output_tokens"] == 8192
     generic = store.save(ModelSettingsUpdate(provider="api", model_name="other-model"))
     with generic.model_kwargs() as kwargs:
@@ -211,3 +211,77 @@ def test_switching_model_resets_legacy_dialect_and_applies_deepseek_defaults(set
     with deepseek.model_kwargs() as kwargs:
         assert kwargs["disable_thinking"]
         assert (kwargs["timeout_seconds"], kwargs["output_tokens"]) == (1800, 32768)
+
+
+def test_existing_profile_defaults_to_gpt2giga_without_reupload(settings, tmp_path):
+    pki = prepare_local_identity(tmp_path / "pki")
+    store = ModelSettingsStore(settings)
+    store.save(ModelSettingsUpdate(
+        provider="api", base_url="https://gateway/v1", model_name="DeepSeek-V4-Flash",
+        ca_pem=pki.ca_cert.read_text(), cert_pem=pki.client_cert.read_text(),
+        key_pem=pki.client_key.read_text(),
+    ))
+    # Simulate a portal profile saved before the adapter selector existed.
+    old = json.loads(store.path.read_text())
+    del old["adapter"]
+    store.path.write_text(json.dumps(old))
+    assert store.load().adapter == "gpt2giga"
+    draft = ModelSettingsUpdate(provider="api")
+    with store.preview(draft).model_kwargs() as args:
+        assert args["adapter"] == "gpt2giga" and args["model_name"] == "DeepSeek-V4-Flash"
+        assert "disable_thinking" not in args
+        assert (args["timeout_seconds"], args["output_tokens"]) == (1800, 32768)
+        assert args["key_file"].read_bytes().strip() == pki.client_key.read_bytes().strip()
+    store.save(draft)
+    reopened = ModelSettingsStore(settings)
+    assert reopened.load().public()["adapter"] == "gpt2giga"
+    assert reopened.load().public()["has_key"]
+    # The admin can switch to GigaCode temporarily, then restore the same API connection.
+    with reopened.save(ModelSettingsUpdate(provider="gigacode")).model_kwargs() as args:
+        assert args == {}
+    with reopened.save(ModelSettingsUpdate(provider="api")).model_kwargs() as args:
+        assert args["adapter"] == "gpt2giga"
+    with pytest.raises(ValueError, match="другого адреса"):
+        reopened.preview(ModelSettingsUpdate(provider="api", base_url="https://other/v1"))
+
+
+@pytest.mark.parametrize("adapter", [None, "openai"])
+def test_gateway_environment_selector(settings, monkeypatch, adapter):
+    if adapter:
+        monkeypatch.setenv("KB_AGENTS_MODEL_ADAPTER", adapter)
+    else:
+        monkeypatch.delenv("KB_AGENTS_MODEL_ADAPTER", raising=False)
+    monkeypatch.setenv("KB_AGENTS_MODEL_BASE_URL", "https://native.test/api/v1")
+    monkeypatch.setenv("KB_AGENTS_MODEL_NAME", "DeepSeek-V4-Flash")
+    configured = Settings(_env_file=None, agents_state_dir=settings.agents_state_dir)
+    store = ModelSettingsStore(configured)
+    expected = adapter or "gpt2giga"
+    assert store.load().public()["adapter"] == expected
+    with store.load().model_kwargs() as args:
+        assert args["adapter"] == expected and args["base_url"] == "https://native.test/api/v1"
+        assert (args["timeout_seconds"], args["output_tokens"]) == (1800, 32768)
+        assert ("disable_thinking" in args) == (expected == "openai")
+
+
+def test_saved_explicit_adapter_wins_over_the_environment_default(settings):
+    legacy_connection(settings.harness_state_dir)
+    direct_default = settings.model_copy(update={"agents_model_adapter": "openai"})
+    assert ModelSettingsStore(direct_default).load().adapter == "openai"
+    store = ModelSettingsStore(settings)
+    store.save(ModelSettingsUpdate(provider="api", adapter="openai"))
+    assert ModelSettingsStore(settings).load().adapter == "openai"
+    store.save(ModelSettingsUpdate(provider="api", adapter="gpt2giga"))
+    assert ModelSettingsStore(direct_default).load().adapter == "gpt2giga"
+
+
+def test_switching_protocol_retains_operator_limits_and_openai_dialect(settings):
+    legacy_connection(settings.harness_state_dir, model="custom-model-alias",
+                      profile="deepseek_v4_flash", timeout_seconds=1200, output_tokens=8192)
+    store = ModelSettingsStore(settings)
+    store.save(ModelSettingsUpdate(provider="api", adapter="gpt2giga"))
+    with ModelSettingsStore(settings).load().model_kwargs() as args:
+        assert (args["timeout_seconds"], args["output_tokens"]) == (1200, 8192)
+        assert "disable_thinking" not in args
+    with store.save(ModelSettingsUpdate(provider="api", adapter="openai")).model_kwargs() as args:
+        assert (args["timeout_seconds"], args["output_tokens"]) == (1200, 8192)
+        assert args["disable_thinking"]

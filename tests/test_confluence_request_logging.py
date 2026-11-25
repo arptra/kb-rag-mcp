@@ -114,6 +114,7 @@ def test_scope_resets_after_exception_and_preserves_other_http_logs(caplog):
         with pytest.raises(ValueError, match="test exception"), safe_http_logging():
             ordinary_http_request()
             logging.getLogger("httpcore.proxy").debug("hidden proxy details")
+            logging.getLogger("gigachat.api.utils").warning("hidden upstream response")
             raise ValueError("test exception")
         assert not caplog.records
         ordinary_http_request()

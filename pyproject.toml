@@ -36,6 +36,7 @@ semantic = [
 agents = [
     "filelock>=3,<4",
     "deepagents>=0.7.39,<1",
+    "gpt2giga==0.3.2",
     "langchain-openai>=1,<2",
     "jsonschema>=4.25,<5",
     "langchain-core>=1,<2",

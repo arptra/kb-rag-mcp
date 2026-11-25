@@ -38,6 +38,7 @@ from portal_agents.artifacts import build_artifact_tools
 from portal_agents.connections import Connections, connection_routes
 from portal_agents.engine import run_turn
 from portal_agents.model import create_model
+from portal_agents.model_errors import ModelGatewayError, check_gateway_reply, gateway_exception
 from portal_agents.model_settings import ModelProfile, ModelSettingsStore, ModelSettingsUpdate
 from portal_agents.tools import build_tools
 from portal_agents.workspace import OfflineWorkspace
@@ -228,9 +229,13 @@ def create_app(
             controller.enable()
         result: dict[str, Any] = {
             "manager": manager, "provider": profile.provider,
-            "model": (profile.model_name or "API") if profile.provider == "api" else "GigaCode",
+            "model": "GigaCode",
         }
         if profile.provider == "api":
+            result["model"] = profile.model_name or (
+                "API GigaChat" if profile.adapter == "gpt2giga" else "API"
+            )
+            result["adapter"] = profile.adapter
             result["state"] = "error" if profile.warning else "configured"
         else:
             snapshot = controller.status() if controller else {}
@@ -267,12 +272,11 @@ def create_app(
             with tracing_context(enabled=False):
                 async with connected(profile, probe=True) as model:
                     reply = await model.ainvoke("Reply with OK.")
+                    check_gateway_reply(reply.text)
         except Exception as exc:
-            status = getattr(exc, "status_code", None)
-            if type(status) is int:
-                detail = f"Шлюз модели вернул HTTP {status}. Проверьте адрес, модель и доступ."
-            else:
-                detail = "Нет ответа от модели. Проверьте доступность адреса и сертификаты TLS."
+            failure = gateway_exception(exc)
+            detail = (str(failure) if failure is not None else
+                      "Нет ответа от модели. Проверьте доступность адреса и сертификаты TLS.")
             raise HTTPException(502, detail) from None
         if (not isinstance(reply, AIMessage) or not reply.text.strip() or reply.tool_calls
                 or reply.additional_kwargs.get("refusal")
@@ -427,13 +431,14 @@ def create_app(
                     await report(
                         "error", "Доступ ограничен. Проверьте права в портале или ответ шлюза."
                     )
+                except ModelGatewayError as exc:
+                    await report("error", str(exc))
                 except Exception as exc:
                     # Provider errors may contain prompts, API credentials or private addresses.
                     _LOG.warning("Agent turn stopped (%s)", type(exc).__name__)
                     await report(
                         "error",
-                        f"Запрос прерван ({type(exc).__name__}). "
-                        "Проверьте подключение модели и выбранной среды.",
+                        "Запрос прерван. Проверьте подключение модели и выбранной среды.",
                     )
                 finally:
                     if workspace:

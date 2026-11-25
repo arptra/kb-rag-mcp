@@ -169,7 +169,8 @@ async def test_admin_probes_and_selects_corporate_api_for_live_chat(
     async with await asyncio.start_server(gateway, "127.0.0.1", 0, ssl=tls) as server:
         port = server.sockets[0].getsockname()[1]
         draft = {
-            "provider": "api", "base_url": f"https://127.0.0.1:{port}/v1/chat/completions",
+            "provider": "api", "adapter": "openai",
+            "base_url": f"https://127.0.0.1:{port}/v1/chat/completions",
             "ca_pem": identity.ca_cert.read_text(), "cert_pem": identity.client_cert.read_text(),
             "key_pem": identity.client_key.read_text(),
         }
@@ -202,7 +203,7 @@ async def test_admin_probes_and_selects_corporate_api_for_live_chat(
             assert saved.json()["has_key"] and saved.json()["has_cert"] and saved.json()["has_ca"]
             assert (await client.get(status, headers=auth)).json() == {
                 "model": "DeepSeek-V4-Flash", "state": "configured", "manager": False,
-                "provider": "api",
+                "provider": "api", "adapter": "openai",
             }
             response = await client.post("/agents/api/chat", headers=auth, json={
                 "chat": str(uuid4()), "question": "Hello",

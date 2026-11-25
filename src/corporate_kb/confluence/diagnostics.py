@@ -35,6 +35,7 @@ for _logger_name in (
     "openai._base_client",
     "openai._response",
     "openai._legacy_response",
+    "gigachat.api.utils",
 ):
     # Logger filters do not propagate to child loggers. Install on each concrete
     # transport logger, but leave records from all other operations untouched.

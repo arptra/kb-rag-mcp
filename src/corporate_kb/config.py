@@ -69,6 +69,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("HARNESS_STATE_DIR", "legacy_standalone_state_dir"),
     )
     agents_model_base_url: str | None = None
+    agents_model_adapter: Literal["openai", "gpt2giga"] = "gpt2giga"
     agents_model_name: str | None = None
     agents_model_ca_file: Path | None = None
     agents_model_cert_file: Path | None = None
