@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Подключения · Агенты</title>
+  <link rel="stylesheet" href="assets/chat.css">
+  <link rel="stylesheet" href="assets/connections.css">
+  <script src="assets/portal-api.js" defer></script>
+  <script src="assets/connections.js" defer></script>
+</head>
+<body>
+  <header>
+    <nav aria-label="Навигация"><a href="/admin">Портал</a><span>/</span><a href="./">Агенты</a><span>/</span><b>Подключения</b></nav>
+    <a href="./" class="back">Вернуться в чат</a>
+  </header>
+  <main class="connections">
+    <h1>Подключения</h1>
+    <p class="intro">Администратор выбирает, с чем может работать агент. Опубликованные инструменты и источники доступны всем пользователям агента.</p>
+    <p id="page-status" role="status">Загружаем подключения…</p>
+    <a id="login-link" href="/admin" hidden>Войти как администратор →</a>
+    <div id="panels" hidden>
+      <section class="card" aria-labelledby="workspace-title">
+        <h2 id="workspace-title">Среда выполнения</h2>
+        <p>Агент запускает код в отдельном контейнере. Файлы в нём доступны до завершения текущего запроса.</p>
+        <form id="workspace-form">
+          <div class="workspace-fields">
+            <label>Название песочницы<input id="workspace-name" maxlength="100" placeholder="Например, Java"></label>
+            <label>Образ Docker<input id="workspace-image" maxlength="255" placeholder="Например, eclipse-temurin:21-jdk" spellcheck="false"></label>
+          </div>
+          <label id="images-field" hidden>Образы на этом Docker-хосте<select id="image-options"></select></label>
+          <div class="actions">
+            <button id="refresh-images" type="button">Найти образы Docker</button>
+            <button id="disable-workspace" type="button" hidden>Отключить среду</button>
+            <button class="primary" type="submit">Сохранить среду</button>
+          </div>
+          <p class="status" id="workspace-status" role="status"></p>
+        </form>
+      </section>
+      <section class="card" aria-labelledby="servers-title">
+        <div class="section-heading"><h2 id="servers-title">Серверы MCP</h2><button id="add-server" type="button">Добавить сервер</button></div>
+        <p>Найдите инструменты чтения сервера и выберите те, которые можно вызывать из чата.</p>
+        <ul class="resources" id="servers"></ul>
+      </section>
+      <section class="card" aria-labelledby="sources-title">
+        <div class="section-heading"><h2 id="sources-title">Репозитории</h2><button id="add-source" type="button">Добавить источник</button></div>
+        <p>Подключите код по SSH или Maven-репозиторий для зависимостей Java и Gradle.</p>
+        <ul class="resources" id="sources"></ul>
+      </section>
+    </div>
+  </main>
+  <dialog id="server-dialog" aria-labelledby="server-title">
+    <div class="dialog-heading"><h2 id="server-title">Добавить сервер MCP</h2><button type="button" data-close aria-label="Закрыть">×</button></div>
+    <form id="server-form">
+      <fieldset class="form-fields" id="new-server-fields">
+        <label>Название<input id="server-name" minlength="2" maxlength="120" required></label>
+        <label>URL сервера MCP<input id="server-url" type="url" maxlength="2048" required placeholder="https://jira.company.ru/mcp" spellcheck="false"></label>
+      </fieldset>
+      <fieldset class="form-fields" id="server-fields" hidden disabled>
+        <p id="server-address" class="detail"></p>
+        <label>Токен доступа <small id="token-state"></small><input id="server-token" maxlength="16384" type="password" autocomplete="new-password" placeholder="При необходимости"></label>
+        <label class="check" id="clear-token-label" hidden><input id="clear-token" type="checkbox">Очистить сохранённый токен</label>
+        <button id="discover-tools" type="button">Найти инструменты</button>
+        <fieldset id="tool-options"><legend>Разрешённые инструменты</legend><div id="tool-list"></div></fieldset>
+      </fieldset>
+      <p class="status" id="server-status" role="status"></p>
+      <div class="dialog-actions"><button type="button" data-close>Закрыть</button><button class="primary" type="submit" id="save-server">Добавить</button></div>
+    </form>
+  </dialog>
+  <dialog id="source-dialog" aria-labelledby="source-title">
+    <div class="dialog-heading"><h2 id="source-title">Добавить источник</h2><button type="button" data-close aria-label="Закрыть">×</button></div>
+    <form id="source-form" autocomplete="off">
+      <fieldset class="form-fields">
+        <label>Идентификатор<input id="source-id" maxlength="63" pattern="[a-z0-9][a-z0-9\-]*" title="Строчные латинские буквы, цифры и дефисы" required placeholder="payments-service" spellcheck="false"></label>
+        <label>Тип источника<select id="source-kind"><option value="git">Git по SSH</option><option value="maven">Maven / Gradle по HTTPS</option></select></label>
+        <label>Адрес репозитория<input id="source-url" maxlength="2048" required spellcheck="false"></label>
+        <fieldset id="git-fields" class="form-fields">
+          <label>Закрытый ключ SSH <small id="ssh-state"></small><input id="ssh-key" type="file"></label>
+          <label>Проверенные ключи хоста (known_hosts)<textarea id="known-hosts" maxlength="32768" rows="2" spellcheck="false" placeholder="git.company.ru ssh-ed25519 …"></textarea></label>
+        </fieldset>
+        <fieldset id="maven-fields" class="form-fields" hidden disabled>
+          <label>Имя пользователя<input id="source-user" maxlength="200" autocomplete="off"></label>
+          <label>Пароль или токен <small id="password-state"></small><input id="source-password" type="password" autocomplete="new-password"></label>
+        </fieldset>
+        <p id="source-retain" class="detail" hidden>Для прежнего подключения можно оставить данные доступа пустыми. При смене адреса, типа или пользователя укажите их заново.</p>
+      </fieldset>
+      <p class="status" id="source-status" role="status"></p>
+      <div class="dialog-actions"><button type="button" id="delete-source" class="danger" hidden>Удалить источник</button><button class="primary" type="submit">Сохранить</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

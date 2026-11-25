@@ -41,9 +41,13 @@ def _bounded(value: Any, limit: int = 24000) -> Any:
 
 
 @asynccontextmanager
-async def _session(url: str) -> AsyncIterator[ClientSession]:
+async def _session(url: str, token: str = "") -> AsyncIterator[ClientSession]:
+    if token and not url.lower().startswith("https://"):
+        raise ValueError("MCP bearer credentials require HTTPS.")
     async with (
-        httpx.AsyncClient(timeout=_MCP_TIMEOUT, follow_redirects=False) as client,
+        httpx.AsyncClient(timeout=_MCP_TIMEOUT, follow_redirects=False,
+                          **({"headers": {"Authorization": f"Bearer {token}"}} if token else {})
+                          ) as client,
         streamable_http_client(url, http_client=client) as (reader, writer, _),
         ClientSession(reader, writer, read_timeout_seconds=timedelta(seconds=_MCP_TIMEOUT)) as mcp,
     ):
@@ -63,7 +67,9 @@ def _self_contained_schema(value: Any) -> bool:
     return not isinstance(value, list) or all(_self_contained_schema(item) for item in value)
 
 
-async def _discover(session: ClientSession, allowed: Collection[str]) -> dict[str, mcp_types.Tool]:
+async def _discover(
+    session: ClientSession, allowed: Collection[str] | None,
+) -> dict[str, mcp_types.Tool]:
     found: dict[str, mcp_types.Tool] = {}
     cursors: set[str] = set()
     params = None
@@ -74,20 +80,26 @@ async def _discover(session: ClientSession, allowed: Collection[str]) -> dict[st
             # The operator publishes each read tool by exact name. Some MCPs
             # omit annotations; an explicit conflicting declaration wins.
             writes = hints and (hints.readOnlyHint is False or hints.destructiveHint is True)
-            if (spec.name in allowed and not writes
+            if ((allowed is None or spec.name in allowed) and not writes
                     and _self_contained_schema(spec.inputSchema)
                     and _self_contained_schema(spec.outputSchema)):
                 found[spec.name] = spec
-        if not page.nextCursor or found.keys() == set(allowed):
+        if not page.nextCursor or (allowed is not None and found.keys() == set(allowed)):
             return found
-        if page.nextCursor in cursors:
-            raise ToolException("The MCP server returned a repeated discovery cursor.")
+        if page.nextCursor in cursors or len(cursors) >= 100 or len(found) > 2000:
+            raise ToolException("The MCP tool catalog could not be read within its limits.")
         cursors.add(page.nextCursor)
         params = mcp_types.PaginatedRequestParams(cursor=page.nextCursor)
 
 
+async def discover_read_tools(url: str, token: str = "") -> list[str]:
+    async with asyncio.timeout(_MCP_TIMEOUT), _session(url, token) as session:
+        return sorted(await _discover(session, None))
+
+
 def _remote_tools(
     registry: McpServerRegistry, published: Mapping[str, Sequence[str]], authorize: Authorize,
+    credential: Callable[[str, str], str] | None,
 ) -> list[BaseTool]:
     allowed = {key: frozenset(names) for key, names in published.items() if names}
 
@@ -105,7 +117,8 @@ def _remote_tools(
     ) -> Any:
         url = await connection(server_id)
         try:
-            async with asyncio.timeout(_MCP_TIMEOUT), _session(url) as mcp:
+            token = await asyncio.to_thread(credential, server_id, url) if credential else ""
+            async with asyncio.timeout(_MCP_TIMEOUT), _session(url, token) as mcp:
                 current = await _discover(mcp, allowed[server_id])
                 if tool_name is None:
                     result: Any = [{"name": t.name, "description": (t.description or "")[:1200],
@@ -158,6 +171,7 @@ def build_tools(
     catalog: RagCatalog, *, authorize: Authorize, authorize_graph: Authorize | None = None,
     index_ids: Collection[str] | None = None, mcp_servers: McpServerRegistry | None = None,
     mcp_read_tools: Mapping[str, Sequence[str]] | None = None,
+    mcp_credential: Callable[[str, str], str] | None = None,
 ) -> list[BaseTool]:
     """Bind the actual caller's grants; constructing the catalog never opens a source."""
     scope = frozenset(index_ids) if index_ids is not None else None
@@ -231,5 +245,5 @@ def build_tools(
 
         tools.append(StructuredTool.from_function(coroutine=search_service_graph))
     if mcp_servers is not None and mcp_read_tools:
-        tools.extend(_remote_tools(mcp_servers, mcp_read_tools, authorize))
+        tools.extend(_remote_tools(mcp_servers, mcp_read_tools, authorize, mcp_credential))
     return tools

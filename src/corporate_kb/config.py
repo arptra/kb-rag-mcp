@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_QUERY_INSTRUCTION = (
@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     gigacode_max_tool_calls: int = Field(default=50, ge=1, le=5000)
     agents_enabled: bool = False
     agents_state_dir: Path = Path("var/portal-agents")
+    harness_state_dir: Path = Path("var/harness")
+    legacy_standalone_state_dir: Path = Field(
+        Path("var/agent-harness"),
+        validation_alias=AliasChoices("HARNESS_STATE_DIR", "legacy_standalone_state_dir"),
+    )
     agents_model_base_url: str | None = None
     agents_model_name: str | None = None
     agents_model_ca_file: Path | None = None
@@ -239,6 +244,8 @@ class Settings(BaseSettings):
                 "confluence_state_dir": resolve(self.confluence_state_dir),
                 "a2a_state_dir": resolve(self.a2a_state_dir),
                 "agents_state_dir": resolve(self.agents_state_dir),
+                "harness_state_dir": resolve(self.harness_state_dir),
+                "legacy_standalone_state_dir": resolve(self.legacy_standalone_state_dir),
                 **{
                     key: resolve(path)
                     for key, path in (

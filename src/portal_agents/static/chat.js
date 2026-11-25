@@ -19,6 +19,8 @@
     read_document: "Чтение документа", search_service_graph: "Поиск по графу сервисов",
     list_environment_tools: "Доступные инструменты среды", call_environment_tool: "Вызов инструмента среды",
     run_in_workspace: "Запуск кода в контейнере", task: "Запуск подагента",
+    list_artifact_sources: "Список подключённых репозиториев", fetch_git_snapshot: "Загрузка файлов из Git",
+    fetch_maven_artifact: "Загрузка артефакта Maven",
     write_todos: "Обновление плана", read_file: "Чтение рабочего файла", write_file: "Запись рабочего файла",
     edit_file: "Редактирование рабочего файла", glob: "Поиск файлов", grep: "Поиск в файлах",
     ls: "Список рабочих файлов",
@@ -38,6 +40,7 @@
   let historyRequest = null;
   let pollTimer = null;
   let modelRequest = 0;
+  let settingsRequest = null;
 
   function newId() {
     if (crypto.randomUUID) return crypto.randomUUID();
@@ -57,24 +60,7 @@
     $("notice").textContent = message;
     $("notice").hidden = !message;
   }
-  async function request(path, options = {}) {
-    const headers = new Headers(options.headers);
-    if (options.method && options.method !== "GET") headers.set("Content-Type", "application/json");
-    const password = storage.get("rag-admin-password");
-    if (password) headers.set("X-KB-Admin-Password", password);
-    const response = await fetch(path, { ...options, headers, credentials: "same-origin", cache: "no-store" });
-    if (response.ok) return response;
-    let message;
-    if (response.status === 401) message = "Войдите в портал и обновите страницу.";
-    else if (response.status === 403) message = "Для этого действия требуется дополнительный доступ.";
-    else {
-      const body = await response.text();
-      message = body.length < 240 && !body.trim().startsWith("<") ? body : "";
-    }
-    const error = new Error(message || "Ошибка сервера (" + response.status + ").");
-    error.status = response.status;
-    throw error;
-  }
+  const { request, adminHeaders, adminLoginUrl } = window.PortalApi;
   function saveChats() {
     storage.set("portal-agents-current", chat);
     storage.set("portal-agents-chats", JSON.stringify(chats));
@@ -180,6 +166,16 @@
   async function submit() {
     const text = question.value.trim();
     if (!text || active || historyRequest) return;
+    if (["/подключения", "/connections"].includes(text.toLowerCase())) {
+      question.value = "";
+      resize();
+      try {
+        const info = await (await request("api/model")).json();
+        if (info.manager) window.location.assign($("agent-connections").href);
+        else notice("Управлять подключениями может администратор портала.");
+      } catch (error) { notice(error.message); }
+      return;
+    }
     const controller = new AbortController();
     active = controller;
     notice();
@@ -233,25 +229,20 @@
   async function modelStatus(enable = false) {
     clearTimeout(pollTimer);
     const revision = ++modelRequest;
-    const headers = {};
     try {
-      if (enable) {
-        $("enable-model").disabled = true;
-        const session = await fetch("/access/api/session", { credentials: "same-origin", cache: "no-store" });
-        if (session.ok) {
-          const payload = await session.json();
-          if (payload.csrf_token) headers["X-CSRF-Token"] = payload.csrf_token;
-        }
-      }
-      const response = await request("api/model", enable ? { method: "POST", headers, body: "{}" } : {});
+      if (enable) $("enable-model").disabled = true;
+      const response = await request("api/model", enable ? { method: "POST", headers: await adminHeaders(), body: "{}" } : {});
       const info = await response.json();
       if (revision !== modelRequest) return;
-      $("model-name").textContent = info.model;
+      $("model-name").textContent = info.provider === "api" ? "API · " + info.model : info.model;
       $("model-label").textContent = info.model;
       $("model-dot").dataset.state = info.state;
       $("model-state").textContent = modelStates[info.state] || info.state;
       $("model-panel").querySelector("summary").title = info.model + " · " + $("model-state").textContent;
-      $("enable-model").hidden = !info.manager || !["disabled", "error"].includes(info.state);
+      $("open-model-settings").hidden = !info.manager;
+      $("agent-connections").hidden = !info.manager;
+      $("model-readonly").hidden = Boolean(info.manager);
+      $("enable-model").hidden = !info.manager || info.provider === "api" || !["disabled", "error"].includes(info.state);
       $("model-login").hidden = true;
       $("model-login").removeAttribute("href");
       if (info.manager && info.authentication_url) {
@@ -261,7 +252,8 @@
           $("model-login").hidden = false;
         }
       }
-      $("portal-login").hidden = true;
+      $("portal-login").hidden = !!info.manager;
+      if (!info.manager) $("portal-login").href = await adminLoginUrl();
       if (!["ready", "configured", "disabled", "error"].includes(info.state)) {
         pollTimer = setTimeout(() => modelStatus(), 2000);
       }
@@ -271,12 +263,126 @@
       $("model-dot").dataset.state = "error";
       $("model-login").hidden = true;
       $("enable-model").hidden = true;
+      $("open-model-settings").hidden = true;
+      $("agent-connections").hidden = true;
+      $("model-readonly").hidden = true;
       $("portal-login").hidden = error.status !== 401;
+      if (error.status === 401) $("portal-login").href = await adminLoginUrl();
       if (error.status === 401 || enable) notice(error.message);
     } finally {
       if (revision === modelRequest) $("enable-model").disabled = false;
     }
   }
+  const settingsDialog = $("model-settings");
+  const settingsForm = $("settings-form");
+  const files = ["ca", "cert", "key"];
+
+  function settingsStatus(text, state = "") {
+    $("settings-status").textContent = text;
+    $("settings-status").dataset.state = state;
+  }
+  function selectProvider() {
+    const api = $("settings-provider").value === "api";
+    $("api-fields").hidden = !api;
+    $("api-fields").disabled = !api;
+  }
+  function loadProfile(info) {
+    settingsForm.reset();
+    $("settings-provider").value = info.provider;
+    $("settings-url").value = info.base_url || "";
+    $("settings-model").value = info.model_name || "";
+    $("settings-source").textContent = ({
+      legacy: "Найдены настройки прежнего Harness.",
+      environment: "Используются настройки из окружения портала.",
+    })[info.source] || "";
+    $("settings-source").hidden = !$("settings-source").textContent;
+    $("settings-warning").textContent = info.warning || "";
+    $("settings-warning").hidden = !info.warning;
+    for (const kind of files) $("saved-" + kind).textContent = info["has_" + kind] ? "Сохранён" : "";
+    $("saved-api-key").textContent = info.has_api_key ? "Сохранён" : "";
+    $("replace-field").hidden = ![info.has_ca, info.has_cert, info.has_key, info.has_api_key].some(Boolean);
+    selectProvider();
+  }
+  function disableSettings(disabled) {
+    $("settings-fields").disabled = disabled;
+    $("test-settings").disabled = disabled;
+    $("save-settings").disabled = disabled;
+  }
+  async function openSettings() {
+    $("model-panel").open = false;
+    loadProfile({ provider: "gigacode" });
+    settingsRequest = new AbortController();
+    const { signal } = settingsRequest;
+    disableSettings(true);
+    settingsStatus("Загружаем подключение…");
+    settingsDialog.showModal();
+    try {
+      const response = await request("api/model/settings", { signal });
+      const info = await response.json();
+      if (signal.aborted) return;
+      loadProfile(info);
+      disableSettings(false);
+      settingsStatus("");
+      $("settings-provider").focus();
+    } catch (error) {
+      if (!signal.aborted) settingsStatus(error.message, "error");
+    }
+  }
+  async function draftSettings() {
+    const draft = { provider: $("settings-provider").value };
+    if (draft.provider !== "api") return draft;
+    draft.base_url = $("settings-url").value.trim();
+    draft.model_name = $("settings-model").value.trim();
+    const replace = $("replace-credentials").checked;
+    for (const kind of files) {
+      const file = $("settings-" + kind).files[0];
+      if (file) {
+        const limit = kind === "key" ? 32 : 64;
+        if (!file.size || file.size > limit * 1024) throw new Error("Выберите непустой PEM-файл размером до " + limit + " КБ.");
+        draft[kind + "_pem"] = await file.text();
+      } else if (replace) draft[kind + "_pem"] = "";
+    }
+    const token = $("settings-api-key").value.trim();
+    if (token || replace) draft.api_key = token;
+    return draft;
+  }
+  async function submitSettings(test) {
+    if ($("settings-fields").disabled || !settingsForm.reportValidity()) return;
+    const { signal } = settingsRequest;
+    disableSettings(true);
+    settingsStatus(test ? "Отправляем короткий запрос модели…" : "Сохраняем подключение…");
+    try {
+      const draft = await draftSettings();
+      const response = await request(test ? "api/model/test" : "api/model/settings", {
+        method: test ? "POST" : "PUT", headers: await adminHeaders(), body: JSON.stringify(draft), signal,
+      });
+      if (signal.aborted) return;
+      if (test) settingsStatus("Модель ответила на проверочный запрос.", "success");
+      else {
+        const info = await response.json();
+        if (signal.aborted) return;
+        loadProfile(info);
+        settingsStatus("Сохранено. Новые запросы используют выбранную модель.", "success");
+        modelStatus();
+      }
+    } catch (error) {
+      if (!signal.aborted) settingsStatus(error.message, "error");
+    } finally {
+      if (!signal.aborted) disableSettings(false);
+    }
+  }
+  $("open-model-settings").addEventListener("click", openSettings);
+  $("close-settings").addEventListener("click", () => settingsDialog.close());
+  settingsDialog.addEventListener("close", () => {
+    settingsRequest?.abort();
+    settingsForm.reset();
+    $("model-panel").querySelector("summary").focus();
+    modelStatus();
+  });
+  $("settings-provider").addEventListener("change", selectProvider);
+  settingsForm.addEventListener("input", () => settingsStatus(""));
+  settingsForm.addEventListener("submit", (e) => { e.preventDefault(); submitSettings(false); });
+  $("test-settings").addEventListener("click", () => submitSettings(true));
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(); });
   question.addEventListener("input", resize);
   question.addEventListener("keydown", (e) => {

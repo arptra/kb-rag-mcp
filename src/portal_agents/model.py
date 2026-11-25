@@ -23,6 +23,7 @@ from pydantic import Field, SecretStr, TypeAdapter
 from corporate_kb.agents.activation import GigaCodeAgentController
 from corporate_kb.agents.gigacode_model import GigaCodeChatModel
 from corporate_kb.config import Settings
+from corporate_kb.confluence.diagnostics import safe_http_logging
 from corporate_kb.gigacode_runner import GigaCodeModelProfile, GigaCodeRunner
 
 
@@ -75,6 +76,8 @@ async def create_model(
     base_url: str | None = None, model_name: str | None = None,
     ca_file: Path | None = None, cert_file: Path | None = None, key_file: Path | None = None,
     api_key: str | None = None, profile_path: Path | None = None,
+    timeout_seconds: int | None = None, output_tokens: int | None = None,
+    max_retries: int = 2, disable_thinking: bool = False,
 ) -> AsyncIterator[BaseChatModel]:
     if not base_url:
         if profile_path is not None:
@@ -97,29 +100,48 @@ async def create_model(
         and not (api_key or cert_file or key_file)
     ):
         raise ValueError("Корпоративному API модели требуется HTTPS.")
-    if not model_name:
-        raise ValueError("Укажите имя модели корпоративного API.")
     if key_file and not cert_file:
         raise ValueError("Для клиентского ключа требуется сертификат.")
-    tls = ssl.create_default_context(cafile=ca_file)
+    tls = ssl.create_default_context()
+    if ca_file:
+        tls.load_verify_locations(cafile=ca_file)
     if cert_file:
-        tls.load_cert_chain(certfile=cert_file, keyfile=key_file)
+        tls.load_cert_chain(certfile=cert_file, keyfile=key_file, password=b"")
 
     # ChatOpenAI's client requires an API key even when the gateway authenticates
     # with mTLS alone. Never inherit OPENAI_API_KEY or send a placeholder bearer.
     def headers(request: httpx.Request) -> None:
+        for name in ("OpenAI-Organization", "OpenAI-Project"):
+            request.headers.pop(name, None)
         if not api_key:
             request.headers.pop("Authorization", None)
 
     async def async_headers(request: httpx.Request) -> None:
         headers(request)
 
-    timeout = settings.gigacode_timeout_seconds
-    with httpx.Client(verify=tls, timeout=timeout, event_hooks={"request": [headers]}) as client:
+    # Some corporate gateways select the model from the URL alone. ChatOpenAI
+    # expects a model identifier locally, the OpenAI SDK's omit sentinel removes
+    # the field on the wire. Preserve the gateway's Chat Completions token option.
+    extra_body: dict[str, Any] = {}
+    if not model_name:
+        from openai import omit
+
+        extra_body["model"] = omit
+    if output_tokens is not None:
+        extra_body["max_tokens"] = output_tokens
+    if disable_thinking:
+        extra_body["thinking"] = {"type": "disabled"}
+    timeout = timeout_seconds or settings.gigacode_timeout_seconds
+    with (
+        safe_http_logging(),
+        httpx.Client(verify=tls, timeout=timeout, event_hooks={"request": [headers]}) as client,
+    ):
         async with httpx.AsyncClient(verify=tls, timeout=timeout,
                                      event_hooks={"request": [async_headers]}) as async_client:
             yield ChatOpenAI(
-                model=model_name, base_url=base_url, api_key=SecretStr(api_key or "mtls"),
+                model=model_name or "gateway", base_url=base_url,
+                api_key=SecretStr(api_key or "mtls"),
                 use_responses_api=False, http_client=client, http_async_client=async_client,
-                timeout=timeout, max_retries=2, cache=False,
+                timeout=timeout, max_retries=max_retries, cache=False,
+                extra_body=extra_body or None,
             )

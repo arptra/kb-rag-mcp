@@ -18,6 +18,8 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
             "confluence_state_dir": tmp_path / "var" / "confluence",
             "a2a_state_dir": tmp_path / "var" / "a2a",
             "agents_state_dir": tmp_path / "var" / "portal-agents",
+            "harness_state_dir": tmp_path / "var" / "harness",
+            "legacy_standalone_state_dir": tmp_path / "var" / "agent-harness",
             "embedding_provider": "hash",
             "embedding_dimension": 64,
             "chunk_size_tokens": 40,

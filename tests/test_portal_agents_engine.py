@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import ssl
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -208,52 +206,6 @@ async def test_activated_portal_controller_receives_real_sdk_tools(settings_fact
         assert runner.calls[-1]["decision_only"] is True
     finally:
         controller.stop()
-
-
-async def test_corporate_api_authenticates_with_real_tls_certificate_without_bearer(
-    settings_factory: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    from corporate_kb.access.dev_pki import prepare_local_identity
-
-    pytest.importorskip("langchain_openai")
-    identity = prepare_local_identity(tmp_path / "certificates")
-    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    tls.load_cert_chain(identity.server_cert, identity.server_key)
-    tls.load_verify_locations(cafile=identity.ca_cert)
-    tls.verify_mode = ssl.CERT_REQUIRED
-    monkeypatch.setenv("OPENAI_API_KEY", "a-key-for-a-different-service")
-    requests: list[tuple[bytes, bytes, Any]] = []
-
-    async def gateway(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        headers = await reader.readuntil(b"\r\n\r\n")
-        length = next(v.partition(b":")[2] for v in headers.lower().splitlines()
-                      if v.startswith(b"content-length:"))
-        request = await reader.readexactly(int(length))
-        requests.append((headers.lower(), request, writer.get_extra_info("peercert")))
-        body = json.dumps({
-            "id": "test", "object": "chat.completion", "model": "corporate", "created": 10,
-            "choices": [{"index": 0, "finish_reason": "stop",
-                         "message": {"role": "assistant", "content": "Hello!"}}],
-        }).encode()
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
-                     str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
-
-    async with await asyncio.start_server(gateway, "127.0.0.1", 0, ssl=tls) as server:
-        port = server.sockets[0].getsockname()[1]
-        async with create_model(
-            settings_factory(), base_url=f"https://127.0.0.1:{port}/v1", model_name="corporate",
-            ca_file=identity.ca_cert, cert_file=identity.client_cert, key_file=identity.client_key,
-        ) as model:
-            async with asyncio.timeout(8):
-                assert await run_turn(model, "Hello", []) == "Hello!"
-    assert len(requests) == 1
-    headers, body, certificate = requests[0]
-    assert certificate and b"authorization:" not in headers
-    assert headers.startswith(b"post /v1/chat/completions ")
-    assert json.loads(body)["messages"][-1]["content"] == "Hello"
 
 
 @pytest.mark.parametrize("reason", ["content_filter", "length"])

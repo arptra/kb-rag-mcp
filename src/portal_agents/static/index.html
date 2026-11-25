@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>Агенты · Портал</title>
   <link rel="stylesheet" href="assets/chat.css">
+  <script src="assets/portal-api.js" defer></script>
   <script src="assets/chat.js" defer></script>
 </head>
 <body>
@@ -13,11 +14,14 @@
     <nav aria-label="Навигация"><a href="/admin">Портал</a><span aria-hidden="true">/</span><b>Агенты</b></nav>
     <div class="toolbar">
       <details id="model-panel" class="popover">
-        <summary><i id="model-dot" aria-hidden="true"></i><span id="model-label">Модель</span></summary>
+        <summary><i id="model-dot" aria-hidden="true"></i><span id="model-label">Модель</span><span class="chevron" aria-hidden="true"></span></summary>
         <div class="menu"><strong id="model-name">Модель</strong><p id="model-state">Загружаем настройки…</p>
+          <button id="open-model-settings" type="button" hidden>Настройки модели…</button>
+          <a id="agent-connections" href="connections" title="Также можно ввести /подключения в чат" hidden>Подключения →</a>
+          <p id="model-readonly" hidden>Подключение выбирает администратор портала.</p>
           <button type="button" id="enable-model" hidden>Включить GigaCode</button>
           <a id="model-login" target="_blank" rel="noopener noreferrer" hidden>Пройти авторизацию ↗</a>
-          <a id="portal-login" href="/admin" hidden>Войти в портал →</a>
+          <a id="portal-login" href="/admin" hidden>Войти как администратор →</a>
         </div>
       </details>
       <button type="button" id="new-chat"><span aria-hidden="true">＋</span> Новый чат</button>
@@ -54,6 +58,57 @@
       </div>
     </div>
   </main>
+  <dialog id="model-settings" aria-labelledby="settings-title">
+    <div class="dialog-heading"><h2 id="settings-title">Настройки модели</h2>
+      <button type="button" id="close-settings" aria-label="Закрыть настройки">×</button>
+    </div>
+    <p class="dialog-intro">Подключение для всех пользователей страницы «Агенты».</p>
+    <form id="settings-form" autocomplete="off">
+      <fieldset id="settings-fields" disabled>
+        <legend class="sr">Подключение модели</legend>
+        <label for="settings-provider">Способ подключения</label>
+        <select id="settings-provider">
+          <option value="gigacode">GigaCode</option>
+          <option value="api">Корпоративный API · DeepSeek и другие</option>
+        </select>
+        <p id="settings-source" hidden></p>
+        <p id="settings-warning" hidden></p>
+        <fieldset id="api-fields" hidden disabled>
+          <legend class="sr">Параметры корпоративного API</legend>
+          <label for="settings-url">Базовый URL API</label>
+          <input id="settings-url" type="url" placeholder="https://model.company.ru/v1" spellcheck="false" required>
+          <label for="settings-model">Имя модели на шлюзе</label>
+          <input id="settings-model" type="text" placeholder="Например, deepseek-v4-flash" spellcheck="false" aria-describedby="model-name-hint">
+          <p class="field-hint" id="model-name-hint">Можно оставить пустым, если модель уже задана адресом.</p>
+          <fieldset class="credentials">
+            <legend>Сертификаты и ключи</legend>
+            <p class="field-hint">Для входа по сертификату укажите файлы в формате PEM. Токен API нужен только по требованию шлюза.</p>
+            <div class="credential-row">
+              <label for="settings-ca">Корневой сертификат (CA) <small id="saved-ca"></small></label>
+              <input id="settings-ca" type="file" accept=".pem,.crt,.cer">
+            </div>
+            <div class="credential-row">
+              <label for="settings-cert">Клиентский сертификат <small id="saved-cert"></small></label>
+              <input id="settings-cert" type="file" accept=".pem,.crt,.cer">
+            </div>
+            <div class="credential-row">
+              <label for="settings-key">Закрытый ключ <small id="saved-key"></small></label>
+              <input id="settings-key" type="file" accept=".pem,.key">
+            </div>
+            <details id="token-option"><summary>Токен API <small id="saved-api-key"></small></summary>
+              <input id="settings-api-key" type="password" autocomplete="new-password" maxlength="8192" aria-label="Токен API" placeholder="Введите новый токен">
+            </details>
+            <label class="clear-credentials" id="replace-field" hidden><input type="checkbox" id="replace-credentials"> Заменить сохранённые сертификаты и токен выбранными здесь</label>
+          </fieldset>
+        </fieldset>
+      </fieldset>
+      <p id="settings-status" role="status"></p>
+      <div class="dialog-actions">
+        <button type="button" id="test-settings" disabled>Проверить запросом</button>
+        <button type="submit" id="save-settings" class="primary" disabled>Сохранить</button>
+      </div>
+    </form>
+  </dialog>
   <dialog id="confirm-delete"><form method="dialog"><h2>Удалить этот чат?</h2>
     <p>Вся его переписка будет удалена. Восстановить её нельзя.</p>
     <div><button value="cancel" autofocus>Отмена</button><button value="delete" class="danger">Удалить</button></div>

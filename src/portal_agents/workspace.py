@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from uuid import uuid4
@@ -56,6 +57,66 @@ class OfflineWorkspace:
             finally:
                 self._started = False
 
+    async def _start(self) -> bool:
+        if not self._started:
+            self._started = True
+            status, _ = await _docker(
+                "run",
+                "--detach",
+                "--rm",
+                "--pull=never",
+                "--name",
+                self.name,
+                "--network=none",
+                "--read-only",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--pids-limit=128",
+                "--memory=512m",
+                "--memory-swap=512m",
+                "--cpus=1",
+                "--log-driver=none",
+                "--user=65534:65534",
+                "--tmpfs",
+                "/tmp:rw,nosuid,nodev,size=128m",
+                "--workdir=/tmp",
+                "--env=HOME=/tmp",
+                "--entrypoint=/bin/sh",
+                self.image,
+                "-c",
+                "exec sleep 600",
+                timeout=20,
+            )
+            if status:
+                await self.close()
+                return False
+        return True
+
+    async def put_file(self, filename: str, contents: bytes) -> str:
+        """Place bytes into a fresh directory without sharing a host path or credentials."""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,230}", filename):
+            raise ValueError("Некорректное имя файла.")
+        if len(contents) > 32 * 1024 * 1024:
+            raise ValueError("Файл превышает 32 МиБ.")
+        directory = "/tmp/portal-artifact-" + uuid4().hex
+        async with self._lock:
+            if not await self.authorize():
+                raise PermissionError("Доступ к среде отозван.")
+            if not await self._start():
+                raise ValueError("Среда не запустилась. Проверьте образ и службу Docker.")
+            if not await self.authorize():
+                raise PermissionError("Доступ к среде отозван.")
+            status, _ = await _docker(
+                "exec", "-i", self.name, "/bin/sh", "-c",
+                'umask 077 && mkdir "$1" && cat > "$1/$2"', "upload", directory, filename,
+                script=contents,
+            )
+            if not await self.authorize():
+                raise PermissionError("Доступ к среде отозван.")
+            if status:
+                raise ValueError("Ошибка записи файла в среду исполнения.")
+        return directory + "/" + filename
+
     def tool(self) -> BaseTool:
         @tool
         async def run_in_workspace(script: str) -> str:
@@ -70,38 +131,8 @@ class OfflineWorkspace:
                 if not await self.authorize():
                     raise PermissionError("Доступ к среде отозван.")
                 try:
-                    if not self._started:
-                        self._started = True
-                        status, _ = await _docker(
-                            "run",
-                            "--detach",
-                            "--rm",
-                            "--pull=never",
-                            "--name",
-                            self.name,
-                            "--network=none",
-                            "--read-only",
-                            "--cap-drop=ALL",
-                            "--security-opt=no-new-privileges",
-                            "--pids-limit=128",
-                            "--memory=512m",
-                            "--memory-swap=512m",
-                            "--cpus=1",
-                            "--log-driver=none",
-                            "--user=65534:65534",
-                            "--tmpfs",
-                            "/tmp:rw,nosuid,nodev,size=128m",
-                            "--workdir=/tmp",
-                            "--env=HOME=/tmp",
-                            "--entrypoint=/bin/sh",
-                            self.image,
-                            "-c",
-                            "exec sleep 600",
-                            timeout=20,
-                        )
-                        if status:
-                            await self.close()
-                            return "Среда не запустилась. Проверьте образ и службу Docker."
+                    if not await self._start():
+                        return "Среда не запустилась. Проверьте образ и службу Docker."
                     if not await self.authorize():
                         raise PermissionError("Доступ к среде отозван.")
                     code, output = await _docker(

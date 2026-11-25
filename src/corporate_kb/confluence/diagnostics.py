@@ -32,6 +32,9 @@ for _logger_name in (
     "httpcore.http2",
     "httpcore.proxy",
     "httpcore.socks",
+    "openai._base_client",
+    "openai._response",
+    "openai._legacy_response",
 ):
     # Logger filters do not propagate to child loggers. Install on each concrete
     # transport logger, but leave records from all other operations untouched.
@@ -40,7 +43,7 @@ for _logger_name in (
 
 @contextmanager
 def safe_http_logging() -> Iterator[None]:
-    """Use the client's safe diagnostics for this context's Confluence request."""
+    """Keep this client's private requests out of third-party transport logs."""
     token = _confluence_http_scope.set(True)
     try:
         yield

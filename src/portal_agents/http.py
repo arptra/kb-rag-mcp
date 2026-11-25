@@ -17,7 +17,10 @@ from uuid import UUID, uuid4
 import aiosqlite
 from filelock import FileLock
 from filelock import Timeout as LockTimeout
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langsmith import tracing_context
 from markdown_it import MarkdownIt
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.applications import Starlette
@@ -31,8 +34,11 @@ from corporate_kb.agents.activation import GigaCodeAgentController
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
 from corporate_kb.mcp.servers import McpServerRegistry
+from portal_agents.artifacts import build_artifact_tools
+from portal_agents.connections import Connections, connection_routes
 from portal_agents.engine import run_turn
 from portal_agents.model import create_model
+from portal_agents.model_settings import ModelProfile, ModelSettingsStore, ModelSettingsUpdate
 from portal_agents.tools import build_tools
 from portal_agents.workspace import OfflineWorkspace
 
@@ -54,8 +60,11 @@ class _Grants(BaseModel):
     graph: bool
     servers: list[tuple[str, str, list[str]]]
     workspace: str | None
+    connection_revisions: dict[str, str] = Field(default_factory=dict)
 
     def includes(self, previous: _Grants) -> bool:
+        if not previous.connection_revisions.items() <= self.connection_revisions.items():
+            return False
         if not previous.indexes <= self.indexes or (previous.graph and not self.graph):
             return False
         if previous.workspace and previous.workspace != self.workspace:
@@ -97,6 +106,15 @@ def _mutation(request: Request) -> None:
         raise HTTPException(403, "Запрос с другого сайта отклонён.")
 
 
+async def _body(request: Request, limit: int) -> bytearray:
+    data = bytearray()
+    async for chunk in request.stream():
+        if len(data) + len(chunk) > limit:
+            raise HTTPException(413, "Слишком большой запрос.")
+        data.extend(chunk)
+    return data
+
+
 def _line(event: str, text: str) -> bytes:
     payload = {"event": event, "text": text}
     if event == "answer":
@@ -119,6 +137,20 @@ def create_app(
     controller: GigaCodeAgentController | None = None,
 ) -> Starlette:
     locks = settings.agents_state_dir / "locks"
+    profiles = ModelSettingsStore(settings)
+    connections = Connections(settings, mcp_servers)
+
+    @asynccontextmanager
+    async def connected(
+        profile: ModelProfile, *, probe: bool = False,
+    ) -> AsyncIterator[BaseChatModel]:
+        with profile.model_kwargs() as kwargs:
+            if probe:
+                kwargs["max_retries"] = 0
+                if profile.provider == "api":
+                    kwargs["output_tokens"] = 128
+            async with create_model(settings, controller=controller, **kwargs) as model:
+                yield model
 
     def acquire(owner_chat: str) -> FileLock:
         lock = FileLock(locks / owner_chat, timeout=0, thread_local=False)
@@ -129,6 +161,7 @@ def create_app(
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         settings.agents_state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         locks.mkdir(mode=0o700, exist_ok=True)
+        await asyncio.to_thread(connections.initialize)
         path = settings.agents_state_dir / "checkpoints.sqlite3"
         async with (
             AsyncSqliteSaver.from_conn_string(str(path)) as saver,
@@ -164,16 +197,11 @@ def create_app(
         # These are local directory entries. Discovery and searches are SDK tools,
         # invoked only when the model asks. Bind private checkpoints to current grants.
         indexes = frozenset(item["id"] for item in catalog.index_directory())
-        allowed = settings.agents_mcp_read_tools
-        servers = (
-            sorted(
-                (s.id, s.url, sorted(allowed[s.id])) for s in mcp_servers.list() if s.id in allowed
-            )
-            if mcp_servers and allowed
-            else []
-        )
+        workspace, servers, revisions = await asyncio.to_thread(connections.snapshot)
         return _Grants(
-            indexes=indexes, graph=graph, servers=servers, workspace=settings.agents_sandbox_image
+            indexes=indexes, graph=graph, workspace=workspace["image"] or None,
+            servers=sorted((s["id"], s["url"], sorted(s["tools"])) for s in servers),
+            connection_revisions=revisions,
         )
 
     async def index(request: Request) -> Response:
@@ -190,26 +218,67 @@ def create_app(
         manager = await manager_authorized(request)
         if not manager:
             await account(request)
+        profile = await asyncio.to_thread(profiles.load)
         if request.method == "POST":
             _mutation(request)
             if not manager:
                 raise HTTPException(403, "Только администратор может включить GigaCode.")
-            if settings.agents_model_base_url or controller is None:
+            if profile.provider == "api" or controller is None:
                 raise HTTPException(409, "Для этого подключения запуск GigaCode не требуется.")
             controller.enable()
         result: dict[str, Any] = {
-            "manager": manager,
-            "model": settings.agents_model_name
-            or ("API" if settings.agents_model_base_url else "GigaCode"),
+            "manager": manager, "provider": profile.provider,
+            "model": (profile.model_name or "API") if profile.provider == "api" else "GigaCode",
         }
-        if settings.agents_model_base_url:
-            result["state"] = "configured"
+        if profile.provider == "api":
+            result["state"] = "error" if profile.warning else "configured"
         else:
             snapshot = controller.status() if controller else {}
             result["state"] = snapshot.get("state", "disabled")
             if manager:
                 result["authentication_url"] = snapshot.get("authentication_url")
         return JSONResponse(result, headers=_HEADERS)
+
+    async def model_settings(request: Request) -> Response:
+        if not await manager_authorized(request):
+            raise HTTPException(403, "Войдите в портал как администратор.")
+        if request.method == "GET":
+            profile = await asyncio.to_thread(profiles.load)
+            return JSONResponse(profile.public(), headers=_HEADERS)
+        _mutation(request)
+        try:
+            update = ModelSettingsUpdate.model_validate_json(await _body(request, 512 * 1024))
+            if not await manager_authorized(request):
+                raise HTTPException(403, "Права администратора изменились.")
+            operation = profiles.save if request.method == "PUT" else profiles.preview
+            profile = await asyncio.to_thread(operation, update)
+        except ValidationError:
+            raise HTTPException(422, "Проверьте поля подключения и размер файлов.") from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        if request.method == "PUT":
+            return JSONResponse(profile.public(), headers=_HEADERS)
+
+        if profile.provider == "gigacode" and not (controller and controller.status()["available"]):
+            raise HTTPException(409, "Сначала включите GigaCode и завершите вход.")
+        try:
+            # A single completed assistant message verifies this exact draft. No chat
+            # history, tools, traces or provider response bodies enter the probe.
+            with tracing_context(enabled=False):
+                async with connected(profile, probe=True) as model:
+                    reply = await model.ainvoke("Reply with OK.")
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            if type(status) is int:
+                detail = f"Шлюз модели вернул HTTP {status}. Проверьте адрес, модель и доступ."
+            else:
+                detail = "Нет ответа от модели. Проверьте доступность адреса и сертификаты TLS."
+            raise HTTPException(502, detail) from None
+        if (not isinstance(reply, AIMessage) or not reply.text.strip() or reply.tool_calls
+                or reply.additional_kwargs.get("refusal")
+                or reply.response_metadata.get("finish_reason") in {"content_filter", "length"}):
+            raise HTTPException(502, "Модель не вернула завершённый ответ на проверочный запрос.")
+        return JSONResponse({"ok": True}, headers=_HEADERS)
 
     async def history(request: Request) -> Response:
         owner = await account(request)
@@ -265,16 +334,14 @@ def create_app(
     async def chat(request: Request) -> Response:
         _mutation(request)
         owner = await account(request)
-        data = bytearray()
-        async for chunk in request.stream():
-            data.extend(chunk)
-            if len(data) > 100000:
-                raise HTTPException(413, "Сообщение слишком длинное.")
         try:
-            turn = Turn.model_validate_json(data)
+            turn = Turn.model_validate_json(await _body(request, 100000))
         except ValidationError:
             raise HTTPException(422, "Укажите чат и вопрос длиной от 1 до 16 000 знаков.") from None
-        if not settings.agents_model_base_url and (
+        profile = await asyncio.to_thread(profiles.load)
+        if profile.provider == "api" and profile.warning:
+            raise HTTPException(503, "Администратору нужно проверить настройки корпоративного API.")
+        if profile.provider == "gigacode" and (
             controller is None or not controller.status()["available"]
         ):
             raise HTTPException(503, "GigaCode ожидает включения или входа администратора.")
@@ -316,20 +383,18 @@ def create_app(
                         index_ids=grants.indexes,
                         mcp_servers=mcp_servers,
                         mcp_read_tools={server: names for server, _, names in grants.servers},
+                        mcp_credential=connections.token,
                     )
                     if workspace:
                         tools.append(workspace.tool())
-                    secret = settings.agents_model_api_key
-                    async with create_model(
-                        settings,
-                        controller=controller,
-                        base_url=settings.agents_model_base_url,
-                        model_name=settings.agents_model_name,
-                        ca_file=settings.agents_model_ca_file,
-                        cert_file=settings.agents_model_cert_file,
-                        key_file=settings.agents_model_key_file,
-                        api_key=secret.get_secret_value() if secret else None,
-                    ) as model:
+                        sources = await asyncio.to_thread(connections.sources)
+                        tools.extend(build_artifact_tools(
+                            {key: source for key, source in sources.items()
+                             if grants.connection_revisions.get("source:" + key)
+                             == source["revision"]},
+                            workspace, authorized,
+                        ))
+                    async with connected(profile) as model:
                         answer = await run_turn(
                             model,
                             turn.question,
@@ -411,7 +476,10 @@ def create_app(
         lifespan=lifespan,
         routes=[
             Route("/", index),
+            *connection_routes(connections, manager_authorized, _mutation, _body),
             Route("/api/model", model_status, methods=["GET", "POST"]),
+            Route("/api/model/settings", model_settings, methods=["GET", "PUT"]),
+            Route("/api/model/test", model_settings, methods=["POST"]),
             Route("/api/chat", chat, methods=["POST"]),
             Route("/api/chats/{chat:uuid}", history, methods=["GET", "DELETE"]),
             Mount("/assets", app=StaticFiles(directory=_ASSETS)),
