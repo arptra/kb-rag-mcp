@@ -121,7 +121,8 @@ async def test_admin_workspace_and_sources_remain_scoped_and_persist_across_rest
 
         def choose(messages, names):
             if isinstance(messages[-1], HumanMessage):
-                exposed = {"fetch_git_snapshot", "fetch_maven_artifact", "run_in_workspace"}
+                exposed = {"fetch_git_snapshot", "fetch_maven_artifact", "run_in_workspace",
+                           "run_gradle"}
                 assert exposed <= set(names)
                 return call("list_artifact_sources")
             assert isinstance(messages[-1], ToolMessage)

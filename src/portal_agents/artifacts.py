@@ -234,16 +234,18 @@ def build_artifact_tools(
         source_id: str, group: str, artifact: str, version: str, extension: str = "jar",
         classifier: str = "",
     ) -> str:
-        """Download one Maven artifact by exact coordinates for use by Gradle or offline tools.
+        """Fetch a dependency file by Gradle/Maven coordinates into the turn's local repository.
 
-        Returns its file path in this turn's offline workspace.
+        The Gradle build can resolve staged files. For transitive dependencies fetch their
+        metadata (extension "pom" or "module") and binaries as required. Returns the file path.
         """
         await check()
         try:
             name, data = await _maven(lookup(source_id, "maven"), group, artifact, version,
                                       extension, classifier)
             await check()
-            return await workspace.put_file(name, data)
+            directories = (*group.split("."), artifact, version)
+            return await workspace.put_dependency(source_id, directories, name, data)
         except PermissionError:
             raise
         except (ValueError, OSError, httpx.HTTPError, TimeoutError):

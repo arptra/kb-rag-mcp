@@ -386,7 +386,7 @@ def create_app(
                         mcp_credential=connections.token,
                     )
                     if workspace:
-                        tools.append(workspace.tool())
+                        tools.extend((workspace.tool(), workspace.gradle_tool()))
                         sources = await asyncio.to_thread(connections.sources)
                         tools.extend(build_artifact_tools(
                             {key: source for key, source in sources.items()

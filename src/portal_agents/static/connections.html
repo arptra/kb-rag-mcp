@@ -23,11 +23,11 @@
     <div id="panels" hidden>
       <section class="card" aria-labelledby="workspace-title">
         <h2 id="workspace-title">Среда выполнения</h2>
-        <p>Агент запускает код в отдельном контейнере. Файлы в нём доступны до завершения текущего запроса.</p>
+        <p>Для сборки Gradle выберите образ с JDK проекта и подготовленным кешем зависимостей. Агент запускает задачи в отдельном контейнере на один запрос.</p>
         <form id="workspace-form">
           <div class="workspace-fields">
-            <label>Название песочницы<input id="workspace-name" maxlength="100" placeholder="Например, Java"></label>
-            <label>Образ Docker<input id="workspace-image" maxlength="255" placeholder="Например, eclipse-temurin:21-jdk" spellcheck="false"></label>
+            <label>Название песочницы<input id="workspace-name" maxlength="100" placeholder="Например, Gradle · JDK 21"></label>
+            <label>Образ Docker<input id="workspace-image" maxlength="255" placeholder="Например, company-gradle:jdk21" spellcheck="false"></label>
           </div>
           <label id="images-field" hidden>Образы на этом Docker-хосте<select id="image-options"></select></label>
           <div class="actions">
@@ -45,7 +45,7 @@
       </section>
       <section class="card" aria-labelledby="sources-title">
         <div class="section-heading"><h2 id="sources-title">Репозитории</h2><button id="add-source" type="button">Добавить источник</button></div>
-        <p>Подключите код по SSH или Maven-репозиторий для зависимостей Java и Gradle.</p>
+        <p>Добавьте Git-репозиторий Gradle-проекта. При необходимости отдельно подключите хранилище библиотек.</p>
         <ul class="resources" id="sources"></ul>
       </section>
     </div>
@@ -73,13 +73,14 @@
     <form id="source-form" autocomplete="off">
       <fieldset class="form-fields">
         <label>Идентификатор<input id="source-id" maxlength="63" pattern="[a-z0-9][a-z0-9\-]*" title="Строчные латинские буквы, цифры и дефисы" required placeholder="payments-service" spellcheck="false"></label>
-        <label>Тип источника<select id="source-kind"><option value="git">Git по SSH</option><option value="maven">Maven / Gradle по HTTPS</option></select></label>
+        <label>Тип источника<select id="source-kind"><option value="git">Код Gradle-проекта · Git по SSH</option><option value="maven">Зависимости Gradle · HTTPS</option></select></label>
         <label>Адрес репозитория<input id="source-url" maxlength="2048" required spellcheck="false"></label>
         <fieldset id="git-fields" class="form-fields">
           <label>Закрытый ключ SSH <small id="ssh-state"></small><input id="ssh-key" type="file"></label>
           <label>Проверенные ключи хоста (known_hosts)<textarea id="known-hosts" maxlength="32768" rows="2" spellcheck="false" placeholder="git.company.ru ssh-ed25519 …"></textarea></label>
         </fieldset>
         <fieldset id="maven-fields" class="form-fields" hidden disabled>
+          <p class="detail">Укажите адрес репозитория в формате Maven из настроек Gradle. По этим данным портал может загрузить отдельную библиотеку в контейнер.</p>
           <label>Имя пользователя<input id="source-user" maxlength="200" autocomplete="off"></label>
           <label>Пароль или токен <small id="password-state"></small><input id="source-password" type="password" autocomplete="new-password"></label>
         </fieldset>

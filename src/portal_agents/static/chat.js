@@ -20,7 +20,7 @@
     list_environment_tools: "Доступные инструменты среды", call_environment_tool: "Вызов инструмента среды",
     run_in_workspace: "Запуск кода в контейнере", task: "Запуск подагента",
     list_artifact_sources: "Список подключённых репозиториев", fetch_git_snapshot: "Загрузка файлов из Git",
-    fetch_maven_artifact: "Загрузка артефакта Maven",
+    fetch_maven_artifact: "Загрузка зависимости Gradle", run_gradle: "Запуск задач Gradle",
     write_todos: "Обновление плана", read_file: "Чтение рабочего файла", write_file: "Запись рабочего файла",
     edit_file: "Редактирование рабочего файла", glob: "Поиск файлов", grep: "Поиск в файлах",
     ls: "Список рабочих файлов",

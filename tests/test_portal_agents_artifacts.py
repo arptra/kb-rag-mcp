@@ -4,6 +4,7 @@ import os
 import shlex
 import subprocess
 import tarfile
+import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -20,6 +21,7 @@ from portal_agents.artifacts import build_artifact_tools
 def make_tools(sources, grant=None):
     room = AsyncMock()
     room.put_file.return_value = "/tmp/test-path/file"
+    room.put_dependency.return_value = "/tmp/staged/file"
     tools = build_artifact_tools(sources, room, grant or AsyncMock(return_value=True))
     return {tool.name: tool for tool in tools}, room
 
@@ -111,11 +113,14 @@ async def test_maven_stream_is_scoped_to_coordinates_with_no_redirect(monkeypatc
     assert request.headers["Authorization"] == (
         "Basic " + base64.b64encode(b"test-user:test-password").decode())
     if status == 200:
-        assert answer == room.put_file.return_value
-        room.put_file.assert_awaited_once_with("widget-1.0.2-sources.jar", b"jar-data")
+        assert answer == room.put_dependency.return_value
+        room.put_dependency.assert_awaited_once_with(
+            "internal", ("com", "example", "widget", "1.0.2"), "widget-1.0.2-sources.jar",
+            b"jar-data",
+        )
     else:
         assert answer == "Maven returned HTTP 302."
-        room.put_file.assert_not_awaited()
+        room.put_dependency.assert_not_awaited()
 
 
 async def test_revocation_before_artifact_delivery(monkeypatch):
@@ -126,7 +131,7 @@ async def test_revocation_before_artifact_delivery(monkeypatch):
     with pytest.raises(PermissionError):
         await tools["fetch_maven_artifact"].ainvoke({
             "source_id": "pkg", "group": "g", "artifact": "a", "version": "v"})
-    room.put_file.assert_not_awaited()
+    room.put_dependency.assert_not_awaited()
 
 
 async def test_transfer_into_workspace_never_mounts_credentials_or_host_paths(monkeypatch):
@@ -144,6 +149,57 @@ async def test_transfer_into_workspace_never_mounts_credentials_or_host_paths(mo
     assert not any(arg.startswith("--mount") for arg in create.args)
     assert copy.args[-2:] == (saved.rsplit("/", 1)[0], "source.tar")
     assert copy.kwargs["script"] == b"archive"
+
+
+async def test_gradle_resolves_staged_files_using_its_native_offline_resolver():
+    image = os.environ.get("PORTAL_AGENTS_TEST_GRADLE_IMAGE")
+    if not image:
+        pytest.skip("Set PORTAL_AGENTS_TEST_GRADLE_IMAGE to a cached image containing Gradle")
+    room = workspace.OfflineWorkspace(image, AsyncMock(return_value=True))
+    invoke = room.tool().ainvoke
+    try:
+        jar = io.BytesIO()
+        with zipfile.ZipFile(jar, "w") as archive:
+            archive.writestr("example.txt", "binary")
+        for name in ("client", "helper"):
+            dependency = ("<dependencies><dependency><groupId>org.example</groupId>"
+                          "<artifactId>helper</artifactId><version>1</version></dependency>"
+                          "</dependencies>") if name == "client" else ""
+            pom = (f"<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId>"
+                   f"<artifactId>{name}</artifactId><version>1</version>{dependency}</project>")
+            parts = ("org", "example", name, "1")
+            await room.put_dependency("corp", parts, f"{name}-1.pom", pom.encode())
+            path = await room.put_dependency("corp", parts, f"{name}-1.jar", jar.getvalue())
+            assert path.endswith(f"/corp/org/example/{name}/1/{name}-1.jar")
+        setup = """mkdir -p /tmp/project && cd /tmp/project
+cat > settings.gradle <<'SETTINGS'
+dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS) }
+rootProject.name = 'staging-test'
+SETTINGS
+cat > build.gradle <<'BUILD'
+configurations { libraries }
+dependencies { libraries 'org.example:client:1' }
+tasks.register('verifyFiles') {
+    doLast {
+        def names = configurations.libraries.files.collect { it.name }.sort()
+        assert names == ['client-1.jar', 'helper-1.jar']
+        println 'Verified staged direct and transitive dependencies'
+    }
+}
+BUILD"""
+        assert await invoke({"script": setup}) == "exit_code=0\n"
+        result = await room.gradle_tool().ainvoke({"project_dir": "/tmp/project",
+                                                 "tasks": ["verifyFiles"]})
+        assert result.startswith("exit_code=0\n"), result
+        assert "Verified staged direct and transitive dependencies" in result
+        # A project process cannot trick later staging into overwriting another directory.
+        assert await invoke({"script": "ln -s /tmp /tmp/portal-gradle-repositories/bad"}) == (
+            "exit_code=0\n"
+        )
+        with pytest.raises(ValueError, match="Ошибка записи"):
+            await room.put_dependency("bad", ("org",), "trap.jar", b"x")
+    finally:
+        await room.close()
 
 def test_verify_hashed_nonstandard_port_host_and_authority_pins(tmp_path):
     key = Ed25519PrivateKey.generate()

@@ -42,7 +42,11 @@ _SYSTEM = (
     "when they help with a complex task. An administrator configures Docker, MCP and service "
     "credentials in Агенты → Подключения (/agents/connections). If asked to add access, guide "
     "the user there. Never request private keys, passwords or tokens in a chat. For actual work, "
-    "discover the services or artifact source IDs available through your tools."
+    "discover the services or artifact source IDs available through your tools. "
+    "The organization's projects build with Gradle. For a requested build or test, locate the "
+    "Gradle project root in the workspace and use run_gradle when available. For a multi-project "
+    "build use the requested task path, such as :service:test. Ground your report in the actual "
+    "task outcome, including skipped tasks or unavailable dependencies."
 )
 _READ_TOOLS = {"list_indexes", "search_index", "search_knowledge", "read_document",
                "search_service_graph"}

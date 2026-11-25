@@ -78,7 +78,7 @@
     resourceList("servers", info.servers, "Серверы MCP ещё не добавлены.",
       item => [item.name, item.url + " · Опубликовано инструментов: " + item.tools.length], openServer);
     resourceList("sources", info.sources, "Репозитории ещё не подключены.",
-      item => [item.id, (item.kind === "git" ? "SSH" : "Maven") + " · " + item.url], openSource);
+      item => [item.id, (item.kind === "git" ? "Gradle-проект" : "Зависимости Gradle") + " · " + item.url], openSource);
     $("panels").hidden = false;
     status("page-status", "");
   }
@@ -205,7 +205,7 @@
     const git = $("source-kind").value === "git";
     $("git-fields").hidden = $("git-fields").disabled = !git;
     $("maven-fields").hidden = $("maven-fields").disabled = git;
-    $("source-url").placeholder = git ? "ssh://git@git.company.ru/payments/api.git" : "https://maven.company.ru/releases";
+    $("source-url").placeholder = git ? "ssh://git@git.company.ru/payments/api.git" : "https://packages.company.ru/repository/releases/";
     $("ssh-state").textContent = source?.kind === "git" && source.has_secret ? "Сохранён" : "";
     $("password-state").textContent = source?.kind === "maven" && source.has_secret ? "Сохранён" : "";
   }
