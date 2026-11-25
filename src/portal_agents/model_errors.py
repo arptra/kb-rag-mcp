@@ -14,10 +14,12 @@ import httpx
 from langchain_core.exceptions import ModelAPIError, ModelConnectionError, ModelTimeoutError
 from langchain_core.messages import BaseMessage
 
+from corporate_kb.agents.activation import GigaCodeDecisionError, GigaCodeRecoveryPending
 from corporate_kb.confluence.diagnostics import network_error
 from corporate_kb.gigacode_runner import (
     GigaCodeAccessError,
     GigaCodePolicyStop,
+    GigaCodeRequestFailed,
     GigaCodeTimedOut,
     GigaCodeTransientError,
 )
@@ -212,6 +214,16 @@ def gateway_exception(exc: BaseException) -> ModelGatewayError | None:
     """Only call at the model boundary; tool HTTP errors have different causes."""
     if isinstance(exc, ModelGatewayError):
         return exc
+    if isinstance(exc, GigaCodeRecoveryPending):
+        return ModelGatewayError(category="restart-pending", retryable=False,
+                                 message="GigaCode ещё восстанавливается. "
+                                         "Портал продолжает проверять готовность")
+    if isinstance(exc, GigaCodeDecisionError):
+        return ModelGatewayError(category="incomplete-reply", retryable=False,
+                                 message="GigaCode не вернул завершённый ответ")
+    if isinstance(exc, GigaCodeRequestFailed):
+        return ModelGatewayError(category="runner-request", retryable=False,
+                                 message="GigaCode завершил этот запрос с ошибкой")
     if isinstance(exc, GigaCodeAccessError):
         return ModelGatewayError(exc.status, message="GigaCode отклонил доступ к модели",
                                  retryable=False, category="access")
@@ -262,6 +274,7 @@ def gateway_exception(exc: BaseException) -> ModelGatewayError | None:
             "overload": "GigaCode сообщил о перегрузке",
             "timeout": "Истекло время обработки запроса GigaCode",
             "server-error": "GigaCode сообщил об ошибке при обработке запроса",
+            "process-crash": "Процесс GigaCode аварийно завершился",
         }
         reason = {408: "timeout", 429: "rate-limit"}.get(exc.status, exc.reason)
         category = reason if reason in hints else "provider"

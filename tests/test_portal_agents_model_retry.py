@@ -1,4 +1,5 @@
 import asyncio
+import json
 import ssl
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -9,6 +10,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from test_portal_agents_engine import Model, call
 
+from corporate_kb.agents.activation import GigaCodeDecisionError
 from corporate_kb.gigacode_runner import GigaCodePolicyStop, GigaCodeTransientError
 from portal_agents import engine
 from portal_agents.model_errors import ModelGatewayError, gateway_exception
@@ -281,6 +283,36 @@ async def test_incomplete_native_step_is_corrected_without_repeating_a_read(firs
     answer = await engine.run_turn(Model(respond=respond), "Which version is live?",
                                    [read_document])
     assert answer == "Version 8 is deployed." and len(invocations) == 3 and reads == [True]
+
+
+@pytest.mark.parametrize("reason", ["format", "length"])
+async def test_compact_gigacode_read_continues_after_an_incomplete_decision(reason):
+    frames = []
+    reads = []
+    outcomes = set()
+
+    @tool
+    async def list_indexes() -> list[str]:
+        """List available indexes."""
+        reads.append(True)
+        return ["release-notes"]
+
+    def respond(messages, names):
+        assert not names
+        frame = json.loads(messages[-1].text)
+        frames.append(frame)
+        if not frame["observations"]:
+            return AIMessage(content='{"tool":"list_indexes","args":{}}')
+        if "correction" not in frame:
+            raise GigaCodeDecisionError("Unusable CLI response", reason=reason)
+        assert frame["observations"] == frames[-2]["observations"]
+        assert "release-notes" in frame["observations"][0]["result"]
+        return AIMessage(content='{"answer":"release-notes"}')
+
+    answer = await engine.run_turn(Model(respond=respond), "Which indexes can I use?",
+                                   [list_indexes], prefer_chat_reads=True, experience=outcomes)
+    assert answer == "release-notes" and reads == [True] and len(frames) == 3
+    assert "read_" + reason in outcomes
 
 
 @pytest.mark.parametrize("param,forbidden,expected", [

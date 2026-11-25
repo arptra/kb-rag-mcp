@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Protocol, TextIO
 from urllib.parse import urlsplit
 
+from pydantic_core import from_json
+
 from corporate_kb.config import Settings
 
 _SSOT_RESULT_SCHEMA: dict[str, Any] = {
@@ -61,10 +63,21 @@ _AUTH_HINT_PATTERN: re.Pattern[str] = re.compile(
     r"sign[ -]?in|verify|verification|open)\b",
     re.IGNORECASE,
 )
+_SETUP_DIAGNOSTIC = re.compile(
+    r"^(?:RuntimeError:\s*)?(?:usage:|unknown (?:argument|option)|unrecognized arguments:"
+    r"|invalid (?:configuration|config file)|failed to load config|no auth type is selected"
+    r"|browser authentication failed|authentication (?:required|failed)|not logged in)(?=\s|:|$)",
+    re.IGNORECASE,
+)
 _RESULT_DRAIN_SECONDS = 1.0
 _SUPERVISOR_GRACE_SECONDS = 10.0
 _STREAM_LINE_LIMIT = 2_000_000
 _OUTPUT_LIMIT = 8_000_000
+
+
+def _hard_process_exit(returncode: int) -> bool:
+    # Signals, conventional fatal shell exits, and EX_SOFTWARE.
+    return returncode < 0 or returncode in {70, 134, 137, 139, 143}
 
 
 def browser_authentication_url(value: str) -> str | None:
@@ -116,6 +129,19 @@ class GigaCodeTransientError(RuntimeError):
         super().__init__("GigaCode reported a temporary request failure")
 
 
+class GigaCodeProcessCrashed(GigaCodeTransientError):
+    """The model decision process died before it delivered a usable result."""
+
+    def __init__(self, returncode: int | None = None) -> None:
+        super().__init__(reason="process-crash")
+        self.returncode = returncode
+
+    def __str__(self) -> str:
+        if self.returncode is not None:
+            return f"GigaCode decision process exited with code {self.returncode}"
+        return "GigaCode decision process stopped before completing its response"
+
+
 class GigaCodeAccessError(PermissionError):
     """The native provider rejected authentication or permission to run this request."""
 
@@ -124,8 +150,26 @@ class GigaCodeAccessError(PermissionError):
         super().__init__("GigaCode rejected access to the model")
 
 
+class GigaCodeRequestFailed(RuntimeError):
+    """The CLI completed with an explicit error for a single model decision."""
+
+    def __init__(self) -> None:
+        super().__init__("GigaCode returned an error for the current decision")
+
+
 class GigaCodeInvalidOutput(RuntimeError):
     """The CLI ran but returned an incomplete or unusable model response."""
+
+    def __init__(self, message: str, *, reason: str = "invalid-output") -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
+class GigaCodeIncompleteOutput(GigaCodeInvalidOutput):
+    """The native stream explicitly reported an output or turn limit."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, reason="length")
 
 
 class GigaCodePolicyStop(RuntimeError):
@@ -402,8 +446,13 @@ class GigaCodeRunner:
         """Run the shared supervised process and return its structured payload."""
         if decision_only and allow_edits:
             raise ValueError("A decision request cannot enable workspace edits")
+        is_decision = decision_only or model_profile is not None
         status = self.status(refresh=True)
         if not status["available"]:
+            if is_decision and type(code := status.get("crash_returncode")) is int:
+                raise GigaCodeProcessCrashed(code)
+            if is_decision and status.get("probe_timed_out") is True:
+                raise GigaCodeTimedOut("GigaCode --version timed out")
             raise RuntimeError(str(status["error"]))
         if model_profile is not None:
             if allow_edits:
@@ -534,8 +583,12 @@ class GigaCodeRunner:
         open_streams = {"stdout", "stderr", "stdin"}
         result_event: dict[str, Any] | None = None
         incomplete_decision = False
+        native_failure_reported = False
         provider_error: GigaCodeTransientError | GigaCodeAccessError | None = None
         result_deadline: float | None = None
+        eof_deadline: float | None = None
+        stopped_after_eof = False
+        truncated_stdout = False
         cleanup_deadline: float | None = None
         process_cleaned = False
         stopped_after_result = False
@@ -561,6 +614,15 @@ class GigaCodeRunner:
                 now = time.monotonic()
                 if cleanup_deadline is not None and now >= cleanup_deadline:
                     break
+                if (is_decision and result_event is None and not waiting_for_authentication and
+                        ("stdout" not in open_streams or process.poll() not in (None, 0))):
+                    # A dead parent can leave inherited pipes open, or a broken CLI can close
+                    # stdout and stay alive. Drain late auth/error events before reaping the group.
+                    if eof_deadline is None:
+                        eof_deadline = now + _RESULT_DRAIN_SECONDS
+                    elif now >= eof_deadline:
+                        stopped_after_eof = process.poll() is None
+                        break
                 if result_deadline is not None and now >= result_deadline:
                     # A final response does not require a well-behaved CLI shutdown.
                     # Keep a short drain window for a later error/native-tool event.
@@ -580,13 +642,19 @@ class GigaCodeRunner:
                 except queue.Empty:
                     continue
                 if source == "overflow":
-                    raise GigaCodeInvalidOutput("GigaCode output exceeded the safe size limit")
+                    raise GigaCodeInvalidOutput(
+                        "GigaCode output exceeded the safe size limit", reason="output-limit"
+                    )
                 if line is None:
                     open_streams.discard(source)
                     continue
                 output_chars += len(line)
                 if output_chars > _OUTPUT_LIMIT:
-                    raise GigaCodeInvalidOutput("GigaCode output exceeded the safe size limit")
+                    raise GigaCodeInvalidOutput(
+                        "GigaCode output exceeded the safe size limit", reason="output-limit"
+                    )
+                unterminated_stdout = is_decision and source == "stdout" and not line.endswith("\n")
+                line = line.rstrip("\r\n")
                 auth_url = self._authentication_url(line)
                 authentication_started = False
                 if auth_url is not None and auth_url not in reported_auth_urls:
@@ -606,16 +674,27 @@ class GigaCodeRunner:
                     if authentication_url is not None:
                         authentication_url(auth_url)
                 event = self._parse_event(line)
+                fragment = event is None and unterminated_stdout
+                if fragment:
+                    # A dying CLI can write part of its last JSONL record. Inspect complete
+                    # metadata (including tool and policy events), never accept a partial answer.
+                    with suppress(ValueError):
+                        partial = from_json(line, allow_partial=True)
+                        if isinstance(partial, dict):
+                            event = partial
                 if event is not None and (source == "stdout" or event.get("type") == "error"):
                     for metadata in self._native_stop_metadata(event):
                         if self._policy_stopped(metadata):
                             raise GigaCodePolicyStop()
-                        if metadata.get("error") and not isinstance(provider_error,
-                                                                    GigaCodeAccessError):
-                            reported = self._provider_error(metadata)
-                            if reported is not None or metadata["error"] is not True:
+                        if (metadata.get("type") == "error" or metadata.get("error")
+                                or metadata.get("is_error")):
+                            native_failure_reported = True
+                        if ((metadata.get("error") or metadata.get("type") == "error")
+                                and not isinstance(provider_error, GigaCodeAccessError)):
+                            reported = self._provider_error(metadata, is_decision=is_decision)
+                            if reported is not None or metadata.get("error") is not True:
                                 provider_error = reported
-                        if decision_only or model_profile is not None:
+                        if is_decision:
                             # A successful CLI wrapper can omit the model's actual stop reason.
                             incomplete_decision |= self._incomplete_result(metadata)
                 if source == "stderr":
@@ -641,6 +720,10 @@ class GigaCodeRunner:
                         "GigaCode emitted a native tool event during a JSON decision; "
                         "invocation aborted. The tool may already have executed."
                     )
+                if fragment:
+                    if event.get("type") in ("result", "assistant", "stream_event"):
+                        truncated_stdout = True
+                    continue
                 if event.get("type") == "result":
                     # A later success must never erase an already reported terminal error.
                     if result_event is None or not (
@@ -692,17 +775,48 @@ class GigaCodeRunner:
         shutdown_codes = {-2, -9, -15, 130, 137, 143}
         expected_shutdown = stopped_after_result and return_code in shutdown_codes
         failed_exit = return_code != 0 and not expected_shutdown
+        if cancel is not None and cancel.is_set():
+            raise GigaCodeCancelled("GigaCode analysis was cancelled")
         # A native runner can recover internally. Honor its later successful result.
         # An explicit policy stop always takes priority in the event loop above.
         if provider_error and (failed_exit or result_event is None or result_event.get("is_error")
                                or result_event.get("error")):
+            if isinstance(provider_error, GigaCodeProcessCrashed):
+                if waiting_for_authentication:
+                    raise GigaCodeAccessError()
+                if failed_exit and not stopped_after_eof:
+                    provider_error.returncode = return_code
             raise provider_error
         if incomplete_decision or (
             result_event is not None and self._incomplete_result(result_event)
         ):
-            error: RuntimeError = GigaCodeInvalidOutput(
+            error: RuntimeError = GigaCodeIncompleteOutput(
                 "GigaCode stopped before completing the response"
             )
+            self._write_debug_failure(debug_directory, error)
+            raise error
+        if (is_decision and (failed_exit or result_event is None)
+                and not waiting_for_authentication and not native_failure_reported
+                and self._decision_process_lost(return_code, stopped_after_eof, result_event,
+                                                stderr_tail, stdout_tail, truncated_stdout)):
+            crash = GigaCodeProcessCrashed(None if stopped_after_eof else return_code)
+            self._write_debug_failure(debug_directory, crash)
+            raise crash
+        if (is_decision and result_event and result_event.get("is_error") and return_code in {0, 1}
+                and not waiting_for_authentication):
+            fields = result_event.get("error")
+            labels = [result_event.get("subtype")]
+            if isinstance(fields, dict):
+                labels.extend((fields.get("code"), fields.get("type")))
+            setup_failure = any(
+                label in ("configuration_error", "invalid_configuration",
+                          "invalid_cli_arguments", "unknown_option") for label in labels
+            )
+            if setup_failure or any(_SETUP_DIAGNOSTIC.match(line.strip()) for line in
+                                    [self._result_error(result_event), *stderr_tail]):
+                error = RuntimeError("GigaCode requires launcher configuration or authentication")
+            else:
+                error = GigaCodeRequestFailed()
             self._write_debug_failure(debug_directory, error)
             raise error
         if failed_exit:
@@ -715,7 +829,9 @@ class GigaCodeRunner:
             self._write_debug_failure(debug_directory, error)
             raise error
         if result_event is None:
-            error = GigaCodeInvalidOutput("GigaCode completed without a result event")
+            error = GigaCodeInvalidOutput(
+                "GigaCode completed without a result event", reason="missing-result"
+            )
             self._write_debug_failure(debug_directory, error)
             raise error
         if bool(result_event.get("is_error")):
@@ -739,7 +855,7 @@ class GigaCodeRunner:
                 progress(f"GigaCode output contract failed: {diagnostic}")
             error = GigaCodeInvalidOutput(
                 "GigaCode result did not contain usable output for the requested contract; "
-                + diagnostic
+                + diagnostic, reason="invalid-contract",
             )
             self._write_debug_failure(debug_directory, error)
             raise error
@@ -815,7 +931,10 @@ class GigaCodeRunner:
                 timeout=5,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except subprocess.TimeoutExpired:
+            return {**base, "executable": executable, "error": "GigaCode --version timed out",
+                    "probe_timed_out": True}
+        except OSError as exc:
             return {**base, "executable": executable, "error": str(exc)}
         version = (checked.stdout or checked.stderr).strip().splitlines()
         if checked.returncode != 0:
@@ -823,6 +942,8 @@ class GigaCodeRunner:
                 **base,
                 "executable": executable,
                 "error": f"GigaCode --version exited with code {checked.returncode}",
+                **({"crash_returncode": checked.returncode}
+                   if _hard_process_exit(checked.returncode) else {}),
             }
         return {
             **base,
@@ -1140,7 +1261,7 @@ class GigaCodeRunner:
                 if len(line) > _STREAM_LINE_LIMIT:
                     cls._publish(events, ("overflow", None), stop)
                     break
-                cls._publish(events, (source, line.rstrip("\r\n")), stop)
+                cls._publish(events, (source, line), stop)
         finally:
             stream.close()
             cls._publish(events, (source, None), stop)
@@ -1175,12 +1296,35 @@ class GigaCodeRunner:
         return (metadata,) if isinstance(metadata, dict) else ()
 
     @staticmethod
+    def _decision_process_lost(
+        returncode: int, stopped_after_eof: bool, result: dict[str, Any] | None,
+        stderr: list[str], stdout: list[str], truncated_stdout: bool,
+    ) -> bool:
+        if any(_SETUP_DIAGNOSTIC.match(line.strip()) for line in stderr + stdout):
+            return False
+        if stopped_after_eof or _hard_process_exit(returncode):
+            return True
+        if returncode not in (0, 1) or result is not None:
+            return False
+        if truncated_stdout:
+            stdout = stdout[:-1]
+        diagnostic = [line.strip() for line in stderr + stdout if line.strip() and
+                      (GigaCodeRunner._parse_event(line) or {}).get("type")
+                      not in ("assistant", "system", "stream_event", "user")]
+        if not diagnostic:
+            return True  # EOF without a result or a failure diagnostic.
+        return returncode != 0 and any(line.startswith("RuntimeError:") for line in stderr)
+
+    @staticmethod
     def _provider_error(
-        metadata: dict[str, Any],
+        metadata: dict[str, Any], *, is_decision: bool = False,
     ) -> GigaCodeTransientError | GigaCodeAccessError | None:
-        error = metadata["error"]
-        fields = error if isinstance(error, dict) else {"code": error}
-        labels = {v.strip().casefold() for v in (fields.get("code"), fields.get("type"))
+        error = metadata.get("error")
+        fields = error if isinstance(error, dict) else (
+            metadata if error is None else {"code": error}
+        )
+        labels = {v.strip().casefold() for v in (fields.get("code"), fields.get("type"),
+                                                 fields.get("name"))
                   if isinstance(v, str)}
         # Native envelopes can carry status beside the error or in its code.
         # Only retain explicit numeric values and known reason labels.
@@ -1208,6 +1352,10 @@ class GigaCodeRunner:
             reason = "server-error"
         if status or reason:
             return GigaCodeTransientError(status=status, reason=reason)
+        crashes = {"runtime_error", "runtimeerror", "uncaught_exception"}
+        if (is_decision and labels & crashes and labels <= crashes | {"error"} and
+                not _SETUP_DIAGNOSTIC.match(str(fields.get("message", "")).strip())):
+            return GigaCodeProcessCrashed()
         return None
 
     @staticmethod

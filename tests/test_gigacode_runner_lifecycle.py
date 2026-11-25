@@ -15,8 +15,11 @@ import corporate_kb.gigacode_runner as module
 from corporate_kb.gigacode_runner import (
     GigaCodeAccessError,
     GigaCodeCancelled,
+    GigaCodeIncompleteOutput,
     GigaCodeInvalidOutput,
     GigaCodePolicyStop,
+    GigaCodeProcessCrashed,
+    GigaCodeRequestFailed,
     GigaCodeRunner,
     GigaCodeTimedOut,
     GigaCodeTransientError,
@@ -147,7 +150,7 @@ def test_completed_parent_does_not_leave_a_child_holding_pipes(
     "suffix,pattern",
     [
         ("time.sleep(0.03)\nraise SystemExit(7)\n", "exited with code 7"),
-        (terminal(is_error=True, error="late terminal failure"), "late terminal failure"),
+        (terminal(is_error=True, error="late terminal failure"), "error for the current decision"),
         (
             "print(json.dumps({'type':'tool_use','name':'read_file'}),flush=True)\n",
             "native tool event",
@@ -165,21 +168,165 @@ def test_terminal_answer_does_not_hide_later_failure_or_native_tool(
 
 
 @pytest.mark.parametrize(
-    "body",
+    "body,reason",
     [
-        "sys.stdin.read()\n",
-        "sys.stdin.read()\n" + terminal(result="not JSON"),
-        "sys.stdin.read()\n"
+        ("sys.stdin.read()\n" + terminal(result="not JSON"), "invalid-contract"),
+        ("sys.stdin.read()\n"
         + terminal(subtype="error_max_turns", is_error=True)
-        + "raise SystemExit(1)\n",
-        "sys.stdin.read()\n" + terminal(stop_reason="max_tokens"),
+        + "raise SystemExit(1)\n", "length"),
+        ("sys.stdin.read()\n" + terminal(stop_reason="max_tokens"), "length"),
+        ("sys.stdin.read()\nprint('unrecognised output')\n", "missing-result"),
     ],
 )
 def test_missing_unusable_and_truncated_results_have_a_recoverable_type(
-    settings_factory, tmp_path, body
+    settings_factory, tmp_path, body, reason,
 ):
-    with pytest.raises(GigaCodeInvalidOutput):
+    with pytest.raises(GigaCodeInvalidOutput) as caught:
         execute(settings_factory, tmp_path, body)
+    assert caught.value.reason == reason
+    assert isinstance(caught.value, GigaCodeIncompleteOutput) is (reason == "length")
+
+
+@pytest.mark.parametrize("body,code", [
+    ("sys.stdin.read()\n", 0),
+    ("sys.stdin.read()\nraise SystemExit(1)\n", 1),
+    ("sys.stdin.read()\nprint('RuntimeError: PRIVATE DETAILS', file=sys.stderr)\n"
+     "raise SystemExit(1)\n", 1),
+    ('print(json.dumps({"type":"error","error":{"name":"RuntimeError","message":"PRIVATE"}}))\n'
+     'raise SystemExit(1)\n', 1),
+    ('print(json.dumps({"type":"result","is_error":True,"error":{"code":"runtime_error"}}))\n',
+     None),
+])
+def test_decision_process_exit_and_explicit_runtime_failure_are_typed(
+    settings_factory, tmp_path, body, code,
+):
+    with pytest.raises(GigaCodeProcessCrashed) as caught:
+        execute(settings_factory, tmp_path, body)
+    assert caught.value.reason == "process-crash" and caught.value.returncode == code
+    assert "PRIVATE" not in str(caught.value)
+
+
+def test_closed_stdout_is_reaped_without_waiting_for_full_request_timeout(
+    settings_factory, tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(module, "_RESULT_DRAIN_SECONDS", 0.15)
+    started = time.monotonic()
+    with pytest.raises(GigaCodeProcessCrashed) as caught:
+        execute(settings_factory, tmp_path, "sys.stdin.read()\nos.close(1)\ntime.sleep(20)\n")
+    assert time.monotonic() - started < 3 and caught.value.returncode is None
+
+
+@pytest.mark.parametrize("raw", [
+    '{"type":"result","result":"partial answer',
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"partial',
+])
+def test_final_partial_jsonl_record_is_process_loss(settings_factory, tmp_path, raw):
+    with pytest.raises(GigaCodeProcessCrashed):
+        execute(settings_factory, tmp_path, f"sys.stdin.read()\nsys.stdout.write({raw!r})\n")
+
+
+def test_malformed_complete_record_is_not_a_truncated_pipe(settings_factory, tmp_path):
+    body = """sys.stdin.read()
+print('{"type":"result","result":"partial')
+"""
+    with pytest.raises(GigaCodeInvalidOutput) as caught:
+        execute(settings_factory, tmp_path, body)
+    assert caught.value.reason == "missing-result"
+
+
+def test_valid_final_result_needs_no_trailing_newline(settings_factory, tmp_path):
+    raw = json.dumps({"type": "result", "result": {"content": "answer", "tool_calls": []}})
+    body = f"sys.stdin.read()\nsys.stdout.write({raw!r})\n"
+    assert execute(settings_factory, tmp_path, body).payload["content"] == "answer"
+
+
+@pytest.mark.parametrize("raw,error", [
+    ('{"type":"stream_event","event":{"type":"content_block_start",'
+     '"content_block":{"type":"tool_use","name":"unsafe', RuntimeError),
+    ('{"type":"result","stop_reason":"blacklist","result":"private', GigaCodePolicyStop),
+])
+def test_partial_events_still_enforce_native_boundaries(settings_factory, tmp_path, raw, error):
+    body = f"sys.stdin.read()\nsys.stdout.write({raw!r})\n"
+    with pytest.raises(error) as failure:
+        execute(settings_factory, tmp_path, body)
+    assert type(failure.value) is error
+
+
+@pytest.mark.parametrize("exit_code,crash", [(70, True), (2, False)])
+def test_failed_version_probe_distinguishes_runtime_and_unsupported_command(
+    settings_factory, tmp_path, exit_code, crash,
+):
+    command = tmp_path / "probe"
+    command.write_text(f"#!{sys.executable}\nraise SystemExit({exit_code})\n")
+    command.chmod(0o755)
+    runner = GigaCodeRunner(settings_factory(gigacode_command=str(command)))
+    status = runner.status()
+    assert not status["available"]
+    assert status.get("crash_returncode") == (exit_code if crash else None)
+    with pytest.raises(RuntimeError) as caught:
+        runner.run_json(checkout=tmp_path, schema={}, prompt="test", decision_only=True)
+    assert isinstance(caught.value, GigaCodeProcessCrashed) is crash
+
+
+def test_status_exposes_transient_version_timeout_only_for_a_recoverable_decision(
+    settings_factory, tmp_path, monkeypatch,
+):
+    runner = GigaCodeRunner(settings_factory(gigacode_command=str(launcher(tmp_path, ""))))
+
+    def timeout(*args, **kwargs):
+        raise module.subprocess.TimeoutExpired("gigacode --version", 5)
+
+    monkeypatch.setattr(module.subprocess, "run", timeout)
+    assert runner.status()["probe_timed_out"] is True
+    with pytest.raises(GigaCodeTimedOut):
+        runner.run_json(checkout=tmp_path, schema={}, prompt="test", decision_only=True)
+    with pytest.raises(RuntimeError) as native:
+        runner.run_json(checkout=tmp_path, schema={}, prompt="test")
+    assert not isinstance(native.value, GigaCodeTimedOut)
+
+
+@pytest.mark.parametrize("body", [
+    terminal(is_error=True, error={"message": "No auth type is selected"}),
+    "print('unknown option: --bad', file=sys.stderr)\nraise SystemExit(1)\n",
+    "print('RuntimeError: invalid configuration', file=sys.stderr)\nraise SystemExit(1)\n",
+    "sys.stdin.read()\nraise SystemExit(2)\n",
+    "print('Open browser https://login.example.test/device', flush=True)\nraise SystemExit(1)\n",
+    'print(json.dumps({"type":"error","error":{"code":"invalid_request","status":422}}))\n'
+    'raise SystemExit(1)\n',
+])
+def test_configuration_auth_and_unknown_rejections_are_not_process_crashes(
+    settings_factory, tmp_path, body,
+):
+    with pytest.raises(RuntimeError) as caught:
+        execute(settings_factory, tmp_path, body)
+    assert not isinstance(caught.value, GigaCodeProcessCrashed)
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_request_error_is_local_and_excludes_provider_content(settings_factory, tmp_path, code):
+    body = terminal(is_error=True, error="PRIVATE") + f"raise SystemExit({code})\n"
+    with pytest.raises(GigaCodeRequestFailed) as caught:
+        execute(settings_factory, tmp_path, body)
+    assert "PRIVATE" not in str(caught.value)
+
+
+def test_structured_launcher_configuration_failure_is_terminal(settings_factory, tmp_path):
+    body = terminal(is_error=True, error={"type": "configuration_error", "message": "PRIVATE"})
+    with pytest.raises(RuntimeError, match="launcher configuration") as caught:
+        execute(settings_factory, tmp_path, body)
+    assert type(caught.value) is RuntimeError and "PRIVATE" not in str(caught.value)
+
+
+@pytest.mark.parametrize("allow_edits", [False, True])
+def test_crashes_in_native_repository_jobs_do_not_become_replayable(
+    settings_factory, tmp_path, allow_edits,
+):
+    runner = GigaCodeRunner(settings_factory(gigacode_command=str(
+        launcher(tmp_path, "sys.stdin.read()\nraise SystemExit(70)\n")
+    )))
+    with pytest.raises(RuntimeError, match="exited with code 70") as caught:
+        runner.run_json(checkout=tmp_path, schema={}, prompt="job", allow_edits=allow_edits)
+    assert not isinstance(caught.value, GigaCodeTransientError)
 
 
 @pytest.mark.parametrize("event", [
@@ -301,7 +448,7 @@ def test_truncated_native_message_invalidates_complete_looking_cli_result(
     event = {"type": "stream_event", "event": {"type": "message_delta",
                                                "delta": {"stop_reason": "max_tokens"}}}
     body = "sys.stdin.read()\n" + f"print({json.dumps(event)!r}, flush=True)\n" + terminal()
-    with pytest.raises(GigaCodeInvalidOutput):
+    with pytest.raises(GigaCodeIncompleteOutput):
         execute(settings_factory, tmp_path, body)
 
 
@@ -311,12 +458,13 @@ def test_unbounded_output_is_rejected_without_truncating_into_an_answer(
     monkeypatch,
 ):
     monkeypatch.setattr(module, "_STREAM_LINE_LIMIT", 1024)
-    with pytest.raises(GigaCodeInvalidOutput, match="size limit"):
+    with pytest.raises(GigaCodeInvalidOutput, match="size limit") as caught:
         execute(
             settings_factory,
             tmp_path,
             "sys.stdin.read()\nprint('x'*10000,flush=True)\ntime.sleep(20)\n",
         )
+    assert caught.value.reason == "output-limit"
 
 
 def test_new_auth_urls_do_not_extend_the_deadline_forever(settings_factory, tmp_path, monkeypatch):

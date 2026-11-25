@@ -9,7 +9,13 @@ from langchain_core.exceptions import ModelAPIError
 from langchain_openai import ChatOpenAI
 from test_a2a import indexed
 
-from corporate_kb.gigacode_runner import GigaCodeAccessError, GigaCodeTransientError
+from corporate_kb.agents.activation import GigaCodeDecisionError, GigaCodeRecoveryPending
+from corporate_kb.gigacode_runner import (
+    GigaCodeAccessError,
+    GigaCodeProcessCrashed,
+    GigaCodeRequestFailed,
+    GigaCodeTransientError,
+)
 from corporate_kb.mcp.http_server import create_http_app
 from portal_agents import http
 from portal_agents.model_errors import check_gateway_reply, gateway_exception
@@ -202,6 +208,10 @@ def test_direct_422_wire_shape_and_opaque_responses_are_safe(body, kind, count):
     (GigaCodeTransientError(reason="rate-limit"), "rate-limit", None, True),
     (GigaCodeTransientError(status=429, reason="server-error"), "rate-limit", 429, True),
     (GigaCodeAccessError(status=403), "access", 403, False),
+    (GigaCodeProcessCrashed(-9), "process-crash", None, True),
+    (GigaCodeRequestFailed(), "runner-request", None, False),
+    (GigaCodeRecoveryPending("PRIVATE"), "restart-pending", None, False),
+    (GigaCodeDecisionError("PRIVATE"), "incomplete-reply", None, False),
 ])
 def test_model_failure_reports_only_the_provider_evidence(exc, category, status, retryable):
     failure = gateway_exception(exc)

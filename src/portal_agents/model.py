@@ -20,7 +20,7 @@ from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import Field, SecretStr, TypeAdapter
 
-from corporate_kb.agents.activation import GigaCodeAgentController
+from corporate_kb.agents.activation import GigaCodeAgentController, accepts_decisions
 from corporate_kb.agents.gigacode_model import GigaCodeChatModel
 from corporate_kb.config import Settings
 from corporate_kb.confluence.diagnostics import safe_http_logging
@@ -98,7 +98,7 @@ async def create_model(
             profile = TypeAdapter(GigaCodeModelProfile).validate_json(profile_path.read_bytes())
             yield GigaCodeChatModel(runner=GigaCodeRunner(settings), launch_profile=profile)
             return
-        if controller is None or not controller.status().get("available"):
+        if controller is None or not accepts_decisions(controller.status()):
             raise RuntimeError("Включите GigaCode в настройках портала и завершите вход.")
         yield _ActivatedGigaCode(controller=controller, cache=False)
         return

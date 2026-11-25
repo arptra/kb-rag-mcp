@@ -10,6 +10,7 @@ from typing import Any
 from langchain_core.tools import tool
 
 from corporate_kb.a2a.store import A2AStore
+from corporate_kb.agents.activation import accepts_decisions
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
 from corporate_kb.mcp.tools import KnowledgeTools
@@ -41,7 +42,7 @@ class ResearchBridge:
         self, agent: dict[str, Any], command: dict[str, Any], task_id: str, cancel: Event,
         progress: Callable[[str, dict[str, Any]], None],
     ) -> dict[str, Any]:
-        if not self.status().get("available"):
+        if not accepts_decisions(self.status()):
             raise ValueError("Агент GigaCode не готов. Откройте A2A и завершите вход.")
         return asyncio.run(self._run(agent, command, cancel, progress))
 

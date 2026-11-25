@@ -6,7 +6,7 @@ import { integrationDate } from "./managementApi";
 interface RuntimeSnapshot {
   enabled: boolean;
   available: boolean;
-  state: "disabled" | "starting" | "authentication_required" | "ready" | "error";
+  state: "disabled" | "starting" | "recovering" | "authentication_required" | "ready" | "error";
   authentication_url: string | null;
   message: string;
   events: Array<{ timestamp: string; state: string; message: string }>;
@@ -16,6 +16,7 @@ type ManagementRequest = <T>(path: string, init?: RequestInit) => Promise<T>;
 const labels: Record<RuntimeSnapshot["state"], string> = {
   disabled: "Агент выключен",
   starting: "Запускаем GigaCode",
+  recovering: "GigaCode перезапускается",
   authentication_required: "Нужна авторизация GigaCode",
   ready: "Агент готов к работе",
   error: "Не удалось подготовить агента",

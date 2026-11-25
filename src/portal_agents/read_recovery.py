@@ -15,6 +15,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_core.utils.json import parse_json_markdown
 from referencing import Registry
 
+from corporate_kb.agents.activation import GigaCodeDecisionError
 from portal_agents.model import short_call_options
 from portal_agents.model_errors import check_gateway_reply, check_policy_reply
 
@@ -193,12 +194,15 @@ async def read_recovery_step(
     output_limit = 2048 if observations else 512
     if (larger_answer or correction == "length") and evidence_available:
         output_limit = 4096
-    reply = await request.model.ainvoke(
-        [SystemMessage(content=_INSTRUCTIONS + " " + task),
-         HumanMessage(content=json.dumps(frame, ensure_ascii=False, separators=(",", ":")))],
-        config={"tags": ["portal_read_recovery"], "metadata": {"portal_read_recovery": True}},
-        **short_call_options(request.model, output_limit),
-    )
+    try:
+        reply = await request.model.ainvoke(
+            [SystemMessage(content=_INSTRUCTIONS + " " + task),
+             HumanMessage(content=json.dumps(frame, ensure_ascii=False, separators=(",", ":")))],
+            config={"tags": ["portal_read_recovery"], "metadata": {"portal_read_recovery": True}},
+            **short_call_options(request.model, output_limit),
+        )
+    except GigaCodeDecisionError as exc:
+        raise ReadDecisionError(exc.reason) from None
     reason = reply.response_metadata.get("finish_reason")
     check_policy_reply(reply)
     check_gateway_reply(reply.text)

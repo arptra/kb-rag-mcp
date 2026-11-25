@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -11,11 +12,21 @@ from typing import Any
 
 import pytest
 
-from corporate_kb.agents.activation import GigaCodeAgentController
+from corporate_kb.agents import activation
+from corporate_kb.agents.activation import (
+    GigaCodeAgentController,
+    GigaCodeDecisionError,
+    GigaCodeRecoveryPending,
+    accepts_decisions,
+)
 from corporate_kb.gigacode_runner import (
     GigaCodeAccessError,
     GigaCodeCancelled,
+    GigaCodeIncompleteOutput,
     GigaCodeInvalidOutput,
+    GigaCodePolicyStop,
+    GigaCodeProcessCrashed,
+    GigaCodeRequestFailed,
     GigaCodeTimedOut,
     GigaCodeTransientError,
 )
@@ -89,8 +100,10 @@ class FakeRunner:
                 self.active -= 1
 
 
-def wait_state(controller: GigaCodeAgentController, state: str) -> dict[str, Any]:
-    deadline = time.monotonic() + 3
+def wait_state(
+    controller: GigaCodeAgentController, state: str, *, timeout: float = 3,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status = controller.status()
         if status["state"] == state:
@@ -159,6 +172,23 @@ def test_unavailable_cli_rejected_before_auth_launch(settings_factory):
     status = wait_state(controller, "error")
     assert _URL not in json.dumps(status)
     assert not runner.calls
+
+
+@pytest.mark.parametrize("failure", [{"crash_returncode": -9}, {"probe_timed_out": True}])
+def test_failed_version_check_recovers_before_first_model_request(
+    settings_factory, monkeypatch, failure,
+):
+    runner = FakeRunner()
+    controller = GigaCodeAgentController(settings_factory(), runner=runner)
+    monkeypatch.setattr(activation, "_RESTART_DELAYS", (0.01,))
+    versions = iter([{"available": False, **failure}, {"available": True}])
+    monkeypatch.setattr(runner, "status", lambda **_: next(versions))
+    try:
+        controller.enable()
+        assert wait_state(controller, "ready")["available"]
+        assert len(runner.calls) == 1
+    finally:
+        controller.stop()
 
 
 def test_auth_completion_does_not_bypass_readiness_validation(settings_factory):
@@ -295,20 +325,37 @@ def test_invalid_model_output_never_reaches_runtime(settings_factory, decision, 
     controller.stop()
 
 
-@pytest.mark.parametrize("error", [GigaCodeInvalidOutput(_URL), GigaCodeTimedOut(_URL)])
-def test_incomplete_or_timed_out_reply_does_not_disable_authenticated_model(
-    settings_factory, error,
-):
+@pytest.mark.parametrize(("error", "reason"), [
+    (GigaCodeInvalidOutput(_URL), "format"), (GigaCodeIncompleteOutput(_URL), "length"),
+])
+def test_controller_preserves_the_model_correction_reason(settings_factory, error, reason, caplog):
     controller, runner = activated(settings_factory)
     runner.error = error
-    expected = ValueError if isinstance(error, GigaCodeInvalidOutput) else GigaCodeTimedOut
-    with pytest.raises(expected) as caught:
+    with pytest.raises(GigaCodeDecisionError) as caught:
         asyncio.run(decide(controller))
-    assert _URL not in str(caught.value)
+    assert caught.value.reason == reason and _URL not in str(caught.value)
+    assert _URL not in caplog.text and "phase=decision" in caplog.text
     assert controller.status()["available"] and controller.status()["state"] == "ready"
     runner.error = None
     assert asyncio.run(decide(controller)) == runner.decision
     controller.stop()
+
+
+def test_decision_timeout_rechecks_process_before_resuming(settings_factory, monkeypatch, caplog):
+    controller, runner = activated(settings_factory)
+    monkeypatch.setattr(activation, "_RESTART_DELAYS", (0.1,))
+    runner.error = GigaCodeTimedOut(_URL)
+    try:
+        with pytest.raises(GigaCodeTimedOut) as caught:
+            asyncio.run(decide(controller))
+        assert controller.status()["state"] == "recovering"
+        assert "phase=decision cause=timeout" in caplog.text
+        assert _URL not in str(caught.value) and _URL not in caplog.text
+        runner.error = None
+        assert wait_state(controller, "ready")["available"]
+        assert asyncio.run(decide(controller)) == runner.decision
+    finally:
+        controller.stop()
 
 
 @pytest.mark.parametrize("error", [GigaCodeInvalidOutput(_URL), GigaCodeTimedOut(_URL),
@@ -444,13 +491,204 @@ def test_event_history_is_bounded_and_snapshot_is_detached(settings_factory):
     controller.stop()
 
 
+def test_crashing_readiness_probe_keeps_recovering_with_capped_delay(settings_factory, monkeypatch):
+    monkeypatch.setattr(activation, "_RESTART_DELAYS", (0.001, 0.002))
+    runner = FakeRunner()
+    run = runner.run_json
+    failures = iter([GigaCodeProcessCrashed(-9) for _ in range(4)])
+
+    def eventually_ready(**kwargs):
+        runner.error = next(failures, None)
+        return run(**kwargs)
+
+    monkeypatch.setattr(runner, "run_json", eventually_ready)
+    controller = GigaCodeAgentController(settings_factory(), runner=runner)
+    try:
+        controller.enable()
+        ready = wait_state(controller, "ready")
+        assert len(runner.calls) == runner.probes == 5
+        assert runner.max_active == 1
+        assert any(e["state"] == "recovering" for e in ready["events"])
+        assert asyncio.run(decide(controller)) == runner.decision
+    finally:
+        controller.stop()
+
+
+def test_malformed_readiness_reply_gets_one_corrected_probe(settings_factory, monkeypatch):
+    monkeypatch.setattr(activation, "_RESTART_DELAYS", (0,))
+    runner = FakeRunner()
+    runner.error = GigaCodeInvalidOutput(_URL)
+    controller = GigaCodeAgentController(settings_factory(), runner=runner)
+    try:
+        controller.enable()
+        snapshot = wait_state(controller, "error")
+        assert not snapshot["available"] and _URL not in json.dumps(snapshot)
+        assert len(runner.calls) == 2
+        assert runner.calls[0]["prompt"] != runner.calls[1]["prompt"]
+    finally:
+        controller.stop()
+
+
+def test_process_restart_survives_truncated_readiness_replies(settings_factory, monkeypatch):
+    controller, runner = activated(settings_factory)
+    monkeypatch.setattr(activation, "_RESTART_DELAYS", (0.001,))
+    run = runner.run_json
+    failures = iter([GigaCodeProcessCrashed(-9), GigaCodeIncompleteOutput("length"),
+                     GigaCodeIncompleteOutput("length")])
+
+    def respond(**kwargs):
+        runner.error = next(failures, None)
+        return run(**kwargs)
+
+    monkeypatch.setattr(runner, "run_json", respond)
+    try:
+        with pytest.raises(GigaCodeProcessCrashed):
+            asyncio.run(decide(controller))
+        assert wait_state(controller, "ready")["available"]
+        assert runner.probes == 4  # Initial activation and three shared recovery checks.
+        assert asyncio.run(decide(controller)) == runner.decision
+    finally:
+        controller.stop()
+
+
+async def test_one_shared_restart_serves_queued_and_new_decisions(settings_factory, monkeypatch,
+                                                                 caplog):
+    controller, runner = activated(settings_factory)
+    monkeypatch.setattr(activation, "_RESTART_DELAYS", (0,))
+    run = runner.run_json
+    crash_started, recovery_started, release = (threading.Event() for _ in range(3))
+    crash = threading.Event()
+    slot = threading.Lock()
+    invocations = []
+
+    def scripted(**kwargs):
+        assert slot.acquire(blocking=False)
+        try:
+            is_probe = "ready" in kwargs["schema"]["properties"]
+            invocations.append("probe" if is_probe else "decision")
+            if len(invocations) == 1:
+                crash_started.set()
+                assert crash.wait(3)
+                raise GigaCodeProcessCrashed(-9)
+            if is_probe:
+                recovery_started.set()
+                assert release.wait(3)
+            return run(**kwargs)
+        finally:
+            slot.release()
+
+    monkeypatch.setattr(runner, "run_json", scripted)
+    try:
+        first = asyncio.create_task(decide(controller))
+        assert await asyncio.to_thread(crash_started.wait, 2)
+        queued = asyncio.create_task(decide(controller))
+        await asyncio.sleep(0.02)
+        crash.set()
+        with pytest.raises(GigaCodeProcessCrashed):
+            await first
+        assert "phase=decision cause=process-crash exit_code=-9 signal=9" in caplog.text
+        assert await asyncio.to_thread(recovery_started.wait, 2)
+        snapshot = controller.status()
+        assert not snapshot["available"] and accepts_decisions(snapshot)
+        newcomers = [asyncio.create_task(decide(controller)) for _ in range(2)]
+        await asyncio.sleep(0.02)
+        assert invocations == ["decision", "probe"]
+        release.set()
+        assert await asyncio.gather(queued, *newcomers) == [runner.decision] * 3
+        assert invocations == ["decision", "probe", "decision", "decision", "decision"]
+        assert controller.status()["available"]
+    finally:
+        release.set()
+        crash.set()
+        controller.stop()
+
+
+async def test_disable_and_cancel_during_restart_backoff(settings_factory, monkeypatch):
+    controller, runner = activated(settings_factory)
+    monkeypatch.setattr(activation, "_RESTART_DELAYS", (60,))
+    runner.error = GigaCodeProcessCrashed(1)
+    try:
+        with pytest.raises(GigaCodeProcessCrashed):
+            await decide(controller)
+        waiter = asyncio.create_task(decide(controller))
+        await asyncio.sleep(0.02)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert controller.status()["state"] == "recovering"
+        second = asyncio.create_task(decide(controller))
+        await asyncio.sleep(0.02)
+        controller.disable()
+        with pytest.raises(GigaCodeCancelled):
+            await second
+        assert not accepts_decisions(controller.status())
+        with pytest.raises(RuntimeError, match="not ready"):
+            await decide(controller)
+        assert len(runner.calls) == 2
+    finally:
+        controller.stop()
+
+
+async def test_expired_wait_leaves_background_restart_running(settings_factory, monkeypatch):
+    controller, runner = activated(settings_factory)
+    monkeypatch.setattr(activation, "_RESTART_DELAYS", (0.2,))
+    monkeypatch.setattr(controller, "_recovery_wait", 0.02)
+    runner.error = GigaCodeProcessCrashed()
+    try:
+        with pytest.raises(GigaCodeProcessCrashed):
+            await decide(controller)
+        with pytest.raises(GigaCodeRecoveryPending):
+            await decide(controller)
+        assert controller.status()["state"] == "recovering"
+        runner.error = None
+        assert (await asyncio.to_thread(wait_state, controller, "ready"))["available"]
+        assert await decide(controller) == runner.decision
+    finally:
+        controller.stop()
+
+
+@pytest.mark.parametrize("end", [GigaCodeAccessError(status=401), GigaCodePolicyStop()])
+def test_recovery_probe_respects_provider_stop(settings_factory, monkeypatch, end):
+    controller, runner = activated(settings_factory)
+    monkeypatch.setattr(activation, "_RESTART_DELAYS", (0,))
+    failures = iter([GigaCodeProcessCrashed(), end])
+    run = runner.run_json
+
+    def stopped(**kwargs):
+        runner.error = next(failures)
+        return run(**kwargs)
+
+    monkeypatch.setattr(runner, "run_json", stopped)
+    try:
+        with pytest.raises(GigaCodeProcessCrashed):
+            asyncio.run(decide(controller))
+        assert not accepts_decisions(wait_state(controller, "error"))
+        assert len(runner.calls) == 3
+    finally:
+        controller.stop()
+
+
+def test_one_rejected_decision_leaves_controller_ready(settings_factory):
+    controller, runner = activated(settings_factory)
+    try:
+        runner.error = GigaCodeRequestFailed()
+        with pytest.raises(GigaCodeRequestFailed):
+            asyncio.run(decide(controller))
+        assert controller.status()["available"]
+        runner.error = None
+        assert asyncio.run(decide(controller)) == runner.decision
+        assert runner.probes == 1
+    finally:
+        controller.stop()
+
+
 def test_real_cli_activation_authentication_and_decision_without_profile(
     settings_factory, tmp_path,
 ):
     executable = tmp_path / "fake-gigacode"
     capture, authorized = tmp_path / "calls.jsonl", tmp_path / "authorized"
     executable.write_text(
-        "#!/usr/bin/env python3\n"
+        f"#!{sys.executable} -IS\n"
         "import json,os,sys,time\n"
         "from pathlib import Path\n"
         f"version = {_VERSION!r}\n"
@@ -470,15 +708,19 @@ def test_real_cli_activation_authentication_and_decision_without_profile(
     settings = settings_factory(gigacode_command=str(executable), gigacode_max_session_turns=7)
     controller = GigaCodeAgentController(settings)
     controller.enable()
-    waiting = wait_state(controller, "authentication_required")
-    assert waiting["authentication_url"] == _URL
-    assert not waiting["available"]
-    authorized.touch()
-    assert wait_state(controller, "ready")["authentication_url"] is None
-    assert asyncio.run(decide(controller)) == {
-        "content": "Verified answer [1]", "tool_calls": [],
-    }
-    controller.stop()
+    try:
+        # The real runner starts two --version processes before the auth CLI.
+        # Its five-second version deadline can exceed the fake-runner test wait.
+        waiting = wait_state(controller, "authentication_required", timeout=15)
+        assert waiting["authentication_url"] == _URL
+        assert not waiting["available"]
+        authorized.touch()
+        assert wait_state(controller, "ready")["authentication_url"] is None
+        assert asyncio.run(decide(controller)) == {
+            "content": "Verified answer [1]", "tool_calls": [],
+        }
+    finally:
+        controller.stop()
     calls = [json.loads(line) for line in capture.read_text().splitlines()]
     assert len(calls) == 2
     assert calls[0]["cwd"] != calls[1]["cwd"]
@@ -497,7 +739,7 @@ def test_authorization_subprocess_and_temporary_checkout_are_cleaned(
     executable, stopped = tmp_path / "fake-waiting-cli", tmp_path / "stopped"
     checkout = tmp_path / "checkout.txt"
     executable.write_text(
-        "#!/usr/bin/env python3\n"
+        f"#!{sys.executable} -IS\n"
         "import json,os,signal,sys,time\n"
         "from pathlib import Path\n"
         "if '--version' in sys.argv:\n"

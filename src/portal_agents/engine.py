@@ -40,6 +40,7 @@ from tenacity import (
     wait_random_exponential,
 )
 
+from corporate_kb.agents.activation import GigaCodeDecisionError
 from portal_agents.document_reads import document_reads
 from portal_agents.model import short_call_options
 from portal_agents.model_diagnostics import log_model_422
@@ -119,7 +120,7 @@ async def _paraphrase(model: BaseChatModel, question: AnyMessage) -> str:
             [SystemMessage(content=_REPHRASE), HumanMessage(content=question.text)],
             config={"metadata": {"portal_rephrase": True}}, **short_call_options(model, 256),
         )
-    except _UnusableReply:
+    except (_UnusableReply, GigaCodeDecisionError):
         return ""
     text = reply.text.strip()
     if (not isinstance(reply, AIMessage) or reply.tool_calls or len(text) > 2000
@@ -216,6 +217,9 @@ def _model_recovery(
                               strategy, "Повторяем обращение к модели")
                 if switch_format:
                     action = "Формат вызова отклонён. Продолжаем чтение через обычный чат"
+                failure = state.outcome.exception() if state.outcome else None
+                if isinstance(failure, ModelGatewayError) and failure.category == "process-crash":
+                    action = "Процесс GigaCode завершился. Повторяем шаг в новом процессе"
                 delay = math.ceil(state.upcoming_sleep)
                 text = f"{action}. Попытка {calls + 1} из {_MODEL_ATTEMPTS} через {delay} сек."
                 if switch_format and rejected_schema is not None:
@@ -295,20 +299,31 @@ def _model_recovery(
                             if native_fallback:
                                 outcomes.add("read_to_native_success")
                         return response
-                    except _UnusableReply:
+                    except (_UnusableReply, GigaCodeDecisionError) as exc:
                         outcomes.add("native_incomplete")
-                        if native_corrected or calls >= _MODEL_ATTEMPTS:
+                        truncated_cli = (isinstance(exc, GigaCodeDecisionError)
+                                         and exc.reason == "length")
+                        if calls >= _MODEL_ATTEMPTS or (native_corrected and not truncated_cli):
                             raise ModelGatewayError(
                                 category="incomplete-reply",
                                 message="Модель не завершила ответ после повторной проверки",
                             ) from None
+                        instruction = (
+                            "Give a concise complete answer. If a tool is needed, choose one "
+                            "available tool and provide its complete valid arguments."
+                        )
+                        if native_corrected:
+                            instruction += (
+                                " The shorter attempt also reached the limit. Use one short "
+                                "sentence with the most important verified fact, or one tool call."
+                            )
                         native_corrected = True
-                        await report_correction("Модель готовит более короткий завершённый ответ")
-                        current = current.override(system_message=SystemMessage(content=(
-                            (current.system_prompt or "") + "\nThe previous response could not be "
-                            "used. Give a concise complete answer. If a tool is needed, choose "
-                            "one available tool and provide its complete valid arguments."
-                        )))
+                        status = ("GigaCode достиг лимита ответа. Повторяем текущий шаг"
+                                  if truncated_cli else "Модель готовит более короткий ответ")
+                        await report_correction(status)
+                        current = current.override(system_message=SystemMessage(
+                            content=(request.system_prompt or "") + "\n" + instruction,
+                        ))
                         raise _CorrectStep from None
                 except ContextOverflowError:
                     # Deep Agents handles typed context errors outside this middleware.

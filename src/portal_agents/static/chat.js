@@ -21,6 +21,7 @@
     disabled: "GigaCode выключен",
     ready: "Готов к работе",
     starting: "Запускается",
+    recovering: "GigaCode перезапускается",
     checking: "Проверяем подключение",
     authentication_required: "Ожидает авторизации",
     error: "Ошибка подключения",
@@ -259,10 +260,12 @@
       const stick = nearEnd();
       if (item.event === "start") timeline.summary.textContent = "Запрос принят";
       if (item.event === "waiting") return;
-      if (["tool_start", "tool_end", "model", "model_retry"].includes(item.event)) {
+      if (["tool_start", "tool_end", "model", "model_retry", "model_recovering"].includes(item.event)) {
         let status;
-        if (item.event === "model_retry") status = item.text;
-        else if (item.event === "model") status = item.text || "Обращение к модели";
+        if (item.event === "model_recovering" || item.event === "model_retry") {
+          status = item.text;
+          if (item.event === "model_recovering" || $("model-label").textContent === "GigaCode") modelStatus();
+        } else if (item.event === "model") status = item.text || "Обращение к модели";
         else {
           const name = tools[item.text] || item.text;
           status = (item.event === "tool_start" ? "Выполняется · " : "Завершено · ") + name;

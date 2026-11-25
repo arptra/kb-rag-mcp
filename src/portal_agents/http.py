@@ -31,9 +31,14 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from corporate_kb.agents.activation import GigaCodeAgentController
+from corporate_kb.agents.activation import (
+    GigaCodeAgentController,
+    GigaCodeDecisionError,
+    accepts_decisions,
+)
 from corporate_kb.catalog import RagCatalog
 from corporate_kb.config import Settings
+from corporate_kb.gigacode_runner import GigaCodeProcessCrashed, GigaCodeTimedOut
 from corporate_kb.mcp.servers import McpServerRegistry
 from portal_agents.artifacts import build_artifact_tools
 from portal_agents.checkpoint_cleanup import CheckpointBoundary
@@ -357,7 +362,9 @@ def create_app(
         if request.method == "PUT":
             return JSONResponse(profile.public(), headers=_HEADERS)
 
-        if profile.provider == "gigacode" and not (controller and controller.status()["available"]):
+        if profile.provider == "gigacode" and not (
+            controller and accepts_decisions(controller.status())
+        ):
             raise HTTPException(409, "Сначала включите GigaCode и завершите вход.")
         if research:
             async def stream() -> AsyncIterator[bytes]:
@@ -378,7 +385,12 @@ def create_app(
             # history, tools, traces or provider response bodies enter the probe.
             with tracing_context(enabled=False):
                 async with connected(profile, probe=True) as model:
-                    reply = await model.ainvoke("Reply with OK.")
+                    probe_model = model.with_retry(
+                        retry_if_exception_type=(GigaCodeProcessCrashed, GigaCodeTimedOut,
+                                                 GigaCodeDecisionError),
+                        stop_after_attempt=2, wait_exponential_jitter=False,
+                    ) if profile.provider == "gigacode" else model
+                    reply = await probe_model.ainvoke("Reply with OK.")
                     check_gateway_reply(reply.text)
         except Exception as exc:
             failure = gateway_exception(exc)
@@ -459,9 +471,8 @@ def create_app(
         profile = await asyncio.to_thread(profiles.load)
         if profile.provider == "api" and profile.warning:
             raise HTTPException(503, "Администратору нужно проверить настройки корпоративного API.")
-        if profile.provider == "gigacode" and (
-            controller is None or not controller.status()["available"]
-        ):
+        runtime = controller.status() if profile.provider == "gigacode" and controller else {}
+        if profile.provider == "gigacode" and not accepts_decisions(runtime):
             raise HTTPException(503, "GigaCode ожидает включения или входа администратора.")
         grants = await scope(request)
         owner_chat = _owner_chat(owner, turn.chat)
@@ -585,6 +596,9 @@ def create_app(
                         reference = _log_model_failure(profile, exc, "chat")
                         if exc.status == 429 or exc.category == "rate-limit":
                             detail = "Достигнут лимит запросов к модели. Попробуйте позже."
+                        elif exc.category == "process-crash":
+                            detail = ("GigaCode повторно завершился во время ответа. "
+                                      "Портал автоматически проверяет его готовность.")
                         elif exc.retryable or (exc.status is not None and exc.status >= 500):
                             detail = "Не удалось получить ответ от модели. Попробуйте позже."
                         else:
@@ -607,6 +621,8 @@ def create_app(
             task = asyncio.create_task(execute())
             try:
                 yield _line("start", "")
+                if runtime.get("state") == "recovering":
+                    yield _line("model_recovering", "Ожидаем восстановления GigaCode.")
                 while True:
                     try:
                         kind, detail, reference = await asyncio.wait_for(events.get(), timeout=10)
