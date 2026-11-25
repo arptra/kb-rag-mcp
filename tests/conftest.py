@@ -17,7 +17,7 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
             "history_dir": tmp_path / "var" / "history",
             "confluence_state_dir": tmp_path / "var" / "confluence",
             "a2a_state_dir": tmp_path / "var" / "a2a",
-            "harness_state_dir": tmp_path / "var" / "harness",
+            "agents_state_dir": tmp_path / "var" / "portal-agents",
             "embedding_provider": "hash",
             "embedding_dimension": 64,
             "chunk_size_tokens": 40,

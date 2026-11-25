@@ -128,15 +128,9 @@ def test_disabled_on_restart_does_not_probe_or_spawn(settings_factory):
         asyncio.run(decide(controller))
 
 
-@pytest.mark.parametrize("legacy_profile", ["unset", "missing", "invalid"])
-def test_activation_ignores_legacy_model_profile(settings_factory, tmp_path, legacy_profile):
+def test_activation_does_not_require_separate_model_profile(settings_factory):
     runner = FakeRunner()
-    path = None if legacy_profile == "unset" else tmp_path / "old-profile.json"
-    if legacy_profile == "invalid":
-        path.write_text("not a valid profile")
-    controller = GigaCodeAgentController(
-        settings_factory(harness_model_profile_path=path), runner=runner,
-    )
+    controller = GigaCodeAgentController(settings_factory(), runner=runner)
     controller.enable()
     status = wait_state(controller, "ready")
     assert status["available"]

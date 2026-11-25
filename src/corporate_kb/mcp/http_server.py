@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import hashlib
 import logging
 import secrets
 import ssl
@@ -405,23 +406,49 @@ def create_http_server(
         return [{"id": item["id"], "name": item["name"]} for item in catalog.payload()["indexes"]]
 
     agent_controller = None
-    if settings.a2a_enabled or (
-        settings.harness_enabled and extension_apps is not None and shutdown_callbacks is not None
-    ):
+    if settings.a2a_enabled or (settings.agents_enabled and extension_apps is not None):
         from corporate_kb.agents.activation import GigaCodeAgentController
 
         agent_controller = GigaCodeAgentController(settings)
         if shutdown_callbacks is not None:
             shutdown_callbacks.append(agent_controller.stop)
 
-    if settings.harness_enabled and extension_apps is not None:
-        # Keep the optional module, its workers and storage out of the default path.
-        from corporate_kb.harness_integration import create_embedded_harness
+    if settings.agents_enabled and extension_apps is not None:
+        try:
+            from portal_agents.http import create_app as create_agents_app
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"deepagents", "filelock"}:
+                raise
+            raise RuntimeError(
+                "Install portal agent dependencies with ./scripts/setup-pip.sh --no-dev --agents"
+            ) from exc
 
-        extension_apps.append(("/harness", create_embedded_harness(
-            settings, catalog, access=access, authorized=integration_reader_authorized,
-            manager_authorized=integration_manager_authorized,
-            graph_authorized=dashboard_authorized, controller=agent_controller,
+        async def agent_identity(request: Request) -> str | None:
+            if access:
+                user = await asyncio.to_thread(access.user, request)
+                return "user:" + str(user["id"]) if user else None
+            password = settings.admin_password
+            if password and password.get_secret_value() and _admin_authorized(request, settings):
+                digest = hashlib.sha256(password.get_secret_value().encode()).hexdigest()
+                return "shared-admin:" + digest
+            if token and _authorized(request, token):
+                return "shared-token:" + hashlib.sha256(token.encode()).hexdigest()
+            if token or (password and password.get_secret_value()):
+                return None
+            if request.client and request.client.host in {"127.0.0.1", "::1", "testclient"}:
+                return "local-development"
+            return None
+
+        async def agent_manager(request: Request) -> bool:
+            if access:
+                return await asyncio.to_thread(access.administrator, request) is not None
+            return bool(settings.admin_password and settings.admin_password.get_secret_value()
+                        and _admin_authorized(request, settings))
+
+        extension_apps.append(("/agents", create_agents_app(
+            settings, catalog, identity=agent_identity, manager_authorized=agent_manager,
+            authorize_graph=dashboard_authorized, mcp_servers=mcp_servers,
+            controller=agent_controller,
         )))
 
     a2a: A2AService | None = None
@@ -626,9 +653,9 @@ def create_http_server(
             return _admin_denied(settings)
         try:
             payload = await asyncio.to_thread(admin.overview)
-            payload["harness"] = {
-                "enabled": settings.harness_enabled,
-                "url": "/harness/" if settings.harness_enabled else None,
+            payload["agents"] = {
+                "enabled": settings.agents_enabled,
+                "url": "/agents/" if settings.agents_enabled else None,
             }
             payload["a2a_usage"] = (
                 {"enabled": True, **await asyncio.to_thread(a2a.store.stats)}

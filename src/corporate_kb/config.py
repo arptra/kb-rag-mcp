@@ -61,9 +61,16 @@ class Settings(BaseSettings):
     gigacode_timeout_seconds: int = Field(default=600, ge=30, le=7200)
     gigacode_max_session_turns: int = Field(default=30, ge=2, le=500)
     gigacode_max_tool_calls: int = Field(default=50, ge=1, le=5000)
-    harness_enabled: bool = False
-    harness_state_dir: Path = Path("var/harness")
-    harness_model_profile_path: Path | None = None
+    agents_enabled: bool = False
+    agents_state_dir: Path = Path("var/portal-agents")
+    agents_model_base_url: str | None = None
+    agents_model_name: str | None = None
+    agents_model_ca_file: Path | None = None
+    agents_model_cert_file: Path | None = None
+    agents_model_key_file: Path | None = None
+    agents_model_api_key: SecretStr | None = None
+    agents_mcp_read_tools: dict[str, list[str]] = Field(default_factory=dict)
+    agents_sandbox_image: str | None = Field(default=None, pattern=r"^[\w][\w./:@-]*$")
     domscribe_enabled: bool = False
     domscribe_workspace_root: Path = Path(".")
     domscribe_poll_interval_seconds: float = Field(default=0.5, ge=0.1, le=10.0)
@@ -179,11 +186,11 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_skills_routes(self) -> Settings:
         prefix = self.skills_mcp_path.rpartition("/")[0]
-        if self.harness_enabled and any(
-            route == "/harness" or route.startswith("/harness/")
+        if self.agents_enabled and any(
+            route == "/agents" or route.startswith("/agents/")
             for route in (self.mcp_http_path, self.a2a_path, prefix)
         ):
-            raise ValueError("Harness must have its own /harness route prefix")
+            raise ValueError("Portal agents require a dedicated /agents route prefix")
         if self.skills_registry_enabled and (
             self.mcp_http_path == prefix or self.mcp_http_path.startswith(prefix + "/")
         ):
@@ -231,11 +238,15 @@ class Settings(BaseSettings):
                 "history_dir": resolve(self.history_dir),
                 "confluence_state_dir": resolve(self.confluence_state_dir),
                 "a2a_state_dir": resolve(self.a2a_state_dir),
-                "harness_state_dir": resolve(self.harness_state_dir),
-                "harness_model_profile_path": (
-                    resolve(self.harness_model_profile_path)
-                    if self.harness_model_profile_path is not None else None
-                ),
+                "agents_state_dir": resolve(self.agents_state_dir),
+                **{
+                    key: resolve(path)
+                    for key, path in (
+                        ("agents_model_ca_file", self.agents_model_ca_file),
+                        ("agents_model_cert_file", self.agents_model_cert_file),
+                        ("agents_model_key_file", self.agents_model_key_file),
+                    ) if path is not None
+                },
                 "ssot_knowledge_dir": resolve(self.ssot_knowledge_dir),
                 "ssot_cache_dir": resolve(self.ssot_cache_dir),
                 "benchmark_questions_path": resolve(self.benchmark_questions_path),

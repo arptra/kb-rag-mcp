@@ -18,7 +18,7 @@ Create/update .venv using pip only. The global or corporate uv installation is n
 Options:
   --no-dev    Install runtime dependencies only
   --semantic  Also install the optional sentence-transformers dependencies
-  --agents    Install Deep Agents for Harness and agent research tools
+  --agents    Install the Deep Agents SDK and OpenAI-compatible model adapter
 EOF
 }
 

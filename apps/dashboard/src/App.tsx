@@ -548,9 +548,9 @@ export default function App({ secureMode = false, accountName, onSessionLogout }
               {item.id === "operations" && <em>{overview.catalog.jobs.filter((job) => ["queued", "running", "cancelling", "failed"].includes(job.status)).length}</em>}
             </button>
           ))}
-          {overview.harness?.enabled && (
-            <button onClick={() => window.location.assign("/harness/")}>
-              <span className="nav-mark">✦</span>Харнес <em>↗</em>
+          {overview.agents?.enabled && (
+            <button onClick={() => window.location.assign("/agents/")}>
+              <span className="nav-mark">✦</span>Агенты <em>↗</em>
             </button>
           )}
         </nav>

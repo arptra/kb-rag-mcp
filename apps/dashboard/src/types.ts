@@ -190,7 +190,7 @@ export interface McpServers {
 }
 
 export interface Overview {
-  harness?: { enabled: boolean; url: string | null };
+  agents?: { enabled: boolean; url: string | null };
   usage: {
     total_calls: number;
     search_count: number;

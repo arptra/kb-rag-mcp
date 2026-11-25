@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Агенты · Портал</title>
+  <link rel="stylesheet" href="assets/chat.css">
+  <script src="assets/chat.js" defer></script>
+</head>
+<body>
+  <header>
+    <nav aria-label="Навигация"><a href="/admin">Портал</a><span aria-hidden="true">/</span><b>Агенты</b></nav>
+    <div class="toolbar">
+      <details id="model-panel" class="popover">
+        <summary><i id="model-dot" aria-hidden="true"></i><span id="model-label">Модель</span></summary>
+        <div class="menu"><strong id="model-name">Модель</strong><p id="model-state">Загружаем настройки…</p>
+          <button type="button" id="enable-model" hidden>Включить GigaCode</button>
+          <a id="model-login" target="_blank" rel="noopener noreferrer" hidden>Пройти авторизацию ↗</a>
+          <a id="portal-login" href="/admin" hidden>Войти в портал →</a>
+        </div>
+      </details>
+      <button type="button" id="new-chat"><span aria-hidden="true">＋</span> Новый чат</button>
+      <details id="chat-menu" class="popover"><summary aria-label="Действия с чатом" title="Действия с чатом">•••</summary>
+        <div class="menu">
+          <label id="recent-field" hidden>Чаты в этой вкладке<select id="recent"></select></label>
+          <button type="button" id="delete-chat">Удалить текущий чат</button>
+        </div>
+      </details>
+    </div>
+  </header>
+  <main>
+    <div id="scroll">
+      <section id="welcome" class="frame">
+        <h1>Что исследуем?</h1>
+        <p>Спросите об устройстве системы, изменениях или конкретной проблеме.</p>
+        <div class="suggestions">
+          <button type="button" data-question="Найди последний релиз и покажи, по каким источникам это можно проверить.">Последний релиз <span aria-hidden="true">↗</span></button>
+          <button type="button" data-question="Как связаны сервисы платёжного контура? Покажи источники.">Связи сервисов <span aria-hidden="true">↗</span></button>
+        </div>
+      </section>
+      <section id="messages" class="frame" aria-label="Переписка"></section>
+    </div>
+    <div class="dock">
+      <div class="frame">
+        <p id="notice" role="status" hidden></p>
+        <form id="composer">
+          <label class="sr" for="question">Сообщение агенту</label>
+          <textarea id="question" placeholder="Задайте вопрос…" rows="1" maxlength="16000" required></textarea>
+          <button type="submit" id="send" aria-label="Отправить" title="Отправить" disabled>↑</button>
+          <button type="button" id="stop" aria-label="Остановить" title="Остановить" hidden>■</button>
+        </form>
+        <div class="hint"><span>Enter — отправить</span><span>Shift + Enter — новая строка</span></div>
+      </div>
+    </div>
+  </main>
+  <dialog id="confirm-delete"><form method="dialog"><h2>Удалить этот чат?</h2>
+    <p>Вся его переписка будет удалена. Восстановить её нельзя.</p>
+    <div><button value="cancel" autofocus>Отмена</button><button value="delete" class="danger">Удалить</button></div>
+  </form></dialog>
+</body>
+</html>

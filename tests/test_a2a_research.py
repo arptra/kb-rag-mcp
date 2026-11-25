@@ -8,10 +8,11 @@ import pytest
 from test_a2a import indexed, message
 
 from corporate_kb.a2a.service import A2AService
+from corporate_kb.agents.activation import GigaCodeAgentController
 from corporate_kb.mcp.http_server import create_http_app
 
 
-class Model:
+class Model(GigaCodeAgentController):
     def __init__(self, settings):
         self.enabled = False
         self.calls = 0
@@ -42,31 +43,31 @@ class Model:
 
     async def decide(self, *, messages, tools, cancel, **kwargs):
         self.calls += 1
-        while self.block and not cancel.is_set():
-            await asyncio.sleep(0.01)
+        try:
+            while self.block and not cancel.is_set():
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
         if cancel.is_set():
             self.cancelled = True
             raise asyncio.CancelledError
-        context = json.loads(messages[-1]["content"])
-        assert context["allowed_indexes"] == ["default"]
         assert "ADMIN-SECRET" not in json.dumps(messages)
-        if self.calls == 1 and tools:
-            item = context["evidence"][0]
-            return {
-                "content": "",
-                "tool_calls": [
-                    {
-                        "name": "read_document",
-                        "args": {
-                            "index_id": "default",
-                            "document_id": item["id"],
-                        },
-                    }
-                ],
-            }
-        item = next(item for item in context["evidence"] if "500" in item["text"])
-        source = item.get("citation") or f"[{item['id']}]"
-        return {"content": f"Дневной лимит — 500 {source}.", "tool_calls": []}
+        assert {t["function"]["name"] for t in tools} >= {"read_document", "search_knowledge"}
+        if self.calls == 1:
+            return {"content": "", "tool_calls": [{
+                "name": "search_knowledge", "args": {"index_id": "default", "query": "daily limit"},
+            }]}
+        data = json.loads(messages[-1]["content"])
+        if self.calls == 2:
+            assert data[0]["index_id"] == "default"
+            return {"content": "", "tool_calls": [{
+                "name": "read_document", "args": {
+                    "index_id": "default", "document_id": data[0]["document_id"],
+                },
+            }]}
+        assert "500" in data["text"]
+        return {"content": "Дневной лимит — 500 [" + data["id"] + "].", "tool_calls": []}
 
 
 @pytest.fixture
@@ -124,8 +125,8 @@ async def test_activation_research_tool_loop_scopes_logs_and_counters(
         result = task["artifacts"][0]["parts"][0]["data"]
         assert result["action"] == "research"
         assert "500" in result["answer"]
-        assert result["metrics"]["model_calls"] == 2
-        assert result["metrics"]["tool_calls"] == 1
+        assert result["metrics"]["model_calls"] == 3
+        assert result["metrics"]["tool_calls"] == 2
         assert result["coverage"]["full_corpus"] is False
         assert result["citations"][0]["index_id"] == "default"
         assert "ADMIN-SECRET" not in json.dumps(task)

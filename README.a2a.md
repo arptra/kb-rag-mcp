@@ -36,8 +36,7 @@ Agent Card — `/.well-known/agent-card.json`, endpoint по умолчанию 
 ответом с источниками. Настройка и авторизация: [включение агента](README.agent-activation.md).
 Для запуска используется уже настроенный GigaCode анализа: `KB_GIGACODE_ENABLED`
 и `KB_GIGACODE_COMMAND`, конфигурация и авторизация пользователя ОС backend.
-Отдельные API-токены, настройки модели и `KB_HARNESS_MODEL_PROFILE_PATH` для A2A
-не нужны; указанная переменная профиля этим агентом не читается. После обновления
+Для исследований установите SDK командой `./scripts/setup-pip.sh --no-dev --agents`,
 перезапустите backend, затем нажмите «Включить агента» во вкладке A2A.
 
 Выдаваемый конфиг теперь содержит `protocol`, `protocolVersion`, `supportedMethods`,
