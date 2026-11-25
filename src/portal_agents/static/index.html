@@ -50,8 +50,9 @@
       <div class="frame">
         <p id="notice" role="status" hidden></p>
         <form id="composer">
+          <div id="command-list" role="listbox" aria-label="Команды чата" hidden></div>
           <label class="sr" for="question">Сообщение агенту</label>
-          <textarea id="question" placeholder="Задайте вопрос…" rows="1" maxlength="16000" required></textarea>
+          <textarea id="question" placeholder="Задайте вопрос или введите /" rows="1" maxlength="16000" aria-autocomplete="list" aria-controls="command-list" required></textarea>
           <button type="submit" id="send" aria-label="Отправить" title="Отправить" disabled>↑</button>
           <button type="button" id="stop" aria-label="Остановить" title="Остановить" hidden>■</button>
         </form>

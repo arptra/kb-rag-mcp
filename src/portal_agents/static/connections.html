@@ -23,7 +23,7 @@
     <div id="panels" hidden>
       <section class="card" aria-labelledby="workspace-title">
         <h2 id="workspace-title">Среда выполнения</h2>
-        <p>Для сборки Gradle выберите образ с JDK проекта и подготовленным кешем зависимостей. Агент запускает задачи в отдельном контейнере на один запрос.</p>
+        <p>Для сборки Gradle выберите образ с JDK проекта и подготовленным кешем зависимостей. Агент сам создаёт контейнер при первом запуске задачи и выполняет команды внутри него без сетевого порта.</p>
         <form id="workspace-form">
           <div class="workspace-fields">
             <label>Название песочницы<input id="workspace-name" maxlength="100" placeholder="Например, Gradle · JDK 21"></label>

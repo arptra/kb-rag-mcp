@@ -3,6 +3,16 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const question = $("question");
+  const commandList = $("command-list");
+  const commands = [
+    { name: "/подключения", alias: "/connections", description: "Открыть подключения", admin: true,
+      run: () => window.location.assign($("agent-connections").href) },
+    { name: "/новый", alias: "/new", description: "Начать новый чат", run: () => switchChat(null) },
+    { name: "/модель", alias: "/model", description: "Настройки модели", admin: true, run: openSettings },
+  ];
+  let matches = [];
+  let highlighted = 0;
+  let dismissedDraft = null;
   const scroller = $("scroll");
   const idPattern = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i;
   const modelStates = {
@@ -77,6 +87,63 @@
     $("stop").hidden = !active;
     $("send").disabled = Boolean(historyRequest) || !question.value.trim();
     $("delete-chat").disabled = Boolean(active || historyRequest);
+    updateCommands();
+  }
+  function hideCommands() {
+    matches = [];
+    commandList.hidden = true;
+    question.removeAttribute("aria-activedescendant");
+  }
+  function selectCommand(index) {
+    highlighted = index;
+    for (const [i, option] of Array.from(commandList.children).entries()) {
+      option.setAttribute("aria-selected", String(i === index));
+    }
+    const option = commandList.children[index];
+    question.setAttribute("aria-activedescendant", option.id);
+    option.scrollIntoView({ block: "nearest" });
+  }
+  function commandMatches(command, prefix) {
+    return command.name.startsWith(prefix) || command.alias.startsWith(prefix);
+  }
+  function updateCommands() {
+    const prefix = question.value.toLowerCase();
+    if (active || historyRequest || document.activeElement !== question ||
+        dismissedDraft === question.value || !/^\/[\p{L}]*$/u.test(prefix)) {
+      hideCommands();
+      return;
+    }
+    const previous = matches[highlighted];
+    matches = commands.filter(command => commandMatches(command, prefix) &&
+      (!command.admin || !$("agent-connections").hidden));
+    if (!matches.length) { hideCommands(); return; }
+    commandList.replaceChildren(...matches.map(command => {
+      const option = element("button", "command-option");
+      option.type = "button";
+      option.id = "command-" + command.alias.slice(1);
+      option.setAttribute("role", "option");
+      option.tabIndex = -1;
+      option.title = command.alias;
+      option.append(element("strong", "", command.name), element("small", "", command.description));
+      option.addEventListener("mousedown", e => e.preventDefault());
+      option.addEventListener("click", () => runCommand(command));
+      return option;
+    }));
+    commandList.hidden = false;
+    selectCommand(Math.max(0, matches.indexOf(previous)));
+  }
+  async function runCommand(command) {
+    if (active || historyRequest) return;
+    question.value = "";
+    resize();
+    notice();
+    try {
+      if (command.admin && !(await (await request("api/model")).json()).manager) {
+        notice("Команду " + command.name + " может использовать администратор портала.");
+        return;
+      }
+      await command.run();
+    } catch (error) { notice(error.message); }
   }
   function resize() {
     question.style.height = "auto";
@@ -166,14 +233,13 @@
   async function submit() {
     const text = question.value.trim();
     if (!text || active || historyRequest) return;
-    if (["/подключения", "/connections"].includes(text.toLowerCase())) {
-      question.value = "";
-      resize();
-      try {
-        const info = await (await request("api/model")).json();
-        if (info.manager) window.location.assign($("agent-connections").href);
-        else notice("Управлять подключениями может администратор портала.");
-      } catch (error) { notice(error.message); }
+    const exact = commands.find(c => [c.name, c.alias].includes(text.toLowerCase()));
+    const command = matches[highlighted] || exact;
+    if (command) return runCommand(command);
+    if (text === "/") {
+      dismissedDraft = null;
+      question.focus();
+      updateCommands();
       return;
     }
     const controller = new AbortController();
@@ -242,6 +308,7 @@
       $("model-panel").querySelector("summary").title = info.model + " · " + $("model-state").textContent;
       $("open-model-settings").hidden = !info.manager;
       $("agent-connections").hidden = !info.manager;
+      updateCommands();
       $("model-readonly").hidden = Boolean(info.manager);
       $("enable-model").hidden = !info.manager || info.provider === "api" || !["disabled", "error"].includes(info.state);
       $("model-login").hidden = true;
@@ -266,6 +333,7 @@
       $("enable-model").hidden = true;
       $("open-model-settings").hidden = true;
       $("agent-connections").hidden = true;
+      updateCommands();
       $("model-readonly").hidden = true;
       $("portal-login").hidden = error.status !== 401;
       if (error.status === 401) $("portal-login").href = await adminLoginUrl();
@@ -391,9 +459,24 @@
   settingsForm.addEventListener("submit", (e) => { e.preventDefault(); submitSettings(false); });
   $("test-settings").addEventListener("click", () => submitSettings(true));
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(); });
-  question.addEventListener("input", resize);
+  question.addEventListener("input", () => { dismissedDraft = null; resize(); });
+  question.addEventListener("focus", updateCommands);
+  $("composer").addEventListener("focusout", e => {
+    if (!$("composer").contains(e.relatedTarget)) hideCommands();
+  });
   question.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(); }
+    if (e.isComposing) return;
+    if (matches.length && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      e.preventDefault();
+      const delta = e.key === "ArrowDown" ? 1 : -1;
+      selectCommand((highlighted + delta + matches.length) % matches.length);
+    } else if (matches.length && e.key === "Escape") {
+      dismissedDraft = question.value;
+      hideCommands();
+    } else if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      submit();
+    }
   });
   for (const button of document.querySelectorAll("[data-question]")) {
     button.addEventListener("click", () => { question.value = button.dataset.question; resize(); question.focus(); });

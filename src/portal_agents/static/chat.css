@@ -391,6 +391,7 @@ h1 {
 }
 
 #composer {
+  position: relative;
   display: flex;
   align-items: flex-end;
   gap: 10px;
@@ -398,6 +399,44 @@ h1 {
   border: 1px solid #414347;
   border-radius: 19px;
   padding: 10px 11px 10px 17px;
+}
+
+#command-list {
+  position: absolute;
+  z-index: 2;
+  bottom: calc(100% + 8px);
+  left: 0;
+  width: min(100%, 26rem);
+  max-height: min(16rem, 32dvh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--raised);
+  box-shadow: 0 8px 24px #0006;
+}
+
+.command-option {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  min-height: 42px;
+  padding: 9px 12px;
+  text-align: left;
+  border: 0;
+  background: transparent;
+}
+
+.command-option[aria-selected=true], .command-option:hover {
+  background: #343538;
+}
+
+.command-option small {
+  color: var(--muted);
+  text-align: right;
 }
 
 #composer:focus-within {
