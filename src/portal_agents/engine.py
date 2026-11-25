@@ -191,7 +191,7 @@ def _model_recovery(
         rejected_schema: ModelGatewayError | None = None
         switch_format = False
         read_correction: str | None = None
-        native_corrected = False
+        native_corrections: set[str] = set()
 
         async def report_correction(text: str) -> None:
             if on_event:
@@ -218,7 +218,9 @@ def _model_recovery(
                 if switch_format:
                     action = "Формат вызова отклонён. Продолжаем чтение через обычный чат"
                 failure = state.outcome.exception() if state.outcome else None
-                if isinstance(failure, ModelGatewayError) and failure.category == "process-crash":
+                if isinstance(failure, ModelGatewayError) and failure.category in {
+                    "process-crash", "runner-exit",
+                }:
                     action = "Процесс GigaCode завершился. Повторяем шаг в новом процессе"
                 delay = math.ceil(state.upcoming_sleep)
                 text = f"{action}. Попытка {calls + 1} из {_MODEL_ATTEMPTS} через {delay} сек."
@@ -301,9 +303,9 @@ def _model_recovery(
                         return response
                     except (_UnusableReply, GigaCodeDecisionError) as exc:
                         outcomes.add("native_incomplete")
-                        truncated_cli = (isinstance(exc, GigaCodeDecisionError)
-                                         and exc.reason == "length")
-                        if calls >= _MODEL_ATTEMPTS or (native_corrected and not truncated_cli):
+                        reason = exc.reason if isinstance(exc, GigaCodeDecisionError) else "format"
+                        corrected = reason in native_corrections
+                        if calls >= _MODEL_ATTEMPTS or (corrected and reason != "length"):
                             raise ModelGatewayError(
                                 category="incomplete-reply",
                                 message="Модель не завершила ответ после повторной проверки",
@@ -312,14 +314,22 @@ def _model_recovery(
                             "Give a concise complete answer. If a tool is needed, choose one "
                             "available tool and provide its complete valid arguments."
                         )
-                        if native_corrected:
+                        status = "Модель готовит более короткий ответ"
+                        if reason == "native-read":
+                            instruction += (
+                                " Emit your decision as JSON in ordinary response text. For a "
+                                "lookup use only a named tool from the portal's supplied list. "
+                                "Do not call a built-in CLI tool."
+                            )
+                            status = "Продолжаем исследование через инструменты портала"
+                        if reason == "length":
+                            status = "GigaCode достиг лимита ответа. Повторяем текущий шаг"
+                        if reason == "length" and corrected:
                             instruction += (
                                 " The shorter attempt also reached the limit. Use one short "
                                 "sentence with the most important verified fact, or one tool call."
                             )
-                        native_corrected = True
-                        status = ("GigaCode достиг лимита ответа. Повторяем текущий шаг"
-                                  if truncated_cli else "Модель готовит более короткий ответ")
+                        native_corrections.add(reason)
                         await report_correction(status)
                         current = current.override(system_message=SystemMessage(
                             content=(request.system_prompt or "") + "\n" + instruction,

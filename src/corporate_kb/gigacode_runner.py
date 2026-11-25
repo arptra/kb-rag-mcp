@@ -78,6 +78,12 @@ _RUNTIME_DIAGNOSTIC = re.compile(
 _CONFIGURATION_CODES = frozenset({
     "configuration_error", "invalid_configuration", "invalid_cli_arguments", "unknown_option",
 })
+_NATIVE_READ_TOOLS = ("read_file", "list_directory", "grep_search", "glob", "read_many_files")
+_READ_ONLY_EXCLUSIONS = "shell,write,edit,agent,web_fetch,web_search"
+_DECISION_EXCLUSIONS = ",".join((
+    _READ_ONLY_EXCLUSIONS, *_NATIVE_READ_TOOLS, "write_file", "run_shell_command", "skill",
+    "todo_write", "write_todos", "task", "tool_search", "tool_call",
+))
 _RESULT_DRAIN_SECONDS = 1.0
 _SUPERVISOR_GRACE_SECONDS = 10.0
 _STREAM_LINE_LIMIT = 2_000_000
@@ -352,8 +358,8 @@ class GigaCodeRunner:
     ) -> GigaCodeJsonResult:
         """Execute a JSON analysis using the existing CLI command and login.
 
-        Decision requests use only supplied evidence and reject native tool events;
-        they do not require a model profile or change the CLI launch arguments.
+        Decision requests exclude built-in tools and reject native tool events.
+        They use the existing CLI account and do not need a separate launcher profile.
         This guard is not an OS sandbox: CLI settings and authentication are shared
         with ordinary analysis, and a reported tool may already have executed.
         """
@@ -503,10 +509,10 @@ class GigaCodeRunner:
 
         executable = str(status["executable"])
         excluded_tools = (
-            "shell,agent,web_fetch,web_search"
-            if allow_edits
-            else "shell,write,edit,agent,web_fetch,web_search"
+            "shell,agent,web_fetch,web_search" if allow_edits else _READ_ONLY_EXCLUSIONS
         )
+        if decision_only:
+            excluded_tools = _DECISION_EXCLUSIONS
         max_turns = 2 if model_profile is not None else self._settings.gigacode_max_session_turns
         if model_profile is not None:
             command = [
@@ -751,9 +757,13 @@ class GigaCodeRunner:
                     if progress is not None:
                         progress(f"GigaCode stdout (non-JSON) | {line[:1000]}")
                     continue
-                if (
-                    model_profile is not None or decision_only
-                ) and self._has_native_tool_event(event):
+                if is_decision and self._has_native_tool_event(event):
+                    if (decision_only and result_event is None and not fragment
+                            and self._is_native_read_request(event)):
+                        raise GigaCodeInvalidOutput(
+                            "GigaCode proposed a built-in read outside the portal tool contract",
+                            reason="native-read",
+                        )
                     raise GigaCodeRequestFailed(reason="native-tool")
                 if fragment:
                     if event.get("type") in ("result", "assistant", "stream_event"):
@@ -1009,6 +1019,34 @@ class GigaCodeRunner:
             + json.dumps(schema, ensure_ascii=False, indent=2)
         )
 
+    @classmethod
+    def _is_native_read_request(cls, event: dict[str, Any]) -> bool:
+        """Allow one fresh decision after an unambiguous, read-only tool proposal."""
+        kind = event.get("type")
+        actions: list[Any]
+        if kind == "assistant" and isinstance(message := event.get("message"), dict):
+            if message.get("role") in ("tool", "function") or message.get("function_call"):
+                return False
+            content = message.get("content")
+            actions = ([part for part in content
+                        if isinstance(part, dict) and cls._has_native_tool_event(part)]
+                       if isinstance(content, list) else [])
+            if calls := message.get("tool_calls"):
+                return not actions and isinstance(calls, list) and all(
+                    isinstance(call, dict) and isinstance(function := call.get("function"), dict)
+                    and function.get("name") in _NATIVE_READ_TOOLS for call in calls
+                )
+        elif kind == "stream_event" and isinstance(stream := event.get("event"), dict):
+            if stream.get("type") != "content_block_start":
+                return False
+            actions = [stream.get("content_block")]
+        else:
+            actions = [event]
+        return bool(actions) and all(
+            isinstance(action, dict) and action.get("type") in ("tool_use", "tool_call")
+            and action.get("name") in _NATIVE_READ_TOOLS for action in actions
+        )
+
     @staticmethod
     def _has_native_tool_event(event: dict[str, Any]) -> bool:
         # The result's JSON decision may describe tool calls for the outer graph.
@@ -1026,9 +1064,10 @@ class GigaCodeRunner:
                 return any(native(item) for item in value)
             if not isinstance(value, dict):
                 return False
-            if value.get("type") in native_types or value.get("subtype") in native_types:
+            if any(isinstance(label, str) and label in native_types
+                   for label in (value.get("type"), value.get("subtype"))):
                 return True
-            if value.get("role") in {"tool", "function"}:
+            if value.get("role") in ("tool", "function"):
                 return True
             if any(value.get(key) for key in ("tool_calls", "function_call", "functionCall")):
                 return True
@@ -1463,9 +1502,11 @@ class GigaCodeRunner:
     def _parse_event(line: str) -> dict[str, Any] | None:
         try:
             payload = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             return None
-        return payload if isinstance(payload, dict) else None
+        if isinstance(payload, dict) and isinstance(payload.get("type"), str):
+            return payload
+        return None
 
     @staticmethod
     def _authentication_url(line: str) -> str | None:
@@ -1474,7 +1515,7 @@ class GigaCodeRunner:
         authentication_context = False
         try:
             structured = json.loads(clean_line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             structured = None
         if isinstance(structured, dict):
             if "type" not in structured:
@@ -1558,7 +1599,7 @@ class GigaCodeRunner:
             return False
         if kind == "result":
             return not bool(event.get("is_error"))
-        if kind in {"assistant", "user"}:
+        if kind in ("assistant", "user"):
             return True
         if kind != "stream_event":
             return False

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from corporate_kb.gigacode_runner import GigaCodeRunner
+from corporate_kb.gigacode_runner import GigaCodeInvalidOutput, GigaCodeRunner
 
 
 def analysis_cli(path: Path) -> Path:
@@ -35,10 +35,16 @@ def test_agent_decision_reuses_analysis_command_and_account(settings_factory, tm
     kwargs = {"checkout": tmp_path, "prompt": "Answer from supplied evidence", "schema": {}}
     analysis = runner.run_json(**kwargs)
     decision = runner.run_json(**kwargs, decision_only=True)
-    assert analysis.payload["arguments"] == decision.payload["arguments"] == [
+    assert analysis.payload["arguments"] == [
         "--output-format", "stream-json", "--exclude-tools",
         "shell,write,edit,agent,web_fetch,web_search", "--max-session-turns", "11",
     ]
+    decision_arguments = decision.payload["arguments"]
+    assert decision_arguments[:3] == analysis.payload["arguments"][:3]
+    assert decision_arguments[4:] == analysis.payload["arguments"][4:]
+    assert set(decision_arguments[3].split(",")) >= {
+        "read_file", "list_directory", "grep_search", "glob", "run_shell_command", "write_file",
+    }
     assert decision.payload["home"] == analysis.payload["home"]
     assert decision.payload["decision_prompt"] is True
     assert analysis.payload["decision_prompt"] is False
@@ -51,8 +57,9 @@ def test_native_tools_still_work_for_analysis_but_not_agent_decisions(
     runner = GigaCodeRunner(settings_factory(gigacode_command=str(executable)))
     kwargs = {"checkout": tmp_path, "prompt": "emit-native-tool", "schema": {}}
     assert runner.run_json(**kwargs).payload["decision_prompt"] is False
-    with pytest.raises(RuntimeError, match="native tool event"):
+    with pytest.raises(GigaCodeInvalidOutput) as failure:
         runner.run_json(**kwargs, decision_only=True)
+    assert failure.value.reason == "native-read"
 
 
 def test_json_tool_choices_are_not_mistaken_for_native_cli_tools(settings_factory, tmp_path):

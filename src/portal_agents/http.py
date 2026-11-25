@@ -616,7 +616,7 @@ def create_app(
                         reference = _log_model_failure(profile, exc, "chat")
                         if exc.status == 429 or exc.category == "rate-limit":
                             detail = "Достигнут лимит запросов к модели. Попробуйте позже."
-                        elif exc.category == "process-crash":
+                        elif exc.category in {"process-crash", "runner-exit"}:
                             detail = ("GigaCode повторно завершился во время ответа. "
                                       "Портал автоматически проверяет его готовность.")
                         elif exc.retryable or (exc.status is not None and exc.status >= 500):

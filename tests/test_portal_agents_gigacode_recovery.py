@@ -36,7 +36,7 @@ async def enable_gigacode(client):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires a POSIX signal and an executable script")
-@pytest.mark.parametrize("failure", ["signal", "runtime-exit", "runtime-result"])
+@pytest.mark.parametrize("failure", ["signal", "runtime-exit", "runtime-result", "unexpected-exit"])
 async def test_chat_survives_a_cli_crash_after_tool_execution_and_accepts_other_chats(
     settings_factory, tmp_path: Path, failure, caplog,
 ):
@@ -63,6 +63,8 @@ async def test_chat_survives_a_cli_crash_after_tool_execution_and_accepts_other_
                     failure = (root / "failure").read_text()
                     if failure == "signal":
                         os.kill(os.getpid(), signal.SIGKILL)
+                    if failure == "unexpected-exit":
+                        raise SystemExit(2)
                     if failure == "runtime-result":
                         print(json.dumps({
                             "type": "result", "is_error": True,
@@ -140,12 +142,79 @@ async def test_chat_survives_a_cli_crash_after_tool_execution_and_accepts_other_
         history = (await client.get(f"/agents/api/chats/{chat}", headers=READER)).json()["messages"]
         assert [m["text"] for m in history] == [question, turns[0][-1]["text"]]
         assert (await client.get("/agents/api/model", headers=READER)).json()["state"] == "ready"
-        code = {"signal": -9, "runtime-exit": 2, "runtime-result": 1}[failure]
-        assert f"cause=process-crash exit_code={code}" in caplog.text
+        code = {"signal": -9, "runtime-exit": 2, "runtime-result": 1, "unexpected-exit": 2}[failure]
+        cause = "unexpected-exit" if failure == "unexpected-exit" else "process-crash"
+        assert f"cause={cause} exit_code={code}" in caplog.text
         assert "PRIVATE_CHILD_TRACE" not in caplog.text
         assert sorted((tmp_path / "calls").read_text().splitlines()) == [
             "answer", "hello", "lookup", "probe", "probe",
         ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires an executable script")
+@pytest.mark.parametrize("native_tool", ["read_file", "run_shell_command"])
+async def test_native_cli_tool_does_not_disable_gigacode(
+    settings_factory, tmp_path: Path, native_tool, caplog,
+):
+    (tmp_path / "native-tool").write_text(native_tool)
+    executable = launcher(tmp_path, dedent(r"""
+        root = Path(__file__).parent
+        native_tool = (root / "native-tool").read_text()
+        prompt = sys.stdin.read()
+        marker = "GIGACODE_AGENT_REQUEST\n"
+        if marker not in prompt:
+            payload = {"ready": True}
+        else:
+            request, _ = json.JSONDecoder().raw_decode(prompt.split(marker, 1)[1])
+            messages = request["messages"]
+            last = messages[-1]
+            if last["role"] == "tool":
+                count = root / "answer-calls"
+                attempts = int(count.read_text()) if count.exists() else 0
+                count.write_text(str(attempts + 1))
+                if attempts == 0:
+                    print(json.dumps({"type": "assistant", "message": {"content": [
+                        {"type": "thinking", "thinking": "PRIVATE_NATIVE_ARGUMENT"},
+                        {"type": "tool_use", "name": native_tool,
+                         "input": {"detail": "PRIVATE_NATIVE_ARGUMENT"}}
+                    ]}}), flush=True)
+                    raise SystemExit(0)
+                assert native_tool == "read_file"
+                assert "Do not call a built-in CLI tool" in messages[0]["content"]
+                indexes = json.loads(last["content"])
+                payload = {"content": "Index " + indexes[0]["id"], "tool_calls": []}
+            elif last["content"] == "Hello":
+                payload = {"content": "Welcome", "tool_calls": []}
+            else:
+                payload = {"content": "", "tool_calls": [{"name": "list_indexes", "args": {}}]}
+        print(json.dumps({"type": "result", "is_error": False, "result": payload}), flush=True)
+    """))
+    async with browser(gigacode_portal(settings_factory, executable)) as client:
+        await enable_gigacode(client)
+        chat = str(uuid4())
+        response = await client.post(
+            "/agents/api/chat", headers=READER,
+            json={"chat": chat, "question": "Which indexes are available?"},
+        )
+        response.raise_for_status()
+        assert "PRIVATE_NATIVE_ARGUMENT" not in response.text + caplog.text
+        events = [json.loads(line) for line in response.text.splitlines()]
+        assert [event["text"] for event in events if event["event"] == "tool_start"] == [
+            "list_indexes",
+        ]
+        if native_tool == "read_file":
+            assert events[-1]["event"] == "answer" and events[-1]["text"] == "Index default"
+            assert any(event["event"] == "model_retry" for event in events)
+            assert (tmp_path / "answer-calls").read_text() == "2"
+        else:
+            assert events[-1]["event"] == "error" and events[-1]["reference"]
+            assert (tmp_path / "answer-calls").read_text() == "1"
+        assert (await client.get("/agents/api/model", headers=READER)).json()["state"] == "ready"
+        following = await client.post("/agents/api/chat", headers=READER,
+                                      json={"chat": chat, "question": "Hello"})
+        following.raise_for_status()
+        last = json.loads(following.text.splitlines()[-1])
+        assert last["event"] == "answer" and last["text"] == "Welcome"
 
 
 @pytest.fixture

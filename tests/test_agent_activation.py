@@ -70,8 +70,11 @@ class FakeRunner:
         return {"available": self.available, "version": self.version, "error": _URL}
 
     def run_json(self, **kwargs: Any) -> Any:
-        assert kwargs["checkout"].is_dir()
-        assert not list(kwargs["checkout"].iterdir())
+        checkout = kwargs["checkout"]
+        assert checkout.is_dir()
+        assert [path.name for path in checkout.iterdir()] == [".gigacode"]
+        config = json.loads((checkout / ".gigacode/settings.json").read_text())
+        assert config == {"mcp": {"allowed": [checkout.name]}}
         assert kwargs["decision_only"] is True
         assert kwargs["allow_edits"] is False
         assert "profile" not in kwargs
@@ -710,7 +713,9 @@ def test_real_cli_activation_authentication_and_decision_without_profile(
         " print(version); raise SystemExit(0)\n"
         "prompt = sys.stdin.read()\n"
         f"with Path({str(capture)!r}).open('a') as capture:\n"
-        " capture.write(json.dumps({'cwd':os.getcwd(),'args':sys.argv[1:]})+'\\n')\n"
+        " config = json.loads(Path('.gigacode/settings.json').read_text())\n"
+        " capture.write(json.dumps({'cwd':os.getcwd(),'args':sys.argv[1:],"
+        "'config':config})+'\\n')\n"
         f"print(json.dumps({{'type':'auth','url':{_URL!r}}}),flush=True)\n"
         f"while not Path({str(authorized)!r}).exists(): time.sleep(0.005)\n"
         "print(json.dumps({'type':'system','subtype':'init','session_id':'test'}),flush=True)\n"
@@ -740,10 +745,10 @@ def test_real_cli_activation_authentication_and_decision_without_profile(
     assert calls[0]["cwd"] != calls[1]["cwd"]
     for call in calls:
         assert not Path(call["cwd"]).exists()
-        assert call["args"] == [
-            "--output-format", "stream-json", "--exclude-tools",
-            "shell,write,edit,agent,web_fetch,web_search", "--max-session-turns", "7",
-        ]
+        assert call["args"][:3] == ["--output-format", "stream-json", "--exclude-tools"]
+        assert "read_file" in call["args"][3].split(",")
+        assert call["args"][4:] == ["--max-session-turns", "7"]
+        assert call["config"]["mcp"]["allowed"] == [Path(call["cwd"]).name]
 
 
 @pytest.mark.parametrize("outcome", ["cancel", "error"])

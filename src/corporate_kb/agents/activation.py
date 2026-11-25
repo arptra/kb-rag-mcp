@@ -96,7 +96,9 @@ class _CancellationGroup:
 class GigaCodeDecisionError(ValueError):
     """A malformed model reply does not invalidate the authenticated CLI session."""
 
-    def __init__(self, message: str, *, reason: Literal["format", "length"] = "format") -> None:
+    def __init__(
+        self, message: str, *, reason: Literal["format", "length", "native-read"] = "format",
+    ) -> None:
         super().__init__(message)
         self.reason = reason
 
@@ -123,7 +125,7 @@ def _log_interruption(phase: str, exc: Exception) -> None:
         cause = "timeout"
     elif isinstance(exc, GigaCodeInvalidOutput):
         reason = exc.reason
-        cause = reason if reason in {"length", "output-limit", "missing-result",
+        cause = reason if reason in {"length", "output-limit", "missing-result", "native-read",
                                      "invalid-contract"} else "invalid-output"
     elif isinstance(exc, GigaCodeTransientError):
         cause = "provider-transient"
@@ -289,8 +291,16 @@ class GigaCodeAgentController:
         # Reuse the working analysis launcher, including its existing CLI account
         # and OAuth flow. Do not hand the CLI a checkout or the backend directory.
         with tempfile.TemporaryDirectory(prefix="kb-gigacode-agent-") as directory:
+            checkout = Path(directory)
+            # The portal supplies its own tools. A project allowlist with a fresh
+            # name keeps user-level MCP servers out of this decision workspace.
+            config = checkout / ".gigacode"
+            config.mkdir()
+            (config / "settings.json").write_text(
+                json.dumps({"mcp": {"allowed": [checkout.name]}}), encoding="utf-8",
+            )
             result: GigaCodeJsonResult = self._runner.run_json(
-                checkout=Path(directory),
+                checkout=checkout,
                 prompt=prompt,
                 schema=copy.deepcopy(schema),
                 allow_edits=False,
@@ -331,7 +341,7 @@ class GigaCodeAgentController:
                 )
             prompt = 'Return exactly {"ready": true}. This is a readiness check; use no tools.'
             if correction:
-                prompt += " Your last output was invalid. Return just the complete JSON object."
+                prompt += " Emit the JSON as plain response text. Do not invoke a CLI tool."
             result = self._run_json(
                 generation,
                 prompt=prompt,
@@ -373,6 +383,13 @@ class GigaCodeAgentController:
                             return
                         if self._state == "authentication_required":
                             raise
+                        if (was_activated and isinstance(exc, GigaCodeRequestFailed)
+                                and exc.reason == "native-tool"):
+                            self._activated = True
+                            self._set_state(
+                                "ready", "GigaCode запущен и может принять следующий запрос."
+                            )
+                            return
                     if isinstance(exc, GigaCodeRequestFailed):
                         if exc.reason in {"configuration", "native-tool"}:
                             raise
@@ -561,9 +578,13 @@ class GigaCodeAgentController:
                     )
                     raise RuntimeError("GigaCode authentication did not complete") from None
             self._update(generation, "ready", "Получен неполный ответ GigaCode.")
+            decision_reason: Literal["format", "length", "native-read"] = "format"
+            if isinstance(exc, GigaCodeIncompleteOutput):
+                decision_reason = "length"
+            elif exc.reason == "native-read":
+                decision_reason = "native-read"
             raise GigaCodeDecisionError(
-                "GigaCode returned an incomplete response",
-                reason="length" if isinstance(exc, GigaCodeIncompleteOutput) else "format",
+                "GigaCode returned an unusable decision", reason=decision_reason,
             ) from None
         except (GigaCodeTimedOut, GigaCodeTransientError) as exc:
             _log_interruption("decision", exc)
@@ -600,9 +621,7 @@ class GigaCodeAgentController:
             reason = exc.reason if isinstance(exc, GigaCodeRequestFailed) else None
             with self._lock:
                 if self._current(generation):
-                    if self._state == "authentication_required" or reason in {
-                        "configuration", "native-tool",
-                    }:
+                    if self._state == "authentication_required" or reason == "configuration":
                         self._failed(generation, exc)
                     elif reason == "unexpected-exit":
                         self._recover()

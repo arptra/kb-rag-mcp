@@ -53,6 +53,8 @@ _CORRECTIONS = {
                         "the facts, or defer.",
     "length": "The previous reply exceeded the output limit. Give one concise, complete "
               "decision. With sufficient evidence, answer briefly and cite the relevant source.",
+    "native-read": "Emit one JSON object in ordinary response text. Use the supplied portal "
+                   "tools by name and do not invoke a built-in CLI tool.",
 }
 
 

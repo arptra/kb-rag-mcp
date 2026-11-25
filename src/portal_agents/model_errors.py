@@ -229,13 +229,15 @@ def gateway_exception(exc: BaseException) -> ModelGatewayError | None:
                 "runner-configuration", "Проверьте параметры запуска и авторизацию GigaCode",
             ),
             "native-tool": (
-                "runner-native-tool", "GigaCode попытался вызвать встроенный инструмент",
+                "runner-native-tool", "GigaCode прервал этот шаг. Можно продолжить в чате",
             ),
             "unexpected-exit": (
                 "runner-exit", "Процесс GigaCode завершился. Портал проверяет его готовность",
             ),
         }[exc.reason]
-        failure = ModelGatewayError(category=category, message=message)
+        failure = ModelGatewayError(
+            category=category, message=message, retryable=exc.reason == "unexpected-exit",
+        )
         if type(exc.returncode) is int:
             failure.diagnostics["exit_code"] = exc.returncode
         return failure
