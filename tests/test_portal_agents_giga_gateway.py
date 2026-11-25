@@ -29,6 +29,9 @@ async def test_native_model_probe_and_tool_round_trip(settings_factory, tmp_path
     requests = []
     state_id = str(uuid4())
     answer = "Доступен индекс default."
+    question = "Какие индексы доступны?"
+    paraphrase = "Перечисли индексы, к которым есть доступ."
+    followup_question = "Напомни результат предыдущей проверки."
 
     async def native_api(stream, writer):
         headers = await stream.readuntil(b"\r\n\r\n")
@@ -36,13 +39,18 @@ async def test_native_model_probe_and_tool_round_trip(settings_factory, tmp_path
                       if line.startswith(b"content-length:"))
         payload = json.loads(await stream.readexactly(int(length)))
         requests.append((headers.lower(), payload, writer.get_extra_info("peercert")))
-        # A transient failure after the index tool must retry only the model step.
-        if model_name == "DeepSeek-V4-Flash" and len(requests) == 3:
+        messages = payload["messages"]
+        # This deployment fails on the solving call until it receives a paraphrase.
+        if (model_name == "DeepSeek-V4-Flash" and payload.get("functions")
+                and any(m["role"] == "function" for m in messages)
+                and not any(followup_question == m.get("content") for m in messages)
+                and not any(paraphrase in (m.get("content") or "") for m in messages)):
             writer.write(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n"
                          b"Connection: close\r\n\r\n")
             await writer.drain()
             writer.close()
-            await writer.wait_closed()
+            with suppress(ConnectionResetError):
+                await writer.wait_closed()
             return
         msg = {"role": "assistant", "content": "OK"}
         reason = "stop"
@@ -50,6 +58,8 @@ async def test_native_model_probe_and_tool_round_trip(settings_factory, tmp_path
             msg = {**msg, "content": "", "functions_state_id": state_id,
                    "function_call": {"name": "list_indexes", "arguments": {}}}
             reason = "function_call"
+        elif len(requests) > 2 and not payload.get("functions"):
+            msg["content"] = paraphrase
         elif len(requests) > 2:
             msg["content"] = answer
         response = json.dumps({
@@ -86,19 +96,26 @@ async def test_native_model_probe_and_tool_round_trip(settings_factory, tmp_path
         user = {"Authorization": f"Bearer {reader}"}
         reply = await client.post(
             "/agents/api/chat", headers=user,
-            json={"chat": chat_id, "question": "Какие индексы доступны?"},
+            json={"chat": chat_id, "question": question},
         )
         events = [json.loads(line) for line in reply.text.splitlines()]
         assert events[-1]["event"] == "answer" and events[-1]["text"] == answer, events
         assert [e["text"] for e in events if e["event"] == "tool_start"] == ["list_indexes"]
         retries = [e for e in events if e["event"] == "model_retry"]
-        assert len(retries) == int(model_name == "DeepSeek-V4-Flash")
+        assert len(retries) == (3 if model_name == "DeepSeek-V4-Flash" else 0)
+        if retries:
+            assert any("переформул" in retry["text"].casefold() for retry in retries)
+            assert all(paraphrase not in event["text"] for event in events)
+        history = (await client.get("/agents/api/chats/" + chat_id, headers=user)).json()
+        assert [(m["role"], m["text"]) for m in history["messages"]] == [
+            ("user", question), ("assistant", answer),
+        ]
         followup = await client.post("/agents/api/chat", headers=user, json={
-            "chat": chat_id, "question": "Напомни результат предыдущей проверки.",
+            "chat": chat_id, "question": followup_question,
         })
         assert json.loads(followup.text.splitlines()[-1])["event"] == "answer"
 
-    assert len(requests) == (5 if model_name == "DeepSeek-V4-Flash" else 4)
+    assert len(requests) == (7 if model_name == "DeepSeek-V4-Flash" else 4)
     for headers, body, certificate in requests:
         assert certificate and b"authorization:" not in headers
         assert headers.startswith(b"post /company/api/v1/chat/completions ")
@@ -106,9 +123,27 @@ async def test_native_model_probe_and_tool_round_trip(settings_factory, tmp_path
         assert "thinking" not in body
     if model_name == "DeepSeek-V4-Flash":
         assert requests[1][1]["max_tokens"] == 32768
-        assert requests[2][1]["messages"] == requests[3][1]["messages"]
+        original = requests[2][1]["messages"]
+        assert requests[3][1]["messages"] == original
+        rewrite = requests[4][1]
+        assert not rewrite.get("functions")
+        assert rewrite["max_tokens"] == 256
+        assert [m["role"] for m in rewrite["messages"]] == ["system", "user"]
+        assert question in rewrite["messages"][-1]["content"]
+        assert all(state_id not in m["content"] for m in rewrite["messages"])
+        solving = requests[5][1]
+        assert solving["max_tokens"] == 32768
+        assert solving["functions"] == requests[2][1]["functions"]
+        assert any(question in m["content"] for m in solving["messages"] if m["role"] == "user")
+        assert any(paraphrase in (m.get("content") or "") for m in solving["messages"]
+                   if m["role"] == "assistant")
+        later = requests[-1][1]["messages"]
+        assert all(paraphrase not in (m.get("content") or "") for m in later)
+        assert [m["content"] for m in later if m["role"] == "user"] == [question, followup_question]
     assert "list_indexes" in {f["name"] for f in requests[1][1]["functions"]}
     for _, body, _ in requests[2:]:
+        if not body.get("functions"):
+            continue  # The tool-free rewrite sees only the user's question.
         messages = body["messages"]
         assert any(m.get("functions_state_id") == state_id for m in messages)
         tool_result = next(m for m in messages if m["role"] == "function")

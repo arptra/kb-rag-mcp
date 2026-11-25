@@ -261,7 +261,7 @@
       if (["tool_start", "tool_end", "model", "model_retry"].includes(item.event)) {
         let status;
         if (item.event === "model_retry") status = item.text;
-        else if (item.event === "model") status = "Обращение к модели";
+        else if (item.event === "model") status = item.text || "Обращение к модели";
         else {
           const name = tools[item.text] || item.text;
           status = (item.event === "tool_start" ? "Выполняется · " : "Завершено · ") + name;
